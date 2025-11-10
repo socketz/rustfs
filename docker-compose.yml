@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-version: "3.8"
-
 services:
   # RustFS main service
   rustfs:
@@ -43,9 +41,9 @@ services:
       - RUSTFS_TLS_PATH=/opt/tls
       - RUSTFS_OBS_ENDPOINT=http://otel-collector:4317
     volumes:
-      - deploy/data/pro:/data
-      - deploy/logs:/app/logs
-      - deploy/data/certs/:/opt/tls # TLS configuration, you should create tls directory and put your tls files in it and then specify the path here
+      - ./deploy/data/pro:/data
+      - ./deploy/logs:/app/logs
+      - ./deploy/data/certs/:/opt/tls # TLS configuration, you should create tls directory and put your tls files in it and then specify the path here
     networks:
       - rustfs-network
     restart: unless-stopped
@@ -60,8 +58,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-    depends_on:
-      - otel-collector
 
   # Development environment
   rustfs-dev:
@@ -87,7 +83,7 @@ services:
       - RUSTFS_LOG_LEVEL=debug
     volumes:
       - .:/app # Mount source code to /app for development
-      - deploy/data/dev:/data
+      - ./deploy/data/dev:/data
     networks:
       - rustfs-network
     restart: unless-stopped
