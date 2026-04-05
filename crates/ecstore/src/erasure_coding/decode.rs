@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::BitrotReader;
-use super::Erasure;
 use crate::disk::error::Error;
 use crate::disk::error_reduce::reduce_errs;
+use crate::erasure_coding::{BitrotReader, Erasure};
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
 use std::io;
@@ -176,12 +175,10 @@ where
     let mut write_left = length;
 
     for block_op in &en_blocks[..data_blocks] {
-        if block_op.is_none() {
+        let Some(block) = block_op else {
             error!("write_data_blocks block_op.is_none()");
             return Err(io::Error::new(ErrorKind::UnexpectedEof, "Missing data block"));
-        }
-
-        let block = block_op.as_ref().unwrap();
+        };
 
         if offset >= block.len() {
             offset -= block.len();
@@ -191,7 +188,7 @@ where
         let block_slice = &block[offset..];
         offset = 0;
 
-        if write_left < block.len() {
+        if write_left < block_slice.len() {
             writer.write_all(&block_slice[..write_left]).await.map_err(|e| {
                 error!("write_data_blocks write_all err: {}", e);
                 e
@@ -268,12 +265,11 @@ impl Erasure {
 
             let (mut shards, errs) = reader.read().await;
 
-            if ret_err.is_none() {
-                if let (_, Some(err)) = reduce_errs(&errs, &[]) {
-                    if err == Error::FileNotFound || err == Error::FileCorrupt {
-                        ret_err = Some(err.into());
-                    }
-                }
+            if ret_err.is_none()
+                && let (_, Some(err)) = reduce_errs(&errs, &[])
+                && (err == Error::FileNotFound || err == Error::FileCorrupt)
+            {
+                ret_err = Some(err.into());
             }
 
             if !reader.can_decode(&shards) {
@@ -315,11 +311,12 @@ impl Erasure {
 
 #[cfg(test)]
 mod tests {
-    use rustfs_utils::HashAlgorithm;
-
-    use crate::{disk::error::DiskError, erasure_coding::BitrotWriter};
-
     use super::*;
+    use crate::{
+        disk::error::DiskError,
+        erasure_coding::{BitrotReader, BitrotWriter},
+    };
+    use rustfs_utils::HashAlgorithm;
     use std::io::Cursor;
 
     #[tokio::test]
@@ -457,6 +454,6 @@ mod tests {
         }
 
         let reader_cursor = Cursor::new(buf);
-        BitrotReader::new(reader_cursor, shard_size, hash_algo.clone())
+        BitrotReader::new(reader_cursor, shard_size, hash_algo.clone(), false)
     }
 }

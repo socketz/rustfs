@@ -13,27 +13,27 @@
 // limitations under the License.
 #![allow(unused_variables, unused_mut, unused_must_use)]
 
-use http::{HeaderMap, StatusCode};
-//use iam::get_global_action_cred;
-use matchit::Params;
-use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{
-    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
-    header::{CONTENT_LENGTH, CONTENT_TYPE},
-    s3_error,
-};
-use serde_urlencoded::from_bytes;
-use time::OffsetDateTime;
-use tracing::{debug, warn};
-
 use crate::{
-    admin::{auth::validate_admin_request, router::Operation},
+    admin::{
+        auth::validate_admin_request,
+        router::{AdminOperation, Operation, S3Router},
+    },
+    app::context::resolve_tier_config_handle,
     auth::{check_key_valid, get_session_token},
+    server::{ADMIN_PREFIX, RemoteAddr},
 };
-
+use http::Uri;
+use http::{HeaderMap, StatusCode};
+use hyper::Method;
+use matchit::Params;
+use percent_encoding::percent_decode_str;
+use rustfs_common::data_usage::TierStats;
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
+use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
 use rustfs_ecstore::{
+    bucket::lifecycle::tier_last_day_stats::DailyAllTierStats,
+    client::admin_handler_utils::AdminError,
     config::storageclass,
-    global::GLOBAL_TierConfigMgr,
     tier::{
         tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY, ERR_TIER_MISSING_CREDENTIALS},
         tier_admin::TierCreds,
@@ -44,6 +44,16 @@ use rustfs_ecstore::{
         },
     },
 };
+use rustfs_policy::policy::action::{Action, AdminAction};
+use s3s::{
+    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+    s3_error,
+};
+use serde_urlencoded::from_bytes;
+use std::collections::HashMap;
+use time::OffsetDateTime;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct AddTierQuery {
@@ -72,6 +82,74 @@ pub struct AddTierQuery {
 }
 
 pub struct AddTier {}
+
+fn resolve_tier_name(uri: &Uri, params: &Params<'_, '_>) -> S3Result<String> {
+    if let Some(tier) = params.get("tier") {
+        let decoded = percent_decode_str(tier)
+            .decode_utf8()
+            .map_err(|_| s3_error!(InvalidArgument, "invalid tier path parameter"))?;
+        let trimmed = decoded.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    let query = if let Some(query) = uri.query() {
+        let input: AddTierQuery = from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
+        input
+    } else {
+        AddTierQuery::default()
+    };
+
+    Ok(require_tier_name(&query)?.to_string())
+}
+
+pub fn register_tier_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier").as_str(),
+        AdminOperation(&ListTiers {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier-stats").as_str(),
+        AdminOperation(&GetTierInfo {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tier}").as_str(),
+        AdminOperation(&VerifyTier {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tiername}").as_str(),
+        AdminOperation(&RemoveTier {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier").as_str(),
+        AdminOperation(&AddTier {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/{tiername}").as_str(),
+        AdminOperation(&EditTier {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/tier/clear").as_str(),
+        AdminOperation(&ClearTier {}),
+    )?;
+
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Operation for AddTier {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -92,14 +170,22 @@ impl Operation for AddTier {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::SetTierAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "tier configuration body too large or failed to read"));
             }
         };
 
@@ -154,7 +240,8 @@ impl Operation for AddTier {
             &_ => (),
         }
 
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        let tier_config_mgr_handle = resolve_tier_config_handle();
+        let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.add(args, force).await {
             return if err.code == ERR_TIER_ALREADY_EXISTS.code {
@@ -220,14 +307,22 @@ impl Operation for EditTier {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::SetTierAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
 
         let mut input = req.input;
-        let body = match input.store_all_unlimited().await {
+        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "get body failed"));
+                return Err(s3_error!(InvalidRequest, "tier configuration body too large or failed to read"));
             }
         };
 
@@ -238,7 +333,8 @@ impl Operation for EditTier {
 
         let tier_name = params.get("tiername").map(|s| s.to_string()).unwrap_or_default();
 
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        let tier_config_mgr_handle = resolve_tier_config_handle();
+        let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.edit(&tier_name, creds).await {
             return if err.code == ERR_TIER_NOT_FOUND.code {
@@ -295,9 +391,18 @@ impl Operation for ListTiers {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ListTierAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
 
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.read().await;
+        let tier_config_mgr_handle = resolve_tier_config_handle();
+        let tier_config_mgr = tier_config_mgr_handle.read().await;
         let tiers = tier_config_mgr.list_tiers();
 
         let data = serde_json::to_vec(&tiers)
@@ -331,7 +436,15 @@ impl Operation for RemoveTier {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::SetTierAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
 
         let mut force: bool = false;
         let force_str = query.force.clone().unwrap_or_default();
@@ -344,7 +457,8 @@ impl Operation for RemoveTier {
 
         let tier_name = params.get("tiername").map(|s| s.to_string()).unwrap_or_default();
 
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        let tier_config_mgr_handle = resolve_tier_config_handle();
+        let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.remove(&tier_name, force).await {
             return if err.code == ERR_TIER_NOT_FOUND.code {
@@ -376,17 +490,7 @@ impl Operation for RemoveTier {
 pub struct VerifyTier {}
 #[async_trait::async_trait]
 impl Operation for VerifyTier {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let query = {
-            if let Some(query) = req.uri.query() {
-                let input: AddTierQuery =
-                    from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get query failed"))?;
-                input
-            } else {
-                AddTierQuery::default()
-            }
-        };
-
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let Some(input_cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
@@ -394,10 +498,20 @@ impl Operation for VerifyTier {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ListTierAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
 
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
-        tier_config_mgr.verify(&query.tier.unwrap()).await;
+        let tier = resolve_tier_name(&req.uri, &params)?;
+        let tier_config_mgr_handle = resolve_tier_config_handle();
+        let mut tier_config_mgr = tier_config_mgr_handle.write().await;
+        tier_config_mgr.verify(&tier).await.map_err(map_tier_verify_error)?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
@@ -417,7 +531,15 @@ impl Operation for GetTierInfo {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ListTierAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -429,8 +551,12 @@ impl Operation for GetTierInfo {
             }
         };
 
-        let tier_config_mgr = GLOBAL_TierConfigMgr.read().await;
-        let info = tier_config_mgr.get(&query.tier.unwrap());
+        let tier_name = if query.tier.is_some() {
+            Some(require_tier_name(&query)?)
+        } else {
+            None
+        };
+        let info = filter_tier_stats(GLOBAL_TransitionState.get_daily_all_tier_stats(), tier_name);
 
         let data = serde_json::to_vec(&info)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tier err {e}")))?;
@@ -440,6 +566,51 @@ impl Operation for GetTierInfo {
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
+}
+
+fn optional_tier_name(query: &AddTierQuery) -> Option<&str> {
+    query.tier.as_deref().map(str::trim).filter(|tier| !tier.is_empty())
+}
+
+fn require_tier_name(query: &AddTierQuery) -> S3Result<&str> {
+    optional_tier_name(query).ok_or_else(|| s3_error!(InvalidArgument, "tier is required"))
+}
+
+fn filter_tier_stats(daily_stats: DailyAllTierStats, tier_name: Option<&str>) -> HashMap<String, TierStats> {
+    daily_stats
+        .into_iter()
+        .filter_map(|(name, stats)| {
+            if tier_name.is_some_and(|requested| !name.eq_ignore_ascii_case(requested)) {
+                return None;
+            }
+
+            Some((name, stats.total()))
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn map_tier_verify_error(err: std::io::Error) -> S3Error {
+    if let Some(admin_err) = err.get_ref().and_then(|inner| inner.downcast_ref::<AdminError>()) {
+        return match admin_err.code.as_str() {
+            code if code == ERR_TIER_NOT_FOUND.code => {
+                S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found!")
+            }
+            code if code == ERR_TIER_CONNECT_ERR.code => S3Error::with_message(
+                S3ErrorCode::Custom("TierVerificationFailed".into()),
+                format!("tier verification failed. {}", admin_err.message),
+            ),
+            _ => S3Error::with_message(
+                S3ErrorCode::Custom("TierVerificationFailed".into()),
+                format!("tier verification failed. {}", admin_err.message),
+            ),
+        };
+    }
+
+    S3Error::with_message(
+        S3ErrorCode::Custom("TierVerificationFailed".into()),
+        format!("tier verification failed. {err}"),
+    )
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -469,7 +640,15 @@ impl Operation for ClearTier {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::SetTierAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
 
         let mut force: bool = false;
         let force_str = query.force;
@@ -487,7 +666,8 @@ impl Operation for ClearTier {
             return Err(s3_error!(InvalidRequest, "get rand failed"));
         };
 
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        let tier_config_mgr_handle = resolve_tier_config_handle();
+        let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.clear_tier(force).await {
             warn!("tier_config_mgr clear failed, e: {:?}", err);
@@ -505,5 +685,179 @@ impl Operation for ClearTier {
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         header.insert(CONTENT_LENGTH, "0".parse().unwrap());
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::Uri;
+    use matchit::Router;
+    use rustfs_ecstore::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
+
+    #[test]
+    fn resolve_tier_name_prefers_path_parameter() {
+        let uri: Uri = "/rustfs/admin/v3/tier/HOT?tier=COLD".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/HOT").expect("route should match");
+
+        let tier = resolve_tier_name(&uri, &matched.params).expect("path parameter should resolve");
+        assert_eq!(tier, "HOT");
+    }
+
+    #[test]
+    fn resolve_tier_name_falls_back_to_query_parameter() {
+        let uri: Uri = "/rustfs/admin/v3/tier-stats?tier=WARM".parse().expect("uri should parse");
+        let mut router: Router<()> = Router::new();
+        router.insert("/", ()).expect("root route should insert");
+        let params = router.at("/").expect("root route should match").params;
+
+        let tier = resolve_tier_name(&uri, &params).expect("query parameter should resolve");
+        assert_eq!(tier, "WARM");
+    }
+
+    #[test]
+    fn resolve_tier_name_falls_back_when_path_parameter_is_blank() {
+        let uri: Uri = "/rustfs/admin/v3/tier/%20?tier=WARM".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/%20").expect("route should match");
+
+        let tier = resolve_tier_name(&uri, &matched.params).expect("query parameter should resolve");
+        assert_eq!(tier, "WARM");
+    }
+
+    #[test]
+    fn resolve_tier_name_preserves_plus_in_path_parameter() {
+        let uri: Uri = "/rustfs/admin/v3/tier/WARM+PLUS".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/WARM+PLUS").expect("route should match");
+
+        let tier = resolve_tier_name(&uri, &matched.params).expect("path parameter should resolve");
+        assert_eq!(tier, "WARM+PLUS");
+    }
+
+    #[test]
+    fn resolve_tier_name_rejects_blank_path_without_query_fallback() {
+        let uri: Uri = "/rustfs/admin/v3/tier/%20".parse().expect("uri should parse");
+        let mut router = Router::new();
+        router
+            .insert("/rustfs/admin/v3/tier/{tier}", ())
+            .expect("route should insert");
+        let matched = router.at("/rustfs/admin/v3/tier/%20").expect("route should match");
+
+        let err = resolve_tier_name(&uri, &matched.params).expect_err("blank path should fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("tier is required"));
+    }
+
+    #[test]
+    fn require_tier_name_rejects_missing_value() {
+        let err = require_tier_name(&AddTierQuery::default()).expect_err("missing tier should return an error");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("tier is required"));
+    }
+
+    #[test]
+    fn require_tier_name_rejects_empty_value() {
+        let err = require_tier_name(&AddTierQuery {
+            tier: Some("   ".to_string()),
+            ..Default::default()
+        })
+        .expect_err("empty tier should return an error");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("tier is required"));
+    }
+
+    #[test]
+    fn filter_tier_stats_returns_all_tiers_without_filter() {
+        let stats = filter_tier_stats(sample_daily_stats(), None);
+
+        assert_eq!(stats.len(), 2);
+        assert_eq!(
+            stats.get("WARM"),
+            Some(&TierStats {
+                total_size: 15,
+                num_versions: 3,
+                num_objects: 1,
+            })
+        );
+        assert_eq!(
+            stats.get("ARCHIVE"),
+            Some(&TierStats {
+                total_size: 9,
+                num_versions: 1,
+                num_objects: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn filter_tier_stats_applies_case_insensitive_filter() {
+        let stats = filter_tier_stats(sample_daily_stats(), Some("warm"));
+
+        assert_eq!(stats.len(), 1);
+        assert_eq!(
+            stats.get("WARM"),
+            Some(&TierStats {
+                total_size: 15,
+                num_versions: 3,
+                num_objects: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn map_tier_verify_error_preserves_not_found() {
+        let err = std::io::Error::other(ERR_TIER_NOT_FOUND.clone());
+        let mapped = map_tier_verify_error(err);
+
+        assert_eq!(mapped.code(), &S3ErrorCode::Custom("TierNotFound".into()));
+        assert_eq!(mapped.message(), Some("tier not found!"));
+    }
+
+    #[test]
+    fn map_tier_verify_error_wraps_other_failures() {
+        let err = std::io::Error::other("backend unavailable");
+        let mapped = map_tier_verify_error(err);
+
+        assert_eq!(mapped.code(), &S3ErrorCode::Custom("TierVerificationFailed".into()));
+        assert_eq!(mapped.message(), Some("tier verification failed. backend unavailable"));
+    }
+
+    fn sample_daily_stats() -> DailyAllTierStats {
+        let mut warm = LastDayTierStats::default();
+        warm.add_stats(TierStats {
+            total_size: 10,
+            num_versions: 1,
+            num_objects: 1,
+        });
+        warm.add_stats(TierStats {
+            total_size: 5,
+            num_versions: 2,
+            num_objects: 0,
+        });
+
+        let mut archive = LastDayTierStats::default();
+        archive.add_stats(TierStats {
+            total_size: 9,
+            num_versions: 1,
+            num_objects: 1,
+        });
+
+        let mut stats = DailyAllTierStats::new();
+        stats.insert("WARM".to_string(), warm);
+        stats.insert("ARCHIVE".to_string(), archive);
+        stats
     }
 }

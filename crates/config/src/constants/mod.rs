@@ -13,9 +13,21 @@
 // limitations under the License.
 
 pub(crate) mod app;
+pub(crate) mod body_limits;
+pub(crate) mod capacity;
+pub(crate) mod compress;
 pub(crate) mod console;
 pub(crate) mod env;
+pub(crate) mod heal;
+pub(crate) mod object;
+pub(crate) mod oidc;
 pub(crate) mod profiler;
+pub(crate) mod protocols;
+pub(crate) mod proxy;
+pub(crate) mod quota;
 pub(crate) mod runtime;
+pub(crate) mod scanner;
 pub(crate) mod targets;
 pub(crate) mod tls;
+pub(crate) mod workload;
+pub(crate) mod zero_copy;

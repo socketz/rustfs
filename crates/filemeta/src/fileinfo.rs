@@ -16,12 +16,16 @@ use crate::{Error, ReplicationState, ReplicationStatusType, Result, TRANSITION_C
 use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
-use rustfs_utils::http::headers::{RESERVED_METADATA_PREFIX_LOWER, RUSTFS_HEALING};
+use rustfs_utils::http::{
+    SUFFIX_COMPRESSION, SUFFIX_DATA_MOVED, SUFFIX_HEALING, SUFFIX_INLINE_DATA, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER,
+    SUFFIX_TIER_SKIP_FV_ID, contains_key_str, get_str, insert_str,
+};
 use s3s::dto::{RestoreStatus, Timestamp};
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{format_description::FormatItem, macros::format_description};
 use uuid::Uuid;
 
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
@@ -36,6 +40,9 @@ pub const TIER_FV_MARKER: &str = "tier-free-marker";
 pub const TIER_SKIP_FV_ID: &str = "tier-skip-fvid";
 
 const ERR_RESTORE_HDR_MALFORMED: &str = "x-amz-restore header malformed";
+
+const RFC1123: &[FormatItem<'_>] =
+    format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 pub struct ObjectPartInfo {
@@ -169,12 +176,31 @@ impl ErasureInfo {
 
     /// Check if this ErasureInfo equals another ErasureInfo
     pub fn equals(&self, other: &ErasureInfo) -> bool {
-        self.algorithm == other.algorithm
-            && self.data_blocks == other.data_blocks
-            && self.parity_blocks == other.parity_blocks
-            && self.block_size == other.block_size
-            && self.index == other.index
-            && self.distribution == other.distribution
+        if self.algorithm != other.algorithm {
+            return false;
+        }
+
+        if self.data_blocks != other.data_blocks {
+            return false;
+        }
+
+        if self.parity_blocks != other.parity_blocks {
+            return false;
+        }
+
+        if self.block_size != other.block_size {
+            return false;
+        }
+
+        if self.distribution.len() != other.distribution.len() {
+            return false;
+        }
+        for (i, v) in self.distribution.iter().enumerate() {
+            if v != &other.distribution[i] {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -213,6 +239,8 @@ pub struct FileInfo {
     // Combined checksum when object was uploaded
     pub checksum: Option<Bytes>,
     pub versioned: bool,
+    /// True when version meta was parsed via rmp_serde fallback (legacy format).
+    pub uses_legacy_checksum: bool,
 }
 
 impl FileInfo {
@@ -220,7 +248,11 @@ impl FileInfo {
         let indices = {
             let cardinality = data_blocks + parity_blocks;
             let mut nums = vec![0; cardinality];
-            let key_crc = crc32fast::hash(object.as_bytes());
+            let key_crc = {
+                let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+                hasher.update(object.as_bytes());
+                hasher.finalize() as u32
+            };
 
             let start = key_crc as usize % cardinality;
             for i in 1..=cardinality {
@@ -340,58 +372,48 @@ impl FileInfo {
     }
 
     pub fn set_healing(&mut self) {
-        self.metadata.insert(RUSTFS_HEALING.to_string(), "true".to_string());
+        insert_str(&mut self.metadata, SUFFIX_HEALING, "true".to_string());
     }
 
     pub fn set_tier_free_version_id(&mut self, version_id: &str) {
-        self.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_ID}"), version_id.to_string());
+        insert_str(&mut self.metadata, SUFFIX_TIER_FV_ID, version_id.to_string());
     }
 
     pub fn tier_free_version_id(&self) -> String {
-        self.metadata[&format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_ID}")].clone()
+        get_str(&self.metadata, SUFFIX_TIER_FV_ID).unwrap_or_default()
     }
 
     pub fn set_tier_free_version(&mut self) {
-        self.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_MARKER}"), "".to_string());
+        insert_str(&mut self.metadata, SUFFIX_TIER_FV_MARKER, "".to_string());
     }
 
     pub fn set_skip_tier_free_version(&mut self) {
-        self.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_SKIP_FV_ID}"), "".to_string());
+        insert_str(&mut self.metadata, SUFFIX_TIER_SKIP_FV_ID, "".to_string());
     }
 
     pub fn skip_tier_free_version(&self) -> bool {
-        self.metadata
-            .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_SKIP_FV_ID}"))
+        contains_key_str(&self.metadata, SUFFIX_TIER_SKIP_FV_ID)
     }
 
     pub fn tier_free_version(&self) -> bool {
-        self.metadata
-            .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}{TIER_FV_MARKER}"))
+        contains_key_str(&self.metadata, SUFFIX_TIER_FV_MARKER)
     }
 
     pub fn set_inline_data(&mut self) {
-        self.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").to_owned(), "true".to_owned());
+        insert_str(&mut self.metadata, SUFFIX_INLINE_DATA, "true".to_string());
     }
 
     pub fn set_data_moved(&mut self) {
-        self.metadata
-            .insert(format!("{RESERVED_METADATA_PREFIX_LOWER}data-moved").to_owned(), "true".to_owned());
+        insert_str(&mut self.metadata, SUFFIX_DATA_MOVED, "true".to_string());
     }
 
     pub fn inline_data(&self) -> bool {
-        self.metadata
-            .contains_key(format!("{RESERVED_METADATA_PREFIX_LOWER}inline-data").as_str())
-            && !self.is_remote()
+        contains_key_str(&self.metadata, SUFFIX_INLINE_DATA) && !self.is_remote()
     }
 
     /// Check if the object is compressed
     pub fn is_compressed(&self) -> bool {
-        self.metadata
-            .contains_key(&format!("{RESERVED_METADATA_PREFIX_LOWER}compression"))
+        contains_key_str(&self.metadata, SUFFIX_COMPRESSION)
     }
 
     /// Check if the object is remote (transitioned to another tier)
@@ -434,21 +456,28 @@ impl FileInfo {
     pub fn equals(&self, other: &FileInfo) -> bool {
         // Check if both are compressed or both are not compressed
         if self.is_compressed() != other.is_compressed() {
+            tracing::warn!("equals: is_compressed is not equal, object_name={}", self.name);
             return false;
         }
 
         // Check transition info
         if !self.transition_info_equals(other) {
+            tracing::warn!("equals: transition_info_equals is not equal, object_name={}", self.name);
             return false;
         }
 
         // Check mod time
         if self.mod_time != other.mod_time {
+            tracing::warn!("equals: mod_time is not equal, object_name={}", self.name);
             return false;
         }
 
         // Check erasure info
-        self.erasure.equals(&other.erasure)
+        if !self.erasure.equals(&other.erasure) {
+            tracing::warn!("equals: erasure is not equal, object_name={}", self.name);
+            return false;
+        }
+        true
     }
 
     /// Check if transition related information are equal
@@ -501,6 +530,10 @@ impl FileInfo {
             ReplicationStatusType::Empty
         }
     }
+
+    pub fn shard_file_size(&self, total_length: i64) -> i64 {
+        self.erasure.shard_file_size(total_length)
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -546,6 +579,7 @@ pub trait RestoreStatusOps {
     fn on_going(&self) -> bool;
     fn on_disk(&self) -> bool;
     fn to_string(&self) -> String;
+    fn to_string2(&self) -> String;
 }
 
 impl RestoreStatusOps for RestoreStatus {
@@ -584,9 +618,21 @@ impl RestoreStatusOps for RestoreStatus {
                 .unwrap()
         )
     }
+
+    fn to_string2(&self) -> String {
+        if self.on_going() {
+            return "ongoing-request=\"true\"".to_string();
+        }
+        format!(
+            "ongoing-request=\"false\", expiry-date=\"{}\"",
+            OffsetDateTime::from(self.restore_expiry_date.clone().unwrap())
+                .format(&RFC1123)
+                .unwrap()
+        )
+    }
 }
 
-fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
+pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
     let tokens: Vec<&str> = restore_hdr.splitn(2, ",").collect();
     let progress_tokens: Vec<&str> = tokens[0].splitn(2, "=").collect();
     if progress_tokens.len() != 2 {
@@ -616,10 +662,8 @@ fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
             if expiry_tokens[0].trim() != "expiry-date" {
                 return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
             }
-            let expiry = OffsetDateTime::parse(expiry_tokens[1].trim_matches('"'), &Rfc3339).unwrap();
-            /*if err != nil {
-                return Err(Error::other(ERR_RESTORE_HDR_MALFORMED));
-            }*/
+            let expiry = OffsetDateTime::parse(expiry_tokens[1].trim_matches('"'), &Rfc3339)
+                .map_err(|_| Error::other(ERR_RESTORE_HDR_MALFORMED))?;
             return Ok(RestoreStatus {
                 is_restore_in_progress: Some(false),
                 restore_expiry_date: Some(Timestamp::from(expiry)),
@@ -631,10 +675,10 @@ fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
 }
 
 pub fn is_restored_object_on_disk(meta: &HashMap<String, String>) -> bool {
-    if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str()) {
-        if let Ok(restore_status) = parse_restore_obj_status(restore_hdr) {
-            return restore_status.on_disk();
-        }
+    if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str())
+        && let Ok(restore_status) = parse_restore_obj_status(restore_hdr)
+    {
+        return restore_status.on_disk();
     }
     false
 }

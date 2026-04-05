@@ -32,12 +32,11 @@ workspace = true
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 uuid = { workspace = true, features = ["serde"] }
-chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-once_cell = { workspace = true }
 
 # Cryptography
 aes-gcm = { workspace = true }
@@ -56,14 +55,16 @@ moka = { workspace = true, features = ["future"] }
 
 # Additional dependencies
 md5 = { workspace = true }
+arc-swap = { workspace = true }
+rustfs-utils = { workspace = true }
 
 # HTTP client for Vault
 reqwest = { workspace = true }
 vaultrs = { workspace = true }
 
 [dev-dependencies]
-tokio-test = { workspace = true }
 tempfile = { workspace = true }
+temp-env = { workspace = true }
 
 [features]
 default = []

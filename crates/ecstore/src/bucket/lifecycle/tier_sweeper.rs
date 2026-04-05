@@ -18,14 +18,14 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
+use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
+use crate::global::GLOBAL_TierConfigMgr;
 use sha2::{Digest, Sha256};
 use std::any::Any;
-use std::io::{Cursor, Write};
+use std::io::Write;
+use uuid::Uuid;
 use xxhash_rust::xxh64;
-
-use super::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
-use super::lifecycle::{self, ObjectOpts};
-use crate::global::GLOBAL_TierConfigMgr;
 
 static XXHASH_SEED: u64 = 0;
 
@@ -34,7 +34,7 @@ static XXHASH_SEED: u64 = 0;
 struct ObjSweeper {
     object: String,
     bucket: String,
-    version_id: String,
+    version_id: Option<Uuid>,
     versioned: bool,
     suspended: bool,
     transition_status: String,
@@ -54,8 +54,8 @@ impl ObjSweeper {
         })
     }
 
-    pub fn with_version(&mut self, vid: String) -> &Self {
-        self.version_id = vid;
+    pub fn with_version(&mut self, vid: Option<Uuid>) -> &Self {
+        self.version_id = vid.clone();
         self
     }
 
@@ -72,8 +72,8 @@ impl ObjSweeper {
             version_suspended: self.suspended,
             ..Default::default()
         };
-        if self.suspended && self.version_id == "" {
-            opts.version_id = String::from("");
+        if self.suspended && self.version_id.is_none_or(|v| v.is_nil()) {
+            opts.version_id = None;
         }
         opts
     }
@@ -94,7 +94,7 @@ impl ObjSweeper {
         if !self.versioned || self.suspended {
             // 1, 2.a, 2.b
             del_tier = true;
-        } else if self.versioned && self.version_id != "" {
+        } else if self.versioned && self.version_id.is_some_and(|v| !v.is_nil()) {
             // 3.a
             del_tier = true;
         }
@@ -120,18 +120,17 @@ impl ObjSweeper {
 #[derive(Debug, Clone)]
 #[allow(unused_assignments)]
 pub struct Jentry {
-    obj_name: String,
-    version_id: String,
-    tier_name: String,
+    pub(crate) obj_name: String,
+    pub(crate) version_id: String,
+    pub(crate) tier_name: String,
 }
 
 impl ExpiryOp for Jentry {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.write(format!("{}", self.tier_name).as_bytes());
-        let _ = hasher.write(format!("{}", self.obj_name).as_bytes());
-        hasher.flush();
-        xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
+        hasher.update(format!("{}", self.tier_name).as_bytes());
+        hasher.update(format!("{}", self.obj_name).as_bytes());
+        xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -146,6 +145,38 @@ pub async fn delete_object_from_remote_tier(obj_name: &str, rv_id: &str, tier_na
         Err(e) => return Err(std::io::Error::other(e)),
     };
     w.remove(obj_name, rv_id).await
+}
+
+pub fn transitioned_delete_journal_entry(
+    version_id: Option<Uuid>,
+    versioned: bool,
+    suspended: bool,
+    transitioned: &TransitionedObject,
+) -> Option<Jentry> {
+    let sweeper = ObjSweeper {
+        version_id,
+        versioned,
+        suspended,
+        transition_status: transitioned.status.clone(),
+        transition_tier: transitioned.tier.clone(),
+        transition_version_id: transitioned.version_id.clone(),
+        remote_object: transitioned.name.clone(),
+        ..Default::default()
+    };
+
+    sweeper.should_remove_remote_object()
+}
+
+pub fn transitioned_force_delete_journal_entry(transitioned: &TransitionedObject) -> Option<Jentry> {
+    if transitioned.status != lifecycle::TRANSITION_COMPLETE {
+        return None;
+    }
+
+    Some(Jentry {
+        obj_name: transitioned.name.clone(),
+        version_id: transitioned.version_id.clone(),
+        tier_name: transitioned.tier.clone(),
+    })
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use crate::disk::{self, DiskAPI};
 use crate::error::{Error, Result};
 use crate::{
     disk::{
-        DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET,
+        DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET,
         error::DiskError,
         format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
         new_disk,
@@ -27,8 +27,7 @@ use crate::{
 };
 use futures::future::join_all;
 use std::collections::{HashMap, hash_map::Entry};
-
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub async fn init_disks(eps: &Endpoints, opt: &DiskOption) -> (Vec<Option<DiskStore>>, Vec<Option<DiskError>>) {
@@ -67,18 +66,18 @@ pub async fn connect_load_init_formats(
 ) -> Result<FormatV3> {
     let (formats, errs) = load_format_erasure_all(disks, false).await;
 
-    // debug!("load_format_erasure_all errs {:?}", &errs);
-
     check_disk_fatal_errs(&errs)?;
 
     check_format_erasure_values(&formats, set_drive_count)?;
 
     if first_disk && should_init_erasure_disks(&errs) {
-        //  UnformattedDisk, not format file create
+        // UnformattedDisk, try migrate from MinIO format first, else create new format
         info!("first_disk && should_init_erasure_disks");
-        // new format and save
+        if let Ok(fm) = try_migrate_format(disks, set_count, set_drive_count).await {
+            info!("Migrated format from MinIO config");
+            return Ok(fm);
+        }
         let fm = init_format_erasure(disks, set_count, set_drive_count, deployment_id).await?;
-
         return Ok(fm);
     }
 
@@ -152,6 +151,60 @@ async fn init_format_erasure(
     get_format_erasure_in_quorum(&fms)
 }
 
+/// Tries to migrate format
+/// Returns Ok(FormatV3) if migration succeeds, Err otherwise.
+async fn try_migrate_format(disks: &[Option<DiskStore>], set_count: usize, set_drive_count: usize) -> Result<FormatV3> {
+    for disk in disks.iter().flatten() {
+        let data = match disk.read_all(MIGRATING_META_BUCKET, FORMAT_CONFIG_FILE).await {
+            Ok(d) if !d.is_empty() => d,
+            _ => continue,
+        };
+
+        let fm = FormatV3::try_from(data.as_ref()).map_err(|e| Error::other(format!("parse MinIO format: {e}")))?;
+
+        let first_set = fm
+            .erasure
+            .sets
+            .first()
+            .ok_or_else(|| Error::other("MinIO format: erasure.sets is empty"))?;
+        if fm.erasure.sets.len() != set_count || first_set.len() != set_drive_count {
+            debug!(
+                "MinIO format set count mismatch: got {}x{}, expected {}x{}",
+                fm.erasure.sets.len(),
+                first_set.len(),
+                set_count,
+                set_drive_count
+            );
+            continue;
+        }
+
+        if fm.erasure.version != FormatErasureVersion::V3 {
+            debug!("MinIO format erasure version not V3: {:?}", fm.erasure.version);
+            continue;
+        }
+
+        let mut fms = vec![None; disks.len()];
+        for (idx, disk_opt) in disks.iter().enumerate() {
+            if disk_opt.is_none() {
+                continue;
+            }
+            let set_idx = idx / set_drive_count;
+            let disk_idx = idx % set_drive_count;
+            if set_idx >= fm.erasure.sets.len() || disk_idx >= fm.erasure.sets[set_idx].len() {
+                continue;
+            }
+            let mut newfm = fm.clone();
+            newfm.erasure.this = fm.erasure.sets[set_idx][disk_idx];
+            fms[idx] = Some(newfm);
+        }
+
+        save_format_file_all(disks, &fms).await?;
+        return get_format_erasure_in_quorum(&fms);
+    }
+
+    Err(Error::other("no MinIO format to migrate"))
+}
+
 pub fn get_format_erasure_in_quorum(formats: &[Option<FormatV3>]) -> Result<FormatV3> {
     let mut countmap = HashMap::new();
 
@@ -200,16 +253,27 @@ pub fn check_format_erasure_values(
 
         check_format_erasure_value(f)?;
 
-        if formats.len() != f.erasure.sets.len() * f.erasure.sets[0].len() {
-            return Err(Error::other("formats length for erasure.sets not mtach"));
+        let first_set = f.erasure.sets.first().ok_or_else(|| Error::other("erasure.sets is empty"))?;
+
+        if formats.len() != f.erasure.sets.len() * first_set.len() {
+            return Err(Error::other(format!(
+                "formats length for erasure.sets does not match: got {}, expected {}",
+                formats.len(),
+                f.erasure.sets.len() * first_set.len()
+            )));
         }
 
-        if f.erasure.sets[0].len() != set_drive_count {
-            return Err(Error::other("erasure set length not match set_drive_count"));
+        if first_set.len() != set_drive_count {
+            return Err(Error::other(format!(
+                "erasure set length for set_drive_count does not match: got {}, expected {}",
+                first_set.len(),
+                set_drive_count
+            )));
         }
     }
     Ok(())
 }
+
 fn check_format_erasure_value(format: &FormatV3) -> Result<()> {
     if format.version != FormatMetaVersion::V1 {
         return Err(Error::other("invalid FormatMetaVersion"));
@@ -255,6 +319,24 @@ pub async fn load_format_erasure_all(disks: &[Option<DiskStore>], heal: bool) ->
         }
     }
 
+    // Log aggregation summary of format load results
+    let ok_count = errors.iter().filter(|e| e.is_none()).count();
+    let err_count = errors.iter().filter(|e| e.is_some()).count();
+    // Count occurrences of each unique error
+    let mut err_counts: HashMap<String, usize> = HashMap::new();
+    for err in errors.iter().flatten() {
+        *err_counts.entry(format!("{err}")).or_default() += 1;
+    }
+    if !err_counts.is_empty() {
+        debug!(
+            disks_ok = ok_count,
+            disks_err = err_count,
+            disks_total = disks.len(),
+            "load format erasure all errors: {:?}",
+            err_counts
+        );
+    }
+
     (datas, errors)
 }
 
@@ -265,7 +347,10 @@ pub async fn load_format_erasure(disk: &DiskStore, heal: bool) -> disk::error::R
         .map_err(|e| match e {
             DiskError::FileNotFound => DiskError::UnformattedDisk,
             DiskError::DiskNotFound => DiskError::UnformattedDisk,
-            _ => e,
+            _ => {
+                warn!("load_format_erasure err: {:?} {:?}", disk.to_string(), e);
+                e
+            }
         })?;
 
     let mut fm = FormatV3::try_from(data.as_ref())?;
@@ -312,17 +397,18 @@ async fn save_format_file_all(disks: &[Option<DiskStore>], formats: &[Option<For
 }
 
 pub async fn save_format_file(disk: &Option<DiskStore>, format: &Option<FormatV3>) -> disk::error::Result<()> {
-    if disk.is_none() {
+    let Some(disk) = disk else {
         return Err(DiskError::DiskNotFound);
-    }
+    };
 
-    let format = format.as_ref().unwrap();
+    let Some(format) = format else {
+        return Err(DiskError::other("format is none"));
+    };
 
     let json_data = format.to_json()?;
 
     let tmpfile = Uuid::new_v4().to_string();
 
-    let disk = disk.as_ref().unwrap();
     disk.write_all(RUSTFS_META_BUCKET, tmpfile.as_str(), json_data.into_bytes().into())
         .await?;
 

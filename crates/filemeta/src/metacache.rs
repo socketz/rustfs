@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Error, FileInfo, FileInfoVersions, FileMeta, FileMetaShallowVersion, Result, VersionType, merge_file_meta_versions};
+use crate::{
+    Error, FileInfo, FileInfoOpts, FileInfoVersions, FileMeta, FileMetaShallowVersion, Result, VersionType, get_file_info,
+    merge_file_meta_versions,
+};
 use rmp::Marker;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -141,8 +144,7 @@ impl MetaCacheEntry {
             });
         }
 
-        if self.cached.is_some() {
-            let fm = self.cached.as_ref().unwrap();
+        if let Some(fm) = &self.cached {
             if fm.versions.is_empty() {
                 return Ok(FileInfo {
                     volume: bucket.to_owned(),
@@ -154,14 +156,20 @@ impl MetaCacheEntry {
                 });
             }
 
-            let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
+            let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false, true)?;
             return Ok(fi);
         }
 
-        let mut fm = FileMeta::new();
-        fm.unmarshal_msg(&self.metadata)?;
-        let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false)?;
-        Ok(fi)
+        get_file_info(
+            &self.metadata,
+            bucket,
+            self.name.as_str(),
+            "",
+            FileInfoOpts {
+                data: false,
+                include_free_versions: false,
+            },
+        )
     }
 
     pub fn file_info_versions(&self, bucket: &str) -> Result<FileInfoVersions> {
@@ -391,7 +399,13 @@ impl MetaCacheEntries {
             return None;
         }
 
-        let metadata = match cached.marshal_msg() {
+        let merged_cached = FileMeta {
+            meta_ver: cached.meta_ver,
+            versions,
+            ..Default::default()
+        };
+
+        let metadata = match merged_cached.marshal_msg() {
             Ok(meta) => meta,
             Err(e) => {
                 warn!("decommission_pool: entries resolve entry marshal_msg {:?}", e);
@@ -403,11 +417,7 @@ impl MetaCacheEntries {
         // Create a new merged result.
         let new_selected = MetaCacheEntry {
             name: selected.name.clone(),
-            cached: Some(FileMeta {
-                meta_ver: cached.meta_ver,
-                versions,
-                ..Default::default()
-            }),
+            cached: Some(merged_cached),
             reusable: true,
             metadata,
         };
@@ -442,10 +452,10 @@ impl MetaCacheEntriesSorted {
     }
 
     pub fn forward_past(&mut self, marker: Option<String>) {
-        if let Some(val) = marker {
-            if let Some(idx) = self.o.0.iter().flatten().position(|v| v.name > val) {
-                self.o.0 = self.o.0.split_off(idx);
-            }
+        if let Some(val) = marker
+            && let Some(idx) = self.o.0.iter().flatten().position(|v| v.name > val)
+        {
+            self.o.0 = self.o.0.split_off(idx);
         }
     }
 }
@@ -788,22 +798,23 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_secs();
-        if now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() {
-            if let Some(v) = v {
-                return Ok(v);
-            }
+        if now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs()
+            && let Some(v) = v
+        {
+            return Ok(v);
         }
 
-        if self.opts.no_wait && now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() * 2 {
-            if let Some(value) = v {
-                if self.updating.try_lock().is_ok() {
-                    let this = Arc::clone(&self);
-                    spawn(async move {
-                        let _ = this.update().await;
-                    });
-                }
-                return Ok(value);
+        if self.opts.no_wait
+            && now - self.last_update_ms.load(AtomicOrdering::SeqCst) < self.ttl.as_secs() * 2
+            && let Some(value) = v
+        {
+            if self.updating.try_lock().is_ok() {
+                let this = Arc::clone(&self);
+                spawn(async move {
+                    let _ = this.update().await;
+                });
             }
+            return Ok(value);
         }
 
         let _ = self.updating.lock().await;
@@ -811,10 +822,9 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
         if let (Ok(duration), Some(value)) = (
             SystemTime::now().duration_since(UNIX_EPOCH + Duration::from_secs(self.last_update_ms.load(AtomicOrdering::SeqCst))),
             v,
-        ) {
-            if duration < self.ttl {
-                return Ok(value);
-            }
+        ) && duration < self.ttl
+        {
+            return Ok(value);
         }
 
         match self.update().await {
@@ -831,10 +841,16 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
         }
     }
 
+    #[allow(unsafe_code)]
     async fn update(&self) -> std::io::Result<()> {
         match (self.update_fn)().await {
             Ok(val) => {
-                self.val.store(Box::into_raw(Box::new(val)), AtomicOrdering::SeqCst);
+                let old = self.val.swap(Box::into_raw(Box::new(val)), AtomicOrdering::SeqCst);
+                if !old.is_null() {
+                    unsafe {
+                        drop(Box::from_raw(old));
+                    }
+                }
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("Time went backwards")
@@ -857,7 +873,11 @@ impl<T: Clone + Debug + Send + 'static> Cache<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_data::create_real_xlmeta;
+    use crate::{FileMetaVersion, MetaDeleteMarker};
+    use std::collections::HashMap;
     use std::io::Cursor;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_writer() {
@@ -885,5 +905,63 @@ mod tests {
         let nobjs = r.read_all().await.unwrap();
 
         assert_eq!(objs, nobjs);
+    }
+
+    #[test]
+    fn test_resolve_rebuilds_metadata_from_merged_versions() {
+        let base_metadata = create_real_xlmeta().expect("base xl.meta");
+        let base = FileMeta::load(&base_metadata).expect("load base xl.meta");
+
+        let extra_version = FileMetaVersion {
+            version_type: VersionType::Delete,
+            object: None,
+            delete_marker: Some(MetaDeleteMarker {
+                version_id: Some(Uuid::from_u128(0x22222222333344445555666666666666)),
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp")),
+                meta_sys: HashMap::new(),
+            }),
+            legacy_object: None,
+            write_version: 99,
+            uses_legacy_checksum: false,
+        };
+
+        let extra_shallow = FileMetaShallowVersion::try_from(extra_version).expect("build shallow delete version");
+
+        let mut extended = base.clone();
+        extended.versions.insert(0, extra_shallow);
+
+        let base_versions = base.versions.len();
+        let extended_versions = extended.versions.len();
+        let extended_metadata = extended.marshal_msg().expect("serialize extended xl.meta");
+
+        let resolved = MetaCacheEntries(vec![
+            Some(MetaCacheEntry {
+                name: "bucket/object".to_string(),
+                metadata: extended_metadata,
+                cached: Some(extended),
+                reusable: false,
+            }),
+            Some(MetaCacheEntry {
+                name: "bucket/object".to_string(),
+                metadata: base_metadata,
+                cached: Some(base),
+                reusable: false,
+            }),
+        ])
+        .resolve(MetadataResolutionParams {
+            obj_quorum: 2,
+            requested_versions: extended_versions,
+            strict: true,
+            ..Default::default()
+        })
+        .expect("merged entry should resolve");
+
+        let cached = resolved.cached.expect("resolved entry should keep merged cached metadata");
+        let decoded = FileMeta::load(&resolved.metadata).expect("resolved metadata should decode");
+
+        assert_eq!(cached.versions.len(), base_versions);
+        assert_eq!(decoded.versions.len(), base_versions);
+        assert_eq!(decoded.versions, cached.versions);
+        assert_ne!(extended_versions, cached.versions.len());
     }
 }

@@ -13,8 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, sync::Arc};
-
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::store_api::{ListPartsInfo, ObjectInfoOrErr, WalkOptions};
@@ -27,34 +25,39 @@ use crate::{
     },
     endpoints::{Endpoints, PoolEndpoints},
     error::StorageError,
-    global::{GLOBAL_LOCAL_DISK_SET_DRIVES, is_dist_erasure},
+    global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
     set_disk::SetDisks,
     store_api::{
-        BucketInfo, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader, HTTPRangeSpec,
-        ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, MakeBucketOptions, MultipartInfo, MultipartUploadResult,
-        ObjectIO, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
+        HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
+        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations,
+        ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
-use futures::future::join_all;
+use futures::{
+    future::join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
 use http::HeaderMap;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_common::{
-    globals::GLOBAL_Local_Node_Name,
+    GLOBAL_LOCAL_NODE_NAME,
     heal_channel::{DriveState, HealItemType},
 };
 use rustfs_filemeta::FileInfo;
-
+use rustfs_lock::NamespaceLockWrapper;
+use rustfs_lock::client::LockClient;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
-
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use tracing::{error, info};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct Sets {
@@ -93,32 +96,30 @@ impl Sets {
         let set_count = fm.erasure.sets.len();
         let set_drive_count = fm.erasure.sets[0].len();
 
-        let mut unique: Vec<Vec<String>> = (0..set_count).map(|_| vec![]).collect();
-
-        for (idx, endpoint) in endpoints.endpoints.as_ref().iter().enumerate() {
-            let set_idx = idx / set_drive_count;
-            if endpoint.is_local && !unique[set_idx].contains(&"local".to_string()) {
-                unique[set_idx].push("local".to_string());
-            }
-
-            if !endpoint.is_local {
-                let host_port = format!("{}:{}", endpoint.url.host_str().unwrap(), endpoint.url.port().unwrap());
-                if !unique[set_idx].contains(&host_port) {
-                    unique[set_idx].push(host_port);
-                }
-            }
-        }
-
         let mut disk_set = Vec::with_capacity(set_count);
+
+        // Get lock clients from global storage
+        let lock_clients = get_global_lock_clients();
 
         for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
+            let mut set_lock_clients: HashMap<String, Arc<dyn LockClient>> = HashMap::new();
             for j in 0..set_drive_count {
                 let idx = i * set_drive_count + j;
                 let mut disk = disks[idx].clone();
 
                 let endpoint = endpoints.endpoints.as_ref()[idx].clone();
+
+                if let Some(lock_clients_map) = lock_clients {
+                    let host_port = endpoint.host_port();
+                    if let Some(lock_client) = lock_clients_map.get(&host_port)
+                        && !set_lock_clients.contains_key(&host_port)
+                    {
+                        set_lock_clients.insert(host_port, lock_client.clone());
+                    }
+                }
+
                 set_endpoints.push(endpoint);
 
                 if disk.is_none() {
@@ -162,14 +163,9 @@ impl Sets {
                 }
             }
 
-            // Note: write_quorum was used for the old lock system, no longer needed with FastLock
-            let _write_quorum = set_drive_count - parity_count;
-            // Create fast lock manager for high performance
-            let fast_lock_manager = Arc::new(rustfs_lock::FastObjectLockManager::new());
-
+            let lockers = set_lock_clients.values().cloned().collect::<Vec<Arc<dyn LockClient>>>();
             let set_disks = SetDisks::new(
-                fast_lock_manager,
-                GLOBAL_Local_Node_Name.read().await.to_string(),
+                GLOBAL_LOCAL_NODE_NAME.read().await.to_string(),
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
                 parity_count,
@@ -177,6 +173,7 @@ impl Sets {
                 pool_idx,
                 set_endpoints,
                 fm.clone(),
+                lockers,
             )
             .await;
 
@@ -254,7 +251,7 @@ impl Sets {
         self.connect_disks().await;
 
         // TODO: config interval
-        let mut interval = tokio::time::interval(Duration::from_secs(15 * 3));
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             tokio::select! {
                _= interval.tick()=>{
@@ -342,6 +339,26 @@ struct DelObj {
     obj: ObjectToDelete,
 }
 
+fn apply_delete_objects_results(
+    del_objects: &mut [DeletedObject],
+    del_errs: &mut [Option<Error>],
+    set_objects: &[DelObj],
+    dobjects: &[DeletedObject],
+    errs: Vec<Option<Error>>,
+) {
+    for (i, err) in errs.into_iter().enumerate() {
+        let obj = set_objects
+            .get(i)
+            .expect("delete_objects should return errors aligned with input objects");
+
+        del_errs[obj.orig_idx] = err;
+        del_objects[obj.orig_idx] = dobjects
+            .get(i)
+            .expect("delete_objects should return objects aligned with input objects")
+            .clone();
+    }
+}
+
 #[async_trait::async_trait]
 impl ObjectIO for Sets {
     #[tracing::instrument(level = "debug", skip(self, object, h, opts))]
@@ -364,52 +381,7 @@ impl ObjectIO for Sets {
 }
 
 #[async_trait::async_trait]
-impl StorageAPI for Sets {
-    #[tracing::instrument(skip(self))]
-    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
-        unimplemented!()
-    }
-    #[tracing::instrument(skip(self))]
-    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let mut futures = Vec::with_capacity(self.disk_set.len());
-
-        for set in self.disk_set.iter() {
-            futures.push(set.storage_info())
-        }
-
-        let results = join_all(futures).await;
-
-        let mut disks = Vec::new();
-
-        for res in results.into_iter() {
-            disks.extend_from_slice(&res.disks);
-        }
-
-        rustfs_madmin::StorageInfo {
-            disks,
-            ..Default::default()
-        }
-    }
-    #[tracing::instrument(skip(self))]
-    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let mut futures = Vec::with_capacity(self.disk_set.len());
-
-        for set in self.disk_set.iter() {
-            futures.push(set.local_storage_info())
-        }
-
-        let results = join_all(futures).await;
-
-        let mut disks = Vec::new();
-
-        for res in results.into_iter() {
-            disks.extend_from_slice(&res.disks);
-        }
-        rustfs_madmin::StorageInfo {
-            disks,
-            ..Default::default()
-        }
-    }
+impl BucketOperations for Sets {
     #[tracing::instrument(skip(self))]
     async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
         unimplemented!()
@@ -428,48 +400,23 @@ impl StorageAPI for Sets {
     async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         unimplemented!()
     }
+}
 
-    #[tracing::instrument(skip(self))]
-    async fn list_objects_v2(
-        self: Arc<Self>,
-        _bucket: &str,
-        _prefix: &str,
-        _continuation_token: Option<String>,
-        _delimiter: Option<String>,
-        _max_keys: i32,
-        _fetch_owner: bool,
-        _start_after: Option<String>,
-    ) -> Result<ListObjectsV2Info> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn list_object_versions(
-        self: Arc<Self>,
-        _bucket: &str,
-        _prefix: &str,
-        _marker: Option<String>,
-        _version_marker: Option<String>,
-        _delimiter: Option<String>,
-        _max_keys: i32,
-    ) -> Result<ListObjectVersionsInfo> {
-        unimplemented!()
-    }
-
-    async fn walk(
-        self: Arc<Self>,
-        _rx: CancellationToken,
-        _bucket: &str,
-        _prefix: &str,
-        _result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
-        _opts: WalkOptions,
-    ) -> Result<()> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
+#[async_trait::async_trait]
+impl ObjectOperations for Sets {
     async fn get_object_info(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object).get_object_info(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        let gor = self.get_object_reader(bucket, object, None, HeaderMap::new(), opts).await?;
+        let mut reader = gor.stream;
+
+        // Stream data to sink instead of reading all into memory to prevent OOM
+        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self))]
@@ -489,12 +436,12 @@ impl StorageAPI for Sets {
         let cp_src_dst_same = path_join_buf(&[src_bucket, src_object]) == path_join_buf(&[dst_bucket, dst_object]);
 
         if cp_src_dst_same {
-            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id) {
-                if src_vid == dst_vid {
-                    return src_set
-                        .copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
-                        .await;
-                }
+            if let (Some(src_vid), Some(dst_vid)) = (&src_opts.version_id, &dst_opts.version_id)
+                && src_vid == dst_vid
+            {
+                return src_set
+                    .copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+                    .await;
             }
 
             if !dst_opts.versioned && src_opts.version_id.is_none() {
@@ -584,38 +531,119 @@ impl StorageAPI for Sets {
             }
         }
 
-        // TODO: concurrency
+        let max_concurrent = set_obj_map.len().min(num_cpus::get()).max(1);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        let mut futures = FuturesUnordered::new();
+        let bucket = bucket.to_string();
+
         for (k, v) in set_obj_map {
             let disks = self.get_disks(k);
             let objs: Vec<ObjectToDelete> = v.iter().map(|v| v.obj.clone()).collect();
-            let (dobjects, errs) = disks.delete_objects(bucket, objs, opts.clone()).await;
+            let bucket = bucket.clone();
+            let opts = opts.clone();
+            let semaphore = semaphore.clone();
 
-            for (i, err) in errs.into_iter().enumerate() {
-                let obj = v.get(i).unwrap();
+            futures.push(async move {
+                let _permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("delete_objects semaphore should remain open");
+                let (dobjects, errs) = disks.delete_objects(&bucket, objs, opts).await;
+                (v, dobjects, errs)
+            });
+        }
 
-                del_errs[obj.orig_idx] = err;
-
-                del_objects[obj.orig_idx] = dobjects.get(i).unwrap().clone();
-            }
+        while let Some((v, dobjects, errs)) = futures.next().await {
+            apply_delete_objects_results(&mut del_objects, &mut del_errs, &v, &dobjects, errs);
         }
 
         (del_objects, del_errs)
     }
 
-    async fn list_object_parts(
-        &self,
-        bucket: &str,
-        object: &str,
-        upload_id: &str,
-        part_number_marker: Option<usize>,
-        max_parts: usize,
-        opts: &ObjectOptions,
-    ) -> Result<ListPartsInfo> {
+    #[tracing::instrument(skip(self))]
+    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object).put_object_metadata(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
+        self.get_disks_by_key(object).get_object_tags(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
         self.get_disks_by_key(object)
-            .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
+            .put_object_tags(bucket, object, tags, opts)
             .await
     }
 
+    #[tracing::instrument(skip(self))]
+    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.get_disks_by_key(object).delete_object_tags(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
+        self.get_disks_by_key(object).add_partial(bucket, object, version_id).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        self.get_disks_by_key(object).transition_object(bucket, object, opts).await
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn restore_transitioned_object(self: Arc<Self>, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        self.get_disks_by_key(object)
+            .restore_transitioned_object(bucket, object, opts)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl ListOperations for Sets {
+    #[tracing::instrument(skip(self))]
+    async fn list_objects_v2(
+        self: Arc<Self>,
+        _bucket: &str,
+        _prefix: &str,
+        _continuation_token: Option<String>,
+        _delimiter: Option<String>,
+        _max_keys: i32,
+        _fetch_owner: bool,
+        _start_after: Option<String>,
+        _incl_deleted: bool,
+    ) -> Result<ListObjectsV2Info> {
+        unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn list_object_versions(
+        self: Arc<Self>,
+        _bucket: &str,
+        _prefix: &str,
+        _marker: Option<String>,
+        _version_marker: Option<String>,
+        _delimiter: Option<String>,
+        _max_keys: i32,
+    ) -> Result<ListObjectVersionsInfo> {
+        unimplemented!()
+    }
+
+    async fn walk(
+        self: Arc<Self>,
+        _rx: CancellationToken,
+        _bucket: &str,
+        _prefix: &str,
+        _result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        _opts: WalkOptions,
+    ) -> Result<()> {
+        unimplemented!()
+    }
+}
+
+#[async_trait::async_trait]
+impl MultipartOperations for Sets {
     #[tracing::instrument(skip(self))]
     async fn list_multipart_uploads(
         &self,
@@ -633,23 +661,6 @@ impl StorageAPI for Sets {
     #[tracing::instrument(skip(self))]
     async fn new_multipart_upload(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<MultipartUploadResult> {
         self.get_disks_by_key(object).new_multipart_upload(bucket, object, opts).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        self.get_disks_by_key(object).transition_object(bucket, object, opts).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn add_partial(&self, bucket: &str, object: &str, version_id: &str) -> Result<()> {
-        self.get_disks_by_key(object).add_partial(bucket, object, version_id).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn restore_transitioned_object(self: Arc<Self>, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        self.get_disks_by_key(object)
-            .restore_transitioned_object(bucket, object, opts)
-            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -698,6 +709,20 @@ impl StorageAPI for Sets {
             .await
     }
 
+    async fn list_object_parts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number_marker: Option<usize>,
+        max_parts: usize,
+        opts: &ObjectOptions,
+    ) -> Result<ListPartsInfo> {
+        self.get_disks_by_key(object)
+            .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
+            .await
+    }
+
     #[tracing::instrument(skip(self))]
     async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str, opts: &ObjectOptions) -> Result<()> {
         self.get_disks_by_key(object)
@@ -718,39 +743,10 @@ impl StorageAPI for Sets {
             .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
             .await
     }
+}
 
-    #[tracing::instrument(skip(self))]
-    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn set_drive_counts(&self) -> Vec<usize> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.get_disks_by_key(object).put_object_metadata(bucket, object, opts).await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn get_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<String> {
-        self.get_disks_by_key(object).get_object_tags(bucket, object, opts).await
-    }
-
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn put_object_tags(&self, bucket: &str, object: &str, tags: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.get_disks_by_key(object)
-            .put_object_tags(bucket, object, tags, opts)
-            .await
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn delete_object_tags(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.get_disks_by_key(object).delete_object_tags(bucket, object, opts).await
-    }
-
+#[async_trait::async_trait]
+impl HealOperations for Sets {
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
         let (disks, _) = init_storage_disks_with_errors(
@@ -821,10 +817,10 @@ impl StorageAPI for Sets {
                         Ok((m, n)) => (m, n),
                         Err(_) => continue,
                     };
-                    if let Some(set) = self.disk_set.get(m) {
-                        if let Some(Some(disk)) = set.disks.read().await.get(n) {
-                            let _ = disk.close().await;
-                        }
+                    if let Some(set) = self.disk_set.get(m)
+                        && let Some(Some(disk)) = set.disks.read().await.get(n)
+                    {
+                        let _ = disk.close().await;
                     }
 
                     if let Some(Some(disk)) = disks.get(index) {
@@ -859,16 +855,67 @@ impl StorageAPI for Sets {
     async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
         unimplemented!()
     }
+}
 
-    #[tracing::instrument(level = "debug", skip(self))]
-    async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let gor = self.get_object_reader(bucket, object, None, HeaderMap::new(), opts).await?;
-        let mut reader = gor.stream;
+#[async_trait::async_trait]
+impl StorageAPI for Sets {
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
+        self.disk_set[0].new_ns_lock(bucket, object).await
+    }
+    #[tracing::instrument(skip(self))]
+    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
+        unimplemented!()
+    }
+    #[tracing::instrument(skip(self))]
+    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
+        let mut futures = Vec::with_capacity(self.disk_set.len());
 
-        // Stream data to sink instead of reading all into memory to prevent OOM
-        tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
+        for set in self.disk_set.iter() {
+            futures.push(set.storage_info())
+        }
 
-        Ok(())
+        let results = join_all(futures).await;
+
+        let mut disks = Vec::new();
+
+        for res in results.into_iter() {
+            disks.extend_from_slice(&res.disks);
+        }
+
+        rustfs_madmin::StorageInfo {
+            disks,
+            ..Default::default()
+        }
+    }
+    #[tracing::instrument(skip(self))]
+    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
+        let mut futures = Vec::with_capacity(self.disk_set.len());
+
+        for set in self.disk_set.iter() {
+            futures.push(set.local_storage_info())
+        }
+
+        let results = join_all(futures).await;
+
+        let mut disks = Vec::new();
+
+        for res in results.into_iter() {
+            disks.extend_from_slice(&res.disks);
+        }
+        rustfs_madmin::StorageInfo {
+            disks,
+            ..Default::default()
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
+        unimplemented!()
+    }
+
+    #[tracing::instrument(skip(self))]
+    fn set_drive_counts(&self) -> Vec<usize> {
+        unimplemented!()
     }
 }
 
@@ -978,28 +1025,100 @@ fn new_heal_format_sets(
     let mut current_disks_info = vec![vec![DiskInfo::default(); set_drive_count]; set_count];
     for (i, set) in ref_format.erasure.sets.iter().enumerate() {
         for j in 0..set.len() {
-            if let Some(Some(err)) = errs.get(i * set_drive_count + j) {
-                if *err == DiskError::UnformattedDisk {
-                    let mut fm = FormatV3::new(set_count, set_drive_count);
-                    fm.id = ref_format.id;
-                    fm.format = ref_format.format.clone();
-                    fm.version = ref_format.version.clone();
-                    fm.erasure.this = ref_format.erasure.sets[i][j];
-                    fm.erasure.sets = ref_format.erasure.sets.clone();
-                    fm.erasure.version = ref_format.erasure.version.clone();
-                    fm.erasure.distribution_algo = ref_format.erasure.distribution_algo.clone();
-                    new_formats[i][j] = Some(fm);
-                }
+            if let Some(Some(err)) = errs.get(i * set_drive_count + j)
+                && *err == DiskError::UnformattedDisk
+            {
+                let mut fm = FormatV3::new(set_count, set_drive_count);
+                fm.id = ref_format.id;
+                fm.format = ref_format.format.clone();
+                fm.version = ref_format.version.clone();
+                fm.erasure.this = ref_format.erasure.sets[i][j];
+                fm.erasure.sets = ref_format.erasure.sets.clone();
+                fm.erasure.version = ref_format.erasure.version.clone();
+                fm.erasure.distribution_algo = ref_format.erasure.distribution_algo.clone();
+                new_formats[i][j] = Some(fm);
             }
-            if let (Some(format), None) = (&formats[i * set_drive_count + j], &errs[i * set_drive_count + j]) {
-                if let Some(info) = &format.disk_info {
-                    if !info.endpoint.is_empty() {
-                        current_disks_info[i][j] = info.clone();
-                    }
-                }
+            if let (Some(format), None) = (&formats[i * set_drive_count + j], &errs[i * set_drive_count + j])
+                && let Some(info) = &format.disk_info
+                && !info.endpoint.is_empty()
+            {
+                current_disks_info[i][j] = info.clone();
             }
         }
     }
 
     (new_formats, current_disks_info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_apply_delete_objects_results_preserves_original_order_for_out_of_order_batches() {
+        let mut del_objects = vec![DeletedObject::default(); 3];
+        let mut del_errs = vec![None, None, None];
+
+        let early_batch = vec![DelObj {
+            orig_idx: 1,
+            obj: ObjectToDelete {
+                object_name: "second".to_string(),
+                ..Default::default()
+            },
+        }];
+        let early_objects = vec![DeletedObject {
+            object_name: "second".to_string(),
+            found: true,
+            ..Default::default()
+        }];
+
+        let late_batch = vec![
+            DelObj {
+                orig_idx: 2,
+                obj: ObjectToDelete {
+                    object_name: "third".to_string(),
+                    ..Default::default()
+                },
+            },
+            DelObj {
+                orig_idx: 0,
+                obj: ObjectToDelete {
+                    object_name: "first".to_string(),
+                    ..Default::default()
+                },
+            },
+        ];
+        let late_objects = vec![
+            DeletedObject {
+                object_name: "third".to_string(),
+                found: true,
+                ..Default::default()
+            },
+            DeletedObject {
+                object_name: "first".to_string(),
+                found: true,
+                ..Default::default()
+            },
+        ];
+
+        apply_delete_objects_results(&mut del_objects, &mut del_errs, &early_batch, &early_objects, vec![None]);
+        apply_delete_objects_results(
+            &mut del_objects,
+            &mut del_errs,
+            &late_batch,
+            &late_objects,
+            vec![Some(Error::other("third failed")), None],
+        );
+
+        assert_eq!(del_objects[0].object_name, "first");
+        assert_eq!(del_objects[1].object_name, "second");
+        assert_eq!(del_objects[2].object_name, "third");
+
+        assert!(del_errs[0].is_none());
+        assert!(del_errs[1].is_none());
+        assert_eq!(
+            del_errs[2].as_ref().map(ToString::to_string),
+            Some(Error::other("third failed").to_string())
+        );
+    }
 }

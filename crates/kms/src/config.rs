@@ -15,6 +15,7 @@
 //! KMS configuration management
 
 use crate::error::{KmsError, Result};
+use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_str};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -69,7 +70,7 @@ pub enum BackendConfig {
     /// Local backend configuration
     Local(LocalConfig),
     /// Vault backend configuration
-    Vault(VaultConfig),
+    Vault(Box<VaultConfig>),
 }
 
 impl Default for BackendConfig {
@@ -194,11 +195,11 @@ impl KmsConfig {
     pub fn vault(address: Url, token: String) -> Self {
         Self {
             backend: KmsBackend::Vault,
-            backend_config: BackendConfig::Vault(VaultConfig {
+            backend_config: BackendConfig::Vault(Box::new(VaultConfig {
                 address: address.to_string(),
                 auth_method: VaultAuthMethod::Token { token },
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         }
     }
@@ -207,11 +208,11 @@ impl KmsConfig {
     pub fn vault_approle(address: Url, role_id: String, secret_id: String) -> Self {
         Self {
             backend: KmsBackend::Vault,
-            backend_config: BackendConfig::Vault(VaultConfig {
+            backend_config: BackendConfig::Vault(Box::new(VaultConfig {
                 address: address.to_string(),
                 auth_method: VaultAuthMethod::AppRole { role_id, secret_id },
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         }
     }
@@ -279,14 +280,13 @@ impl KmsConfig {
                 }
 
                 // Validate TLS configuration if using HTTPS
-                if config.address.starts_with("https://") {
-                    if let Some(ref tls) = config.tls {
-                        if !tls.skip_verify {
-                            // In production, we should have proper TLS configuration
-                            if tls.ca_cert_path.is_none() && tls.client_cert_path.is_none() {
-                                tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
-                            }
-                        }
+                if config.address.starts_with("https://")
+                    && let Some(ref tls) = config.tls
+                    && !tls.skip_verify
+                {
+                    // In production, we should have proper TLS configuration
+                    if tls.ca_cert_path.is_none() && tls.client_cert_path.is_none() {
+                        tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
                     }
                 }
             }
@@ -305,7 +305,7 @@ impl KmsConfig {
         let mut config = Self::default();
 
         // Backend type
-        if let Ok(backend_type) = std::env::var("RUSTFS_KMS_BACKEND") {
+        if let Some(backend_type) = get_env_opt_str("RUSTFS_KMS_BACKEND") {
             config.backend = match backend_type.to_lowercase().as_str() {
                 "local" => KmsBackend::Local,
                 "vault" => KmsBackend::Vault,
@@ -314,12 +314,12 @@ impl KmsConfig {
         }
 
         // Default key ID
-        if let Ok(key_id) = std::env::var("RUSTFS_KMS_DEFAULT_KEY_ID") {
+        if let Some(key_id) = get_env_opt_str("RUSTFS_KMS_DEFAULT_KEY_ID") {
             config.default_key_id = Some(key_id);
         }
 
         // Timeout
-        if let Ok(timeout_str) = std::env::var("RUSTFS_KMS_TIMEOUT_SECS") {
+        if let Some(timeout_str) = get_env_opt_str("RUSTFS_KMS_TIMEOUT_SECS") {
             let timeout_secs = timeout_str
                 .parse::<u64>()
                 .map_err(|_| KmsError::configuration_error("Invalid timeout value"))?;
@@ -327,22 +327,20 @@ impl KmsConfig {
         }
 
         // Retry attempts
-        if let Ok(retries_str) = std::env::var("RUSTFS_KMS_RETRY_ATTEMPTS") {
+        if let Some(retries_str) = get_env_opt_str("RUSTFS_KMS_RETRY_ATTEMPTS") {
             config.retry_attempts = retries_str
                 .parse()
                 .map_err(|_| KmsError::configuration_error("Invalid retry attempts value"))?;
         }
 
         // Enable cache
-        if let Ok(cache_str) = std::env::var("RUSTFS_KMS_ENABLE_CACHE") {
-            config.enable_cache = cache_str.parse().unwrap_or(true);
-        }
+        config.enable_cache = get_env_bool("RUSTFS_KMS_ENABLE_CACHE", config.enable_cache);
 
         // Backend-specific configuration
         match config.backend {
             KmsBackend::Local => {
-                let key_dir = std::env::var("RUSTFS_KMS_LOCAL_KEY_DIR").unwrap_or_else(|_| "./kms_keys".to_string());
-                let master_key = std::env::var("RUSTFS_KMS_LOCAL_MASTER_KEY").ok();
+                let key_dir = get_env_str("RUSTFS_KMS_LOCAL_KEY_DIR", "./kms_keys");
+                let master_key = get_env_opt_str("RUSTFS_KMS_LOCAL_MASTER_KEY");
 
                 config.backend_config = BackendConfig::Local(LocalConfig {
                     key_dir: PathBuf::from(key_dir),
@@ -351,19 +349,18 @@ impl KmsConfig {
                 });
             }
             KmsBackend::Vault => {
-                let address = std::env::var("RUSTFS_KMS_VAULT_ADDRESS").unwrap_or_else(|_| "http://localhost:8200".to_string());
-                let token = std::env::var("RUSTFS_KMS_VAULT_TOKEN").unwrap_or_else(|_| "dev-token".to_string());
+                let address = get_env_str("RUSTFS_KMS_VAULT_ADDRESS", "http://localhost:8200");
+                let token = get_env_str("RUSTFS_KMS_VAULT_TOKEN", "dev-token");
 
-                config.backend_config = BackendConfig::Vault(VaultConfig {
+                config.backend_config = BackendConfig::Vault(Box::new(VaultConfig {
                     address,
                     auth_method: VaultAuthMethod::Token { token },
-                    namespace: std::env::var("RUSTFS_KMS_VAULT_NAMESPACE").ok(),
-                    mount_path: std::env::var("RUSTFS_KMS_VAULT_MOUNT_PATH").unwrap_or_else(|_| "transit".to_string()),
-                    kv_mount: std::env::var("RUSTFS_KMS_VAULT_KV_MOUNT").unwrap_or_else(|_| "secret".to_string()),
-                    key_path_prefix: std::env::var("RUSTFS_KMS_VAULT_KEY_PREFIX")
-                        .unwrap_or_else(|_| "rustfs/kms/keys".to_string()),
+                    namespace: get_env_opt_str("RUSTFS_KMS_VAULT_NAMESPACE"),
+                    mount_path: get_env_str("RUSTFS_KMS_VAULT_MOUNT_PATH", "transit"),
+                    kv_mount: get_env_str("RUSTFS_KMS_VAULT_KV_MOUNT", "secret"),
+                    key_path_prefix: get_env_str("RUSTFS_KMS_VAULT_KEY_PREFIX", "rustfs/kms/keys"),
                     tls: None,
-                });
+                }));
             }
         }
 
@@ -375,6 +372,7 @@ impl KmsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temp_env::with_vars;
     use tempfile::TempDir;
 
     #[test]
@@ -423,5 +421,40 @@ mod tests {
         config.timeout = Duration::from_secs(30);
         config.retry_attempts = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_from_env_reads_vault_settings() {
+        with_vars(
+            vec![
+                ("RUSTFS_KMS_BACKEND", Some("vault")),
+                ("RUSTFS_KMS_DEFAULT_KEY_ID", Some("tenant-key")),
+                ("RUSTFS_KMS_TIMEOUT_SECS", Some("42")),
+                ("RUSTFS_KMS_RETRY_ATTEMPTS", Some("7")),
+                ("RUSTFS_KMS_ENABLE_CACHE", Some("false")),
+                ("RUSTFS_KMS_VAULT_ADDRESS", Some("https://vault.example.com")),
+                ("RUSTFS_KMS_VAULT_TOKEN", Some("vault-token")),
+                ("RUSTFS_KMS_VAULT_NAMESPACE", Some("tenant-a")),
+                ("RUSTFS_KMS_VAULT_MOUNT_PATH", Some("transit-alt")),
+                ("RUSTFS_KMS_VAULT_KV_MOUNT", Some("secret-alt")),
+                ("RUSTFS_KMS_VAULT_KEY_PREFIX", Some("tenant/keys")),
+            ],
+            || {
+                let config = KmsConfig::from_env().expect("kms config should load from env");
+
+                assert_eq!(config.backend, KmsBackend::Vault);
+                assert_eq!(config.default_key_id.as_deref(), Some("tenant-key"));
+                assert_eq!(config.timeout, Duration::from_secs(42));
+                assert_eq!(config.retry_attempts, 7);
+                assert!(!config.enable_cache);
+
+                let vault = config.vault_config().expect("vault backend config");
+                assert_eq!(vault.address, "https://vault.example.com");
+                assert_eq!(vault.namespace.as_deref(), Some("tenant-a"));
+                assert_eq!(vault.mount_path, "transit-alt");
+                assert_eq!(vault.kv_mount, "secret-alt");
+                assert_eq!(vault.key_path_prefix, "tenant/keys");
+            },
+        );
     }
 }

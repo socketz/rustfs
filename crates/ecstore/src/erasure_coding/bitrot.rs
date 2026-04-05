@@ -15,6 +15,7 @@
 use bytes::Bytes;
 use pin_project_lite::pin_project;
 use rustfs_utils::HashAlgorithm;
+use std::io::IoSlice;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::error;
 use uuid::Uuid;
@@ -28,10 +29,7 @@ pin_project! {
         shard_size: usize,
         buf: Vec<u8>,
         hash_buf: Vec<u8>,
-        // hash_read: usize,
-        // data_buf: Vec<u8>,
-        // data_read: usize,
-        // hash_checked: bool,
+        skip_verify: bool,
         id: Uuid,
     }
 }
@@ -41,7 +39,7 @@ where
     R: AsyncRead + Unpin + Send + Sync,
 {
     /// Create a new BitrotReader.
-    pub fn new(inner: R, shard_size: usize, algo: HashAlgorithm) -> Self {
+    pub fn new(inner: R, shard_size: usize, algo: HashAlgorithm, skip_verify: bool) -> Self {
         let hash_size = algo.size();
         Self {
             inner,
@@ -49,10 +47,7 @@ where
             shard_size,
             buf: Vec::new(),
             hash_buf: vec![0u8; hash_size],
-            // hash_read: 0,
-            // data_buf: Vec::new(),
-            // data_read: 0,
-            // hash_checked: false,
+            skip_verify,
             id: Uuid::new_v4(),
         }
     }
@@ -90,7 +85,7 @@ where
             data_len += n;
         }
 
-        if hash_size > 0 {
+        if hash_size > 0 && !self.skip_verify {
             let actual_hash = self.hash_algo.hash_encode(&out[..data_len]);
             if actual_hash.as_ref() != self.hash_buf.as_slice() {
                 error!("bitrot reader hash mismatch, id={} data_len={}, out_len={}", self.id, data_len, out.len());
@@ -108,7 +103,6 @@ pin_project! {
         inner: W,
         hash_algo: HashAlgorithm,
         shard_size: usize,
-        buf: Vec<u8>,
         finished: bool,
     }
 }
@@ -124,7 +118,6 @@ where
             inner,
             hash_algo,
             shard_size,
-            buf: Vec::new(),
             finished: false,
         }
     }
@@ -159,29 +152,55 @@ where
 
         if hash_algo.size() > 0 {
             let hash = hash_algo.hash_encode(buf);
-            self.buf.extend_from_slice(hash.as_ref());
+            if hash.as_ref().is_empty() {
+                error!("bitrot writer write hash error: hash is empty");
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "hash is empty"));
+            }
+            write_all_vectored(&mut self.inner, hash.as_ref(), buf).await?;
+        } else {
+            self.inner.write_all(buf).await?;
         }
 
-        self.buf.extend_from_slice(buf);
-
-        self.inner.write_all(&self.buf).await?;
-
-        // self.inner.flush().await?;
-
         let n = buf.len();
-
-        self.buf.clear();
 
         Ok(n)
     }
 
     pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.inner.flush().await?;
         self.inner.shutdown().await
     }
 }
 
+async fn write_all_vectored<W>(writer: &mut W, hash: &[u8], data: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut hash_offset = 0;
+    let mut data_offset = 0;
+
+    while hash_offset < hash.len() || data_offset < data.len() {
+        let slices = [IoSlice::new(&hash[hash_offset..]), IoSlice::new(&data[data_offset..])];
+        let written = writer.write_vectored(&slices).await?;
+        if written == 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write hash and data"));
+        }
+
+        let hash_remaining = hash.len() - hash_offset;
+        if written < hash_remaining {
+            hash_offset += written;
+            continue;
+        }
+
+        hash_offset = hash.len();
+        data_offset += written - hash_remaining;
+    }
+
+    Ok(())
+}
+
 pub fn bitrot_shard_file_size(size: usize, shard_size: usize, algo: HashAlgorithm) -> usize {
-    if algo != HashAlgorithm::HighwayHash256S {
+    if algo != HashAlgorithm::HighwayHash256S && algo != HashAlgorithm::HighwayHash256SLegacy {
         return size;
     }
     size.div_ceil(shard_size) * algo.size() + size
@@ -300,6 +319,33 @@ impl AsyncWrite for CustomWriter {
             }
         }
     }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::InlineBuffer(data) => {
+                let total = bufs.iter().map(|buf| buf.len()).sum::<usize>();
+                for buf in bufs {
+                    data.extend_from_slice(buf);
+                }
+                std::task::Poll::Ready(Ok(total))
+            }
+            Self::Other(writer) => {
+                let pinned_writer = std::pin::Pin::new(writer.as_mut());
+                pinned_writer.poll_write_vectored(cx, bufs)
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::InlineBuffer(_) => true,
+            Self::Other(writer) => writer.is_write_vectored(),
+        }
+    }
 }
 
 /// Wrapper around BitrotWriter that uses our custom writer
@@ -369,7 +415,74 @@ mod tests {
     use super::BitrotReader;
     use super::BitrotWriter;
     use rustfs_utils::HashAlgorithm;
-    use std::io::Cursor;
+    use std::io::{Cursor, IoSlice};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
+
+    #[derive(Default)]
+    struct VectoredCountingWriter {
+        vectored_writes: Arc<AtomicUsize>,
+        writes: Vec<u8>,
+    }
+
+    impl AsyncWrite for VectoredCountingWriter {
+        fn poll_write(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::other("poll_write should not be used")))
+        }
+
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_write_vectored(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            self.vectored_writes.fetch_add(1, Ordering::SeqCst);
+            let total = bufs.iter().map(|buf| buf.len()).sum::<usize>();
+            for buf in bufs {
+                self.writes.extend_from_slice(buf);
+            }
+            Poll::Ready(Ok(total))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingWriter {
+        flushes: Arc<AtomicUsize>,
+        shutdowns: Arc<AtomicUsize>,
+        writes: Vec<u8>,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(mut self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            self.writes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn test_bitrot_read_write_ok() {
@@ -390,7 +503,7 @@ mod tests {
         // Read
         let reader = bitrot_writer.into_inner();
         let reader = Cursor::new(reader.into_inner());
-        let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::HighwayHash256);
+        let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::HighwayHash256, false);
         let mut out = Vec::new();
         let mut n = 0;
         while n < data_size {
@@ -422,7 +535,7 @@ mod tests {
         let pos = written.len() - 1;
         written[pos] ^= 0xFF;
         let reader = Cursor::new(written);
-        let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::HighwayHash256);
+        let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::HighwayHash256, false);
 
         let count = data_size.div_ceil(shard_size);
 
@@ -466,7 +579,7 @@ mod tests {
 
         let reader = bitrot_writer.into_inner();
         let reader = Cursor::new(reader.into_inner());
-        let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::None);
+        let mut bitrot_reader = BitrotReader::new(reader, shard_size, HashAlgorithm::None, false);
         let mut out = Vec::new();
         let mut n = 0;
         while n < data_size {
@@ -478,5 +591,42 @@ mod tests {
         }
         assert_eq!(n, data_size);
         assert_eq!(data, &out[..]);
+    }
+
+    #[tokio::test]
+    async fn test_bitrot_writer_flushes_once_on_shutdown() {
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let writer = CountingWriter {
+            flushes: flushes.clone(),
+            shutdowns: shutdowns.clone(),
+            writes: Vec::new(),
+        };
+        let mut bitrot_writer = BitrotWriter::new(writer, 8, HashAlgorithm::None);
+
+        bitrot_writer.write(b"12345678").await.unwrap();
+        bitrot_writer.write(b"abc").await.unwrap();
+
+        assert_eq!(flushes.load(Ordering::SeqCst), 0);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 0);
+
+        bitrot_writer.shutdown().await.unwrap();
+
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_bitrot_writer_uses_vectored_write_for_hash_and_data() {
+        let vectored_writes = Arc::new(AtomicUsize::new(0));
+        let writer = VectoredCountingWriter {
+            vectored_writes: vectored_writes.clone(),
+            writes: Vec::new(),
+        };
+        let mut bitrot_writer = BitrotWriter::new(writer, 8, HashAlgorithm::HighwayHash256);
+
+        bitrot_writer.write(b"payload").await.unwrap();
+
+        assert!(vectored_writes.load(Ordering::SeqCst) > 0);
     }
 }

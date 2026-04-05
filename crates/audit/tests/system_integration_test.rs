@@ -29,27 +29,21 @@ async fn test_complete_audit_system_lifecycle() {
     assert_eq!(system.get_state().await, system::AuditSystemState::Stopped);
     assert!(!system.is_running().await);
 
-    // 2. Start with empty config (will fail due to no server storage in test)
+    // 2. Start with empty config. The current implementation returns Ok(())
+    // but keeps the system stopped when no audit targets are enabled.
     let config = Config(HashMap::new());
     let start_result = system.start(config).await;
 
-    // Should fail in test environment but state handling should work
+    // State handling should remain consistent for both empty-config success and
+    // storage-unavailable failure paths.
     match start_result {
         Err(AuditError::StorageNotAvailable(_)) => {
             // Expected in test environment
             assert_eq!(system.get_state().await, system::AuditSystemState::Stopped);
         }
         Ok(_) => {
-            // If it somehow succeeds, verify running state
-            assert_eq!(system.get_state().await, system::AuditSystemState::Running);
-            assert!(system.is_running().await);
-
-            // Test pause/resume
-            system.pause().await.expect("Should pause successfully");
-            assert_eq!(system.get_state().await, system::AuditSystemState::Paused);
-
-            system.resume().await.expect("Should resume successfully");
-            assert_eq!(system.get_state().await, system::AuditSystemState::Running);
+            assert_eq!(system.get_state().await, system::AuditSystemState::Stopped);
+            assert!(!system.is_running().await);
         }
         Err(e) => {
             panic!("Unexpected error: {e}");
@@ -135,7 +129,7 @@ async fn test_global_audit_functions() {
 
 #[tokio::test]
 async fn test_config_parsing_with_multiple_instances() {
-    let mut registry = AuditRegistry::new();
+    let registry = AuditRegistry::new();
 
     // Create config with multiple webhook instances
     let mut config = Config(HashMap::new());
@@ -164,7 +158,7 @@ async fn test_config_parsing_with_multiple_instances() {
     config.0.insert("audit_webhook".to_string(), webhook_section);
 
     // Try to create targets from config
-    let result = registry.create_targets_from_config(&config).await;
+    let result = registry.create_audit_targets_from_config(&config).await;
 
     // Should fail due to server storage not initialized, but parsing should work
     match result {

@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// use async_zip::tokio::read::seek::ZipFileReader;
-// use async_zip::tokio::write::ZipFileWriter;
-// use async_zip::{Compression, ZipEntryBuilder};
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder, XzDecoder, ZlibDecoder, ZstdDecoder};
 use async_compression::tokio::write::{BzEncoder, GzipEncoder, XzEncoder, ZlibEncoder, ZstdEncoder};
 use std::path::Path;
@@ -48,12 +45,12 @@ impl CompressionFormat {
     /// Identify compression format from file extension
     pub fn from_extension(ext: &str) -> Self {
         match ext.to_lowercase().as_str() {
-            "gz" | "gzip" => CompressionFormat::Gzip,
-            "bz2" | "bzip2" => CompressionFormat::Bzip2,
+            "gz" | "gzip" | "tgz" => CompressionFormat::Gzip,
+            "bz2" | "bzip2" | "tbz" | "tbz2" => CompressionFormat::Bzip2,
             "zip" => CompressionFormat::Zip,
-            "xz" => CompressionFormat::Xz,
+            "xz" | "txz" => CompressionFormat::Xz,
             "zlib" => CompressionFormat::Zlib,
-            "zst" | "zstd" => CompressionFormat::Zstd,
+            "zst" | "zstd" | "tzst" => CompressionFormat::Zstd,
             "tar" => CompressionFormat::Tar,
             _ => CompressionFormat::Unknown,
         }
@@ -115,6 +112,15 @@ impl CompressionFormat {
 
         Ok(decoder)
     }
+    /// Convert CompressionLevel to async_compression::Level
+    fn convert_level(level: CompressionLevel) -> async_compression::Level {
+        match level {
+            CompressionLevel::Fastest => async_compression::Level::Fastest,
+            CompressionLevel::Best => async_compression::Level::Best,
+            CompressionLevel::Default => async_compression::Level::Default,
+            CompressionLevel::Level(n) => async_compression::Level::Precise(n as i32),
+        }
+    }
 
     /// Create compressor
     pub fn get_encoder<W>(&self, output: W, level: CompressionLevel) -> io::Result<Box<dyn AsyncWrite + Send + Unpin>>
@@ -125,48 +131,23 @@ impl CompressionFormat {
 
         let encoder: Box<dyn AsyncWrite + Send + Unpin + 'static> = match self {
             CompressionFormat::Gzip => {
-                let level = match level {
-                    CompressionLevel::Fastest => async_compression::Level::Fastest,
-                    CompressionLevel::Best => async_compression::Level::Best,
-                    CompressionLevel::Default => async_compression::Level::Default,
-                    CompressionLevel::Level(n) => async_compression::Level::Precise(n as i32),
-                };
+                let level = Self::convert_level(level);
                 Box::new(GzipEncoder::with_quality(writer, level))
             }
             CompressionFormat::Bzip2 => {
-                let level = match level {
-                    CompressionLevel::Fastest => async_compression::Level::Fastest,
-                    CompressionLevel::Best => async_compression::Level::Best,
-                    CompressionLevel::Default => async_compression::Level::Default,
-                    CompressionLevel::Level(n) => async_compression::Level::Precise(n as i32),
-                };
+                let level = Self::convert_level(level);
                 Box::new(BzEncoder::with_quality(writer, level))
             }
             CompressionFormat::Zlib => {
-                let level = match level {
-                    CompressionLevel::Fastest => async_compression::Level::Fastest,
-                    CompressionLevel::Best => async_compression::Level::Best,
-                    CompressionLevel::Default => async_compression::Level::Default,
-                    CompressionLevel::Level(n) => async_compression::Level::Precise(n as i32),
-                };
+                let level = Self::convert_level(level);
                 Box::new(ZlibEncoder::with_quality(writer, level))
             }
             CompressionFormat::Xz => {
-                let level = match level {
-                    CompressionLevel::Fastest => async_compression::Level::Fastest,
-                    CompressionLevel::Best => async_compression::Level::Best,
-                    CompressionLevel::Default => async_compression::Level::Default,
-                    CompressionLevel::Level(n) => async_compression::Level::Precise(n as i32),
-                };
+                let level = Self::convert_level(level);
                 Box::new(XzEncoder::with_quality(writer, level))
             }
             CompressionFormat::Zstd => {
-                let level = match level {
-                    CompressionLevel::Fastest => async_compression::Level::Fastest,
-                    CompressionLevel::Best => async_compression::Level::Best,
-                    CompressionLevel::Default => async_compression::Level::Default,
-                    CompressionLevel::Level(n) => async_compression::Level::Precise(n as i32),
-                };
+                let level = Self::convert_level(level);
                 Box::new(ZstdEncoder::with_quality(writer, level))
             }
             CompressionFormat::Tar => Box::new(writer),
@@ -189,7 +170,7 @@ impl CompressionFormat {
 pub async fn decompress<R, F>(input: R, format: CompressionFormat, mut callback: F) -> io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
-    F: AsyncFnMut(tokio_tar::Entry<Archive<Box<dyn AsyncRead + Send + Unpin + 'static>>>) -> std::io::Result<()> + Send + 'static,
+    F: AsyncFnMut(tokio_tar::Entry<Archive<Box<dyn AsyncRead + Send + Unpin + 'static>>>) -> io::Result<()> + Send + 'static,
 {
     let decoder = format.get_decoder(input)?;
     let mut ar = Archive::new(decoder);
@@ -258,7 +239,7 @@ impl Compressor {
         let cursor = std::io::Cursor::new(output);
         let mut encoder = self.format.get_encoder(cursor, self.level)?;
 
-        tokio::io::copy(&mut std::io::Cursor::new(input), &mut encoder).await?;
+        io::copy(&mut std::io::Cursor::new(input), &mut encoder).await?;
         encoder.shutdown().await?;
 
         // Get compressed data
@@ -273,7 +254,7 @@ impl Compressor {
         let cursor = std::io::Cursor::new(input);
         let mut decoder = self.format.get_decoder(cursor)?;
 
-        tokio::io::copy(&mut decoder, &mut output).await?;
+        io::copy(&mut decoder, &mut output).await?;
 
         Ok(output)
     }
@@ -302,7 +283,7 @@ impl Decompressor {
         let mut decoder = self.format.get_decoder(input_file)?;
         let mut writer = BufWriter::new(output_file);
 
-        tokio::io::copy(&mut decoder, &mut writer).await?;
+        io::copy(&mut decoder, &mut writer).await?;
         writer.shutdown().await?;
 
         Ok(())
@@ -320,17 +301,23 @@ mod tests {
         // Test supported compression format recognition
         assert_eq!(CompressionFormat::from_extension("gz"), CompressionFormat::Gzip);
         assert_eq!(CompressionFormat::from_extension("gzip"), CompressionFormat::Gzip);
+        assert_eq!(CompressionFormat::from_extension("tgz"), CompressionFormat::Gzip);
         assert_eq!(CompressionFormat::from_extension("bz2"), CompressionFormat::Bzip2);
         assert_eq!(CompressionFormat::from_extension("bzip2"), CompressionFormat::Bzip2);
+        assert_eq!(CompressionFormat::from_extension("tbz"), CompressionFormat::Bzip2);
+        assert_eq!(CompressionFormat::from_extension("tbz2"), CompressionFormat::Bzip2);
         assert_eq!(CompressionFormat::from_extension("zip"), CompressionFormat::Zip);
         assert_eq!(CompressionFormat::from_extension("xz"), CompressionFormat::Xz);
+        assert_eq!(CompressionFormat::from_extension("txz"), CompressionFormat::Xz);
         assert_eq!(CompressionFormat::from_extension("zlib"), CompressionFormat::Zlib);
         assert_eq!(CompressionFormat::from_extension("zst"), CompressionFormat::Zstd);
         assert_eq!(CompressionFormat::from_extension("zstd"), CompressionFormat::Zstd);
+        assert_eq!(CompressionFormat::from_extension("tzst"), CompressionFormat::Zstd);
         assert_eq!(CompressionFormat::from_extension("tar"), CompressionFormat::Tar);
 
         // Test case insensitivity
         assert_eq!(CompressionFormat::from_extension("GZ"), CompressionFormat::Gzip);
+        assert_eq!(CompressionFormat::from_extension("TGZ"), CompressionFormat::Gzip);
         assert_eq!(CompressionFormat::from_extension("ZIP"), CompressionFormat::Zip);
 
         // Test unknown formats
@@ -538,15 +525,12 @@ mod tests {
 
     #[test]
     fn test_compression_format_memory_efficiency() {
-        // Test memory efficiency of enum
-        use std::mem;
-
         // Verify enum size is reasonable
-        let size = mem::size_of::<CompressionFormat>();
+        let size = size_of::<CompressionFormat>();
         assert!(size <= 8, "CompressionFormat should be memory efficient, got {size} bytes");
 
         // Verify Option<CompressionFormat> size
-        let option_size = mem::size_of::<Option<CompressionFormat>>();
+        let option_size = size_of::<Option<CompressionFormat>>();
         assert!(
             option_size <= 16,
             "Option<CompressionFormat> should be efficient, got {option_size} bytes"

@@ -15,7 +15,6 @@
 use crate::errors::ChecksumMismatch;
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
-use crc32fast::Hasher as Crc32Hasher;
 use http::HeaderMap;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -388,7 +387,7 @@ impl Checksum {
 
             // Ensure we don't divide by 0
             let raw_len = self.checksum_type.raw_byte_len();
-            if raw_len == 0 || parts.len() % raw_len != 0 {
+            if raw_len == 0 || !parts.len().is_multiple_of(raw_len) {
                 checksums = 0;
             } else if !parts.is_empty() {
                 checksums = (parts.len() / raw_len) as i32;
@@ -506,17 +505,17 @@ pub fn get_content_checksum(headers: &HeaderMap) -> Result<Option<Checksum>, std
 
         for header in trailing_headers {
             let mut duplicates = false;
-            for &checksum_type in crate::checksum::BASE_CHECKSUM_TYPES {
-                if let Some(key) = checksum_type.key() {
-                    if header.eq_ignore_ascii_case(key) {
-                        duplicates = result.is_some();
-                        result = Some(Checksum {
-                            checksum_type: ChecksumType(checksum_type.0 | ChecksumType::TRAILING.0),
-                            encoded: String::new(),
-                            raw: Vec::new(),
-                            want_parts: 0,
-                        });
-                    }
+            for &checksum_type in BASE_CHECKSUM_TYPES {
+                if let Some(key) = checksum_type.key()
+                    && header.eq_ignore_ascii_case(key)
+                {
+                    duplicates = result.is_some();
+                    result = Some(Checksum {
+                        checksum_type: ChecksumType(checksum_type.0 | ChecksumType::TRAILING.0),
+                        encoded: String::new(),
+                        raw: Vec::new(),
+                        want_parts: 0,
+                    });
                 }
             }
             if duplicates {
@@ -547,7 +546,26 @@ pub fn get_content_checksum(headers: &HeaderMap) -> Result<Option<Checksum>, std
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid checksum"));
     }
 
+    if checksum_type == ChecksumType::INVALID {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            crate::errors::ChecksumMismatch {
+                want: "valid checksum header".to_string(),
+                got: "invalid or duplicate checksum headers".to_string(),
+            },
+        ));
+    }
+
     let checksum = Checksum::new_with_type(checksum_type, &value);
+    if checksum.is_none() && !value.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            crate::errors::ChecksumMismatch {
+                want: value,
+                got: "invalid checksum value".to_string(),
+            },
+        ));
+    }
     Ok(checksum)
 }
 
@@ -568,36 +586,36 @@ fn get_content_checksum_direct(headers: &HeaderMap) -> (ChecksumType, String) {
             checksum_type = ChecksumType(checksum_type.0 | ChecksumType::FULL_OBJECT.0);
         }
 
-        if checksum_type.is_set() {
-            if let Some(key) = checksum_type.key() {
-                if let Some(value) = headers.get(key).and_then(|v| v.to_str().ok()) {
-                    return (checksum_type, value.to_string());
-                } else {
-                    return (ChecksumType::NONE, String::new());
-                }
-            }
+        if checksum_type.is_set()
+            && let Some(key) = checksum_type.key()
+        {
+            return if let Some(value) = headers.get(key).and_then(|v| v.to_str().ok()) {
+                (checksum_type, value.to_string())
+            } else {
+                (ChecksumType::NONE, String::new())
+            };
         }
         return (checksum_type, String::new());
     }
 
     // Check individual checksum headers
-    for &ct in crate::checksum::BASE_CHECKSUM_TYPES {
-        if let Some(key) = ct.key() {
-            if let Some(value) = headers.get(key).and_then(|v| v.to_str().ok()) {
-                // If already set, invalid
-                if checksum_type != ChecksumType::NONE {
+    for &ct in BASE_CHECKSUM_TYPES {
+        if let Some(key) = ct.key()
+            && let Some(value) = headers.get(key).and_then(|v| v.to_str().ok())
+        {
+            // If already set, invalid
+            if checksum_type != ChecksumType::NONE {
+                return (ChecksumType::INVALID, String::new());
+            }
+            checksum_type = ct;
+
+            if headers.get("x-amz-checksum-type").and_then(|v| v.to_str().ok()) == Some("FULL_OBJECT") {
+                if !checksum_type.can_merge() {
                     return (ChecksumType::INVALID, String::new());
                 }
-                checksum_type = ct;
-
-                if headers.get("x-amz-checksum-type").and_then(|v| v.to_str().ok()) == Some("FULL_OBJECT") {
-                    if !checksum_type.can_merge() {
-                        return (ChecksumType::INVALID, String::new());
-                    }
-                    checksum_type = ChecksumType(checksum_type.0 | ChecksumType::FULL_OBJECT.0);
-                }
-                return (checksum_type, value.to_string());
+                checksum_type = ChecksumType(checksum_type.0 | ChecksumType::FULL_OBJECT.0);
             }
+            return (checksum_type, value.to_string());
         }
     }
 
@@ -612,7 +630,7 @@ pub trait ChecksumHasher: Write + Send + Sync {
 
 /// CRC32 IEEE hasher
 pub struct Crc32IeeeHasher {
-    hasher: Crc32Hasher,
+    hasher: crc_fast::Digest,
 }
 
 impl Default for Crc32IeeeHasher {
@@ -624,7 +642,7 @@ impl Default for Crc32IeeeHasher {
 impl Crc32IeeeHasher {
     pub fn new() -> Self {
         Self {
-            hasher: Crc32Hasher::new(),
+            hasher: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc),
         }
     }
 }
@@ -642,27 +660,36 @@ impl Write for Crc32IeeeHasher {
 
 impl ChecksumHasher for Crc32IeeeHasher {
     fn finalize(&mut self) -> Vec<u8> {
-        self.hasher.clone().finalize().to_be_bytes().to_vec()
+        (self.hasher.clone().finalize() as u32).to_be_bytes().to_vec()
     }
 
     fn reset(&mut self) {
-        self.hasher = Crc32Hasher::new();
+        self.hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
     }
 }
 
 /// CRC32 Castagnoli hasher
-#[derive(Default)]
-pub struct Crc32CastagnoliHasher(u32);
+pub struct Crc32CastagnoliHasher {
+    hasher: crc_fast::Digest,
+}
+
+impl Default for Crc32CastagnoliHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Crc32CastagnoliHasher {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            hasher: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi),
+        }
     }
 }
 
 impl Write for Crc32CastagnoliHasher {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0 = crc32c::crc32c_append(self.0, buf);
+        self.hasher.update(buf);
         Ok(buf.len())
     }
 
@@ -673,11 +700,11 @@ impl Write for Crc32CastagnoliHasher {
 
 impl ChecksumHasher for Crc32CastagnoliHasher {
     fn finalize(&mut self) -> Vec<u8> {
-        self.0.to_be_bytes().to_vec()
+        (self.hasher.clone().finalize() as u32).to_be_bytes().to_vec()
     }
 
     fn reset(&mut self) {
-        self.0 = 0;
+        self.hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
     }
 }
 
@@ -758,22 +785,27 @@ impl ChecksumHasher for Sha256Hasher {
 }
 
 /// CRC64 NVME hasher
-#[derive(Default)]
 pub struct Crc64NvmeHasher {
-    hasher: crc64fast_nvme::Digest,
+    hasher: crc_fast::Digest,
+}
+
+impl Default for Crc64NvmeHasher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Crc64NvmeHasher {
     pub fn new() -> Self {
         Self {
-            hasher: Default::default(),
+            hasher: crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme),
         }
     }
 }
 
 impl Write for Crc64NvmeHasher {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.hasher.write(buf);
+        self.hasher.update(buf);
         Ok(buf.len())
     }
 
@@ -784,11 +816,11 @@ impl Write for Crc64NvmeHasher {
 
 impl ChecksumHasher for Crc64NvmeHasher {
     fn finalize(&mut self) -> Vec<u8> {
-        self.hasher.sum64().to_be_bytes().to_vec()
+        self.hasher.clone().finalize().to_be_bytes().to_vec()
     }
 
     fn reset(&mut self) {
-        self.hasher = Default::default();
+        self.hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme);
     }
 }
 
@@ -949,17 +981,17 @@ const CRC64_NVME_POLYNOMIAL: u64 = 0xad93d23594c93659;
 /// GF(2) matrix multiplication
 fn gf2_matrix_times(mat: &[u64], mut vec: u64) -> u64 {
     let mut sum = 0u64;
-    let mut mat_iter = mat.iter();
+    for &m in mat {
+        if vec == 0 {
+            break;
+        }
 
-    while vec != 0 {
         if vec & 1 != 0 {
-            if let Some(&m) = mat_iter.next() {
-                sum ^= m;
-            }
+            sum ^= m;
         }
         vec >>= 1;
-        mat_iter.next();
     }
+
     sum
 }
 
@@ -1095,4 +1127,63 @@ fn crc64_combine(poly: u64, crc1: u64, crc2: u64, len2: i64) -> u64 {
 
     // Return combined crc
     crc1n ^ crc2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Checksum, ChecksumType};
+
+    #[test]
+    fn crc64_nvme_add_part_matches_full_object_checksum() {
+        let data = (0..200_000).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let split_at = 73_421;
+        let (first, second) = data.split_at(split_at);
+
+        let expected = Checksum::new_from_data(ChecksumType::CRC64_NVME, &data).expect("full checksum");
+        let first_checksum = Checksum::new_from_data(ChecksumType::CRC64_NVME, first).expect("first checksum");
+        let second_checksum = Checksum::new_from_data(ChecksumType::CRC64_NVME, second).expect("second checksum");
+
+        let mut combined = Checksum {
+            checksum_type: ChecksumType::CRC64_NVME,
+            ..Default::default()
+        };
+        combined
+            .add_part(&first_checksum, first.len() as i64)
+            .expect("add first part");
+        combined
+            .add_part(&second_checksum, second.len() as i64)
+            .expect("add second part");
+
+        assert_eq!(combined.encoded, expected.encoded);
+        assert_eq!(combined.raw, expected.raw);
+    }
+
+    #[test]
+    fn crc32c_add_part_matches_full_object_checksum() {
+        let data = (0..32_768).map(|i| (255 - (i % 251)) as u8).collect::<Vec<_>>();
+        let (first, rest) = data.split_at(7_777);
+        let (second, third) = rest.split_at(13_333);
+
+        let expected = Checksum::new_from_data(ChecksumType::CRC32C, &data).expect("full checksum");
+        let first_checksum = Checksum::new_from_data(ChecksumType::CRC32C, first).expect("first checksum");
+        let second_checksum = Checksum::new_from_data(ChecksumType::CRC32C, second).expect("second checksum");
+        let third_checksum = Checksum::new_from_data(ChecksumType::CRC32C, third).expect("third checksum");
+
+        let mut combined = Checksum {
+            checksum_type: ChecksumType::CRC32C,
+            ..Default::default()
+        };
+        combined
+            .add_part(&first_checksum, first.len() as i64)
+            .expect("add first part");
+        combined
+            .add_part(&second_checksum, second.len() as i64)
+            .expect("add second part");
+        combined
+            .add_part(&third_checksum, third.len() as i64)
+            .expect("add third part");
+
+        assert_eq!(combined.encoded, expected.encoded);
+        assert_eq!(combined.raw, expected.raw);
+    }
 }

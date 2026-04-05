@@ -27,11 +27,11 @@ use crate::client::{
 };
 
 pub fn is_object(reader: &ReaderImpl) -> bool {
-    todo!();
+    matches!(reader, ReaderImpl::ObjectBody(_))
 }
 
 pub fn is_read_at(reader: ReaderImpl) -> bool {
-    todo!();
+    matches!(reader, ReaderImpl::ObjectBody(_))
 }
 
 pub fn optimal_part_info(object_size: i64, configured_part_size: u64) -> Result<(i64, i64, i64), std::io::Error> {
@@ -87,14 +87,14 @@ pub fn optimal_part_info(object_size: i64, configured_part_size: u64) -> Result<
             object_size = configured_part_size as i64 * MAX_PARTS_COUNT;
         }
     } else {
-        let mut configured_part_size = configured_part_size;
-        configured_part_size = MIN_PART_SIZE as u64;
-        part_size_flt = (object_size / MAX_PARTS_COUNT) as f64;
-        part_size_flt = (part_size_flt / configured_part_size as f64) * configured_part_size as f64;
+        let min_part = MIN_PART_SIZE as f64;
+        part_size_flt = (object_size as f64 / MAX_PARTS_COUNT as f64).ceil();
+        part_size_flt = part_size_flt.max(min_part);
+        part_size_flt = (part_size_flt / min_part).ceil() * min_part;
     }
 
     let total_parts_count = (object_size as f64 / part_size_flt).ceil() as i64;
-    let part_size = part_size_flt.ceil() as i64;
+    let part_size = part_size_flt as i64;
     let last_part_size = object_size - (total_parts_count - 1) * part_size;
     Ok((total_parts_count, part_size, last_part_size))
 }

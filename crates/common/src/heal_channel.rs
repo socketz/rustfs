@@ -50,7 +50,7 @@ impl Display for HealItemType {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum DriveState {
     Ok,
     Offline,
@@ -59,7 +59,7 @@ pub enum DriveState {
     PermissionDenied,
     Faulty,
     RootMount,
-    Unknown,
+    Unknown(String),
     Unformatted, // only returned by disk
 }
 
@@ -73,8 +73,24 @@ impl DriveState {
             DriveState::PermissionDenied => "permission-denied",
             DriveState::Faulty => "faulty",
             DriveState::RootMount => "root-mount",
-            DriveState::Unknown => "unknown",
+            DriveState::Unknown(reason) => reason,
             DriveState::Unformatted => "unformatted",
+        }
+    }
+}
+
+impl Clone for DriveState {
+    fn clone(&self) -> Self {
+        match self {
+            DriveState::Unknown(reason) => DriveState::Unknown(reason.clone()),
+            DriveState::Ok => DriveState::Ok,
+            DriveState::Offline => DriveState::Offline,
+            DriveState::Corrupt => DriveState::Corrupt,
+            DriveState::Missing => DriveState::Missing,
+            DriveState::PermissionDenied => DriveState::PermissionDenied,
+            DriveState::Faulty => DriveState::Faulty,
+            DriveState::RootMount => DriveState::RootMount,
+            DriveState::Unformatted => DriveState::Unformatted,
         }
     }
 }
@@ -85,12 +101,90 @@ impl Display for DriveState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub enum HealScanMode {
-    Unknown,
+    Unknown = 0,
     #[default]
-    Normal,
-    Deep,
+    Normal = 1,
+    Deep = 2,
+}
+
+impl Serialize for HealScanMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8(*self as u8)
+    }
+}
+
+impl<'de> Deserialize<'de> for HealScanMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct HealScanModeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for HealScanModeVisitor {
+            type Value = HealScanMode;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("an integer between 0 and 2")
+            }
+
+            fn visit_u8<E>(self, value: u8) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match value {
+                    0 => Ok(HealScanMode::Unknown),
+                    1 => Ok(HealScanMode::Normal),
+                    2 => Ok(HealScanMode::Deep),
+                    _ => Err(E::custom(format!("invalid HealScanMode value: {value}"))),
+                }
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value > u8::MAX as u64 {
+                    return Err(E::custom(format!("HealScanMode value too large: {value}")));
+                }
+                self.visit_u8(value as u8)
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value < 0 || value > u8::MAX as i64 {
+                    return Err(E::custom(format!("invalid HealScanMode value: {value}")));
+                }
+                self.visit_u8(value as u8)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                // Try parsing as number string first (for URL-encoded values)
+                if let Ok(num) = value.parse::<u8>() {
+                    return self.visit_u8(num);
+                }
+                // Try parsing as named string
+                match value {
+                    "Unknown" | "unknown" => Ok(HealScanMode::Unknown),
+                    "Normal" | "normal" => Ok(HealScanMode::Normal),
+                    "Deep" | "deep" => Ok(HealScanMode::Deep),
+                    _ => Err(E::custom(format!("invalid HealScanMode string: {value}"))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(HealScanModeVisitor)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -106,7 +200,9 @@ pub struct HealOpts {
     pub update_parity: bool,
     #[serde(rename = "nolock")]
     pub no_lock: bool,
+    #[serde(rename = "pool", default)]
     pub pool: Option<usize>,
+    #[serde(rename = "set", default)]
     pub set: Option<usize>,
 }
 
@@ -132,6 +228,8 @@ pub struct HealChannelRequest {
     pub bucket: String,
     /// Object prefix (optional)
     pub object_prefix: Option<String>,
+    /// Object version ID (optional)
+    pub object_version_id: Option<String>,
     /// Force start heal
     pub force_start: bool,
     /// Priority
@@ -198,12 +296,13 @@ type HealResponseSender = broadcast::Sender<HealChannelResponse>;
 static GLOBAL_HEAL_RESPONSE_SENDER: OnceLock<HealResponseSender> = OnceLock::new();
 
 /// Initialize global heal channel
-pub fn init_heal_channel() -> HealChannelReceiver {
+pub fn init_heal_channel() -> Result<HealChannelReceiver, &'static str> {
     let (tx, rx) = mpsc::unbounded_channel();
-    GLOBAL_HEAL_CHANNEL_SENDER
-        .set(tx)
-        .expect("Heal channel sender already initialized");
-    rx
+    if GLOBAL_HEAL_CHANNEL_SENDER.set(tx).is_ok() {
+        Ok(rx)
+    } else {
+        Err("Heal channel sender already initialized")
+    }
 }
 
 /// Get global heal channel sender
@@ -266,6 +365,7 @@ pub fn create_heal_request(
         id: Uuid::new_v4().to_string(),
         bucket,
         object_prefix,
+        object_version_id: None,
         force_start,
         priority: priority.unwrap_or_default(),
         pool_index: None,
@@ -294,6 +394,7 @@ pub fn create_heal_request_with_options(
         id: Uuid::new_v4().to_string(),
         bucket,
         object_prefix,
+        object_version_id: None,
         force_start,
         priority: priority.unwrap_or_default(),
         pool_index,
@@ -323,10 +424,10 @@ fn lc_get_prefix(rule: &LifecycleRule) -> String {
     } else if let Some(filter) = &rule.filter {
         if let Some(p) = &filter.prefix {
             return p.to_string();
-        } else if let Some(and) = &filter.and {
-            if let Some(p) = &and.prefix {
-                return p.to_string();
-            }
+        } else if let Some(and) = &filter.and
+            && let Some(p) = &and.prefix
+        {
+            return p.to_string();
         }
     }
 
@@ -395,21 +496,19 @@ pub fn rep_has_active_rules(config: &ReplicationConfiguration, prefix: &str, rec
         {
             continue;
         }
-        if !prefix.is_empty() {
-            if let Some(filter) = &rule.filter {
-                if let Some(r_prefix) = &filter.prefix {
-                    if !r_prefix.is_empty() {
-                        // incoming prefix must be in rule prefix
-                        if !recursive && !prefix.starts_with(r_prefix) {
-                            continue;
-                        }
-                        // If recursive, we can skip this rule if it doesn't match the tested prefix or level below prefix
-                        // does not match
-                        if recursive && !r_prefix.starts_with(prefix) && !prefix.starts_with(r_prefix) {
-                            continue;
-                        }
-                    }
-                }
+        if !prefix.is_empty()
+            && let Some(filter) = &rule.filter
+            && let Some(r_prefix) = &filter.prefix
+            && !r_prefix.is_empty()
+        {
+            // incoming prefix must be in rule prefix
+            if !recursive && !prefix.starts_with(r_prefix) {
+                continue;
+            }
+            // If recursive, we can skip this rule if it doesn't match the tested prefix or level below prefix
+            // does not match
+            if recursive && !r_prefix.starts_with(prefix) && !prefix.starts_with(r_prefix) {
+                continue;
             }
         }
         return true;
@@ -423,6 +522,7 @@ pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPri
         bucket: "".to_string(),
         object_prefix: None,
         disk: Some(set_disk_id),
+        object_version_id: None,
         force_start: false,
         priority: priority.unwrap_or_default(),
         pool_index: None,

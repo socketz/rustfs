@@ -40,7 +40,8 @@ pub enum NetError {
     SchemeWithEmptyHost,
 }
 
-// Host represents a network host with IP/name and port.
+/// Host represents a network host with IP/name and port.
+/// Similar to Go's net.Host structure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Host {
     pub name: String,
@@ -130,22 +131,38 @@ fn trim_ipv6(host: &str) -> Result<String, NetError> {
     }
 }
 
-// URL is a wrapper around url::Url for custom handling.
+/// URL is a wrapper around url::Url for custom handling.
+/// Provides methods similar to Go's URL struct.
 #[derive(Debug, Clone)]
 pub struct ParsedURL(pub Url);
 
 impl ParsedURL {
     /// is_empty returns true if the URL is empty or "about:blank".
+    ///
+    /// # Arguments
+    /// * `&self` - Reference to the ParsedURL instance.
+    ///
+    /// # Returns
+    /// * `bool` - True if the URL is empty or "about:blank", false otherwise.
+    ///
     pub fn is_empty(&self) -> bool {
         self.0.as_str() == "" || (self.0.scheme() == "about" && self.0.path() == "blank")
     }
 
     /// hostname returns the hostname of the URL.
+    ///
+    /// # Returns
+    /// * `String` - The hostname of the URL, or an empty string if not set.
+    ///
     pub fn hostname(&self) -> String {
         self.0.host_str().unwrap_or("").to_string()
     }
 
     /// port returns the port of the URL as a string, defaulting to "80" for http and "443" for https if not set.
+    ///
+    /// # Returns
+    /// * `String` - The port of the URL as a string.
+    ///
     pub fn port(&self) -> String {
         match self.0.port() {
             Some(p) => p.to_string(),
@@ -158,11 +175,19 @@ impl ParsedURL {
     }
 
     /// scheme returns the scheme of the URL.
+    ///
+    /// # Returns
+    /// * `&str` - The scheme of the URL.
+    ///
     pub fn scheme(&self) -> &str {
         self.0.scheme()
     }
 
     /// url returns a reference to the underlying Url.
+    ///
+    /// # Returns
+    /// * `&Url` - Reference to the underlying Url.
+    ///
     pub fn url(&self) -> &Url {
         &self.0
     }
@@ -171,13 +196,12 @@ impl ParsedURL {
 impl std::fmt::Display for ParsedURL {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut url = self.0.clone();
-        if let Some(host) = url.host_str().map(|h| h.to_string()) {
-            if let Some(port) = url.port() {
-                if (url.scheme() == "http" && port == 80) || (url.scheme() == "https" && port == 443) {
-                    url.set_host(Some(&host)).unwrap();
-                    url.set_port(None).unwrap();
-                }
-            }
+        if let Some(host) = url.host_str().map(|h| h.to_string())
+            && let Some(port) = url.port()
+            && ((url.scheme() == "http" && port == 80) || (url.scheme() == "https" && port == 443))
+        {
+            let _ = url.set_host(Some(&host));
+            let _ = url.set_port(None);
         }
         let mut s = url.to_string();
 
@@ -213,14 +237,25 @@ impl<'de> serde::Deserialize<'de> for ParsedURL {
     }
 }
 
-// parse_url parses a string into a ParsedURL, with host validation and path cleaning.
+/// parse_url parses a string into a ParsedURL, with host validation and path cleaning.
+///
+/// # Arguments
+/// * `s` - The URL string to parse.
+///
+/// # Returns
+/// * `Ok(ParsedURL)` - If parsing is successful.
+/// * `Err(NetError)` - If parsing fails or host is invalid.
+///
+/// # Errors
+/// Returns NetError if parsing fails or host is invalid.
+///
 pub fn parse_url(s: &str) -> Result<ParsedURL, NetError> {
-    if let Some(scheme_end) = s.find("://") {
-        if s[scheme_end + 3..].starts_with('/') {
-            let scheme = &s[..scheme_end];
-            if !scheme.is_empty() {
-                return Err(NetError::SchemeWithEmptyHost);
-            }
+    if let Some(scheme_end) = s.find("://")
+        && s[scheme_end + 3..].starts_with('/')
+    {
+        let scheme = &s[..scheme_end];
+        if !scheme.is_empty() {
+            return Err(NetError::SchemeWithEmptyHost);
         }
     }
 
@@ -273,6 +308,14 @@ pub fn parse_url(s: &str) -> Result<ParsedURL, NetError> {
 
 #[allow(dead_code)]
 /// parse_http_url parses a string into a ParsedURL, ensuring the scheme is http or https.
+///
+/// # Arguments
+/// * `s` - The URL string to parse.
+///
+/// # Returns
+/// * `Ok(ParsedURL)` - If parsing is successful and scheme is http/https.
+/// * `Err(NetError)` - If parsing fails or scheme is not http/https.
+///
 pub fn parse_http_url(s: &str) -> Result<ParsedURL, NetError> {
     let u = parse_url(s)?;
     match u.0.scheme() {
@@ -283,6 +326,14 @@ pub fn parse_http_url(s: &str) -> Result<ParsedURL, NetError> {
 
 #[allow(dead_code)]
 /// is_network_or_host_down checks if an error indicates network or host down, considering timeouts.
+///
+/// # Arguments
+/// * `err` - The std::io::Error to check.
+/// * `expect_timeouts` - Whether timeouts are expected.
+///
+/// # Returns
+/// * `bool` - True if the error indicates network or host down, false otherwise.
+///
 pub fn is_network_or_host_down(err: &std::io::Error, expect_timeouts: bool) -> bool {
     if err.kind() == std::io::ErrorKind::TimedOut {
         return !expect_timeouts;
@@ -297,12 +348,26 @@ pub fn is_network_or_host_down(err: &std::io::Error, expect_timeouts: bool) -> b
 
 #[allow(dead_code)]
 /// is_conn_reset_err checks if an error indicates a connection reset by peer.
+///
+/// # Arguments
+/// * `err` - The std::io::Error to check.
+///
+/// # Returns
+/// * `bool` - True if the error indicates connection reset, false otherwise.
+///
 pub fn is_conn_reset_err(err: &std::io::Error) -> bool {
     err.to_string().contains("connection reset by peer") || matches!(err.raw_os_error(), Some(libc::ECONNRESET))
 }
 
 #[allow(dead_code)]
 /// is_conn_refused_err checks if an error indicates a connection refused.
+///
+/// # Arguments
+/// * `err` - The std::io::Error to check.
+///
+/// # Returns
+/// * `bool` - True if the error indicates connection refused, false otherwise.
+///
 pub fn is_conn_refused_err(err: &std::io::Error) -> bool {
     err.to_string().contains("connection refused") || matches!(err.raw_os_error(), Some(libc::ECONNREFUSED))
 }

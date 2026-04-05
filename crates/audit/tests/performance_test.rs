@@ -44,7 +44,7 @@ async fn test_audit_system_startup_performance() {
 #[tokio::test]
 async fn test_concurrent_target_creation() {
     // Test that multiple targets can be created concurrently
-    let mut registry = AuditRegistry::new();
+    let registry = AuditRegistry::new();
 
     // Create config with multiple webhook instances
     let mut config = rustfs_ecstore::config::Config(std::collections::HashMap::new());
@@ -63,7 +63,7 @@ async fn test_concurrent_target_creation() {
     let start = Instant::now();
 
     // This will fail due to server storage not being initialized, but we can measure timing
-    let result = registry.create_targets_from_config(&config).await;
+    let result = registry.create_audit_targets_from_config(&config).await;
     let elapsed = start.elapsed();
 
     println!("Concurrent target creation took: {elapsed:?}");
@@ -159,7 +159,8 @@ async fn test_audit_log_dispatch_performance() {
 
     let start = Instant::now();
 
-    // Dispatch audit log (should be fast since no targets are configured)
+    // Dispatch audit log against an unstarted system state. Empty config keeps
+    // the audit system stopped, so dispatch should fail fast without targets.
     let result = system.dispatch(Arc::new(audit_entry)).await;
     let elapsed = start.elapsed();
 
@@ -168,8 +169,10 @@ async fn test_audit_log_dispatch_performance() {
     // Should be very fast (sub-millisecond for no targets)
     assert!(elapsed < Duration::from_millis(100), "Dispatch took too long: {elapsed:?}");
 
-    // Should succeed even with no targets
-    assert!(result.is_ok(), "Dispatch should succeed with no targets");
+    assert!(
+        matches!(result, Err(AuditError::NotInitialized(_))),
+        "Dispatch on a stopped system should return NotInitialized, got: {result:?}"
+    );
 
     // Clean up
     let _ = system.close().await;
@@ -186,11 +189,11 @@ async fn test_system_state_transitions() {
     let config = rustfs_ecstore::config::Config(std::collections::HashMap::new());
     let start_result = system.start(config).await;
 
-    // Should be running (or failed due to server storage)
+    // Empty config keeps the audit system stopped even when start() succeeds.
     let state = system.get_state().await;
     match start_result {
         Ok(_) => {
-            assert_eq!(state, rustfs_audit::system::AuditSystemState::Running);
+            assert_eq!(state, rustfs_audit::system::AuditSystemState::Stopped);
         }
         Err(_) => {
             // Expected in test environment due to server storage not being initialized

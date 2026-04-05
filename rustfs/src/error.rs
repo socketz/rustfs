@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_ecstore::bucket::quota::QuotaError;
 use rustfs_ecstore::error::StorageError;
 use s3s::{S3Error, S3ErrorCode};
 
@@ -192,6 +193,19 @@ impl From<ApiError> for S3Error {
 
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
+        // Special handling for Io errors that may contain ChecksumMismatch
+        if let StorageError::Io(ref io_err) = err
+            && let Some(inner) = io_err.get_ref()
+            && (inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some()
+                || inner.downcast_ref::<rustfs_rio::BadDigest>().is_some())
+        {
+            return ApiError {
+                code: S3ErrorCode::BadDigest,
+                message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                source: Some(Box::new(err)),
+            };
+        }
+
         let code = match &err {
             StorageError::NotImplemented => S3ErrorCode::NotImplemented,
             StorageError::InvalidArgument(_, _, _) => S3ErrorCode::InvalidArgument,
@@ -203,8 +217,12 @@ impl From<StorageError> for ApiError {
             StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
             StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
             StorageError::SlowDown => S3ErrorCode::SlowDown,
+            StorageError::DecommissionNotStarted => S3ErrorCode::InvalidRequest,
+            StorageError::DecommissionAlreadyRunning => S3ErrorCode::InvalidRequest,
+            StorageError::RebalanceAlreadyRunning => S3ErrorCode::InvalidRequest,
             StorageError::PrefixAccessDenied(_, _) => S3ErrorCode::AccessDenied,
             StorageError::InvalidUploadIDKeyCombination(_, _) => S3ErrorCode::InvalidArgument,
+            StorageError::MalformedUploadID(_) => S3ErrorCode::InvalidArgument,
             StorageError::ObjectNameTooLong(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::ObjectNamePrefixAsSlash(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::ObjectNotFound(_, _) => S3ErrorCode::NoSuchKey,
@@ -213,7 +231,7 @@ impl From<StorageError> for ApiError {
             StorageError::FileNotFound => S3ErrorCode::NoSuchKey,
             StorageError::FileVersionNotFound => S3ErrorCode::NoSuchVersion,
             StorageError::VersionNotFound(_, _, _) => S3ErrorCode::NoSuchVersion,
-            StorageError::InvalidUploadID(_, _, _) => S3ErrorCode::InvalidPart,
+            StorageError::InvalidUploadID(_, _, _) => S3ErrorCode::NoSuchUpload,
             StorageError::InvalidVersionID(_, _, _) => S3ErrorCode::InvalidArgument,
             StorageError::DataMovementOverwriteErr(_, _, _) => S3ErrorCode::InvalidArgument,
             StorageError::ObjectExistsAsDirectory(_, _) => S3ErrorCode::InvalidArgument,
@@ -239,6 +257,23 @@ impl From<StorageError> for ApiError {
 
 impl From<std::io::Error> for ApiError {
     fn from(err: std::io::Error) -> Self {
+        // Check if the error is a ChecksumMismatch (BadDigest)
+        if let Some(inner) = err.get_ref() {
+            if inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some() {
+                return ApiError {
+                    code: S3ErrorCode::BadDigest,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                    source: Some(Box::new(err)),
+                };
+            }
+            if inner.downcast_ref::<rustfs_rio::BadDigest>().is_some() {
+                return ApiError {
+                    code: S3ErrorCode::BadDigest,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                    source: Some(Box::new(err)),
+                };
+            }
+        }
         ApiError {
             code: S3ErrorCode::InternalError,
             message: err.to_string(),
@@ -251,6 +286,29 @@ impl From<rustfs_iam::error::Error> for ApiError {
     fn from(err: rustfs_iam::error::Error) -> Self {
         let serr: StorageError = err.into();
         serr.into()
+    }
+}
+
+impl From<QuotaError> for ApiError {
+    fn from(err: QuotaError) -> Self {
+        let code = match &err {
+            QuotaError::QuotaExceeded { .. } => S3ErrorCode::InvalidRequest,
+            QuotaError::ConfigNotFound { .. } => S3ErrorCode::NoSuchBucket,
+            QuotaError::InvalidConfig { .. } => S3ErrorCode::InvalidArgument,
+            QuotaError::StorageError(_) => S3ErrorCode::InternalError,
+        };
+
+        let message = if code == S3ErrorCode::InternalError {
+            err.to_string()
+        } else {
+            ApiError::error_code_to_message(&code)
+        };
+
+        ApiError {
+            code,
+            message,
+            source: Some(Box::new(err)),
+        }
     }
 }
 
@@ -355,12 +413,20 @@ mod tests {
             (StorageError::BucketExists("test".into()), S3ErrorCode::BucketAlreadyOwnedByYou),
             (StorageError::StorageFull, S3ErrorCode::ServiceUnavailable),
             (StorageError::SlowDown, S3ErrorCode::SlowDown),
+            (StorageError::DecommissionNotStarted, S3ErrorCode::InvalidRequest),
+            (StorageError::DecommissionAlreadyRunning, S3ErrorCode::InvalidRequest),
+            (StorageError::RebalanceAlreadyRunning, S3ErrorCode::InvalidRequest),
             (StorageError::PrefixAccessDenied("test".into(), "test".into()), S3ErrorCode::AccessDenied),
             (StorageError::ObjectNotFound("test".into(), "test".into()), S3ErrorCode::NoSuchKey),
             (StorageError::ConfigNotFound, S3ErrorCode::NoSuchKey),
             (StorageError::VolumeNotFound, S3ErrorCode::NoSuchBucket),
             (StorageError::FileNotFound, S3ErrorCode::NoSuchKey),
             (StorageError::FileVersionNotFound, S3ErrorCode::NoSuchVersion),
+            (StorageError::MalformedUploadID("test".into()), S3ErrorCode::InvalidArgument),
+            (
+                StorageError::InvalidUploadID("bucket".into(), "object".into(), "uploadid".into()),
+                S3ErrorCode::NoSuchUpload,
+            ),
         ];
 
         for (storage_error, expected_code) in test_cases {

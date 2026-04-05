@@ -436,20 +436,12 @@ impl DataUsageEntry {
         self.obj_sizes.add(summary.total_size as u64);
         self.obj_versions.add(summary.versions as u64);
 
-        let replication_stats = if self.replication_stats.is_none() {
-            self.replication_stats = Some(ReplicationAllStats::default());
-            self.replication_stats.as_mut().unwrap()
-        } else {
-            self.replication_stats.as_mut().unwrap()
-        };
+        let replication_stats = self.replication_stats.get_or_insert_with(ReplicationAllStats::default);
         replication_stats.replica_size += summary.replica_size as u64;
         replication_stats.replica_count += summary.replica_count as u64;
 
         for (arn, st) in &summary.repl_target_stats {
-            let tgt_stat = replication_stats
-                .targets
-                .entry(arn.to_string())
-                .or_insert(ReplicationStats::default());
+            let tgt_stat = replication_stats.targets.entry(arn.to_string()).or_default();
             tgt_stat.pending_size += st.pending_size as u64;
             tgt_stat.failed_size += st.failed_size as u64;
             tgt_stat.replicated_size += st.replicated_size as u64;
@@ -466,10 +458,7 @@ impl DataUsageEntry {
         self.size += other.size;
 
         if let Some(o_rep) = &other.replication_stats {
-            if self.replication_stats.is_none() {
-                self.replication_stats = Some(ReplicationAllStats::default());
-            }
-            let s_rep = self.replication_stats.as_mut().unwrap();
+            let s_rep = self.replication_stats.get_or_insert_with(ReplicationAllStats::default);
             s_rep.targets.clear();
             s_rep.replica_size += o_rep.replica_size;
             s_rep.replica_count += o_rep.replica_count;
@@ -594,7 +583,7 @@ impl DataUsageCache {
                     return Some(root);
                 }
                 let mut flat = self.flatten(&root);
-                if flat.replication_stats.is_some() && flat.replication_stats.as_ref().unwrap().empty() {
+                if flat.replication_stats.as_ref().is_some_and(|stats| stats.empty()) {
                     flat.replication_stats = None;
                 }
                 Some(flat)
@@ -605,13 +594,12 @@ impl DataUsageCache {
 
     pub fn search_parent(&self, hash: &DataUsageHash) -> Option<DataUsageHash> {
         let want = hash.key();
-        if let Some(last_index) = want.rfind('/') {
-            if let Some(v) = self.find(&want[0..last_index]) {
-                if v.children.contains(&want) {
-                    let found = hash_path(&want[0..last_index]);
-                    return Some(found);
-                }
-            }
+        if let Some(last_index) = want.rfind('/')
+            && let Some(v) = self.find(&want[0..last_index])
+            && v.children.contains(&want)
+        {
+            let found = hash_path(&want[0..last_index]);
+            return Some(found);
         }
 
         for (k, v) in self.cache.iter() {
@@ -688,7 +676,9 @@ impl DataUsageCache {
         leaves.sort_by(|a, b| a.objects.cmp(&b.objects));
 
         while remove > 0 && !leaves.is_empty() {
-            let e = leaves.first().unwrap();
+            let Some(e) = leaves.first() else {
+                break;
+            };
             let candidate = e.path.clone();
             if candidate == *path && !compact_self {
                 break;
@@ -712,12 +702,9 @@ impl DataUsageCache {
     }
 
     pub fn total_children_rec(&self, path: &str) -> usize {
-        let root = self.find(path);
-
-        if root.is_none() {
+        let Some(root) = self.find(path) else {
             return 0;
-        }
-        let root = root.unwrap();
+        };
         if root.children.is_empty() {
             return 0;
         }
@@ -730,31 +717,36 @@ impl DataUsageCache {
     }
 
     pub fn merge(&mut self, o: &DataUsageCache) {
-        let mut existing_root = self.root();
-        let other_root = o.root();
-        if existing_root.is_none() && other_root.is_none() {
-            return;
-        }
-        if other_root.is_none() {
-            return;
-        }
-        if existing_root.is_none() {
+        let Some(mut existing_root) = self.root() else {
+            if o.root().is_none() {
+                return;
+            }
             *self = o.clone();
             return;
-        }
-        if o.info.last_update.gt(&self.info.last_update) {
+        };
+
+        let Some(other_root) = o.root() else {
+            return;
+        };
+
+        if o.info.last_update > self.info.last_update {
             self.info.last_update = o.info.last_update;
         }
 
-        existing_root.as_mut().unwrap().merge(other_root.as_ref().unwrap());
-        self.cache.insert(hash_path(&self.info.name).key(), existing_root.unwrap());
-        let e_hash = self.root_hash();
-        for key in other_root.as_ref().unwrap().children.iter() {
-            let entry = &o.cache[key];
+        existing_root.merge(&other_root);
+        self.cache.insert(hash_path(&self.info.name).key(), existing_root);
+
+        let root_hash = self.root_hash();
+        for key in other_root.children.iter() {
+            let Some(entry) = o.cache.get(key) else {
+                continue;
+            };
             let flat = o.flatten(entry);
-            let mut existing = self.cache[key].clone();
-            existing.merge(&flat);
-            self.replace_hashed(&DataUsageHash(key.clone()), &Some(e_hash.clone()), &existing);
+            if let Some(existing) = self.cache.get_mut(key) {
+                existing.merge(&flat);
+            } else {
+                self.replace_hashed(&DataUsageHash(key.clone()), &Some(root_hash.clone()), &flat);
+            }
         }
     }
 
@@ -1151,8 +1143,10 @@ impl DataUsageInfo {
 
         // Update last update time
         if let Some(other_update) = other.last_update {
-            if self.last_update.is_none() || other_update > self.last_update.unwrap() {
-                self.last_update = Some(other_update);
+            match self.last_update {
+                None => self.last_update = Some(other_update),
+                Some(self_update) if other_update > self_update => self.last_update = Some(other_update),
+                _ => {}
             }
         }
     }
@@ -1293,5 +1287,60 @@ mod tests {
 
         assert_eq!(summary1.total_size, 300);
         assert_eq!(summary1.versions, 15);
+    }
+
+    #[test]
+    fn test_data_usage_cache_merge_adds_missing_child() {
+        let mut base = DataUsageCache::default();
+        base.info.name = "bucket".to_string();
+        base.replace("bucket", "", DataUsageEntry::default());
+
+        let mut other = DataUsageCache::default();
+        other.info.name = "bucket".to_string();
+        let child = DataUsageEntry {
+            size: 42,
+            ..Default::default()
+        };
+        other.replace("bucket/child", "bucket", child);
+
+        base.merge(&other);
+
+        let root = base.find("bucket").expect("root bucket should exist");
+        assert_eq!(root.size, 0);
+        let child_entry = base.find("bucket/child").expect("merged child should be added");
+        assert_eq!(child_entry.size, 42);
+    }
+
+    #[test]
+    fn test_data_usage_cache_merge_accumulates_existing_child() {
+        let mut base = DataUsageCache::default();
+        base.info.name = "bucket".to_string();
+        base.replace(
+            "bucket/child",
+            "bucket",
+            DataUsageEntry {
+                size: 10,
+                objects: 1,
+                ..Default::default()
+            },
+        );
+
+        let mut other = DataUsageCache::default();
+        other.info.name = "bucket".to_string();
+        other.replace(
+            "bucket/child",
+            "bucket",
+            DataUsageEntry {
+                size: 20,
+                objects: 2,
+                ..Default::default()
+            },
+        );
+
+        base.merge(&other);
+
+        let child_entry = base.find("bucket/child").expect("child should remain after merge");
+        assert_eq!(child_entry.size, 30);
+        assert_eq!(child_entry.objects, 3);
     }
 }

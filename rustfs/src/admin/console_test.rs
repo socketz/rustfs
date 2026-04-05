@@ -15,9 +15,10 @@
 #[cfg(test)]
 mod tests {
     use crate::config::Opt;
-    use clap::Parser;
+    use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn test_console_cors_configuration() {
         // Test CORS configuration parsing
         use crate::admin::console::parse_cors_origins;
@@ -42,6 +43,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_console_tls_configuration() {
         // Test TLS configuration options (now uses shared tls_path)
         let args = vec!["rustfs", "/tmp/test", "--tls-path", "/path/to/tls"];
@@ -51,6 +53,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_console_health_check_endpoint() {
         // Test that console health check can be called
         // This test would need a running server to be comprehensive
@@ -63,6 +66,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_console_separate_logging_target() {
         // Test that console uses separate logging targets
         use tracing::info;
@@ -77,6 +81,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_console_configuration_validation() {
         // Test configuration validation
         let args = vec![

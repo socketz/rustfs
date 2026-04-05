@@ -12,27 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::get_env_bool;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
-use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
+use rustls::RootCertStore;
+use rustls::server::{
+    ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni, WebPkiClientVerifier, danger::ClientCertVerifier,
+};
 use rustls::sign::CertifiedKey;
-use rustls_pemfile::{certs, private_key};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::collections::HashMap;
 use std::io::Error;
 use std::path::Path;
 use std::sync::Arc;
-use std::{env, fs, io};
+use std::{fs, io};
 use tracing::{debug, warn};
 
 /// Load public certificate from file.
 /// This function loads a public certificate from the specified file.
+///
+/// # Arguments
+///  * `filename` - A string slice that holds the name of the file containing the public certificate.
+///
+/// # Returns
+/// * An io::Result containing a vector of CertificateDer if successful, or an io::Error if an error occurs during loading.
+///
 pub fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
     // Open certificate file.
     let cert_file = fs::File::open(filename).map_err(|e| certs_error(format!("failed to open {filename}: {e}")))?;
     let mut reader = io::BufReader::new(cert_file);
 
     // Load and return certificate.
-    let certs = certs(&mut reader)
+    let certs = CertificateDer::pem_reader_iter(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| certs_error(format!("certificate file {filename} format error:{e:?}")))?;
     if certs.is_empty() {
@@ -41,18 +51,111 @@ pub fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
+/// Load a PEM certificate bundle and return each certificate as DER bytes.
+///
+/// This is a low-level helper intended for TLS clients (reqwest/hyper-rustls) that
+/// need to add root certificates one-by-one.
+///
+/// - Input: a PEM file that may contain multiple cert blocks.
+/// - Output: Vec of DER-encoded cert bytes, one per cert.
+///
+/// NOTE: This intentionally returns raw bytes to avoid forcing downstream crates
+/// to depend on rustls types.
+pub fn load_cert_bundle_der_bytes(path: &str) -> io::Result<Vec<Vec<u8>>> {
+    let pem = fs::read(path)?;
+    let mut reader = io::BufReader::new(&pem[..]);
+
+    let certs = CertificateDer::pem_reader_iter(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| certs_error(format!("Failed to parse PEM certs from {path}: {e}")))?;
+
+    Ok(certs.into_iter().map(|c| c.to_vec()).collect())
+}
+
+/// Builds a WebPkiClientVerifier for mTLS if enabled via environment variable.
+///
+/// # Arguments
+/// * `tls_path` - Directory containing client CA certificates
+///
+/// # Returns
+/// * `Ok(Some(verifier))` if mTLS is enabled and CA certs are found
+/// * `Ok(None)` if mTLS is disabled
+/// * `Err` if mTLS is enabled but configuration is invalid
+pub fn build_webpki_client_verifier(tls_path: &str) -> io::Result<Option<Arc<dyn ClientCertVerifier>>> {
+    if !get_env_bool(rustfs_config::ENV_SERVER_MTLS_ENABLE, rustfs_config::DEFAULT_SERVER_MTLS_ENABLE) {
+        return Ok(None);
+    }
+
+    let ca_path = mtls_ca_bundle_path(tls_path).ok_or_else(|| {
+        Error::other(format!(
+            "RUSTFS_SERVER_MTLS_ENABLE=true but missing {}/client_ca.crt (or fallback {}/ca.crt)",
+            tls_path, tls_path
+        ))
+    })?;
+
+    let ca_path = ca_path
+        .to_str()
+        .ok_or_else(|| Error::other(format!("Invalid UTF-8 in mTLS CA path: {ca_path:?}")))?;
+
+    let der_list = load_cert_bundle_der_bytes(ca_path)?;
+
+    let mut store = RootCertStore::empty();
+    for der in der_list {
+        store
+            .add(der.into())
+            .map_err(|e| Error::other(format!("Invalid client CA cert: {e}")))?;
+    }
+
+    let verifier = WebPkiClientVerifier::builder(Arc::new(store))
+        .build()
+        .map_err(|e| Error::other(format!("Build client cert verifier failed: {e}")))?;
+
+    Ok(Some(verifier))
+}
+
+/// Locate the mTLS client CA bundle in the specified TLS path
+fn mtls_ca_bundle_path(tls_path: &str) -> Option<std::path::PathBuf> {
+    use std::path::Path;
+
+    let p1 = Path::new(tls_path).join(rustfs_config::RUSTFS_CLIENT_CA_CERT_FILENAME);
+    if p1.exists() {
+        return Some(p1);
+    }
+    let p2 = Path::new(tls_path).join(rustfs_config::RUSTFS_CA_CERT);
+    if p2.exists() {
+        return Some(p2);
+    }
+    None
+}
+
 /// Load private key from file.
 /// This function loads a private key from the specified file.
+///
+/// # Arguments
+///  * `filename` - A string slice that holds the name of the file containing the private key.
+///
+/// # Returns
+/// * An io::Result containing the PrivateKeyDer if successful, or an io::Error if an error occurs during loading.
+///
 pub fn load_private_key(filename: &str) -> io::Result<PrivateKeyDer<'static>> {
     // Open keyfile.
     let keyfile = fs::File::open(filename).map_err(|e| certs_error(format!("failed to open {filename}: {e}")))?;
     let mut reader = io::BufReader::new(keyfile);
 
     // Load and return a single private key.
-    private_key(&mut reader)?.ok_or_else(|| certs_error(format!("no private key found in {filename}")))
+    PrivateKeyDer::from_pem_reader(&mut reader)
+        .map_err(|e| certs_error(format!("failed to parse private key in {filename}: {e}")))
 }
 
 /// error function
+/// This function creates a new io::Error with the provided error message.
+///
+/// # Arguments
+///  * `err` - A string containing the error message.
+///
+/// # Returns
+///  * An io::Error instance with the specified error message.
+///
 pub fn certs_error(err: String) -> Error {
     Error::other(err)
 }
@@ -61,6 +164,13 @@ pub fn certs_error(err: String) -> Error {
 /// This function loads all certificate and private key pairs from the specified directory.
 /// It looks for files named `rustfs_cert.pem` and `rustfs_key.pem` in each subdirectory.
 /// The root directory can also contain a default certificate/private key pair.
+///
+/// # Arguments
+/// * `dir_path` - A string slice that holds the path to the directory containing the certificates and private keys.
+///
+/// # Returns
+/// * An io::Result containing a HashMap where the keys are domain names (or "default" for the root certificate) and the values are tuples of (Vec<CertificateDer>, PrivateKeyDer). If no valid certificate/private key pairs are found, an io::Error is returned.
+///
 pub fn load_all_certs_from_directory(
     dir_path: &str,
 ) -> io::Result<HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
@@ -113,7 +223,23 @@ pub fn load_all_certs_from_directory(
 
             if cert_path.exists() && key_path.exists() {
                 debug!("find the domain name certificate: {} in {:?}", domain_name, cert_path);
-                match load_cert_key_pair(cert_path.to_str().unwrap(), key_path.to_str().unwrap()) {
+                let cert_path = match cert_path.to_str() {
+                    Some(path) => path,
+                    None => {
+                        warn!("skip domain certificate load, invalid UTF-8 path: {:?}", cert_path);
+                        continue;
+                    }
+                };
+
+                let key_path = match key_path.to_str() {
+                    Some(path) => path,
+                    None => {
+                        warn!("skip domain key load, invalid UTF-8 path: {:?}", key_path);
+                        continue;
+                    }
+                };
+
+                match load_cert_key_pair(cert_path, key_path) {
                     Ok((certs, key)) => {
                         cert_key_pairs.insert(domain_name.to_string(), (certs, key));
                     }
@@ -137,6 +263,14 @@ pub fn load_all_certs_from_directory(
 /// loading a single certificate private key pair
 /// This function loads a certificate and private key from the specified paths.
 /// It returns a tuple containing the certificate and private key.
+///
+/// # Arguments
+/// * `cert_path` - A string slice that holds the path to the certificate file.
+/// * `key_path` - A string slice that holds the path to the private key file
+///
+/// # Returns
+/// * An io::Result containing a tuple of (Vec<CertificateDer>, PrivateKeyDer) if successful, or an io::Error if an error occurs during loading.
+///
 fn load_cert_key_pair(cert_path: &str, key_path: &str) -> io::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
@@ -147,6 +281,12 @@ fn load_cert_key_pair(cert_path: &str, key_path: &str) -> io::Result<(Vec<Certif
 /// This function loads all certificates and private keys from the specified directory.
 /// It uses the first certificate/private key pair found in the root directory as the default certificate.
 /// The rest of the certificates/private keys are used for SNI resolution.
+///
+/// # Arguments
+/// * `cert_key_pairs` - A HashMap where the keys are domain names (or "default" for the root certificate) and the values are tuples of (Vec<CertificateDer>, PrivateKeyDer).
+///
+/// # Returns
+/// * An io::Result containing an implementation of ResolvesServerCert if successful, or an io::Error if an error occurs during loading.
 ///
 pub fn create_multi_cert_resolver(
     cert_key_pairs: HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
@@ -173,7 +313,7 @@ pub fn create_multi_cert_resolver(
 
     for (domain, (certs, key)) in cert_key_pairs {
         // create a signature
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+        let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
             .map_err(|e| certs_error(format!("unsupported private key types:{domain}, err:{e:?}")))?;
 
         // create a CertifiedKey
@@ -195,22 +335,19 @@ pub fn create_multi_cert_resolver(
 }
 
 /// Checks if TLS key logging is enabled.
+///
+/// # Returns
+/// * A boolean indicating whether TLS key logging is enabled based on the `RUSTFS_TLS_KEYLOG` environment variable.
+///
 pub fn tls_key_log() -> bool {
-    env::var("RUSTFS_TLS_KEYLOG")
-        .map(|v| {
-            let v = v.trim();
-            v.eq_ignore_ascii_case("1")
-                || v.eq_ignore_ascii_case("on")
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("yes")
-        })
-        .unwrap_or(false)
+    get_env_bool(rustfs_config::ENV_TLS_KEYLOG, rustfs_config::DEFAULT_TLS_KEYLOG)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::ErrorKind;
     use tempfile::TempDir;
 
     #[test]
@@ -218,7 +355,7 @@ mod tests {
         let error_msg = "Test error message";
         let error = certs_error(error_msg.to_string());
 
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.kind(), ErrorKind::Other);
         assert_eq!(error.to_string(), error_msg);
     }
 
@@ -228,7 +365,7 @@ mod tests {
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.kind(), ErrorKind::Other);
         assert!(error.to_string().contains("failed to open"));
     }
 
@@ -238,7 +375,7 @@ mod tests {
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.kind(), ErrorKind::Other);
         assert!(error.to_string().contains("failed to open"));
     }
 
@@ -278,7 +415,7 @@ mod tests {
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("no private key found"));
+        assert!(error.to_string().contains("failed to parse private key in"));
     }
 
     #[test]
@@ -291,7 +428,7 @@ mod tests {
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("no private key found"));
+        assert!(error.to_string().contains("failed to parse private key in"));
     }
 
     #[test]
@@ -470,11 +607,8 @@ mod tests {
 
     #[test]
     fn test_memory_efficiency() {
-        // Test that error types are reasonably sized
-        use std::mem;
-
         let error = certs_error("test".to_string());
-        let error_size = mem::size_of_val(&error);
+        let error_size = std::mem::size_of_val(&error);
 
         // Error should not be excessively large
         assert!(error_size < 1024, "Error size should be reasonable, got {error_size} bytes");

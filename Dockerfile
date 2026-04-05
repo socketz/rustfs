@@ -1,4 +1,18 @@
-FROM alpine:3.22 AS build
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+FROM alpine:3.23 AS build
 
 ARG TARGETARCH
 ARG RELEASE=latest
@@ -40,7 +54,7 @@ RUN set -eux; \
     rm -rf rustfs.zip /build/.tmp || true
 
 
-FROM alpine:3.22
+FROM alpine:3.23
 
 ARG RELEASE=latest
 ARG BUILD_DATE
@@ -58,7 +72,8 @@ LABEL name="RustFS" \
       url="https://rustfs.com" \
       license="Apache-2.0"
 
-RUN apk add --no-cache ca-certificates coreutils curl
+RUN apk update && \
+    apk add --no-cache ca-certificates coreutils curl "zlib>=1.3.2-r0"
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /build/rustfs /usr/bin/rustfs
@@ -66,28 +81,22 @@ COPY entrypoint.sh /entrypoint.sh
 
 RUN chmod +x /usr/bin/rustfs /entrypoint.sh
 
-RUN addgroup -g 1000 -S rustfs && \
-    adduser -u 1000 -G rustfs -S rustfs -D && \
+RUN addgroup -g 10001 -S rustfs && \
+    adduser -u 10001 -G rustfs -S rustfs -D && \
     mkdir -p /data /logs && \
     chown -R rustfs:rustfs /data /logs && \
     chmod 0750 /data /logs
 
-ENV RUSTFS_ADDRESS=":9000" \
-    RUSTFS_CONSOLE_ADDRESS=":9001" \
-    RUSTFS_ACCESS_KEY="rustfsadmin" \
-    RUSTFS_SECRET_KEY="rustfsadmin" \
-    RUSTFS_CONSOLE_ENABLE="true" \
-    RUSTFS_EXTERNAL_ADDRESS="" \
-    RUSTFS_CORS_ALLOWED_ORIGINS="*" \
+ENV RUSTFS_CORS_ALLOWED_ORIGINS="*" \
     RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
     RUSTFS_VOLUMES="/data" \
-    RUST_LOG="warn" \
-    RUSTFS_OBS_LOG_DIRECTORY="/logs" \
-    RUSTFS_SINKS_FILE_PATH="/logs"
-
+    RUSTFS_OBS_LOGGER_LEVEL=warn \
+    RUSTFS_OBS_LOG_DIRECTORY=/logs \
+    RUSTFS_OBS_ENVIRONMENT=production
+    
 EXPOSE 9000 9001
 
-VOLUME ["/data", "/logs"]
+VOLUME ["/data"]
 
 USER rustfs
 

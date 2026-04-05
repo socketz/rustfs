@@ -19,21 +19,33 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use bytes::Bytes;
+use futures_util::ready;
 use http::HeaderMap;
-use std::io::Cursor;
+use std::io::{Cursor, Error as IoError, ErrorKind as IoErrorKind, Read};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::io::BufReader;
+use tokio_util::io::StreamReader;
 
 use crate::client::{
     api_error_response::err_invalid_argument,
     api_get_options::GetObjectOptions,
     transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info},
 };
+use futures_util::StreamExt;
+use http_body_util::BodyExt;
+use hyper::body::Body;
+use hyper::body::Bytes;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
+use tokio_util::io::ReaderStream;
 
 impl TransitionClient {
     pub fn get_object(&self, bucket_name: &str, object_name: &str, opts: &GetObjectOptions) -> Result<Object, std::io::Error> {
-        todo!();
+        let _ = opts;
+        Err(std::io::Error::new(
+            IoErrorKind::Unsupported,
+            format!("get_object is not implemented for {bucket_name}/{object_name}"),
+        ))
     }
 
     pub async fn get_object_inner(
@@ -65,11 +77,19 @@ impl TransitionClient {
             )
             .await?;
 
-        let resp = &resp;
         let object_stat = to_object_info(bucket_name, object_name, resp.headers())?;
 
-        let b = resp.body().bytes().expect("err").to_vec();
-        Ok((object_stat, resp.headers().clone(), BufReader::new(Cursor::new(b))))
+        let h = resp.headers().clone();
+
+        let mut body_vec = Vec::new();
+        let mut body = resp.into_body();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            if let Some(data) = frame.data_ref() {
+                body_vec.extend_from_slice(data);
+            }
+        }
+        Ok((object_stat, h, BufReader::new(Cursor::new(body_vec))))
     }
 }
 
@@ -115,7 +135,18 @@ impl Object {
     }
 
     fn do_get_request(&self, request: &GetRequest) -> Result<GetResponse, std::io::Error> {
-        todo!()
+        let _ = request.did_offset_change;
+        let _ = request.offset;
+        let _ = request.is_first_req;
+        let _ = request.is_read_at;
+        let _ = request.setting_object_info;
+        let _ = request.is_read_op;
+        let _ = request.been_read;
+        let _ = request.buffer.len();
+        Err(std::io::Error::new(
+            IoErrorKind::Unsupported,
+            "read-path for Object in api_get_object is not implemented",
+        ))
     }
 
     fn set_offset(&mut self, bytes_read: i64) -> Result<(), std::io::Error> {

@@ -16,12 +16,12 @@
 
 use crate::error::{KmsError, Result};
 use crate::types::EncryptionAlgorithm;
-use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, KeyInit},
 };
 use chacha20poly1305::ChaCha20Poly1305;
+use rand::RngExt;
 
 /// Trait for object encryption ciphers
 #[cfg_attr(not(test), allow(dead_code))]
@@ -52,13 +52,23 @@ pub struct AesCipher {
 
 impl AesCipher {
     /// Create a new AES cipher with the given key
+    ///
+    /// #Arguments
+    /// * `key` - A byte slice representing the AES-256 key (32 bytes)
+    ///
+    /// #Errors
+    /// Returns `KmsError` if the key size is invalid
+    ///
+    /// #Returns
+    /// A Result containing the AesCipher instance
+    ///
     pub fn new(key: &[u8]) -> Result<Self> {
         if key.len() != 32 {
             return Err(KmsError::invalid_key_size(32, key.len()));
         }
 
-        let key = Key::<Aes256Gcm>::from_slice(key);
-        let cipher = Aes256Gcm::new(key);
+        let key = Key::<Aes256Gcm>::try_from(key).map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
+        let cipher = Aes256Gcm::new(&key);
 
         Ok(Self { cipher })
     }
@@ -70,12 +80,12 @@ impl ObjectCipher for AesCipher {
             return Err(KmsError::invalid_key_size(12, iv.len()));
         }
 
-        let nonce = Nonce::from_slice(iv);
+        let nonce = Nonce::try_from(iv).map_err(|_| KmsError::cryptographic_error("nonce", "Invalid nonce length"))?;
 
         // AES-GCM includes the tag in the ciphertext
         let ciphertext_with_tag = self
             .cipher
-            .encrypt(nonce, aes_gcm::aead::Payload { msg: plaintext, aad })
+            .encrypt(&nonce, aes_gcm::aead::Payload { msg: plaintext, aad })
             .map_err(KmsError::from_aes_gcm_error)?;
 
         // Split ciphertext and tag
@@ -98,7 +108,7 @@ impl ObjectCipher for AesCipher {
             return Err(KmsError::invalid_key_size(self.tag_size(), tag.len()));
         }
 
-        let nonce = Nonce::from_slice(iv);
+        let nonce = Nonce::try_from(iv).map_err(|_| KmsError::cryptographic_error("nonce", "Invalid nonce length"))?;
 
         // Combine ciphertext and tag for AES-GCM
         let mut ciphertext_with_tag = ciphertext.to_vec();
@@ -107,7 +117,7 @@ impl ObjectCipher for AesCipher {
         let plaintext = self
             .cipher
             .decrypt(
-                nonce,
+                &nonce,
                 aes_gcm::aead::Payload {
                     msg: &ciphertext_with_tag,
                     aad,
@@ -142,13 +152,23 @@ pub struct ChaCha20Cipher {
 
 impl ChaCha20Cipher {
     /// Create a new ChaCha20 cipher with the given key
+    ///
+    /// #Arguments
+    /// * `key` - A byte slice representing the ChaCha20-Poly1305 key (32 bytes)
+    ///
+    /// #Errors
+    /// Returns `KmsError` if the key size is invalid
+    ///
+    /// #Returns
+    /// A Result containing the ChaCha20Cipher instance
+    ///
     pub fn new(key: &[u8]) -> Result<Self> {
         if key.len() != 32 {
             return Err(KmsError::invalid_key_size(32, key.len()));
         }
 
-        let key = chacha20poly1305::Key::from_slice(key);
-        let cipher = ChaCha20Poly1305::new(key);
+        let key = chacha20poly1305::Key::try_from(key).map_err(|_| KmsError::cryptographic_error("key", "Invalid key length"))?;
+        let cipher = ChaCha20Poly1305::new(&key);
 
         Ok(Self { cipher })
     }
@@ -160,12 +180,13 @@ impl ObjectCipher for ChaCha20Cipher {
             return Err(KmsError::invalid_key_size(12, iv.len()));
         }
 
-        let nonce = chacha20poly1305::Nonce::from_slice(iv);
+        let nonce =
+            chacha20poly1305::Nonce::try_from(iv).map_err(|_| KmsError::cryptographic_error("nonce", "Invalid nonce length"))?;
 
         // ChaCha20-Poly1305 includes the tag in the ciphertext
         let ciphertext_with_tag = self
             .cipher
-            .encrypt(nonce, chacha20poly1305::aead::Payload { msg: plaintext, aad })
+            .encrypt(&nonce, chacha20poly1305::aead::Payload { msg: plaintext, aad })
             .map_err(KmsError::from_chacha20_error)?;
 
         // Split ciphertext and tag
@@ -188,7 +209,8 @@ impl ObjectCipher for ChaCha20Cipher {
             return Err(KmsError::invalid_key_size(self.tag_size(), tag.len()));
         }
 
-        let nonce = chacha20poly1305::Nonce::from_slice(iv);
+        let nonce =
+            chacha20poly1305::Nonce::try_from(iv).map_err(|_| KmsError::cryptographic_error("nonce", "Invalid nonce length"))?;
 
         // Combine ciphertext and tag for ChaCha20-Poly1305
         let mut ciphertext_with_tag = ciphertext.to_vec();
@@ -197,7 +219,7 @@ impl ObjectCipher for ChaCha20Cipher {
         let plaintext = self
             .cipher
             .decrypt(
-                nonce,
+                &nonce,
                 chacha20poly1305::aead::Payload {
                     msg: &ciphertext_with_tag,
                     aad,
@@ -226,6 +248,14 @@ impl ObjectCipher for ChaCha20Cipher {
 }
 
 /// Create a cipher instance for the given algorithm and key
+///
+/// #Arguments
+/// * `algorithm` - The encryption algorithm to use
+/// * `key` - A byte slice representing the encryption key
+///
+/// #Returns
+/// A Result containing a boxed ObjectCipher instance
+///
 pub fn create_cipher(algorithm: &EncryptionAlgorithm, key: &[u8]) -> Result<Box<dyn ObjectCipher>> {
     match algorithm {
         EncryptionAlgorithm::Aes256 | EncryptionAlgorithm::AwsKms => Ok(Box::new(AesCipher::new(key)?)),
@@ -234,6 +264,13 @@ pub fn create_cipher(algorithm: &EncryptionAlgorithm, key: &[u8]) -> Result<Box<
 }
 
 /// Generate a random IV for the given algorithm
+///
+/// #Arguments
+/// * `algorithm` - The encryption algorithm for which to generate the IV
+///
+/// #Returns
+/// A vector containing the generated IV bytes
+///
 pub fn generate_iv(algorithm: &EncryptionAlgorithm) -> Vec<u8> {
     let iv_size = match algorithm {
         EncryptionAlgorithm::Aes256 | EncryptionAlgorithm::AwsKms => 12,
@@ -241,7 +278,7 @@ pub fn generate_iv(algorithm: &EncryptionAlgorithm) -> Vec<u8> {
     };
 
     let mut iv = vec![0u8; iv_size];
-    OsRng.fill_bytes(&mut iv);
+    rand::rng().fill(&mut iv[..]);
     iv
 }
 

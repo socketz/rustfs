@@ -17,6 +17,7 @@ pub mod com;
 #[allow(dead_code)]
 pub mod heal;
 mod notify;
+mod oidc;
 pub mod storageclass;
 
 use crate::error::Result;
@@ -26,6 +27,7 @@ use rustfs_config::COMMENT_KEY;
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -65,14 +67,27 @@ impl ConfigSys {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+pub fn get_global_server_config() -> Option<Config> {
+    GLOBAL_SERVER_CONFIG.get().cloned()
+}
+
+pub async fn init_global_config_sys(api: Arc<ECStore>) -> Result<()> {
+    GLOBAL_CONFIG_SYS.init(api).await
+}
+
+pub async fn try_migrate_server_config(api: Arc<ECStore>) {
+    com::try_migrate_server_config(api).await
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct KV {
     pub key: String,
     pub value: String,
+    #[serde(default, alias = "hiddenIfEmpty")]
     pub hidden_if_empty: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct KVS(pub Vec<KV>);
 
 impl Default for KVS {
@@ -148,7 +163,7 @@ impl KVS {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config(pub HashMap<String, HashMap<String, KVS>>);
 
 impl Default for Config {
@@ -180,10 +195,10 @@ impl Config {
                     let mut default = HashMap::new();
                     default.insert(DEFAULT_DELIMITER.to_owned(), v.clone());
                     self.0.insert(k.clone(), default);
-                } else if !self.0[k].contains_key(DEFAULT_DELIMITER) {
-                    if let Some(m) = self.0.get_mut(k) {
-                        m.insert(DEFAULT_DELIMITER.to_owned(), v.clone());
-                    }
+                } else if !self.0[k].contains_key(DEFAULT_DELIMITER)
+                    && let Some(m) = self.0.get_mut(k)
+                {
+                    m.insert(DEFAULT_DELIMITER.to_owned(), v.clone());
                 }
             }
         }
@@ -226,6 +241,7 @@ pub fn init() {
     kvs.insert(AUDIT_WEBHOOK_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_WEBHOOK_KVS.clone());
     kvs.insert(NOTIFY_MQTT_SUB_SYS.to_owned(), notify::DEFAULT_NOTIFY_MQTT_KVS.clone());
     kvs.insert(AUDIT_MQTT_SUB_SYS.to_owned(), audit::DEFAULT_AUDIT_MQTT_KVS.clone());
+    kvs.insert(IDENTITY_OPENID_SUB_SYS.to_owned(), oidc::DEFAULT_IDENTITY_OPENID_KVS.clone());
 
     // Register all default configurations
     register_default_kvs(kvs)

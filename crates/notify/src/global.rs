@@ -14,7 +14,8 @@
 
 use crate::{BucketNotificationConfig, Event, EventArgs, LifecycleError, NotificationError, NotificationSystem};
 use rustfs_ecstore::config::Config;
-use rustfs_targets::{EventName, arn::TargetID};
+use rustfs_s3_common::EventName;
+use rustfs_targets::arn::TargetID;
 use std::sync::{Arc, OnceLock};
 use tracing::error;
 
@@ -77,12 +78,6 @@ pub mod notifier_global {
             return;
         }
 
-        // Check if any subscribers are interested in the event
-        if !notification_sys.has_subscriber(&args.bucket_name, &args.event_name).await {
-            // error!("No subscribers for event: {} in bucket: {}", args.event_name, args.bucket_name);
-            return;
-        }
-
         // Create an event and send it
         let event = Arc::new(Event::new(args));
         notification_sys.send_event(event).await;
@@ -110,15 +105,11 @@ pub mod notifier_global {
         suffix: &str,
         target_ids: &[TargetID],
     ) -> Result<(), NotificationError> {
-        // Construct pattern, simple splicing of prefixes and suffixes
-        let mut pattern = String::new();
-        if !prefix.is_empty() {
-            pattern.push_str(prefix);
-        }
-        pattern.push('*');
-        if !suffix.is_empty() {
-            pattern.push_str(suffix);
-        }
+        // Construct pattern using proper pattern function
+        let pattern = crate::rules::pattern::new_pattern(
+            if prefix.is_empty() { None } else { Some(prefix) },
+            if suffix.is_empty() { None } else { Some(suffix) },
+        );
 
         // Create BucketNotificationConfig
         let mut bucket_config = BucketNotificationConfig::new(region);

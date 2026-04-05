@@ -18,19 +18,48 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use bytes::Bytes;
+use crate::client::bucket_cache::BucketLocationCache;
+use crate::client::{
+    api_error_response::ErrorResponse,
+    api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
+    api_get_options::GetObjectOptions,
+    api_put_object::PutObjectOptions,
+    api_put_object_multipart::UploadPartParams,
+    api_s3_datatypes::{
+        CompleteMultipartUpload, CompletePart, ListBucketResult, ListBucketV2Result, ListMultipartUploadsResult,
+        ListObjectPartsResult, ObjectPart,
+    },
+    constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
+    credentials::{CredContext, Credentials, SignatureType, Static},
+};
+use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
 use futures::{Future, StreamExt};
 use http::{HeaderMap, HeaderName};
 use http::{
     HeaderValue, Response, StatusCode,
     request::{Builder, Request},
 };
+use http_body::Body;
+use http_body_util::BodyExt;
+use hyper::body::Bytes;
+use hyper::body::Incoming;
 use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use hyper_util::{client::legacy::Client, client::legacy::connect::HttpConnector, rt::TokioExecutor};
 use md5::Digest;
 use md5::Md5;
-use rand::Rng;
+use rand::{Rng, RngExt};
+use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
+use rustfs_rio::HashReader;
 use rustfs_utils::HashAlgorithm;
+use rustfs_utils::{
+    net::get_endpoint_url,
+    retry::{
+        DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
+    },
+};
+use s3s::S3ErrorCode;
+use s3s::dto::Owner;
+use s3s::dto::ReplicationStatus;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::io::Cursor;
@@ -47,31 +76,6 @@ use tokio::io::BufReader;
 use tracing::{debug, error, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
-
-use crate::client::bucket_cache::BucketLocationCache;
-use crate::client::{
-    api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
-    api_get_options::GetObjectOptions,
-    api_put_object::PutObjectOptions,
-    api_put_object_multipart::UploadPartParams,
-    api_s3_datatypes::{
-        CompleteMultipartUpload, CompletePart, ListBucketResult, ListBucketV2Result, ListMultipartUploadsResult,
-        ListObjectPartsResult, ObjectPart,
-    },
-    constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
-    credentials::{CredContext, Credentials, SignatureType, Static},
-};
-use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
-use rustfs_rio::HashReader;
-use rustfs_utils::{
-    net::get_endpoint_url,
-    retry::{
-        DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
-    },
-};
-use s3s::S3ErrorCode;
-use s3s::dto::ReplicationStatus;
-use s3s::{Body, dto::Owner};
 
 const C_USER_AGENT: &str = "RustFS (linux; x86)";
 
@@ -95,7 +99,7 @@ pub struct TransitionClient {
     pub creds_provider: Arc<Mutex<Credentials<Static>>>,
     pub override_signer_type: SignatureType,
     pub secure: bool,
-    pub http_client: Client<HttpsConnector<HttpConnector>, Body>,
+    pub http_client: Client<HttpsConnector<HttpConnector>, s3s::Body>,
     pub bucket_loc_cache: Arc<Mutex<BucketLocationCache>>,
     pub is_trace_enabled: Arc<Mutex<bool>>,
     pub trace_errors_only: Arc<Mutex<bool>>,
@@ -132,37 +136,104 @@ pub enum BucketLookupType {
     BucketLookupPath,
 }
 
+fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
+    // Load the root certificate bundle from the path specified by the
+    // RUSTFS_TLS_PATH environment variable.
+    let tp = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
+    // If no TLS path is configured, do not fall back to a CA bundle in the current directory.
+    if tp.is_empty() {
+        return None;
+    }
+    let ca = std::path::Path::new(&tp).join(rustfs_config::RUSTFS_CA_CERT);
+    if !ca.exists() {
+        return None;
+    }
+
+    let der_list = rustfs_utils::load_cert_bundle_der_bytes(ca.to_str().unwrap_or_default()).ok()?;
+    let mut store = rustls::RootCertStore::empty();
+    for der in der_list {
+        if let Err(e) = store.add(der.into()) {
+            warn!("Warning: failed to add certificate from '{}' to root store: {e}", ca.display());
+        }
+    }
+    Some(store)
+}
+
+fn panic_payload_to_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_string();
+    }
+
+    "unknown panic payload".to_string()
+}
+
+fn with_rustls_init_guard<T, F>(build: F) -> Result<T, std::io::Error>
+where
+    F: FnOnce() -> Result<T, std::io::Error>,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)).unwrap_or_else(|payload| {
+        let panic_message = panic_payload_to_message(payload);
+        Err(std::io::Error::other(format!(
+            "failed to initialize rustls crypto provider: {panic_message}. Ensure exactly one rustls crypto provider feature is enabled (aws-lc-rs or ring), or install one with CryptoProvider::install_default()"
+        )))
+    })
+}
+
+fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
+    with_rustls_init_guard(|| {
+        let config = if let Some(store) = load_root_store_from_tls_path() {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(store)
+                .with_no_client_auth()
+        } else {
+            rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth()
+        };
+
+        Ok(config)
+    })
+}
+
 impl TransitionClient {
     pub async fn new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
-        let clnt = Self::private_new(endpoint, opts, tier_type).await?;
+        let client = Self::private_new(endpoint, opts, tier_type).await?;
 
-        Ok(clnt)
+        Ok(client)
     }
 
     async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            // No default provider is set yet; try to install aws-lc-rs.
+            // `install_default` can only fail if another thread races us and installs a provider
+            // between our check and this call, which is still safe to ignore.
+            if rustls::crypto::aws_lc_rs::default_provider().install_default().is_err() {
+                debug!("rustls crypto provider was installed concurrently, skipping aws-lc-rs install");
+            }
+        } else {
+            debug!("rustls crypto provider already installed, skipping aws-lc-rs install");
+        }
+
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
-        //#[cfg(feature = "ring")]
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        //#[cfg(feature = "aws-lc-rs")]
-        // let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let tls = build_tls_config()?;
 
-        let scheme = endpoint_url.scheme();
-        let client;
-        let tls = rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth();
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls)
             .https_or_http()
             .enable_http1()
+            .enable_http2()
             .build();
-        client = Client::builder(TokioExecutor::new()).build(https);
+        let http_client = Client::builder(TokioExecutor::new()).build(https);
 
-        let mut clnt = TransitionClient {
+        let mut client = TransitionClient {
             endpoint_url,
             creds_provider: Arc::new(Mutex::new(opts.creds)),
             override_signer_type: SignatureType::SignatureDefault,
             secure: opts.secure,
-            http_client: client,
+            http_client,
             bucket_loc_cache: Arc::new(Mutex::new(BucketLocationCache::new())),
             is_trace_enabled: Arc::new(Mutex::new(false)),
             trace_errors_only: Arc::new(Mutex::new(false)),
@@ -180,23 +251,23 @@ impl TransitionClient {
         };
 
         {
-            let mut md5_hasher = clnt.md5_hasher.lock().unwrap();
+            let mut md5_hasher = client.md5_hasher.lock().unwrap();
             if md5_hasher.is_none() {
                 *md5_hasher = Some(HashAlgorithm::Md5);
             }
         }
-        if clnt.sha256_hasher.is_none() {
-            clnt.sha256_hasher = Some(HashAlgorithm::SHA256);
+        if client.sha256_hasher.is_none() {
+            client.sha256_hasher = Some(HashAlgorithm::SHA256);
         }
 
-        clnt.trailing_header_support = opts.trailing_headers && clnt.override_signer_type == SignatureType::SignatureV4;
+        client.trailing_header_support = opts.trailing_headers && client.override_signer_type == SignatureType::SignatureV4;
 
-        clnt.max_retries = MAX_RETRY;
+        client.max_retries = MAX_RETRY;
         if opts.max_retries > 0 {
-            clnt.max_retries = opts.max_retries;
+            client.max_retries = opts.max_retries;
         }
 
-        Ok(clnt)
+        Ok(client)
     }
 
     fn endpoint_url(&self) -> Url {
@@ -216,11 +287,13 @@ impl TransitionClient {
     }
 
     fn set_s3_transfer_accelerate(&self, accelerate_endpoint: &str) {
-        todo!();
+        let mut endpoint = self.s3_accelerate_endpoint.lock().unwrap();
+        *endpoint = accelerate_endpoint.to_string();
     }
 
     fn set_s3_enable_dual_stack(&self, enabled: bool) {
-        todo!();
+        let mut dual_stack = self.s3_dual_stack_enabled.lock().unwrap();
+        *dual_stack = enabled;
     }
 
     pub fn hash_materials(
@@ -228,7 +301,22 @@ impl TransitionClient {
         is_md5_requested: bool,
         is_sha256_requested: bool,
     ) -> (HashMap<String, HashAlgorithm>, HashMap<String, Vec<u8>>) {
-        todo!()
+        // `hash_algos` declares which algorithms are active for this multipart upload.
+        // `hash_sums` keeps the current part digest bytes and is refreshed on every loop.
+        let mut hash_algos = HashMap::new();
+        let mut hash_sums = HashMap::new();
+
+        if is_md5_requested {
+            hash_algos.insert("md5".to_string(), HashAlgorithm::Md5);
+            hash_sums.insert("md5".to_string(), vec![]);
+        }
+
+        if is_sha256_requested {
+            hash_algos.insert("sha256".to_string(), HashAlgorithm::SHA256);
+            hash_sums.insert("sha256".to_string(), vec![]);
+        }
+
+        (hash_algos, hash_sums)
     }
 
     fn is_online(&self) -> bool {
@@ -245,10 +333,10 @@ impl TransitionClient {
     }
 
     fn health_check(hc_duration: Duration) {
-        todo!();
+        let _ = hc_duration;
     }
 
-    fn dump_http(&self, req: &http::Request<Body>, resp: &http::Response<Body>) -> Result<(), std::io::Error> {
+    fn dump_http(&self, req: &Request<s3s::Body>, resp: &Response<Incoming>) -> Result<(), std::io::Error> {
         let mut resp_trace: Vec<u8>;
 
         //info!("{}{}", self.trace_output, "---------BEGIN-HTTP---------");
@@ -257,7 +345,7 @@ impl TransitionClient {
         Ok(())
     }
 
-    pub async fn doit(&self, req: http::Request<Body>) -> Result<http::Response<Body>, std::io::Error> {
+    pub async fn doit(&self, req: Request<s3s::Body>) -> Result<Response<Incoming>, std::io::Error> {
         let req_method;
         let req_uri;
         let req_headers;
@@ -272,9 +360,7 @@ impl TransitionClient {
             debug!("endpoint_url: {}", self.endpoint_url.as_str().to_string());
             resp = http_client.request(req);
         }
-        let resp = resp
-            .await /*.map_err(Into::into)*/
-            .map(|res| res.map(Body::from));
+        let resp = resp.await;
         debug!("http_client url: {} {}", req_method, req_uri);
         debug!("http_client headers: {:?}", req_headers);
         if let Err(err) = resp {
@@ -282,27 +368,36 @@ impl TransitionClient {
             return Err(std::io::Error::other(err));
         }
 
-        let mut resp = resp.unwrap();
+        let resp = resp.unwrap();
         debug!("http_resp: {:?}", resp);
 
         //let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
         //debug!("http_resp_body: {}", String::from_utf8(b).unwrap());
 
         //if self.is_trace_enabled && !(self.trace_errors_only && resp.status() == StatusCode::OK) {
-        if resp.status() != StatusCode::OK {
+        if !resp.status().is_success() {
             //self.dump_http(&cloned_req, &resp)?;
-            let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
-            warn!("err_body: {}", String::from_utf8(b).unwrap());
+            let mut body_vec = Vec::new();
+            let mut body = resp.into_body();
+            while let Some(frame) = body.frame().await {
+                let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                if let Some(data) = frame.data_ref() {
+                    body_vec.extend_from_slice(data);
+                }
+            }
+            let body_str = String::from_utf8_lossy(&body_vec);
+            warn!("err_body: {}", body_str);
+            Err(std::io::Error::other(format!("http_client call error: {}", body_str)))
+        } else {
+            Ok(resp)
         }
-
-        Ok(resp)
     }
 
     pub async fn execute_method(
         &self,
         method: http::Method,
         metadata: &mut RequestMetadata,
-    ) -> Result<http::Response<Body>, std::io::Error> {
+    ) -> Result<Response<Incoming>, std::io::Error> {
         if self.is_offline() {
             let mut s = self.endpoint_url.to_string();
             s.push_str(" is offline.");
@@ -312,7 +407,7 @@ impl TransitionClient {
         let retryable: bool;
         //let mut body_seeker: BufferReader;
         let mut req_retry = self.max_retries;
-        let mut resp: http::Response<Body>;
+        let mut resp: Response<Incoming>;
 
         //if metadata.content_body != nil {
         //body_seeker = BufferReader::new(metadata.content_body.read_all().await?);
@@ -334,15 +429,26 @@ impl TransitionClient {
                 }
             }
 
-            let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
-            let mut err_response = http_resp_to_error_response(&resp, b.clone(), &metadata.bucket_name, &metadata.object_name);
+            let resp_status = resp.status();
+            let h = resp.headers().clone();
+
+            let mut body_vec = Vec::new();
+            let mut body = resp.into_body();
+            while let Some(frame) = body.frame().await {
+                let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                if let Some(data) = frame.data_ref() {
+                    body_vec.extend_from_slice(data);
+                }
+            }
+            let mut err_response =
+                http_resp_to_error_response(resp_status, &h, body_vec.clone(), &metadata.bucket_name, &metadata.object_name);
             err_response.message = format!("remote tier error: {}", err_response.message);
 
             if self.region == "" {
-                match err_response.code {
+                return match err_response.code {
                     S3ErrorCode::AuthorizationHeaderMalformed | S3ErrorCode::InvalidArgument /*S3ErrorCode::InvalidRegion*/ => {
                         //break;
-                        return Err(std::io::Error::other(err_response));
+                        Err(std::io::Error::other(err_response))
                     }
                     S3ErrorCode::AccessDenied => {
                         if err_response.region == "" {
@@ -359,19 +465,19 @@ impl TransitionClient {
                             metadata.bucket_location = err_response.region.clone();
                             //continue;
                         }
-                        return Err(std::io::Error::other(err_response));
+                        Err(std::io::Error::other(err_response))
                     }
                     _ => {
-                        return Err(std::io::Error::other(err_response));
+                        Err(std::io::Error::other(err_response))
                     }
-                }
+                };
             }
 
             if is_s3code_retryable(err_response.code.as_str()) {
                 continue;
             }
 
-            if is_http_status_retryable(&resp.status()) {
+            if is_http_status_retryable(&resp_status) {
                 continue;
             }
 
@@ -385,7 +491,7 @@ impl TransitionClient {
         &self,
         method: &http::Method,
         metadata: &mut RequestMetadata,
-    ) -> Result<http::Request<Body>, std::io::Error> {
+    ) -> Result<Request<s3s::Body>, std::io::Error> {
         let mut location = metadata.bucket_location.clone();
         if location == "" && metadata.bucket_name != "" {
             location = self.get_bucket_location(&metadata.bucket_name).await?;
@@ -405,7 +511,7 @@ impl TransitionClient {
         let Ok(mut req) = Request::builder()
             .method(method)
             .uri(target_url.to_string())
-            .body(Body::empty())
+            .body(s3s::Body::empty())
         else {
             return Err(std::io::Error::other("create request error"));
         };
@@ -517,10 +623,10 @@ impl TransitionClient {
         if metadata.content_length > 0 {
             match &mut metadata.content_body {
                 ReaderImpl::Body(content_body) => {
-                    *req.body_mut() = Body::from(content_body.clone());
+                    *req.body_mut() = s3s::Body::from(content_body.clone());
                 }
                 ReaderImpl::ObjectBody(content_body) => {
-                    *req.body_mut() = Body::from(content_body.read_all().await?);
+                    *req.body_mut() = s3s::Body::from(content_body.read_all().await?);
                 }
             }
         }
@@ -528,7 +634,7 @@ impl TransitionClient {
         Ok(req)
     }
 
-    pub fn set_user_agent(&self, req: &mut Request<Body>) {
+    pub fn set_user_agent(&self, req: &mut Request<s3s::Body>) {
         let headers = req.headers_mut();
         headers.insert("User-Agent", C_USER_AGENT.parse().expect("err"));
     }
@@ -689,7 +795,19 @@ impl TransitionCore {
     ) -> Result<CompletePart, std::io::Error> {
         //self.0.copy_object_part_do(src_bucket, src_object, dest_bucket, dest_object, upload_id,
         //    part_id, start_offset, length, metadata)
-        todo!();
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            crate::client::credentials::ErrorResponse {
+                sts_error: crate::client::credentials::STSError {
+                    r#type: "".to_string(),
+                    code: "NotImplemented".to_string(),
+                    message: format!(
+                        "copy_object_part is not implemented for {src_bucket}/{src_object} -> {dest_bucket}/{dest_object}"
+                    ),
+                },
+                request_id: "".to_string(),
+            },
+        ))
     }
 
     pub async fn put_object(
@@ -966,25 +1084,217 @@ impl Default for UploadInfo {
     }
 }
 
+/// Convert HTTP headers to ObjectInfo struct
+/// This function parses various S3 response headers to construct an ObjectInfo struct
+/// containing metadata about an S3 object.
 pub fn to_object_info(bucket_name: &str, object_name: &str, h: &HeaderMap) -> Result<ObjectInfo, std::io::Error> {
-    todo!()
+    // Helper function to get header value as string
+    let get_header = |name: &str| -> String { h.get(name).and_then(|val| val.to_str().ok()).unwrap_or("").to_string() };
+
+    // Get and process the ETag
+    let etag = {
+        let etag_raw = get_header("ETag");
+        // Remove surrounding quotes if present (trimming ETag)
+        let trimmed = etag_raw.trim_start_matches('"').trim_end_matches('"');
+        Some(trimmed.to_string())
+    };
+
+    // Parse content length if it exists
+    let size = {
+        let content_length_str = get_header("Content-Length");
+        if !content_length_str.is_empty() {
+            content_length_str
+                .parse::<i64>()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Content-Length is not an integer"))?
+        } else {
+            -1
+        }
+    };
+
+    // Parse Last-Modified time
+    let mod_time = {
+        let last_modified_str = get_header("Last-Modified");
+        if !last_modified_str.is_empty() {
+            // Parse HTTP date format (RFC 7231)
+            // Using time crate to parse HTTP dates
+            let parsed_time = OffsetDateTime::parse(&last_modified_str, &time::format_description::well_known::Rfc2822)
+                .or_else(|_| OffsetDateTime::parse(&last_modified_str, &time::format_description::well_known::Rfc3339))
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Last-Modified time format is invalid"))?;
+            Some(parsed_time)
+        } else {
+            Some(OffsetDateTime::now_utc())
+        }
+    };
+
+    // Get content type
+    let content_type = {
+        let content_type_raw = get_header("Content-Type");
+        let content_type_trimmed = content_type_raw.trim();
+        if content_type_trimmed.is_empty() {
+            Some("application/octet-stream".to_string())
+        } else {
+            Some(content_type_trimmed.to_string())
+        }
+    };
+
+    // Parse Expires time
+    let expiration = {
+        let expiry_str = get_header("Expires");
+        if !expiry_str.is_empty() {
+            OffsetDateTime::parse(&expiry_str, &time::format_description::well_known::Rfc2822)
+                .or_else(|_| OffsetDateTime::parse(&expiry_str, &time::format_description::well_known::Rfc3339))
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "'Expires' is not in supported format"))?
+        } else {
+            OffsetDateTime::now_utc()
+        }
+    };
+
+    // Extract user metadata (headers prefixed with "X-Amz-Meta-")
+    let user_metadata = {
+        let mut meta = HashMap::new();
+        for (name, value) in h.iter() {
+            let header_name = name.as_str().to_lowercase();
+            if header_name.starts_with("x-amz-meta-") {
+                let key = header_name.strip_prefix("x-amz-meta-").unwrap().to_string();
+                if let Ok(value_str) = value.to_str() {
+                    meta.insert(key, value_str.to_string());
+                }
+            }
+        }
+        meta
+    };
+
+    let user_tag = {
+        let user_tag_str = get_header("X-Amz-Tagging");
+        user_tag_str
+    };
+
+    // Extract user tags count
+    let user_tag_count = {
+        let count_str = get_header("x-amz-tagging-count");
+        if !count_str.is_empty() {
+            count_str
+                .parse::<usize>()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "x-amz-tagging-count is not an integer"))?
+        } else {
+            0
+        }
+    };
+
+    // Handle restore info
+    let restore = {
+        let restore_hdr = get_header("x-amz-restore");
+        if !restore_hdr.is_empty() {
+            // Simplified restore header parsing - in real implementation, this would parse the specific format
+            // "ongoing-request=\"true\"" or "ongoing-request=\"false\", expiry-date=\"..."
+            let ongoing_restore = restore_hdr.contains("ongoing-request=\"true\"");
+            RestoreInfo {
+                ongoing_restore,
+                expiry_time: if ongoing_restore {
+                    OffsetDateTime::now_utc()
+                } else {
+                    // Try to extract expiry date from the header
+                    // This is simplified - real parsing would be more complex
+                    OffsetDateTime::now_utc()
+                },
+            }
+        } else {
+            RestoreInfo::default()
+        }
+    };
+
+    // Extract version ID
+    let version_id = {
+        let version_id_str = get_header("x-amz-version-id");
+        if !version_id_str.is_empty() {
+            Some(Uuid::parse_str(&version_id_str).unwrap_or_else(|_| Uuid::nil()))
+        } else {
+            None
+        }
+    };
+
+    // Check if it's a delete marker
+    let is_delete_marker = get_header("x-amz-delete-marker") == "true";
+
+    // Get replication status
+    let replication_status = {
+        let status_str = get_header("x-amz-replication-status");
+        ReplicationStatus::from_static(match status_str.as_str() {
+            "COMPLETE" => ReplicationStatus::COMPLETE,
+            "PENDING" => ReplicationStatus::PENDING,
+            "FAILED" => ReplicationStatus::FAILED,
+            "REPLICA" => ReplicationStatus::REPLICA,
+            _ => ReplicationStatus::PENDING,
+        })
+    };
+
+    // Extract expiration rule ID and time (simplified)
+    let (expiration_time, expiration_rule_id) = {
+        // In a real implementation, this would parse the x-amz-expiration header
+        // which typically has format: "expiry-date="Fri, 11 Dec 2020 00:00:00 GMT", rule-id="myrule""
+        let exp_header = get_header("x-amz-expiration");
+        if !exp_header.is_empty() {
+            // Simplified parsing - real implementation would be more thorough
+            (OffsetDateTime::now_utc(), exp_header) // Placeholder
+        } else {
+            (OffsetDateTime::now_utc(), "".to_string())
+        }
+    };
+
+    // Extract checksums
+    let checksum_crc32 = get_header("x-amz-checksum-crc32");
+    let checksum_crc32c = get_header("x-amz-checksum-crc32c");
+    let checksum_sha1 = get_header("x-amz-checksum-sha1");
+    let checksum_sha256 = get_header("x-amz-checksum-sha256");
+    let checksum_crc64nvme = get_header("x-amz-checksum-crc64nvme");
+    let checksum_mode = get_header("x-amz-checksum-mode");
+
+    // Build and return the ObjectInfo struct
+    Ok(ObjectInfo {
+        etag,
+        name: object_name.to_string(),
+        mod_time,
+        size,
+        content_type,
+        metadata: h.clone(),
+        user_metadata,
+        user_tags: "".to_string(), // Tags would need separate parsing
+        user_tag_count,
+        owner: Owner::default(),
+        storage_class: get_header("x-amz-storage-class"),
+        is_latest: true, // Would be determined by versioning settings
+        is_delete_marker,
+        version_id,
+        replication_status,
+        replication_ready: false, // Would be computed based on status
+        expiration: expiration_time,
+        expiration_rule_id,
+        num_versions: 1, // Would be determined by versioning
+        restore,
+        checksum_crc32,
+        checksum_crc32c,
+        checksum_sha1,
+        checksum_sha256,
+        checksum_crc64nvme,
+        checksum_mode,
+    })
 }
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 //#[derive(Clone)]
 pub struct SendRequest {
-    inner: hyper::client::conn::http1::SendRequest<Body>,
+    inner: hyper::client::conn::http1::SendRequest<s3s::Body>,
 }
 
-impl From<hyper::client::conn::http1::SendRequest<Body>> for SendRequest {
-    fn from(inner: hyper::client::conn::http1::SendRequest<Body>) -> Self {
+impl From<hyper::client::conn::http1::SendRequest<s3s::Body>> for SendRequest {
+    fn from(inner: hyper::client::conn::http1::SendRequest<s3s::Body>) -> Self {
         Self { inner }
     }
 }
 
-impl tower::Service<Request<Body>> for SendRequest {
-    type Response = Response<Body>;
+impl tower::Service<Request<s3s::Body>> for SendRequest {
+    type Response = Response<Incoming>;
     type Error = std::io::Error;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -992,13 +1302,13 @@ impl tower::Service<Request<Body>> for SendRequest {
         self.inner.poll_ready(cx).map_err(std::io::Error::other)
     }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
+    fn call(&mut self, req: Request<s3s::Body>) -> Self::Future {
         //let req = hyper::Request::builder().uri("/").body(http_body_util::Empty::<Bytes>::new()).unwrap();
         //let req = hyper::Request::builder().uri("/").body(Body::empty()).unwrap();
 
         let fut = self.inner.send_request(req);
 
-        Box::pin(async move { fut.await.map_err(std::io::Error::other).map(|res| res.map(Body::from)) })
+        Box::pin(async move { fut.await.map_err(std::io::Error::other) })
     }
 }
 
@@ -1012,4 +1322,58 @@ pub struct LocationConstraint {
 pub struct CreateBucketConfiguration {
     #[serde(rename = "LocationConstraint")]
     pub location_constraint: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_tls_config, load_root_store_from_tls_path, with_rustls_init_guard};
+
+    #[test]
+    fn rustls_guard_converts_panics_to_io_errors() {
+        let err = with_rustls_init_guard(|| -> Result<(), std::io::Error> { panic!("missing provider") })
+            .expect_err("panic should be converted into an io::Error");
+        assert!(
+            err.to_string().contains("missing provider"),
+            "expected panic message to be preserved, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_tls_config_returns_result_without_panicking() {
+        let outcome = std::panic::catch_unwind(build_tls_config);
+        assert!(outcome.is_ok(), "TLS config creation should not panic");
+    }
+
+    /// When RUSTFS_TLS_PATH is not set, `load_root_store_from_tls_path` must return `None`
+    /// (i.e. it must not silently look for a CA bundle in the current working directory).
+    #[test]
+    fn tls_path_unset_returns_none() {
+        let result = temp_env::with_var_unset(rustfs_config::ENV_RUSTFS_TLS_PATH, || load_root_store_from_tls_path());
+        assert!(result.is_none(), "expected None when RUSTFS_TLS_PATH is unset, but got a root store");
+    }
+
+    /// When RUSTFS_TLS_PATH is set to an empty string, `load_root_store_from_tls_path` must
+    /// return `None` to avoid accidentally trusting a CA bundle in the current directory.
+    #[test]
+    fn tls_path_empty_returns_none() {
+        let result = temp_env::with_var(rustfs_config::ENV_RUSTFS_TLS_PATH, Some(""), || load_root_store_from_tls_path());
+        assert!(result.is_none(), "expected None when RUSTFS_TLS_PATH is empty, but got a root store");
+    }
+
+    /// Installing the rustls crypto provider when one is already set must not panic or return
+    /// an error that surfaces to callers (the race-safe `get_default` check guards the install).
+    #[test]
+    fn provider_install_is_idempotent() {
+        // Install once (may already be set by another test in this binary — that's fine).
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        // A second install attempt on an already-set provider must not panic.
+        let outcome = std::panic::catch_unwind(|| {
+            if rustls::crypto::CryptoProvider::get_default().is_none() {
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            }
+            // If a default is already present, the branch above is simply skipped.
+        });
+        assert!(outcome.is_ok(), "provider install guard must not panic when a provider is already set");
+    }
 }

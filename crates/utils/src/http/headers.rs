@@ -51,6 +51,7 @@ pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
 pub const AMZ_TAG_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
 
 // S3 transition restore
+pub const AMZ_RESTORE: &str = "x-amz-restore";
 pub const AMZ_RESTORE_EXPIRY_DAYS: &str = "X-Amz-Restore-Expiry-Days";
 pub const AMZ_RESTORE_REQUEST_DATE: &str = "X-Amz-Restore-Request-Date";
 
@@ -66,13 +67,41 @@ pub const AMZ_COPY_SOURCE_VERSION_ID: &str = "X-Amz-Copy-Source-Version-Id";
 pub const AMZ_COPY_SOURCE_RANGE: &str = "X-Amz-Copy-Source-Range";
 pub const AMZ_METADATA_DIRECTIVE: &str = "X-Amz-Metadata-Directive";
 pub const AMZ_OBJECT_LOCK_MODE: &str = "X-Amz-Object-Lock-Mode";
+pub const AMZ_OBJECT_LOCK_MODE_LOWER: &str = "x-amz-object-lock-mode";
 pub const AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE: &str = "X-Amz-Object-Lock-Retain-Until-Date";
+pub const AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER: &str = "x-amz-object-lock-retain-until-date";
 pub const AMZ_OBJECT_LOCK_LEGAL_HOLD: &str = "X-Amz-Object-Lock-Legal-Hold";
+pub const AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER: &str = "x-amz-object-lock-legal-hold";
 pub const AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE: &str = "X-Amz-Bypass-Governance-Retention";
 pub const AMZ_BUCKET_REPLICATION_STATUS: &str = "X-Amz-Replication-Status";
 
-// AmzSnowballExtract will trigger unpacking of an archive content
+// Snowball auto-extract compatibility headers.
+//
+// Supported external request headers:
+// - X-Amz-Meta-Snowball-Auto-Extract
+// - X-Amz-Snowball-Auto-Extract
+// - X-Amz-Meta-Snowball-Prefix
+// - X-Amz-Meta-Snowball-Ignore-Dirs
+// - X-Amz-Meta-Snowball-Ignore-Errors
+// - X-Amz-Meta-Minio-Snowball-Prefix
+// - X-Amz-Meta-Minio-Snowball-Ignore-Dirs
+// - X-Amz-Meta-Minio-Snowball-Ignore-Errors
+//
+// Internal compatibility headers:
+// - X-Amz-Meta-Rustfs-Snowball-Prefix
+// - X-Amz-Meta-Rustfs-Snowball-Ignore-Dirs
+// - X-Amz-Meta-Rustfs-Snowball-Ignore-Errors
 pub const AMZ_SNOWBALL_EXTRACT: &str = "X-Amz-Meta-Snowball-Auto-Extract";
+pub const AMZ_SNOWBALL_EXTRACT_ALT: &str = "X-Amz-Snowball-Auto-Extract";
+pub const AMZ_SNOWBALL_PREFIX: &str = "X-Amz-Meta-Snowball-Prefix";
+pub const AMZ_SNOWBALL_IGNORE_DIRS: &str = "X-Amz-Meta-Snowball-Ignore-Dirs";
+pub const AMZ_SNOWBALL_IGNORE_ERRORS: &str = "X-Amz-Meta-Snowball-Ignore-Errors";
+pub const AMZ_MINIO_SNOWBALL_PREFIX: &str = "X-Amz-Meta-Minio-Snowball-Prefix";
+pub const AMZ_MINIO_SNOWBALL_IGNORE_DIRS: &str = "X-Amz-Meta-Minio-Snowball-Ignore-Dirs";
+pub const AMZ_MINIO_SNOWBALL_IGNORE_ERRORS: &str = "X-Amz-Meta-Minio-Snowball-Ignore-Errors";
+pub const AMZ_RUSTFS_SNOWBALL_PREFIX: &str = "X-Amz-Meta-Rustfs-Snowball-Prefix";
+pub const AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Dirs";
+pub const AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Errors";
 
 // Object lock enabled
 pub const AMZ_OBJECT_LOCK_ENABLED: &str = "x-amz-bucket-object-lock-enabled";
@@ -145,36 +174,7 @@ pub const AMZ_META_NAME: &str = "X-Amz-Meta-Name";
 pub const AMZ_META_UNENCRYPTED_CONTENT_LENGTH: &str = "X-Amz-Meta-X-Amz-Unencrypted-Content-Length";
 pub const AMZ_META_UNENCRYPTED_CONTENT_MD5: &str = "X-Amz-Meta-X-Amz-Unencrypted-Content-Md5";
 
-pub const RESERVED_METADATA_PREFIX: &str = "X-RustFS-Internal-";
-pub const RESERVED_METADATA_PREFIX_LOWER: &str = "x-rustfs-internal-";
-
-pub const RUSTFS_HEALING: &str = "X-Rustfs-Internal-healing";
-// pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
-
-// pub const X_RUSTFS_INLINE_DATA: &str = "x-rustfs-inline-data";
-
-pub const VERSION_PURGE_STATUS_KEY: &str = "X-Rustfs-Internal-purgestatus";
-
-pub const X_RUSTFS_HEALING: &str = "X-Rustfs-Internal-healing";
-pub const X_RUSTFS_DATA_MOV: &str = "X-Rustfs-Internal-data-mov";
-
 pub const AMZ_TAGGING_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
-
-pub const RUSTFS_DATA_MOVE: &str = "X-Rustfs-Internal-data-mov";
-
-pub const RUSTFS_FORCE_DELETE: &str = "X-Rustfs-Force-Delete";
-
-pub const RUSTFS_REPLICATION_RESET_STATUS: &str = "X-Rustfs-Replication-Reset-Status";
-pub const RUSTFS_REPLICATION_AUTUAL_OBJECT_SIZE: &str = "X-Rustfs-Replication-Actual-Object-Size";
-
-pub const RUSTFS_BUCKET_SOURCE_VERSION_ID: &str = "X-Rustfs-Source-Version-Id";
-pub const RUSTFS_BUCKET_SOURCE_MTIME: &str = "X-Rustfs-Source-Mtime";
-pub const RUSTFS_BUCKET_SOURCE_ETAG: &str = "X-Rustfs-Source-Etag";
-pub const RUSTFS_BUCKET_REPLICATION_DELETE_MARKER: &str = "X-Rustfs-Source-DeleteMarker";
-pub const RUSTFS_BUCKET_REPLICATION_PROXY_REQUEST: &str = "X-Rustfs-Source-Proxy-Request";
-pub const RUSTFS_BUCKET_REPLICATION_REQUEST: &str = "X-Rustfs-Source-Replication-Request";
-pub const RUSTFS_BUCKET_REPLICATION_CHECK: &str = "X-Rustfs-Source-Replication-Check";
-pub const RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM: &str = "X-Rustfs-Source-Replication-Ssec-Crc";
 
 // SSEC encryption header constants
 pub const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";

@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::Display;
-
 use datafusion::{common::DataFusionError, sql::sqlparser::parser::ParserError};
 use snafu::{Backtrace, Location, Snafu};
+use std::fmt::Display;
 
 pub mod object_store;
 pub mod query;
@@ -62,13 +61,14 @@ pub enum QueryError {
 }
 
 impl From<DataFusionError> for QueryError {
+    #[track_caller]
     fn from(value: DataFusionError) -> Self {
         match value {
             DataFusionError::External(e) if e.downcast_ref::<QueryError>().is_some() => *e.downcast::<QueryError>().unwrap(),
 
             v => Self::Datafusion {
                 source: Box::new(v),
-                location: Default::default(),
+                location: std::panic::Location::caller(),
                 backtrace: Backtrace::capture(),
             },
         }

@@ -13,9 +13,12 @@
 // limitations under the License.
 
 /// Check if MQTT Broker is available
+///
 /// # Arguments
 /// * `broker_url` - URL of MQTT Broker, for example `mqtt://localhost:1883`
 /// * `topic` - Topic for testing connections
+/// * `username` - Optional username for authentication
+/// * `password` - Optional password for authentication
 /// # Returns
 /// * `Ok(())` - If the connection is successful
 /// * `Err(String)` - If the connection fails, contains an error message
@@ -24,7 +27,12 @@
 /// ```rust,no_run
 ///  #[tokio::main]
 ///  async fn main() {
-///     let result = rustfs_targets::check_mqtt_broker_available("mqtt://localhost:1883", "test/topic").await;
+///     let result = rustfs_targets::check_mqtt_broker_available(
+///         "mqtt://localhost:1883",
+///         "test/topic",
+///         Some("myuser"),
+///         Some("mypass"),
+///     ).await;
 ///     if result.is_ok() {
 ///         println!("MQTT Broker is available");
 ///     } else {
@@ -40,7 +48,13 @@
 /// url = "2.5.7"
 /// tokio = { version = "1", features = ["full"] }
 /// ```
-pub async fn check_mqtt_broker_available(broker_url: &str, topic: &str) -> Result<(), String> {
+///
+pub async fn check_mqtt_broker_available(
+    broker_url: &str,
+    topic: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<(), String> {
     use rumqttc::{AsyncClient, MqttOptions, QoS};
     let url = rustfs_utils::parse_url(broker_url).map_err(|e| format!("Broker URL parsing failed:{e}"))?;
     let url = url.url();
@@ -53,6 +67,15 @@ pub async fn check_mqtt_broker_available(broker_url: &str, topic: &str) -> Resul
     let host = url.host_str().ok_or("Broker is missing host")?;
     let port = url.port().unwrap_or(1883);
     let mut mqtt_options = MqttOptions::new("rustfs_check", host, port);
+
+    // Set credentials if provided
+    if let Some(user) = username
+        && !user.is_empty()
+    {
+        let pass = password.unwrap_or("");
+        mqtt_options.set_credentials(user, pass);
+    }
+
     mqtt_options.set_keep_alive(std::time::Duration::from_secs(5));
     let (client, mut eventloop) = AsyncClient::new(mqtt_options, 1);
 

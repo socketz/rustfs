@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod disk_store;
 pub mod endpoint;
 pub mod error;
 pub mod error_conv;
@@ -22,6 +23,7 @@ pub mod local;
 pub mod os;
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
+pub const MIGRATING_META_BUCKET: &str = ".minio.sys";
 pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
 pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
 pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
@@ -30,6 +32,8 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
+use crate::disk::disk_store::LocalDiskWrapper;
+use crate::disk::local::ScanGuard;
 use crate::rpc::RemoteDisk;
 use bytes::Bytes;
 use endpoint::Endpoint;
@@ -51,13 +55,12 @@ pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
 #[derive(Debug)]
 pub enum Disk {
-    Local(Box<LocalDisk>),
+    Local(Box<LocalDiskWrapper>),
     Remote(Box<RemoteDisk>),
 }
 
 #[async_trait::async_trait]
 impl DiskAPI for Disk {
-    #[tracing::instrument(skip(self))]
     fn to_string(&self) -> String {
         match self {
             Disk::Local(local_disk) => local_disk.to_string(),
@@ -65,7 +68,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn is_online(&self) -> bool {
         match self {
             Disk::Local(local_disk) => local_disk.is_online().await,
@@ -73,7 +75,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn is_local(&self) -> bool {
         match self {
             Disk::Local(local_disk) => local_disk.is_local(),
@@ -81,7 +82,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn host_name(&self) -> String {
         match self {
             Disk::Local(local_disk) => local_disk.host_name(),
@@ -89,7 +89,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn endpoint(&self) -> Endpoint {
         match self {
             Disk::Local(local_disk) => local_disk.endpoint(),
@@ -97,7 +96,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn close(&self) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.close().await,
@@ -105,7 +103,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
         match self {
             Disk::Local(local_disk) => local_disk.get_disk_id().await,
@@ -113,7 +110,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.set_disk_id(id).await,
@@ -121,7 +117,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn path(&self) -> PathBuf {
         match self {
             Disk::Local(local_disk) => local_disk.path(),
@@ -129,7 +124,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn get_disk_location(&self) -> DiskLocation {
         match self {
             Disk::Local(local_disk) => local_disk.get_disk_location(),
@@ -161,7 +155,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
         match self {
             Disk::Local(local_disk) => local_disk.stat_volume(volume).await,
@@ -271,10 +264,10 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {
+    async fn list_dir(&self, _origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         match self {
-            Disk::Local(local_disk) => local_disk.list_dir(_origvolume, volume, _dir_path, _count).await,
-            Disk::Remote(remote_disk) => remote_disk.list_dir(_origvolume, volume, _dir_path, _count).await,
+            Disk::Local(local_disk) => local_disk.list_dir(_origvolume, volume, dir_path, count).await,
+            Disk::Remote(remote_disk) => remote_disk.list_dir(_origvolume, volume, dir_path, count).await,
         }
     }
 
@@ -291,6 +284,14 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.read_file_stream(volume, path, offset, length).await,
             Disk::Remote(remote_disk) => remote_disk.read_file_stream(volume, path, offset, length).await,
+        }
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        match self {
+            Disk::Local(local_disk) => local_disk.read_file_zero_copy(volume, path, offset, length).await,
+            Disk::Remote(remote_disk) => remote_disk.read_file_zero_copy(volume, path, offset, length).await,
         }
     }
 
@@ -393,12 +394,38 @@ impl DiskAPI for Disk {
             Disk::Remote(remote_disk) => remote_disk.disk_info(opts).await,
         }
     }
+
+    fn start_scan(&self) -> ScanGuard {
+        match self {
+            Disk::Local(local_disk) => local_disk.start_scan(),
+            Disk::Remote(remote_disk) => remote_disk.start_scan(),
+        }
+    }
+
+    async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
+        match self {
+            Disk::Local(local_disk) => local_disk.read_metadata(volume, path).await,
+            Disk::Remote(remote_disk) => remote_disk.read_metadata(volume, path).await,
+        }
+    }
+}
+
+impl Disk {
+    /// Enable health monitoring on this disk.
+    /// Called after startup format loading completes so that remote peers
+    /// have time to come online before being marked as faulty.
+    pub fn enable_health_check(&self) {
+        match self {
+            Disk::Local(local_disk) => local_disk.enable_health_check(),
+            Disk::Remote(remote_disk) => remote_disk.enable_health_check(),
+        }
+    }
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
     if ep.is_local {
         let s = LocalDisk::new(ep, opt.cleanup).await?;
-        Ok(Arc::new(Disk::Local(Box::new(s))))
+        Ok(Arc::new(Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(s), opt.health_check)))))
     } else {
         let remote_disk = RemoteDisk::new(ep, opt).await?;
         Ok(Arc::new(Disk::Remote(Box::new(remote_disk))))
@@ -456,6 +483,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         opts: &ReadOptions,
     ) -> Result<FileInfo>;
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
+    async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -470,6 +498,13 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>>;
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
+
+    /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
+    /// Returns Bytes that can be shared without copying.
+    /// On Unix, this uses mmap for true zero-copy access.
+    /// On other platforms, falls back to efficient read operations.
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes>;
+
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter>;
     // ReadFileStream
@@ -487,6 +522,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
+    fn start_scan(&self) -> ScanGuard;
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -534,7 +570,7 @@ pub struct DiskInfo {
     pub scanning: bool,
     pub endpoint: String,
     pub mount_path: String,
-    pub id: String,
+    pub id: Option<Uuid>,
     pub rotational: bool,
     pub metrics: DiskMetrics,
     pub error: String,
@@ -681,12 +717,19 @@ pub fn conv_part_err_to_int(err: &Option<Error>) -> usize {
         Some(DiskError::VolumeNotFound) => CHECK_PART_VOLUME_NOT_FOUND,
         Some(DiskError::DiskNotFound) => CHECK_PART_DISK_NOT_FOUND,
         None => CHECK_PART_SUCCESS,
-        _ => CHECK_PART_UNKNOWN,
+        _ => {
+            tracing::warn!("conv_part_err_to_int: unknown error: {err:?}");
+            CHECK_PART_UNKNOWN
+        }
     }
 }
 
 pub fn has_part_err(part_errs: &[usize]) -> bool {
     part_errs.iter().any(|err| *err != CHECK_PART_SUCCESS)
+}
+
+pub fn count_part_not_success(part_errs: &[usize]) -> usize {
+    part_errs.iter().filter(|err| **err != CHECK_PART_SUCCESS).count()
 }
 
 #[cfg(test)]
@@ -1012,7 +1055,7 @@ mod tests {
 
         let endpoint = Endpoint::try_from(test_dir).unwrap();
         let local_disk = LocalDisk::new(&endpoint, false).await.unwrap();
-        let disk = Disk::Local(Box::new(local_disk));
+        let disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
 
         // Test basic methods
         assert!(disk.is_local());

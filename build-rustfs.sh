@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # RustFS Binary Build Script
 # This script compiles RustFS binaries for different platforms and architectures
@@ -31,7 +31,7 @@ detect_platform() {
                     echo "armv7-unknown-linux-gnueabihf"
                     ;;
                 "loongarch64")
-                    echo "loongarch64-unknown-linux-musl"
+                    echo "loongarch64-unknown-linux-gnu"
                     ;;
                 *)
                     echo "unknown-platform"
@@ -126,6 +126,7 @@ usage() {
     echo "                              Supported platforms:"
     echo "                                x86_64-unknown-linux-gnu"
     echo "                                aarch64-unknown-linux-gnu"
+    echo "                                loongarch64-unknown-linux-gnu"
     echo "                                armv7-unknown-linux-gnueabihf"
     echo "                                x86_64-unknown-linux-musl"
     echo "                                aarch64-unknown-linux-musl"
@@ -163,6 +164,35 @@ print_message() {
     echo -e "${color}${message}${NC}"
 }
 
+# Prevent zig/ld from hitting macOS file descriptor defaults during linking
+ensure_file_descriptor_limit() {
+    local required_limit=4096
+    local current_limit
+    current_limit=$(ulimit -Sn 2>/dev/null || echo "")
+
+    if [ -z "$current_limit" ] || [ "$current_limit" = "unlimited" ]; then
+        return
+    fi
+
+    if (( current_limit >= required_limit )); then
+        return
+    fi
+
+    local hard_limit target_limit
+    hard_limit=$(ulimit -Hn 2>/dev/null || echo "")
+    target_limit=$required_limit
+
+    if [ -n "$hard_limit" ] && [ "$hard_limit" != "unlimited" ] && (( hard_limit < required_limit )); then
+        target_limit=$hard_limit
+    fi
+
+    if ulimit -Sn "$target_limit" 2>/dev/null; then
+        print_message $YELLOW "🔧 Increased open file limit from $current_limit to $target_limit to avoid ProcessFdQuotaExceeded"
+    else
+        print_message $YELLOW "⚠️ Unable to raise ulimit -n automatically (current: $current_limit, needed: $required_limit). Please run 'ulimit -n $required_limit' manually before building."
+    fi
+}
+
 # Get version from git
 get_version() {
     if git describe --abbrev=0 --tags >/dev/null 2>&1; then
@@ -183,7 +213,7 @@ setup_rust_environment() {
     # Set up environment variables for musl targets
     if [[ "$PLATFORM" == *"musl"* ]]; then
         print_message $YELLOW "Setting up environment for musl target..."
-        export RUSTFLAGS="-C target-feature=-crt-static"
+        export RUSTFLAGS="'--cfg tokio_unstable -C target-feature=-crt-static'"
 
         # For cargo-zigbuild, set up additional environment variables
         if command -v cargo-zigbuild &> /dev/null; then
@@ -400,7 +430,7 @@ build_binary() {
         fi
     else
         # Native compilation
-        build_cmd="RUSTFLAGS=-Clink-arg=-lm cargo build"
+        build_cmd="RUSTFLAGS='--cfg tokio_unstable -Clink-arg=-lm' cargo build"
     fi
 
     if [ "$BUILD_TYPE" = "release" ]; then
@@ -570,10 +600,11 @@ main() {
         fi
     fi
 
+    ensure_file_descriptor_limit
+
     # Start build process
     build_rustfs
 }
 
 # Run main function
 main
-

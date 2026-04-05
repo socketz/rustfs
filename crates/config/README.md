@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" /></a>
-  <a href="https://docs.rustfs.com/en/">📖 Documentation</a>
+  <a href="https://docs.rustfs.com/">📖 Documentation</a>
   · <a href="https://github.com/rustfs/rustfs/issues">🐛 Bug Reports</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">💬 Discussions</a>
 </p>
@@ -31,6 +31,30 @@
 ## 📚 Documentation
 
 For comprehensive documentation, examples, and usage guides, please visit the main [RustFS repository](https://github.com/rustfs/rustfs).
+
+## Environment Variable Naming Conventions
+
+RustFS uses a flat naming style for top-level configuration: environment variables are `RUSTFS_*` without nested module segments.
+
+Examples:
+- `RUSTFS_REGION`
+- `RUSTFS_ADDRESS`
+- `RUSTFS_VOLUMES`
+- `RUSTFS_LICENSE`
+
+Current guidance:
+- Prefer module-specific names only when they are not top-level product configuration.
+- Renamed variables must keep backward-compatible aliases until before beta.
+- Alias usage must emit deprecation warnings and be treated as transitional only.
+- Deprecated example:
+  - `RUSTFS_ENABLE_SCANNER` -> `RUSTFS_SCANNER_ENABLED`
+  - `RUSTFS_ENABLE_HEAL` -> `RUSTFS_HEAL_ENABLED`
+  - `RUSTFS_DATA_SCANNER_START_DELAY_SECS` -> `RUSTFS_SCANNER_START_DELAY_SECS`
+
+## Scanner environment aliases
+
+- `RUSTFS_SCANNER_START_DELAY_SECS` (canonical)
+- `RUSTFS_DATA_SCANNER_START_DELAY_SECS` (deprecated alias for compatibility)
 
 ## 📄 License
 

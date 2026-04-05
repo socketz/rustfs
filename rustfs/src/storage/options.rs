@@ -18,6 +18,11 @@ use rustfs_ecstore::error::Result;
 use rustfs_ecstore::error::StorageError;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_LENGTH;
 use rustfs_utils::http::AMZ_META_UNENCRYPTED_CONTENT_MD5;
+use rustfs_utils::http::{
+    SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_DELETEMARKER,
+    SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header, insert_header_map,
+    is_encryption_metadata_key, is_internal_key,
+};
 use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
 use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 
@@ -27,11 +32,6 @@ use rustfs_ecstore::store_api::{HTTPPreconditions, HTTPRangeSpec, ObjectOptions}
 use rustfs_policy::service_type::ServiceType;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use rustfs_utils::http::AMZ_CONTENT_SHA256;
-use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
-use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_DELETE_MARKER;
-use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_REQUEST;
-use rustfs_utils::http::RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM;
-use rustfs_utils::http::RUSTFS_BUCKET_SOURCE_VERSION_ID;
 use rustfs_utils::path::is_dir_object;
 use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
@@ -40,8 +40,12 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::auth::AuthType;
-use crate::auth::get_request_auth_type;
-use crate::auth::is_request_presigned_signature_v4;
+use crate::auth::get_query_param;
+use crate::auth::get_request_auth_type_with_query;
+use crate::auth::is_request_presigned_signature_v4_with_query;
+
+#[cfg(test)]
+use rustfs_utils::http::insert_header;
 
 /// Creates options for deleting an object in a bucket.
 pub async fn del_opts(
@@ -55,35 +59,43 @@ pub async fn del_opts(
     let version_suspended = BucketVersioningSys::suspended(bucket).await;
 
     let vid = if vid.is_none() {
-        headers
-            .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
-            .map(|v| v.to_str().unwrap().to_owned())
+        get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned())
     } else {
         vid
     };
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid {
-        if let Err(err) = Uuid::parse_str(id.as_str()) {
-            error!("del_opts: invalid version id: {} error: {}", id, err);
-            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
+    // Handle AWS S3 special case: "null" string represents null version ID
+    // When VersionId='null' is specified, it means delete the object with null version ID
+    let vid = if let Some(ref id) = vid {
+        if id.eq_ignore_ascii_case("null") {
+            // Convert "null" to Uuid::nil() string representation
+            Some(Uuid::nil().to_string())
+        } else {
+            // Validate UUID format for other version IDs
+            if *id != Uuid::nil().to_string() && Uuid::parse_str(id.as_str()).is_err() {
+                error!("del_opts: invalid version id: {} error: invalid UUID format", id);
+                return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
+            }
+            Some(id.clone())
         }
-
-        if !versioned {
-            error!("del_opts: object not versioned: {}", object);
-            return Err(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
-    }
+    } else {
+        None
+    };
 
     let mut opts = put_opts_from_headers(headers, metadata.clone()).map_err(|err| {
         error!("del_opts: invalid argument: {} error: {}", object, err);
         StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string())
     })?;
 
+    opts.delete_prefix = get_header(headers, SUFFIX_FORCE_DELETE)
+        .map(|v| v.as_ref() == "true")
+        .unwrap_or_default();
+
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::max().to_string())
+            Some(Uuid::nil().to_string())
         } else {
             vid
         }
@@ -91,10 +103,11 @@ pub async fn del_opts(
     opts.version_suspended = version_suspended;
     opts.versioned = versioned;
 
-    opts.delete_marker = headers
-        .get(RUSTFS_BUCKET_REPLICATION_DELETE_MARKER)
-        .map(|v| v.to_str().unwrap() == "true")
+    opts.delete_marker = get_header(headers, SUFFIX_SOURCE_DELETEMARKER)
+        .map(|v| v.as_ref() == "true")
         .unwrap_or_default();
+
+    fill_conditional_writes_opts_from_header(headers, &mut opts)?;
 
     Ok(opts)
 }
@@ -112,22 +125,28 @@ pub async fn get_opts(
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid {
-        if let Err(_err) = Uuid::parse_str(id.as_str()) {
-            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
+    let nil_uuid_str = Uuid::nil().to_string();
 
-        if !versioned {
-            return Err(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), id.clone()));
+    let vid = match vid {
+        Some(ref id) => {
+            if id.eq_ignore_ascii_case("null") {
+                Some(nil_uuid_str.clone())
+            } else {
+                if id.as_str() != nil_uuid_str.as_str() && Uuid::parse_str(id).is_err() {
+                    return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
+                }
+                Some(id.clone())
+            }
         }
-    }
+        None => None,
+    };
 
     let mut opts = get_default_opts(headers, HashMap::new(), false)
         .map_err(|err| StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), err.to_string()))?;
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::max().to_string())
+            Some(nil_uuid_str)
         } else {
             vid
         }
@@ -137,6 +156,15 @@ pub async fn get_opts(
 
     opts.version_suspended = version_suspended;
     opts.versioned = versioned;
+
+    // Optionally skip per-shard bitrot hash verification on reads to save CPU.
+    // Background scanner still performs full integrity checks asynchronously.
+    opts.skip_verify_bitrot = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_GET_SKIP_BITROT_VERIFY,
+        rustfs_config::DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY,
+    );
+
+    fill_conditional_writes_opts_from_header(headers, &mut opts)?;
 
     Ok(opts)
 }
@@ -179,23 +207,18 @@ pub async fn put_opts(
     let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
 
     let vid = if vid.is_none() {
-        headers
-            .get(RUSTFS_BUCKET_SOURCE_VERSION_ID)
-            .map(|v| v.to_str().unwrap().to_owned())
+        get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned())
     } else {
         vid
     };
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid {
-        if let Err(_err) = Uuid::parse_str(id.as_str()) {
-            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
-
-        if !versioned {
-            return Err(StorageError::InvalidArgument(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
+    if let Some(ref id) = vid
+        && *id != Uuid::nil().to_string()
+        && let Err(_err) = Uuid::parse_str(id.as_str())
+    {
+        return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
     }
 
     let mut opts = put_opts_from_headers(headers, metadata)
@@ -203,7 +226,7 @@ pub async fn put_opts(
 
     opts.version_id = {
         if is_dir_object(object) && vid.is_none() {
-            Some(Uuid::max().to_string())
+            Some(Uuid::nil().to_string())
         } else {
             vid
         }
@@ -220,19 +243,21 @@ pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> s
     let mut user_defined = HashMap::new();
 
     let mut replication_request = false;
-    if let Some(v) = headers.get(RUSTFS_BUCKET_REPLICATION_REQUEST) {
-        user_defined.insert(
-            format!("{RESERVED_METADATA_PREFIX_LOWER}Actual-Object-Size"),
-            v.to_str().unwrap_or_default().to_owned(),
-        );
+    if get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         replication_request = true;
+        if let Some(actual_size_str) = get_header(headers, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE) {
+            rustfs_utils::http::insert_str(
+                &mut user_defined,
+                rustfs_utils::http::SUFFIX_ACTUAL_OBJECT_SIZE_CAP,
+                actual_size_str.into_owned(),
+            );
+        } else {
+            tracing::warn!("Failed to get or parse replication actual object size header (x-rustfs-* or x-minio-*)");
+        }
     }
 
-    if let Some(v) = headers.get(RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM) {
-        user_defined.insert(
-            RUSTFS_BUCKET_REPLICATION_SSEC_CHECKSUM.to_string(),
-            v.to_str().unwrap_or_default().to_owned(),
-        );
+    if let Some(v) = get_header(headers, SUFFIX_REPLICATION_SSEC_CRC) {
+        insert_header_map(&mut user_defined, SUFFIX_REPLICATION_SSEC_CRC, v.into_owned());
     }
 
     let mut opts = ObjectOptions {
@@ -262,7 +287,21 @@ pub fn copy_src_opts(_bucket: &str, _object: &str, headers: &HeaderMap<HeaderVal
 }
 
 pub fn put_opts_from_headers(headers: &HeaderMap<HeaderValue>, metadata: HashMap<String, String>) -> Result<ObjectOptions> {
-    get_default_opts(headers, metadata, false)
+    let mut opts = get_default_opts(headers, metadata, false)?;
+    if get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
+        opts.replication_request = true;
+        if let Some(v) = get_header(headers, SUFFIX_SOURCE_MTIME) {
+            let trimmed_s = v.trim();
+            match time::OffsetDateTime::parse(trimmed_s, &time::format_description::well_known::Rfc3339) {
+                Ok(mtime) => opts.mod_time = Some(mtime),
+                Err(e) => {
+                    tracing::warn!("Invalid source-mtime value '{}' (replication request=true): {}", trimmed_s, e);
+                    opts.mod_time = None;
+                }
+            }
+        }
+    }
+    Ok(opts)
 }
 
 /// Creates default options for getting an object from a bucket.
@@ -291,6 +330,25 @@ pub fn extract_metadata_from_mime(headers: &HeaderMap<HeaderValue>, metadata: &m
     extract_metadata_from_mime_with_object_name(headers, metadata, false, None);
 }
 
+/// Normalizes Content-Encoding for storage per AWS S3 behavior: "aws-chunked" is a
+/// request-side transfer encoding for SigV4 streaming and must not be stored or returned.
+/// If the only value is "aws-chunked", returns None (do not persist). Otherwise returns
+/// the value with "aws-chunked" stripped, or None if nothing remains.
+pub(crate) fn normalize_content_encoding_for_storage(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized: String = trimmed
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.eq_ignore_ascii_case("aws-chunked"))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if normalized.is_empty() { None } else { Some(normalized) }
+}
+
 /// Extracts metadata from headers and returns it as a HashMap with object name for MIME type detection.
 pub fn extract_metadata_from_mime_with_object_name(
     headers: &HeaderMap<HeaderValue>,
@@ -298,12 +356,17 @@ pub fn extract_metadata_from_mime_with_object_name(
     skip_content_type: bool,
     object_name: Option<&str>,
 ) {
+    const USER_METADATA_PREFIXES: &[&str] = &["x-amz-meta-", "x-rustfs-meta-", "x-minio-meta-"];
+
     for (k, v) in headers.iter() {
         if k.as_str() == "content-type" && skip_content_type {
             continue;
         }
 
-        if let Some(key) = k.as_str().strip_prefix("x-amz-meta-") {
+        if let Some(key) = USER_METADATA_PREFIXES
+            .iter()
+            .find_map(|prefix| k.as_str().strip_prefix(prefix))
+        {
             if key.is_empty() {
                 continue;
             }
@@ -312,14 +375,16 @@ pub fn extract_metadata_from_mime_with_object_name(
             continue;
         }
 
-        if let Some(key) = k.as_str().strip_prefix("x-rustfs-meta-") {
-            metadata.insert(key.to_owned(), String::from_utf8_lossy(v.as_bytes()).to_string());
-            continue;
-        }
-
         for hd in SUPPORTED_HEADERS.iter() {
             if k.as_str() == *hd {
-                metadata.insert(k.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string());
+                let raw = String::from_utf8_lossy(v.as_bytes()).to_string();
+                if *hd == "content-encoding" {
+                    if let Some(normalized) = normalize_content_encoding_for_storage(&raw) {
+                        metadata.insert(k.to_string(), normalized);
+                    }
+                } else {
+                    metadata.insert(k.to_string(), raw);
+                }
                 continue;
             }
         }
@@ -336,29 +401,60 @@ pub fn extract_metadata_from_mime_with_object_name(
 }
 
 pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
+    // HTTP headers that should NOT be returned in the Metadata field.
+    // These headers are returned as separate response headers, not user metadata.
+    const EXCLUDED_HEADERS: &[&str] = &[
+        "content-type",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "cache-control",
+        "expires",
+        "etag",
+        "x-amz-storage-class",
+        "x-amz-tagging",
+        "x-amz-replication-status",
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key-md5",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+    ];
+
     let mut filtered_metadata = HashMap::new();
     for (k, v) in metadata {
-        if k.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
+        let lower_key = k.to_ascii_lowercase();
+        // Skip internal/reserved metadata (x-rustfs-internal-* or x-minio-internal-*)
+        if is_internal_key(&lower_key) {
             continue;
         }
+
+        // Skip internal encryption metadata (x-rustfs-encryption-* or x-minio-encryption-*)
+        if is_encryption_metadata_key(&lower_key) {
+            continue;
+        }
+
+        // Skip empty object lock values
         if v.is_empty() && (k == &X_AMZ_OBJECT_LOCK_MODE.to_string() || k == &X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string()) {
             continue;
         }
 
+        // Skip UNENCRYPTED metadata placeholders
         if k == AMZ_META_UNENCRYPTED_CONTENT_MD5 || k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH {
             continue;
         }
 
-        let lower_key = k.to_ascii_lowercase();
-        if let Some(key) = lower_key.strip_prefix("x-amz-meta-") {
-            filtered_metadata.insert(key.to_string(), v.to_string());
-            continue;
-        }
-        if let Some(key) = lower_key.strip_prefix("x-rustfs-meta-") {
-            filtered_metadata.insert(key.to_string(), v.to_string());
+        // Skip excluded HTTP headers (they are returned as separate headers, not metadata)
+        if EXCLUDED_HEADERS.contains(&lower_key.as_str()) {
             continue;
         }
 
+        // Skip any x-amz-* headers that are not user metadata
+        // User metadata was stored WITHOUT the x-amz-meta- prefix by extract_metadata_from_mime
+        if lower_key.starts_with("x-amz-") {
+            continue;
+        }
+
+        // Include user-defined metadata (keys like "meta1", "custom-key", etc.)
         filtered_metadata.insert(k.clone(), v.clone());
     }
     if filtered_metadata.is_empty() {
@@ -407,6 +503,10 @@ static SUPPORTED_HEADERS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         "x-amz-tagging",
         "expires",
         "x-amz-replication-status",
+        // Object Lock headers - required for S3 Object Lock functionality
+        "x-amz-object-lock-mode",
+        "x-amz-object-lock-retain-until-date",
+        "x-amz-object-lock-legal-hold",
     ]
 });
 
@@ -465,13 +565,18 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn get_content_sha256(headers: &HeaderMap<HeaderValue>) -> Option<String> {
-    match get_request_auth_type(headers) {
+    get_content_sha256_with_query(headers, None)
+}
+
+pub(crate) fn get_content_sha256_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> Option<String> {
+    match get_request_auth_type_with_query(headers, query) {
         AuthType::Presigned | AuthType::Signed => {
-            if skip_content_sha256_cksum(headers) {
+            if skip_content_sha256_cksum_with_query(headers, query) {
                 None
             } else {
-                Some(get_content_sha256_cksum(headers, ServiceType::S3))
+                Some(get_content_sha256_cksum_with_query(headers, query, ServiceType::S3))
             }
         }
         _ => None,
@@ -480,24 +585,21 @@ pub(crate) fn get_content_sha256(headers: &HeaderMap<HeaderValue>) -> Option<Str
 
 /// skip_content_sha256_cksum returns true if caller needs to skip
 /// payload checksum, false if not.
+#[allow(dead_code)]
 fn skip_content_sha256_cksum(headers: &HeaderMap<HeaderValue>) -> bool {
-    let content_sha256 = if is_request_presigned_signature_v4(headers) {
-        // For presigned requests, check query params first, then headers
-        // Note: In a real implementation, you would need to check query parameters
-        // For now, we'll just check headers
-        headers.get(AMZ_CONTENT_SHA256)
-    } else {
-        headers.get(AMZ_CONTENT_SHA256)
-    };
+    skip_content_sha256_cksum_with_query(headers, None)
+}
 
-    // Skip if no header was set
+fn skip_content_sha256_cksum_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> bool {
+    let include_query_values = matches!(get_request_auth_type_with_query(headers, query), AuthType::Presigned);
+    let content_sha256 = get_content_sha256_value(headers, query, include_query_values);
+
+    // Skip if no checksum value was set in header/query for query-presigned requests.
     let Some(header_value) = content_sha256 else {
         return true;
     };
 
-    let Ok(value) = header_value.to_str() else {
-        return true;
-    };
+    let value = header_value;
 
     // If x-amz-content-sha256 is set and the value is not
     // 'UNSIGNED-PAYLOAD' we should validate the content sha256.
@@ -515,12 +617,11 @@ fn skip_content_sha256_cksum(headers: &HeaderMap<HeaderValue>) -> bool {
             // such broken clients and content-length > 0.
             // For now, we'll assume strict compatibility is disabled
             // In a real implementation, you would check a global config
-            if let Some(content_length) = headers.get("content-length") {
-                if let Ok(length_str) = content_length.to_str() {
-                    if let Ok(length) = length_str.parse::<i64>() {
-                        return length > 0; // && !global_server_ctxt.strict_s3_compat
-                    }
-                }
+            if let Some(content_length) = headers.get("content-length")
+                && let Ok(length_str) = content_length.to_str()
+                && let Ok(length) = length_str.parse::<i64>()
+            {
+                return length > 0; // && !global_server_ctxt.strict_s3_compat
             }
             false
         }
@@ -529,7 +630,11 @@ fn skip_content_sha256_cksum(headers: &HeaderMap<HeaderValue>) -> bool {
 }
 
 /// Returns SHA256 for calculating canonical-request.
-fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: ServiceType) -> String {
+fn get_content_sha256_cksum_with_query(
+    headers: &HeaderMap<HeaderValue>,
+    query: Option<&str>,
+    service_type: ServiceType,
+) -> String {
     if service_type == ServiceType::STS {
         // For STS requests, we would need to read the body and calculate SHA256
         // This is a simplified implementation - in practice you'd need access to the request body
@@ -537,26 +642,52 @@ fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: Serv
         return "sts-body-sha256-placeholder".to_string();
     }
 
-    let (default_sha256_cksum, content_sha256) = if is_request_presigned_signature_v4(headers) {
+    let (default_sha256_cksum, content_sha256) = if is_request_presigned_signature_v4_with_query(headers, query) {
         // For a presigned request we look at the query param for sha256.
         // X-Amz-Content-Sha256, if not set in presigned requests, checksum
         // will default to 'UNSIGNED-PAYLOAD'.
-        (UNSIGNED_PAYLOAD.to_string(), headers.get(AMZ_CONTENT_SHA256))
+        (UNSIGNED_PAYLOAD.to_string(), get_content_sha256_value(headers, query, true))
     } else {
         // X-Amz-Content-Sha256, if not set in signed requests, checksum
         // will default to sha256([]byte("")).
-        (EMPTY_STRING_SHA256_HASH.to_string(), headers.get(AMZ_CONTENT_SHA256))
+        (
+            EMPTY_STRING_SHA256_HASH.to_string(),
+            headers
+                .get(AMZ_CONTENT_SHA256)
+                .and_then(|v| v.to_str().ok().map(str::to_owned)),
+        )
     };
 
     // We found 'X-Amz-Content-Sha256' return the captured value.
     if let Some(header_value) = content_sha256 {
-        if let Ok(value) = header_value.to_str() {
-            return value.to_string();
-        }
+        return header_value;
     }
 
     // We couldn't find 'X-Amz-Content-Sha256'.
     default_sha256_cksum
+}
+
+fn get_content_sha256_value(
+    headers: &HeaderMap<HeaderValue>,
+    query: Option<&str>,
+    include_query_for_presigned: bool,
+) -> Option<String> {
+    if include_query_for_presigned && is_request_presigned_signature_v4_with_query(headers, query) {
+        return query
+            .and_then(|q| get_query_param(q, "x-amz-content-sha256"))
+            .or_else(|| headers.get(AMZ_CONTENT_SHA256).and_then(|v| v.to_str().ok()))
+            .map(str::to_owned);
+    }
+
+    headers
+        .get(AMZ_CONTENT_SHA256)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+}
+
+#[allow(dead_code)]
+fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: ServiceType) -> String {
+    get_content_sha256_cksum_with_query(headers, None, service_type)
 }
 
 #[cfg(test)]
@@ -603,7 +734,7 @@ mod tests {
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert_eq!(opts.version_id, Some(Uuid::max().to_string()));
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
     }
 
     #[tokio::test]
@@ -646,6 +777,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_del_opts_with_delete_prefix() {
+        let mut headers = create_test_headers();
+        let metadata = create_test_metadata();
+
+        // Test without force-delete header - should default to false
+        let result = del_opts("test-bucket", "test-object", None, &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert!(!opts.delete_prefix);
+
+        // Test with RUSTFS_FORCE_DELETE header set to "true"
+        insert_header(&mut headers, SUFFIX_FORCE_DELETE, "true");
+        let result = del_opts("test-bucket", "test-object", None, &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert!(opts.delete_prefix);
+
+        // Test with RUSTFS_FORCE_DELETE header set to "false"
+        insert_header(&mut headers, SUFFIX_FORCE_DELETE, "false");
+        let result = del_opts("test-bucket", "test-object", None, &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert!(!opts.delete_prefix);
+
+        // Test with RUSTFS_FORCE_DELETE header set to other value
+        insert_header(&mut headers, SUFFIX_FORCE_DELETE, "maybe");
+        let result = del_opts("test-bucket", "test-object", None, &headers, metadata).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert!(!opts.delete_prefix);
+    }
+
+    #[tokio::test]
+    async fn test_del_opts_with_null_version_id() {
+        let headers = create_test_headers();
+        let metadata = create_test_metadata();
+        let result = del_opts("test-bucket", "test-object", Some("null".to_string()), &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+        let result = del_opts("test-bucket", "test-object", Some("NULL".to_string()), &headers, metadata.clone()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_get_ops_with_null_version_id() {
+        let headers = create_test_headers();
+        let result = get_opts("test-bucket", "test-object", Some("null".to_string()), None, &headers).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+        let result = get_opts("test-bucket", "test-object", Some("NULL".to_string()), None, &headers).await;
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
+    }
+
+    #[tokio::test]
     async fn test_get_opts_basic() {
         let headers = create_test_headers();
 
@@ -676,7 +863,7 @@ mod tests {
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert_eq!(opts.version_id, Some(Uuid::max().to_string()));
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
     }
 
     #[tokio::test]
@@ -720,7 +907,7 @@ mod tests {
 
         assert!(result.is_ok());
         let opts = result.unwrap();
-        assert_eq!(opts.version_id, Some(Uuid::max().to_string()));
+        assert_eq!(opts.version_id, Some(Uuid::nil().to_string()));
     }
 
     #[tokio::test]
@@ -779,6 +966,35 @@ mod tests {
         let user_defined = opts.user_defined;
         assert_eq!(user_defined.get("key1"), Some(&"value1".to_string()));
         assert_eq!(user_defined.get("key2"), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_put_opts_from_headers_with_replication_request() {
+        let mut headers = HeaderMap::new();
+        insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        let valid_mtime = "2024-05-20T10:30:00+08:00";
+        insert_header(&mut headers, SUFFIX_SOURCE_MTIME, valid_mtime);
+
+        let metadata = HashMap::new();
+
+        let result = put_opts_from_headers(&headers, metadata);
+
+        assert!(result.is_ok());
+        let opts = result.unwrap();
+
+        assert!(opts.replication_request);
+
+        let expected_mtime = time::OffsetDateTime::parse(valid_mtime, &time::format_description::well_known::Rfc3339).unwrap();
+        assert_eq!(opts.mod_time, Some(expected_mtime));
+
+        let mut headers_invalid_mtime = HeaderMap::new();
+        insert_header(&mut headers_invalid_mtime, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        insert_header(&mut headers_invalid_mtime, SUFFIX_SOURCE_MTIME, "invalid-time");
+        let result_invalid = put_opts_from_headers(&headers_invalid_mtime, HashMap::new());
+        assert!(result_invalid.is_ok());
+        let opts_invalid = result_invalid.unwrap();
+        assert!(opts_invalid.replication_request);
+        assert!(opts_invalid.mod_time.is_none());
     }
 
     #[test]
@@ -852,6 +1068,21 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_metadata_from_mime_minio_meta() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-minio-meta-origin", HeaderValue::from_static("gateway"));
+        headers.insert("x-minio-meta-source-id", HeaderValue::from_static("abc123"));
+        headers.insert("x-minio-meta-", HeaderValue::from_static("empty-key"));
+
+        let mut metadata = HashMap::new();
+        extract_metadata_from_mime(&headers, &mut metadata);
+
+        assert_eq!(metadata.get("origin"), Some(&"gateway".to_string()));
+        assert_eq!(metadata.get("source-id"), Some(&"abc123".to_string()));
+        assert!(!metadata.contains_key(""));
+    }
+
+    #[test]
     fn test_extract_metadata_from_mime_supported_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("text/plain"));
@@ -876,6 +1107,48 @@ mod tests {
         assert_eq!(metadata.get("x-amz-tagging"), Some(&"key1=value1&key2=value2".to_string()));
         assert_eq!(metadata.get("expires"), Some(&"Wed, 21 Oct 2015 07:28:00 GMT".to_string()));
         assert_eq!(metadata.get("x-amz-replication-status"), Some(&"COMPLETED".to_string()));
+    }
+
+    /// Issue #1857: SigV4 streaming sends Content-Encoding: aws-chunked. Per AWS S3,
+    /// this is a request-side transfer encoding and must not be stored or returned.
+    /// This test verifies: (1) "aws-chunked" alone is not persisted;
+    /// (2) when combined with real encoding (e.g. gzip), only the real encoding is stored;
+    /// (3) case-insensitive stripping of aws-chunked.
+    #[test]
+    fn test_content_encoding_aws_chunked_not_persisted_issue_1857() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("aws-chunked", None),
+            ("AWS-CHUNKED", None),
+            ("aws-chunked ", None),
+            ("gzip, aws-chunked", Some("gzip")),
+            ("aws-chunked, gzip", Some("gzip")),
+            ("gzip", Some("gzip")),
+            ("zstd", Some("zstd")),
+        ];
+
+        for (header_value, expected) in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-encoding", HeaderValue::from_static(header_value));
+
+            let mut metadata = HashMap::new();
+            extract_metadata_from_mime(&headers, &mut metadata);
+
+            match expected {
+                None => assert!(
+                    !metadata.contains_key("content-encoding"),
+                    "content-encoding {:?} should not be persisted, got metadata keys: {:?}",
+                    header_value,
+                    metadata.keys().collect::<Vec<_>>()
+                ),
+                Some(exp) => assert_eq!(
+                    metadata.get("content-encoding"),
+                    Some(&exp.to_string()),
+                    "content-encoding {:?} should be normalized to {:?}",
+                    header_value,
+                    exp
+                ),
+            }
+        }
     }
 
     #[test]
@@ -942,10 +1215,13 @@ mod tests {
             "x-amz-tagging",
             "expires",
             "x-amz-replication-status",
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-retain-until-date",
+            "x-amz-object-lock-legal-hold",
         ];
 
         assert_eq!(*SUPPORTED_HEADERS, expected_headers);
-        assert_eq!(SUPPORTED_HEADERS.len(), 9);
+        assert_eq!(SUPPORTED_HEADERS.len(), 12);
     }
 
     #[test]
@@ -965,6 +1241,7 @@ mod tests {
         headers.insert("content-type", HeaderValue::from_static("application/xml"));
         headers.insert("x-amz-meta-version", HeaderValue::from_static("1.0"));
         headers.insert("x-rustfs-meta-source", HeaderValue::from_static("upload"));
+        headers.insert("x-minio-meta-origin", HeaderValue::from_static("replication"));
         headers.insert("cache-control", HeaderValue::from_static("public"));
         headers.insert("authorization", HeaderValue::from_static("Bearer xyz")); // Should be ignored
 
@@ -973,6 +1250,7 @@ mod tests {
         assert_eq!(metadata.get("content-type"), Some(&"application/xml".to_string()));
         assert_eq!(metadata.get("version"), Some(&"1.0".to_string()));
         assert_eq!(metadata.get("source"), Some(&"upload".to_string()));
+        assert_eq!(metadata.get("origin"), Some(&"replication".to_string()));
         assert_eq!(metadata.get("cache-control"), Some(&"public".to_string()));
         assert!(!metadata.contains_key("authorization"));
     }
@@ -1026,6 +1304,34 @@ mod tests {
 
         // Should preserve existing content-type, not overwrite
         assert_eq!(metadata.get("content-type"), Some(&"custom/type".to_string()));
+    }
+
+    #[test]
+    fn test_filter_object_metadata_excludes_standard_headers() {
+        let mut metadata = HashMap::new();
+        metadata.insert("content-type".to_string(), "application/octet-stream".to_string());
+        metadata.insert("content-disposition".to_string(), "inline".to_string());
+        metadata.insert("cache-control".to_string(), "no-cache".to_string());
+        metadata.insert("x-amz-storage-class".to_string(), "STANDARD".to_string());
+        metadata.insert("custom-key".to_string(), "custom-value".to_string());
+
+        let filtered = filter_object_metadata(&metadata).unwrap();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.get("custom-key"), Some(&"custom-value".to_string()));
+        assert!(!filtered.contains_key("content-type"));
+        assert!(!filtered.contains_key("content-disposition"));
+        assert!(!filtered.contains_key("cache-control"));
+        assert!(!filtered.contains_key("x-amz-storage-class"));
+    }
+
+    #[test]
+    fn test_filter_object_metadata_returns_none_for_only_content_type() {
+        let mut metadata = HashMap::new();
+        metadata.insert("content-type".to_string(), "application/octet-stream".to_string());
+
+        let filtered = filter_object_metadata(&metadata);
+        assert!(filtered.is_none(), "content-type must not be exposed as user metadata");
     }
 
     #[test]

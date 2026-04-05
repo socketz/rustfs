@@ -16,8 +16,11 @@ pub const DEFAULT_DELIMITER: &str = "_";
 pub const ENV_PREFIX: &str = "RUSTFS_";
 pub const ENV_WORD_DELIMITER: &str = "_";
 
-pub const DEFAULT_DIR: &str = "/opt/rustfs/events"; // Default directory for event store
+pub const EVENT_DEFAULT_DIR: &str = "/opt/rustfs/events"; // Default directory for event store
+pub const AUDIT_DEFAULT_DIR: &str = "/opt/rustfs/audit"; // Default directory for audit store
 pub const DEFAULT_LIMIT: u64 = 100000; // Default store limit
+
+pub const RUSTFS_WEBHOOK_SKIP_TLS_VERIFY_DEFAULT: bool = false;
 
 /// Standard config keys and values.
 pub const ENABLE_KEY: &str = "enable";

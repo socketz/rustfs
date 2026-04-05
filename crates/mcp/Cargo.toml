@@ -32,6 +32,7 @@ path = "src/main.rs"
 [dependencies]
 # AWS SDK for S3 operations
 aws-sdk-s3.workspace = true
+aws-smithy-http-client.workspace = true
 
 # Async runtime and utilities
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "signal"] }
@@ -57,5 +58,6 @@ tracing-subscriber.workspace = true
 # File handling and MIME type detection
 mime_guess = { workspace = true }
 
-[dev-dependencies]
+[lib]
+doctest = false
 # Testing framework and utilities

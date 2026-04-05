@@ -33,14 +33,17 @@ tokio = { workspace = true, features = ["full"] }
 rand = { workspace = true }
 http.workspace = true
 aes-gcm = { workspace = true }
-crc32fast = { workspace = true }
+crc-fast = { workspace = true }
 pin-project-lite.workspace = true
 serde = { workspace = true }
 bytes.workspace = true
 reqwest.workspace = true
 tokio-util.workspace = true
+faster-hex.workspace = true
 futures.workspace = true
-rustfs-utils = { workspace = true, features = ["io", "hash", "compress"] }
+rustfs-config = { workspace = true, features = ["constants"] }
+rustfs-common.workspace = true
+rustfs-utils = { workspace = true, features = ["io", "hash", "compress", "tls"] }
 serde_json.workspace = true
 md-5 = { workspace = true }
 tracing.workspace = true
@@ -48,10 +51,10 @@ thiserror.workspace = true
 base64.workspace = true
 sha1.workspace = true
 sha2.workspace = true
-crc64fast-nvme.workspace = true
 s3s.workspace = true
 hex-simd.workspace = true
-crc32c.workspace = true
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+axum = { workspace = true }
+http-body-util = { workspace = true }

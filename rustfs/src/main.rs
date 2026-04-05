@@ -13,130 +13,240 @@
 // limitations under the License.
 
 mod admin;
+mod app;
 mod auth;
+mod auth_keystone;
+mod capacity;
 mod config;
 mod error;
-// mod grpc;
-pub mod license;
-#[cfg(not(target_os = "windows"))]
+mod init;
+mod license;
 mod profiling;
+#[cfg(any(feature = "ftps", feature = "webdav"))]
+mod protocols;
 mod server;
 mod storage;
 mod update;
 mod version;
 
 // Ensure the correct path for parse_license is imported
+use crate::app::context::{AppContext, init_global_app_context};
+use crate::init::{
+    add_bucket_notification_configuration, init_buffer_profile_system, init_kms_system, init_update_check, print_server_info,
+};
+
+#[cfg(feature = "ftps")]
+use crate::init::{init_ftp_system, init_ftps_system};
+
+#[cfg(feature = "webdav")]
+use crate::init::init_webdav_system;
+
+use crate::capacity::capacity_integration::init_capacity_management;
 use crate::server::{
     SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
     start_audit_system, start_http_server, stop_audit_system, wait_for_shutdown,
 };
-use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
-use chrono::Datelike;
-use clap::Parser;
-use license::init_license;
-use rustfs_ahm::{
-    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager,
-    scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
-};
-use rustfs_common::globals::set_global_addr;
-use rustfs_config::DEFAULT_UPDATE_CHECK;
-use rustfs_config::ENV_UPDATE_CHECK;
-use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
-use rustfs_ecstore::bucket::replication::{GLOBAL_REPLICATION_POOL, init_background_replication};
-use rustfs_ecstore::config as ecconfig;
-use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
-use rustfs_ecstore::store_api::BucketOptions;
+use license::{current_license, init_license, license_status};
+use rustfs_common::{GlobalReadiness, SystemStage, set_global_addr};
+use rustfs_credentials::init_global_action_credentials;
+use rustfs_ecstore::store::init_lock_clients;
 use rustfs_ecstore::{
-    StorageAPI,
+    bucket::metadata_sys::init_bucket_metadata_sys,
+    bucket::migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
+    bucket::replication::{get_global_replication_pool, init_background_replication},
+    config as ecconfig,
     endpoints::EndpointServerPools,
     global::{set_global_rustfs_port, shutdown_background_services},
     notification_sys::new_global_notification_sys,
     set_global_endpoints,
     store::ECStore,
     store::init_local_disks,
+    store_api::BucketOperations,
+    store_api::BucketOptions,
     update_erasure_type,
 };
-use rustfs_iam::init_iam_sys;
-use rustfs_notify::notifier_global;
+use rustfs_heal::{
+    create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
+};
+use rustfs_iam::{init_iam_sys, init_oidc_sys};
+use rustfs_metrics::init_metrics_system;
 use rustfs_obs::{init_obs, set_global_guard};
-use rustfs_targets::arn::TargetID;
-use rustfs_utils::net::parse_and_resolve_address;
-use s3s::s3_error;
-use std::env;
+use rustfs_scanner::init_data_scanner;
+use rustfs_utils::{
+    ExternalEnvCompatReport, apply_external_env_compat, get_env_bool_with_aliases, net::parse_and_resolve_address,
+};
+use rustls::crypto::aws_lc_rs::default_provider;
 use std::io::{Error, Result};
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
+const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
+const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
+const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
+
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(all(target_os = "linux", target_env = "musl"))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+#[global_allocator]
+static GLOBAL: profiling::allocator::TracingAllocator<mimalloc::MiMalloc> =
+    profiling::allocator::TracingAllocator::new(mimalloc::MiMalloc);
+
+#[cfg(target_os = "windows")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const LOGO: &str = r#"
+fn main() {
+    if let Err(err) = bootstrap_external_prefix_compat() {
+        eprintln!("[WARN] Failed to bootstrap external-prefix compatibility: {err}");
+    }
 
-░█▀▄░█░█░█▀▀░▀█▀░█▀▀░█▀▀
-░█▀▄░█░█░▀▀█░░█░░█▀▀░▀▀█
-░▀░▀░▀▀▀░▀▀▀░░▀░░▀░░░▀▀▀
-
-"#;
-
-#[instrument]
-fn print_server_info() {
-    let current_year = chrono::Utc::now().year();
-    // Use custom macros to print server information
-    info!("RustFS Object Storage Server");
-    info!("Copyright: 2024-{} RustFS, Inc", current_year);
-    info!("License: Apache-2.0 https://www.apache.org/licenses/LICENSE-2.0");
-    info!("Version: {}", version::get_version());
-    info!("Docs: https://rustfs.com/docs/");
+    // Build Tokio runtime with optional dial9 telemetry support
+    let runtime = server::build_tokio_runtime().expect("Failed to build Tokio runtime");
+    let result = runtime.block_on(async_main());
+    if let Err(ref e) = result {
+        // Use eprintln as tracing may not be initialized at this point
+        eprintln!("[FATAL] Server encountered an error and is shutting down: {e}");
+        std::process::exit(1);
+    }
 }
 
-fn main() -> Result<()> {
-    let runtime = server::get_tokio_runtime_builder()
-        .build()
-        .expect("Failed to build Tokio runtime");
-    runtime.block_on(async_main())
+fn bootstrap_external_prefix_compat() -> Result<()> {
+    let env_compat_report = apply_external_env_compat();
+    if env_compat_report.conflict_count() > 0 {
+        // RUSTFS_* is the canonical namespace in this codebase, so on key conflicts we keep RUSTFS_*
+        // to preserve explicit user/operator overrides and avoid changing existing runtime behavior.
+        eprintln!(
+            "[WARN] Found {} source/RUSTFS_ conflict(s), keeping RUSTFS_ values: {}",
+            env_compat_report.conflict_count(),
+            env_compat_report.conflict_keys.join(", ")
+        );
+    }
+
+    if env_compat_report.mapped_count() == 0 {
+        return Ok(());
+    }
+
+    eprintln!(
+        "[INFO] Applying external-prefix compatibility in-process for {} variable(s): {}",
+        env_compat_report.mapped_count(),
+        format_external_prefix_mappings(&env_compat_report)
+    );
+
+    Ok(())
 }
+
+fn format_external_prefix_mappings(report: &ExternalEnvCompatReport) -> String {
+    report
+        .mapped_pairs
+        .iter()
+        .map(|(source_key, rustfs_key)| format!("{source_key}->{rustfs_key}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 async fn async_main() -> Result<()> {
-    // Parse the obtained parameters
-    let opt = config::Opt::parse();
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    let command_result = match config::Opt::parse_command(args) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("Command parse failed, error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Handle info command
+    if let config::CommandResult::Info(opts) = command_result {
+        config::execute_info(&opts);
+        return Ok(());
+    }
+
+    // Get config for server command
+    let config = match command_result {
+        config::CommandResult::Server(cfg) => cfg,
+        config::CommandResult::Info(_) => unreachable!(),
+    };
+
+    // Initialize the global config snapshot for info command
+    config::init_config_snapshot(&config);
 
     // Initialize the configuration
-    init_license(opt.license.clone());
+    init_license(config.license.clone());
 
     // Initialize Observability
-    let guard = match init_obs(Some(opt.clone().obs_endpoint)).await {
+    let guard = match init_obs(Some(config.clone().obs_endpoint)).await {
         Ok(g) => g,
         Err(e) => {
-            println!("Failed to initialize observability: {}", e);
+            // Use eprintln as tracing is not yet initialized
+            eprintln!("[FATAL] Failed to initialize observability: {e}");
             return Err(Error::other(e));
         }
     };
 
     // Store in global storage
     match set_global_guard(guard).map_err(Error::other) {
-        Ok(_) => (),
+        Ok(_) => {
+            info!(target: "rustfs::main", "Global observability guard set successfully.");
+        }
         Err(e) => {
             error!("Failed to set global observability guard: {}", e);
             return Err(e);
         }
     }
 
+    // Check dial9 Tokio runtime telemetry status
+    // Note: The actual telemetry session is created in build_tokio_runtime()
+    // which stores the TelemetryGuard globally for the program duration.
+    if rustfs_obs::dial9::is_enabled() {
+        info!(target: "rustfs::main", "Dial9 Tokio telemetry is configured as enabled; runtime guard was installed during startup.");
+    } else {
+        info!(target: "rustfs::main", "Dial9 Tokio telemetry is not configured (set RUSTFS_RUNTIME_DIAL9_ENABLED=true to enable).");
+    }
+
+    info!("license status: {}", license_status());
+    if let Some(token) = current_license() {
+        info!("runtime license loaded: {}", token.name);
+    }
+
     // print startup logo
-    info!("{}", LOGO);
+    info!("{}", server::LOGO);
 
     // Initialize performance profiling if enabled
-    #[cfg(not(target_os = "windows"))]
     profiling::init_from_env().await;
 
+    // Initialize trusted proxies system
+    rustfs_trusted_proxies::init();
+
+    // Make sure to use a modern encryption suite
+    if default_provider().install_default().is_err() {
+        // A crypto provider is already installed (e.g. by the host process); this is fine.
+        debug!("rustls crypto provider already installed, skipping aws-lc-rs default install");
+    }
+    // Initialize TLS outbound material (root CAs, mTLS identity) if configured.
+    // Server-side TLS acceptor is built separately inside start_http_server()
+    // using the same TlsMaterialSnapshot loading logic.
+    if let Some(tls_path) = &config.tls_path {
+        match crate::server::tls_material::TlsMaterialSnapshot::load(tls_path).await {
+            Ok(snapshot) => {
+                snapshot.apply_outbound().await;
+                info!(target: "rustfs::main", "TLS outbound material initialized from {}", tls_path);
+            }
+            Err(e) => {
+                error!("Failed to initialize TLS from {}: {}", tls_path, e);
+                return Err(Error::other(e.to_string()));
+            }
+        }
+    }
+
     // Run parameters
-    match run(opt).await {
+    match run(*config).await {
         Ok(_) => Ok(()),
         Err(e) => {
             error!("Server encountered an error and is shutting down: {}", e);
@@ -145,15 +255,20 @@ async fn async_main() -> Result<()> {
     }
 }
 
-#[instrument(skip(opt))]
-async fn run(opt: config::Opt) -> Result<()> {
-    debug!("opt: {:?}", &opt);
+#[instrument(skip(config))]
+async fn run(config: config::Config) -> Result<()> {
+    debug!("config: {:?}", &config);
+    // 1. Initialize global readiness tracker
+    let readiness = Arc::new(GlobalReadiness::new());
 
-    if let Some(region) = &opt.region {
-        rustfs_ecstore::global::set_global_region(region.clone());
+    if let Some(region_str) = &config.region {
+        region_str
+            .parse()
+            .map(rustfs_ecstore::global::set_global_region)
+            .map_err(|e| Error::other(format!("invalid region '{}': {}", region_str, e)))?;
     }
 
-    let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
+    let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
 
@@ -168,16 +283,34 @@ async fn run(opt: config::Opt) -> Result<()> {
     );
 
     // Set up AK and SK
-    rustfs_ecstore::global::init_global_action_credentials(Some(opt.access_key.clone()), Some(opt.secret_key.clone()));
+    match init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone())) {
+        Ok(_) => {
+            info!(target: "rustfs::main::run", "Global action credentials initialized successfully.");
+        }
+        Err(e) => {
+            let msg = format!("init global action credentials failed: {e:?}");
+            error!(target: "rustfs::main::run","{msg}");
+            return Err(Error::other(msg));
+        }
+    };
 
     set_global_rustfs_port(server_port);
 
-    set_global_addr(&opt.address).await;
+    set_global_addr(&config.address).await;
 
     // For RPC
-    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), opt.volumes.clone())
+    let (endpoint_pools, setup_type) = EndpointServerPools::from_volumes(server_address.clone().as_str(), config.volumes.clone())
         .await
         .map_err(Error::other)?;
+
+    set_global_endpoints(endpoint_pools.as_ref().clone());
+    update_erasure_type(setup_type).await;
+
+    // Initialize the local disk
+    init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
+    // Initialize the lock clients
+
+    init_lock_clients(endpoint_pools.clone());
 
     for (i, eps) in endpoint_pools.as_ref().iter().enumerate() {
         info!(
@@ -211,36 +344,32 @@ async fn run(opt: config::Opt) -> Result<()> {
             );
         }
     }
-
+    // Initialize capacity management system
+    init_capacity_management().await;
     let state_manager = ServiceStateManager::new();
     // Update service status to Starting
     state_manager.update(ServiceState::Starting);
 
     let s3_shutdown_tx = {
-        let mut s3_opt = opt.clone();
-        s3_opt.console_enable = false;
-        let s3_shutdown_tx = start_http_server(&s3_opt, state_manager.clone()).await?;
+        let mut s3_config = config.clone();
+        s3_config.console_enable = false;
+        let s3_shutdown_tx = start_http_server(&s3_config, state_manager.clone(), readiness.clone()).await?;
         Some(s3_shutdown_tx)
     };
 
-    let console_shutdown_tx = if opt.console_enable && !opt.console_address.is_empty() {
-        let mut console_opt = opt.clone();
-        console_opt.address = console_opt.console_address.clone();
-        let console_shutdown_tx = start_http_server(&console_opt, state_manager.clone()).await?;
+    let console_shutdown_tx = if config.console_enable && !config.console_address.is_empty() {
+        let mut console_config = config.clone();
+        console_config.address = console_config.console_address.clone();
+        let console_shutdown_tx = start_http_server(&console_config, state_manager.clone(), readiness.clone()).await?;
         Some(console_shutdown_tx)
     } else {
         None
     };
 
-    set_global_endpoints(endpoint_pools.as_ref().clone());
-    update_erasure_type(setup_type).await;
-
-    // Initialize the local disk
-    init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
-
     let ctx = CancellationToken::new();
 
     // init store
+    // 2. Start Storage Engine (ECStore)
     let store = ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone())
         .await
         .inspect_err(|err| {
@@ -248,13 +377,87 @@ async fn run(opt: config::Opt) -> Result<()> {
         })?;
 
     ecconfig::init();
-    // config system configuration
-    GLOBAL_CONFIG_SYS.init(store.clone()).await?;
+    ecconfig::try_migrate_server_config(store.clone()).await;
 
-    // init  replication_pool
+    // // Initialize global configuration system
+    let mut retry_count = 0;
+    while let Err(e) = ecconfig::init_global_config_sys(store.clone()).await {
+        error!("ecstore config::init_global_config_sys failed {:?}", e);
+        // TODO: check error type
+        retry_count += 1;
+        if retry_count > 15 {
+            return Err(Error::other("ecconfig::init_global_config_sys failed"));
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    }
+    readiness.mark_stage(SystemStage::StorageReady);
+    // init replication_pool
     init_background_replication(store.clone()).await;
     // Initialize KMS system if enabled
-    init_kms_system(&opt).await?;
+    init_kms_system(&config).await?;
+
+    // Initialize FTP system if enabled
+    #[cfg(feature = "ftps")]
+    let ftp_shutdown_tx = match init_ftp_system().await {
+        Ok(Some(tx)) => {
+            info!("FTP system initialized successfully");
+            Some(tx)
+        }
+        Ok(None) => {
+            info!("FTP system disabled");
+            None
+        }
+        Err(e) => {
+            error!("Failed to initialize FTP system: {}", e);
+            return Err(Error::other(e));
+        }
+    };
+
+    #[cfg(not(feature = "ftps"))]
+    let ftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
+
+    // Initialize FTPS system if enabled
+    #[cfg(feature = "ftps")]
+    let ftps_shutdown_tx = match init_ftps_system().await {
+        Ok(Some(tx)) => {
+            info!("FTPS system initialized successfully");
+            Some(tx)
+        }
+        Ok(None) => {
+            info!("FTPS system disabled");
+            None
+        }
+        Err(e) => {
+            error!("Failed to initialize FTPS system: {}", e);
+            return Err(Error::other(e));
+        }
+    };
+
+    #[cfg(not(feature = "ftps"))]
+    let ftps_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
+
+    // Initialize WebDAV system if enabled
+    #[cfg(feature = "webdav")]
+    let webdav_shutdown_tx = match init_webdav_system().await {
+        Ok(Some(tx)) => {
+            info!("WebDAV system initialized successfully");
+            Some(tx)
+        }
+        Ok(None) => {
+            info!("WebDAV system disabled");
+            None
+        }
+        Err(e) => {
+            error!("Failed to initialize WebDAV system: {}", e);
+            return Err(Error::other(e));
+        }
+    };
+
+    #[cfg(not(feature = "webdav"))]
+    let webdav_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>> = None;
+
+    // Initialize buffer profiling system
+    init_buffer_profile_system(&config);
 
     // Initialize event notifier
     init_event_notifier().await;
@@ -262,6 +465,15 @@ async fn run(opt: config::Opt) -> Result<()> {
     match start_audit_system().await {
         Ok(_) => info!(target: "rustfs::main::run","Audit system started successfully."),
         Err(e) => error!(target: "rustfs::main::run","Failed to start audit system: {}", e),
+    }
+
+    // Initialize deadlock detector if enabled
+    let detector = crate::storage::deadlock_detector::get_deadlock_detector();
+    if detector.is_enabled() {
+        detector.start();
+        info!(target: "rustfs::main::run","Deadlock detector started successfully.");
+    } else {
+        info!(target: "rustfs::main::run","Deadlock detector disabled.");
     }
 
     let buckets_list = store
@@ -275,13 +487,41 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
-    if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
-        pool.clone().init_resync(ctx.clone(), buckets.clone()).await?;
+    try_migrate_bucket_metadata(store.clone()).await;
+
+    if let Some(pool) = get_global_replication_pool() {
+        pool.init_resync(ctx.clone(), buckets.clone()).await?;
     }
 
+    try_migrate_iam_config(store.clone()).await;
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 
+    // 3. Initialize IAM System (Blocking load)
+    // This ensures data is in memory before moving forward
     init_iam_sys(store.clone()).await.map_err(Error::other)?;
+    readiness.mark_stage(SystemStage::IamReady);
+
+    // 3a. Initialize Keystone authentication if enabled
+    let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
+    if keystone_config.enable {
+        match auth_keystone::init_keystone_auth(keystone_config).await {
+            Ok(_) => info!("Keystone authentication initialized successfully"),
+            Err(e) => {
+                error!("Failed to initialize Keystone authentication: {}", e);
+                // Continue without Keystone - fall back to standard auth
+            }
+        }
+    }
+
+    // 3b. Initialize OIDC System (non-fatal if no providers configured)
+    if let Err(e) = init_oidc_sys().await {
+        warn!("OIDC initialization failed (non-fatal): {}", e);
+    }
+
+    let iam_interface =
+        rustfs_iam::get().map_err(|e| Error::other(format!("initialize app context IAM dependency failed: {e}")))?;
+    let kms_interface = rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
+    let _app_context = init_global_app_context(AppContext::with_default_interfaces(store.clone(), iam_interface, kms_interface));
 
     add_bucket_notification_configuration(buckets.clone()).await;
 
@@ -295,8 +535,8 @@ async fn run(opt: config::Opt) -> Result<()> {
     let _ = create_ahm_services_cancel_token();
 
     // Check environment variables to determine if scanner and heal should be enabled
-    let enable_scanner = parse_bool_env_var("RUSTFS_ENABLE_SCANNER", true);
-    let enable_heal = parse_bool_env_var("RUSTFS_ENABLE_HEAL", true);
+    let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
+    let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
 
     info!(
         target: "rustfs::main::run",
@@ -305,26 +545,17 @@ async fn run(opt: config::Opt) -> Result<()> {
         "Background services configuration: scanner={}, heal={}", enable_scanner, enable_heal
     );
 
-    // Initialize heal manager and scanner based on environment variables
+    // Scanner depends on the heal channel/manager, so scanner implies heal.
     if enable_heal || enable_scanner {
-        if enable_heal {
-            // Initialize heal manager with channel processor
-            let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
-            let heal_manager = init_heal_manager(heal_storage, None).await?;
+        let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
+        init_heal_manager(heal_storage, None).await?;
+    }
 
-            if enable_scanner {
-                info!(target: "rustfs::main::run","Starting scanner with heal manager...");
-                let scanner = Scanner::new(Some(ScannerConfig::default()), Some(heal_manager));
-                scanner.start().await?;
-            } else {
-                info!(target: "rustfs::main::run","Scanner disabled, but heal manager is initialized and available");
-            }
-        } else if enable_scanner {
-            info!("Starting scanner without heal manager...");
-            let scanner = Scanner::new(Some(ScannerConfig::default()), None);
-            scanner.start().await?;
-        }
-    } else {
+    if enable_scanner {
+        init_data_scanner(ctx.clone(), store.clone()).await;
+    }
+
+    if !enable_heal && !enable_scanner {
         info!(target: "rustfs::main::run","Both scanner and heal are disabled, skipping AHM service initialization");
     }
 
@@ -333,17 +564,56 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     init_update_check();
 
+    if rustfs_obs::observability_metric_enabled() {
+        // Initialize metrics system
+        init_metrics_system(ctx.clone());
+
+        // Initialize auto-tuner for performance optimization (optional)
+        crate::init::init_auto_tuner(ctx.clone()).await;
+    }
+
+    info!(
+        target: "rustfs::main::run",
+        "RustFS server version: {} started successfully at {}, current time: {}",
+        version::get_version(),
+        &server_address,
+        jiff::Zoned::now()
+    );
+    // 4. Mark as Full Ready now that critical components are warm
+    readiness.mark_stage(SystemStage::FullReady);
+
+    // Set the global RustFS initialization time to now
+    rustfs_common::set_global_init_time_now().await;
+
     // Perform hibernation for 1 second
     tokio::time::sleep(SHUTDOWN_TIMEOUT).await;
     // listen to the shutdown signal
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(
+                &state_manager,
+                s3_shutdown_tx,
+                console_shutdown_tx,
+                ftp_shutdown_tx,
+                ftps_shutdown_tx,
+                webdav_shutdown_tx,
+                ctx.clone(),
+            )
+            .await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, s3_shutdown_tx, console_shutdown_tx, ctx.clone()).await;
+            handle_shutdown(
+                &state_manager,
+                s3_shutdown_tx,
+                console_shutdown_tx,
+                ftp_shutdown_tx,
+                ftps_shutdown_tx,
+                webdav_shutdown_tx,
+                ctx.clone(),
+            )
+            .await;
         }
     }
 
@@ -351,22 +621,14 @@ async fn run(opt: config::Opt) -> Result<()> {
     Ok(())
 }
 
-/// Parse a boolean environment variable with default value
-///
-/// Returns true if the environment variable is not set or set to true/1/yes/on/enabled,
-/// false if set to false/0/no/off/disabled
-fn parse_bool_env_var(var_name: &str, default: bool) -> bool {
-    env::var(var_name)
-        .unwrap_or_else(|_| default.to_string())
-        .parse::<bool>()
-        .unwrap_or(default)
-}
-
 /// Handles the shutdown process of the server
 async fn handle_shutdown(
     state_manager: &ServiceStateManager,
     s3_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     console_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    ftp_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    ftps_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    webdav_shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     ctx: CancellationToken,
 ) {
     ctx.cancel();
@@ -379,27 +641,57 @@ async fn handle_shutdown(
     state_manager.update(ServiceState::Stopping);
 
     // Check environment variables to determine what services need to be stopped
-    let enable_scanner = parse_bool_env_var("RUSTFS_ENABLE_SCANNER", true);
-    let enable_heal = parse_bool_env_var("RUSTFS_ENABLE_HEAL", true);
+    let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
+    let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
 
-    // Stop background services based on what was enabled
-    if enable_scanner || enable_heal {
+    // Stop background services based on what was enabled.
+    if enable_scanner {
         info!(
             target: "rustfs::main::handle_shutdown",
-            "Stopping background services (data scanner and auto heal)..."
+            "Stopping background services (data scanner)..."
         );
         shutdown_background_services();
+    }
 
+    if enable_heal || enable_scanner {
         info!(
             target: "rustfs::main::handle_shutdown",
             "Stopping AHM services..."
         );
         shutdown_ahm_services();
-    } else {
+    }
+
+    if !enable_scanner && !enable_heal {
         info!(
             target: "rustfs::main::handle_shutdown",
             "Background services were disabled, skipping AHM shutdown"
         );
+    }
+
+    // Shutdown FTP and FTPS servers
+    if let Some(ftp_shutdown_tx) = ftp_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Shutting down FTP server..."
+        );
+        let _ = ftp_shutdown_tx.send(());
+    }
+
+    if let Some(ftps_shutdown_tx) = ftps_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Shutting down FTPS server..."
+        );
+        let _ = ftps_shutdown_tx.send(());
+    }
+
+    // Shutdown WebDAV server
+    if let Some(webdav_shutdown_tx) = webdav_shutdown_tx {
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            "Shutting down WebDAV server..."
+        );
+        let _ = webdav_shutdown_tx.send(());
     }
 
     // Stop the notification system
@@ -419,6 +711,13 @@ async fn handle_shutdown(
         Err(e) => error!("Failed to stop audit system: {}", e),
     }
 
+    // Stop profiling tasks
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        "Stopping profiling tasks..."
+    );
+    profiling::shutdown_profiling();
+
     info!(
         target: "rustfs::main::handle_shutdown",
         "Server is stopping..."
@@ -435,194 +734,31 @@ async fn handle_shutdown(
 
     // the last updated status is stopped
     state_manager.update(ServiceState::Stopped);
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        "Server stopped current "
-    );
-    println!("Server stopped successfully.");
+    info!(target: "rustfs::main::handle_shutdown", "Server stopped successfully.");
 }
 
-fn init_update_check() {
-    let update_check_enable = env::var(ENV_UPDATE_CHECK)
-        .unwrap_or_else(|_| DEFAULT_UPDATE_CHECK.to_string())
-        .parse::<bool>()
-        .unwrap_or(DEFAULT_UPDATE_CHECK);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if !update_check_enable {
-        return;
-    }
-
-    // Async update check with timeout
-    tokio::spawn(async {
-        use crate::update::{UpdateCheckError, check_updates};
-
-        // Add timeout to prevent hanging network calls
-        match tokio::time::timeout(std::time::Duration::from_secs(30), check_updates()).await {
-            Ok(Ok(result)) => {
-                if result.update_available {
-                    if let Some(latest) = &result.latest_version {
-                        info!(
-                            "🚀 Version check: New version available: {} -> {} (current: {})",
-                            result.current_version, latest.version, result.current_version
-                        );
-                        if let Some(notes) = &latest.release_notes {
-                            info!("📝 Release notes: {}", notes);
-                        }
-                        if let Some(url) = &latest.download_url {
-                            info!("🔗 Download URL: {}", url);
-                        }
-                    }
-                } else {
-                    debug!("✅ Version check: Current version is up to date: {}", result.current_version);
-                }
-            }
-            Ok(Err(UpdateCheckError::HttpError(e))) => {
-                debug!("Version check: network error (this is normal): {}", e);
-            }
-            Ok(Err(e)) => {
-                debug!("Version check: failed (this is normal): {}", e);
-            }
-            Err(_) => {
-                debug!("Version check: timeout after 30 seconds (this is normal)");
-            }
-        }
-    });
-}
-
-#[instrument(skip_all)]
-async fn add_bucket_notification_configuration(buckets: Vec<String>) {
-    let region_opt = rustfs_ecstore::global::get_global_region();
-    let region = match region_opt {
-        Some(ref r) if !r.is_empty() => r,
-        _ => {
-            warn!("Global region is not set; attempting notification configuration for all buckets with an empty region.");
-            ""
-        }
-    };
-    for bucket in buckets.iter() {
-        let has_notification_config = metadata_sys::get_notification_config(bucket).await.unwrap_or_else(|err| {
-            warn!("get_notification_config err {:?}", err);
-            None
-        });
-
-        match has_notification_config {
-            Some(cfg) => {
-                info!(
-                    target: "rustfs::main::add_bucket_notification_configuration",
-                    bucket = %bucket,
-                    "Bucket '{}' has existing notification configuration: {:?}", bucket, cfg);
-
-                let mut event_rules = Vec::new();
-                process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), TargetID::from_str);
-                process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), TargetID::from_str);
-                process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), TargetID::from_str);
-
-                if let Err(e) = notifier_global::add_event_specific_rules(bucket, region, &event_rules)
-                    .await
-                    .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))
-                {
-                    error!("Failed to add rules for bucket '{}': {:?}", bucket, e);
-                }
-            }
-            None => {
-                info!(
-                    target: "rustfs::main::add_bucket_notification_configuration",
-                    bucket = %bucket,
-                    "Bucket '{}' has no existing notification configuration.", bucket);
-            }
-        }
-    }
-}
-
-/// Initialize KMS system and configure if enabled
-#[instrument(skip(opt))]
-async fn init_kms_system(opt: &config::Opt) -> Result<()> {
-    println!("CLAUDE DEBUG: init_kms_system called!");
-    info!("CLAUDE DEBUG: init_kms_system called!");
-    info!("Initializing KMS service manager...");
-    info!(
-        "CLAUDE DEBUG: KMS configuration - kms_enable: {}, kms_backend: {}, kms_key_dir: {:?}, kms_default_key_id: {:?}",
-        opt.kms_enable, opt.kms_backend, opt.kms_key_dir, opt.kms_default_key_id
-    );
-
-    // Initialize global KMS service manager (starts in NotConfigured state)
-    let service_manager = rustfs_kms::init_global_kms_service_manager();
-
-    // If KMS is enabled in configuration, configure and start the service
-    if opt.kms_enable {
-        info!("KMS is enabled, configuring and starting service...");
-
-        // Create KMS configuration from command line options
-        let kms_config = match opt.kms_backend.as_str() {
-            "local" => {
-                let key_dir = opt
-                    .kms_key_dir
-                    .as_ref()
-                    .ok_or_else(|| Error::other("KMS key directory is required for local backend"))?;
-
-                rustfs_kms::config::KmsConfig {
-                    backend: rustfs_kms::config::KmsBackend::Local,
-                    backend_config: rustfs_kms::config::BackendConfig::Local(rustfs_kms::config::LocalConfig {
-                        key_dir: std::path::PathBuf::from(key_dir),
-                        master_key: None,
-                        file_permissions: Some(0o600),
-                    }),
-                    default_key_id: opt.kms_default_key_id.clone(),
-                    timeout: std::time::Duration::from_secs(30),
-                    retry_attempts: 3,
-                    enable_cache: true,
-                    cache_config: rustfs_kms::config::CacheConfig::default(),
-                }
-            }
-            "vault" => {
-                let vault_address = opt
-                    .kms_vault_address
-                    .as_ref()
-                    .ok_or_else(|| Error::other("Vault address is required for vault backend"))?;
-                let vault_token = opt
-                    .kms_vault_token
-                    .as_ref()
-                    .ok_or_else(|| Error::other("Vault token is required for vault backend"))?;
-
-                rustfs_kms::config::KmsConfig {
-                    backend: rustfs_kms::config::KmsBackend::Vault,
-                    backend_config: rustfs_kms::config::BackendConfig::Vault(rustfs_kms::config::VaultConfig {
-                        address: vault_address.clone(),
-                        auth_method: rustfs_kms::config::VaultAuthMethod::Token {
-                            token: vault_token.clone(),
-                        },
-                        namespace: None,
-                        mount_path: "transit".to_string(),
-                        kv_mount: "secret".to_string(),
-                        key_path_prefix: "rustfs/kms/keys".to_string(),
-                        tls: None,
-                    }),
-                    default_key_id: opt.kms_default_key_id.clone(),
-                    timeout: std::time::Duration::from_secs(30),
-                    retry_attempts: 3,
-                    enable_cache: true,
-                    cache_config: rustfs_kms::config::CacheConfig::default(),
-                }
-            }
-            _ => return Err(Error::other(format!("Unsupported KMS backend: {}", opt.kms_backend))),
+    #[test]
+    fn format_external_prefix_mappings_lists_mapped_pairs() {
+        let report = ExternalEnvCompatReport {
+            mapped_pairs: vec![
+                ("MINIO_ROOT_USER".to_string(), "RUSTFS_ROOT_USER".to_string()),
+                (
+                    "MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
+                    "RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY".to_string(),
+                ),
+            ],
+            conflict_keys: Vec::new(),
         };
 
-        // Configure the KMS service
-        service_manager
-            .configure(kms_config)
-            .await
-            .map_err(|e| Error::other(format!("Failed to configure KMS: {e}")))?;
+        let formatted = format_external_prefix_mappings(&report);
 
-        // Start the KMS service
-        service_manager
-            .start()
-            .await
-            .map_err(|e| Error::other(format!("Failed to start KMS: {e}")))?;
-
-        info!("KMS service configured and started successfully");
-    } else {
-        info!("KMS service manager initialized. KMS is ready for dynamic configuration via API.");
+        assert_eq!(
+            formatted,
+            "MINIO_ROOT_USER->RUSTFS_ROOT_USER, MINIO_NOTIFY_WEBHOOK_ENABLE_PRIMARY->RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY"
+        );
     }
-
-    Ok(())
 }

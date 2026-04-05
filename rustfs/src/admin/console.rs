@@ -12,31 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::build;
+use crate::admin::handlers::health::{HealthProbe, build_component_details, collect_dependency_readiness, health_check_state};
 use crate::license::get_license;
+use crate::server::{CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, RUSTFS_ADMIN_PREFIX};
+use crate::version::build;
 use axum::{
-    Json, Router,
+    Router,
     body::Body,
     extract::Request,
     middleware,
     response::{IntoResponse, Response},
     routing::get,
 };
-use axum_extra::extract::Host;
-use axum_server::tls_rustls::RustlsConfig;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use mime_guess::from_path;
 use rust_embed::RustEmbed;
-use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use serde::Serialize;
 use serde_json::json;
 use std::{
-    io::Result,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, OnceLock},
+    sync::OnceLock,
     time::Duration,
 };
-use tokio_rustls::rustls::ServerConfig;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -44,9 +41,6 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, instrument, warn};
-
-pub(crate) const CONSOLE_PREFIX: &str = "/rustfs/console";
-const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
 
 #[derive(RustEmbed)]
 #[folder = "$CARGO_MANIFEST_DIR/static"]
@@ -58,25 +52,43 @@ struct StaticFiles;
 /// If the requested file is not found, it serves index.html as a fallback.
 /// If index.html is also not found, it returns a 404 Not Found response.
 ///
-/// Arguments:
+/// # Arguments:
 /// - `uri`: The request URI.
 ///
-/// Returns:
+/// # Returns:
 /// - An `impl IntoResponse` containing the static file content or a 404 response.
 ///
-pub(crate) async fn static_handler(uri: Uri) -> impl IntoResponse {
+async fn static_handler(uri: Uri) -> impl IntoResponse {
     let mut path = uri.path().trim_start_matches('/');
     if path.is_empty() {
         path = "index.html"
     }
+
+    // Try the exact path first
     if let Some(file) = StaticFiles::get(path) {
         let mime_type = from_path(path).first_or_octet_stream();
-        Response::builder()
+        return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", mime_type.to_string())
             .body(Body::from(file.data))
-            .unwrap()
-    } else if let Some(file) = StaticFiles::get("index.html") {
+            .unwrap();
+    }
+
+    // For directory paths (trailing slash), try <path>index.html
+    if path.ends_with('/') {
+        let index_path = format!("{path}index.html");
+        if let Some(file) = StaticFiles::get(&index_path) {
+            let mime_type = from_path(&index_path).first_or_octet_stream();
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", mime_type.to_string())
+                .body(Body::from(file.data))
+                .unwrap();
+        }
+    }
+
+    // SPA fallback: serve root index.html for client-side routing
+    if let Some(file) = StaticFiles::get("index.html") {
         let mime_type = from_path("index.html").first_or_octet_stream();
         Response::builder()
             .status(StatusCode::OK)
@@ -100,28 +112,52 @@ pub(crate) struct Config {
     release: Release,
     license: License,
     doc: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    oidc: Vec<OidcProviderInfo>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct OidcProviderInfo {
+    provider_id: String,
+    display_name: String,
 }
 
 impl Config {
     fn new(local_ip: IpAddr, port: u16, version: &str, date: &str) -> Self {
+        let http_prefix = rustfs_config::RUSTFS_HTTP_PREFIX;
+
+        // Collect OIDC provider info if available
+        let oidc = rustfs_iam::get_oidc()
+            .map(|sys| {
+                sys.list_providers()
+                    .into_iter()
+                    .map(|p| OidcProviderInfo {
+                        provider_id: p.provider_id,
+                        display_name: p.display_name,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Config {
             port,
             api: Api {
-                base_url: format!("http://{local_ip}:{port}/{RUSTFS_ADMIN_PREFIX}"),
+                base_url: build_console_api_base_url(&format!("{http_prefix}{local_ip}:{port}")),
             },
             s3: S3 {
-                endpoint: format!("http://{local_ip}:{port}"),
-                region: "cn-east-1".to_owned(),
+                endpoint: format!("{http_prefix}{local_ip}:{port}"),
+                region: rustfs_config::RUSTFS_REGION.to_string(),
             },
             release: Release {
                 version: version.to_string(),
                 date: date.to_string(),
             },
             license: License {
-                name: "Apache-2.0".to_string(),
-                url: "https://www.apache.org/licenses/LICENSE-2.0".to_string(),
+                name: rustfs_config::RUSTFS_LICENSE.to_string(),
+                url: rustfs_config::RUSTFS_LICENSE_URL.to_string(),
             },
-            doc: "https://rustfs.com/docs/".to_string(),
+            doc: rustfs_config::RUSTFS_DOCS_URL.to_string(),
+            oidc,
         }
     }
 
@@ -156,6 +192,10 @@ impl Config {
     }
 }
 
+fn build_console_api_base_url(base_url: &str) -> String {
+    format!("{base_url}{RUSTFS_ADMIN_PREFIX}")
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct Api {
     #[serde(rename = "baseURL")]
@@ -180,7 +220,8 @@ struct License {
     url: String,
 }
 
-pub(crate) static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
+/// Global console configuration
+static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
 
 #[allow(clippy::const_is_empty)]
 pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16) {
@@ -199,12 +240,13 @@ pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16) {
     });
 }
 
-// fn is_socket_addr_or_ip_addr(host: &str) -> bool {
-//     host.parse::<SocketAddr>().is_ok() || host.parse::<IpAddr>().is_ok()
-// }
-
-#[allow(dead_code)]
-pub async fn license_handler() -> impl IntoResponse {
+/// License handler
+/// Returns the current license information of the console.
+///
+/// # Returns:
+/// - 200 OK with JSON body containing license details.
+#[instrument]
+async fn license_handler() -> impl IntoResponse {
     let license = get_license().unwrap_or_default();
 
     Response::builder()
@@ -214,6 +256,7 @@ pub async fn license_handler() -> impl IntoResponse {
         .unwrap()
 }
 
+/// Check if the given IP address is a private IP
 fn _is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -229,15 +272,62 @@ fn _is_private_ip(ip: IpAddr) -> bool {
     }
 }
 
-#[instrument(fields(host))]
-pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> impl IntoResponse {
+/// Version handler
+/// Returns the current version information of the console.
+///
+/// # Returns:
+/// - 200 OK with JSON body containing version details if configuration is initialized.
+/// - 500 Internal Server Error if configuration is not initialized.
+#[instrument]
+async fn version_handler() -> impl IntoResponse {
+    match CONSOLE_CONFIG.get() {
+        Some(cfg) => Response::builder()
+            .header("content-type", "application/json")
+            .status(StatusCode::OK)
+            .body(Body::from(
+                json!({
+                    "version": cfg.release.version,
+                    "version_info": cfg.version_info(),
+                    "date": cfg.release.date,
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+        None => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from("Console configuration not initialized"))
+            .unwrap(),
+    }
+}
+
+/// Configuration handler
+/// Returns the current console configuration in JSON format.
+/// The configuration is dynamically adjusted based on the request's host and scheme.
+///
+/// # Arguments:
+/// - `uri`: The request URI.
+/// - `headers`: The request headers.
+///
+/// # Returns:
+/// - 200 OK with JSON body containing the console configuration if initialized.
+/// - 500 Internal Server Error if configuration is not initialized.
+#[instrument(fields(uri))]
+#[allow(dead_code)]
+async fn config_handler(uri: Uri, headers: HeaderMap) -> impl IntoResponse {
     // Get the scheme from the headers or use the URI scheme
     let scheme = headers
         .get(HeaderName::from_static("x-forwarded-proto"))
         .and_then(|value| value.to_str().ok())
         .unwrap_or_else(|| uri.scheme().map(|s| s.as_str()).unwrap_or("http"));
 
-    let raw_host = uri.host().unwrap_or(host.as_str());
+    // Prefer URI host, fallback to `Host` header
+    let header_host = headers
+        .get(http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+
+    let raw_host = uri.host().unwrap_or(header_host);
+
     let host_for_url = if let Ok(socket_addr) = raw_host.parse::<SocketAddr>() {
         // Successfully parsed, it's in IP:Port format.
         // For IPv6, we need to enclose it in brackets to form a valid URL.
@@ -264,7 +354,7 @@ pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> i
     };
 
     let url = format!("{}://{}:{}", scheme, host_for_url, cfg.port);
-    cfg.api.base_url = format!("{url}{RUSTFS_ADMIN_PREFIX}");
+    cfg.api.base_url = build_console_api_base_url(&url);
     cfg.s3.endpoint = url;
 
     Response::builder()
@@ -275,7 +365,15 @@ pub async fn config_handler(uri: Uri, Host(host): Host, headers: HeaderMap) -> i
 }
 
 /// Console access logging middleware
-async fn console_logging_middleware(req: Request, next: axum::middleware::Next) -> axum::response::Response {
+/// Logs each console access with method, URI, status code, and duration.
+///
+/// # Arguments:
+/// - `req`: The incoming request.
+/// - `next`: The next middleware or handler in the chain.
+///
+/// # Returns:
+/// - The response from the next middleware or handler.
+async fn console_logging_middleware(req: Request, next: middleware::Next) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let start = std::time::Instant::now();
@@ -294,79 +392,15 @@ async fn console_logging_middleware(req: Request, next: axum::middleware::Next) 
     response
 }
 
-/// Setup TLS configuration for console using axum-server, following endpoint TLS implementation logic
-#[instrument(skip(tls_path))]
-async fn _setup_console_tls_config(tls_path: Option<&String>) -> Result<Option<RustlsConfig>> {
-    let tls_path = match tls_path {
-        Some(path) if !path.is_empty() => path,
-        _ => {
-            debug!("TLS path is not provided, console starting with HTTP");
-            return Ok(None);
-        }
-    };
-
-    if tokio::fs::metadata(tls_path).await.is_err() {
-        debug!("TLS path does not exist, console starting with HTTP");
-        return Ok(None);
-    }
-
-    debug!("Found TLS directory for console, checking for certificates");
-
-    // Make sure to use a modern encryption suite
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
-    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
-        if !cert_key_pairs.is_empty() {
-            debug!(
-                "Found {} certificates for console, creating SNI-aware multi-cert resolver",
-                cert_key_pairs.len()
-            );
-
-            // Create an SNI-enabled certificate resolver
-            let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
-
-            // Configure the server to enable SNI support
-            let mut server_config = ServerConfig::builder()
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(resolver));
-
-            // Configure ALPN protocol priority
-            server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
-
-            // Log SNI requests
-            if rustfs_utils::tls_key_log() {
-                server_config.key_log = Arc::new(rustls::KeyLogFile::new());
-            }
-
-            info!(target: "rustfs::console::tls", "Console TLS enabled with multi-certificate SNI support");
-            return Ok(Some(RustlsConfig::from_config(Arc::new(server_config))));
-        }
-    }
-
-    // 2. Revert to the traditional single-certificate mode
-    let key_path = format!("{tls_path}/{RUSTFS_TLS_KEY}");
-    let cert_path = format!("{tls_path}/{RUSTFS_TLS_CERT}");
-    if tokio::try_join!(tokio::fs::metadata(&key_path), tokio::fs::metadata(&cert_path)).is_ok() {
-        debug!("Found legacy single TLS certificate for console, starting with HTTPS");
-
-        return match RustlsConfig::from_pem_file(cert_path, key_path).await {
-            Ok(config) => {
-                info!(target: "rustfs::console::tls", "Console TLS enabled with single certificate");
-                Ok(Some(config))
-            }
-            Err(e) => {
-                error!(target: "rustfs::console::error", error = %e, "Failed to create TLS config for console");
-                Err(std::io::Error::other(e))
-            }
-        };
-    }
-
-    debug!("No valid TLS certificates found in the directory for console, starting with HTTP");
-    Ok(None)
-}
-
 /// Get console configuration from environment variables
+/// Returns a tuple containing console configuration values from environment variables.
+///
+/// # Returns:
+/// - rate_limit_enable: bool indicating if rate limiting is enabled.
+/// - rate_limit_rpm: u32 indicating the rate limit in requests per minute.
+/// - auth_timeout: u64 indicating the authentication timeout in seconds.
+/// - cors_allowed_origins: String containing allowed CORS origins.
+///
 fn get_console_config_from_env() -> (bool, u32, u64, String) {
     let rate_limit_enable = std::env::var(rustfs_config::ENV_CONSOLE_RATE_LIMIT_ENABLE)
         .unwrap_or_else(|_| rustfs_config::DEFAULT_CONSOLE_RATE_LIMIT_ENABLE.to_string())
@@ -390,11 +424,27 @@ fn get_console_config_from_env() -> (bool, u32, u64, String) {
     (rate_limit_enable, rate_limit_rpm, auth_timeout, cors_allowed_origins)
 }
 
+/// Check if the given path is for console access
+///
+/// # Arguments:
+/// - `path`: The request path.
+///
+/// # Returns:
+/// - `true` if the path is for console access, `false` otherwise.
 pub fn is_console_path(path: &str) -> bool {
-    path == "/favicon.ico" || path.starts_with(CONSOLE_PREFIX)
+    path == FAVICON_PATH || path.starts_with(CONSOLE_PREFIX)
 }
 
 /// Setup comprehensive middleware stack with tower-http features
+///
+/// # Arguments:
+/// - `cors_layer`: The CORS layer to apply.
+/// - `rate_limit_enable`: bool indicating if rate limiting is enabled.
+/// - `rate_limit_rpm`: u32 indicating the rate limit in requests per minute.
+/// - `auth_timeout`: u64 indicating the authentication timeout in seconds.
+///
+/// # Returns:
+/// - A `Router` with the configured middleware stack.
 fn setup_console_middleware_stack(
     cors_layer: CorsLayer,
     rate_limit_enable: bool,
@@ -402,10 +452,11 @@ fn setup_console_middleware_stack(
     auth_timeout: u64,
 ) -> Router {
     let mut app = Router::new()
-        .route("/favicon.ico", get(static_handler))
+        .route(FAVICON_PATH, get(static_handler))
         .route(&format!("{CONSOLE_PREFIX}/license"), get(license_handler))
-        .route(&format!("{CONSOLE_PREFIX}/config.json"), get(config_handler))
-        .route(&format!("{CONSOLE_PREFIX}/health"), get(health_check))
+        .route(&format!("{CONSOLE_PREFIX}/version"), get(version_handler))
+        .route(&format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"), get(health_check).head(health_check))
+        .route(&format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"), get(health_check).head(health_check))
         .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
         .fallback_service(get(static_handler));
 
@@ -418,7 +469,10 @@ fn setup_console_middleware_stack(
         .layer(middleware::from_fn(console_logging_middleware))
         .layer(cors_layer)
         // Add timeout layer - convert auth_timeout from seconds to Duration
-        .layer(TimeoutLayer::new(Duration::from_secs(auth_timeout)))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(auth_timeout),
+        ))
         // Add request body limit (10MB for console uploads)
         .layer(RequestBodyLimitLayer::new(5 * 1024 * 1024 * 1024));
 
@@ -434,45 +488,108 @@ fn setup_console_middleware_stack(
 }
 
 /// Console health check handler with comprehensive health information
-async fn health_check() -> Json<serde_json::Value> {
-    use rustfs_ecstore::new_object_layer_fn;
-
-    let mut health_status = "ok";
-    let mut details = json!({});
-
-    // Check storage backend health
-    if let Some(_store) = new_object_layer_fn() {
-        details["storage"] = json!({"status": "connected"});
+///
+/// # Arguments:
+/// - `method`: The HTTP method of the request.
+///
+/// # Returns:
+/// - A `Response` containing the health check result.
+#[instrument]
+async fn health_check(method: Method, uri: Uri) -> Response {
+    let probe = if uri.path().strip_prefix(CONSOLE_PREFIX) == Some(HEALTH_READY_PATH) {
+        HealthProbe::Readiness
     } else {
-        health_status = "degraded";
-        details["storage"] = json!({"status": "disconnected"});
-    }
+        HealthProbe::Liveness
+    };
+    let (storage_ready, iam_ready) = collect_dependency_readiness();
+    let health = health_check_state(storage_ready, iam_ready, probe);
 
-    // Check IAM system health
-    match rustfs_iam::get() {
-        Ok(_) => {
-            details["iam"] = json!({"status": "connected"});
-        }
-        Err(_) => {
-            health_status = "degraded";
-            details["iam"] = json!({"status": "disconnected"});
-        }
-    }
+    let builder = Response::builder()
+        .status(health.status_code)
+        .header("content-type", "application/json");
 
-    Json(json!({
-        "status": health_status,
-        "service": "rustfs-console",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "version": env!("CARGO_PKG_VERSION"),
-        "details": details,
-        "uptime": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    }))
+    match method {
+        // GET: Returns complete JSON
+        Method::GET => {
+            let body_json = json!({
+                "status": health.status,
+                "ready": health.ready,
+                "service": "rustfs-console",
+                "timestamp": jiff::Zoned::now().to_string(),
+                "version": env!("CARGO_PKG_VERSION"),
+                "details": build_component_details(storage_ready, iam_ready),
+                "uptime": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+
+            // Return a minimal JSON when serialization fails to avoid panic
+            let body_str = serde_json::to_string(&body_json).unwrap_or_else(|e| {
+                error!(
+                    target: "rustfs::console::health",
+                    "failed to serialize health check body: {}",
+                    e
+                );
+                // Simplified back-up JSON
+                "{\"status\":\"error\",\"service\":\"rustfs-console\"}".to_string()
+            });
+            builder.body(Body::from(body_str)).unwrap_or_else(|e| {
+                error!(
+                    target: "rustfs::console::health",
+                    "failed to build GET health response: {}",
+                    e
+                );
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("failed to build response"))
+                    .unwrap_or_else(|_| Response::new(Body::from("")))
+            })
+        }
+
+        // HEAD: Only status + headers are returned, body is empty
+        Method::HEAD => builder.body(Body::empty()).unwrap_or_else(|e| {
+            error!(
+                target: "rustfs::console::health",
+                "failed to build HEAD health response: {}",
+                e
+            );
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("failed to build response"))
+                .unwrap_or_else(|e| {
+                    error!(
+                        target: "rustfs::console::health",
+                        "failed to build HEAD health empty response, reason: {}",
+                        e
+                    );
+                    Response::new(Body::from(""))
+                })
+        }),
+
+        // Other methods: 405
+        _ => Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header("allow", "GET, HEAD")
+            .body(Body::from("Method Not Allowed"))
+            .unwrap_or_else(|e| {
+                error!(
+                    target: "rustfs::console::health",
+                    "failed to build 405 response: {}",
+                    e
+                );
+                Response::new(Body::from("Method Not Allowed"))
+            }),
+    }
 }
 
 /// Parse CORS allowed origins from configuration
+///
+/// # Arguments:
+/// - `origins`: An optional reference to a string containing allowed origins.
+///
+/// # Returns:
+/// - A `CorsLayer` configured with the specified origins.
 pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
     let cors_layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
@@ -515,6 +632,10 @@ pub fn parse_cors_origins(origins: Option<&String>) -> CorsLayer {
     }
 }
 
+/// Create and configure the console server router
+///
+/// # Returns:
+/// - A `Router` configured for the console server with middleware.
 pub(crate) fn make_console_server() -> Router {
     let (rate_limit_enable, rate_limit_rpm, auth_timeout, cors_allowed_origins) = get_console_config_from_env();
     // String to Option<&String>
@@ -528,4 +649,39 @@ pub(crate) fn make_console_server() -> Router {
 
     // Build console router with enhanced middleware stack using tower-http features
     setup_console_middleware_stack(cors_layer, rate_limit_enable, rate_limit_rpm, auth_timeout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn console_api_base_url_keeps_rustfs_admin_prefix() {
+        let cfg = Config::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001, "test", "2026-03-16T00:00:00Z");
+
+        assert!(
+            cfg.api.base_url.ends_with("/rustfs/admin/v3"),
+            "console baseURL must keep using the RustFS admin prefix"
+        );
+        assert!(
+            !cfg.api.base_url.ends_with("/minio/admin/v3"),
+            "console baseURL must not switch to the MinIO admin prefix by default"
+        );
+    }
+
+    #[test]
+    fn console_api_base_url_builder_preserves_existing_console_contract() {
+        assert_eq!(
+            build_console_api_base_url("http://127.0.0.1:9001"),
+            "http://127.0.0.1:9001/rustfs/admin/v3"
+        );
+    }
+
+    #[test]
+    fn external_admin_paths_are_not_console_paths() {
+        assert!(is_console_path("/rustfs/console/"));
+        assert!(!is_console_path("/minio/admin/v3/info"));
+        assert!(!is_console_path("/rustfs/admin/v3/info"));
+    }
 }

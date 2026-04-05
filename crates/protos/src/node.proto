@@ -225,6 +225,8 @@ message ReadAtResponse {
 message ListDirRequest {
   string disk = 1;  // indicate which one in the disks
   string volume = 2;
+  string dir_path = 3;
+  int32 count = 4;
 }
 
 message ListDirResponse {
@@ -311,12 +313,26 @@ message DeletePathsResponse {
   optional Error error = 2;
 }
 
+message ReadMetadataRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+}
+
+message ReadMetadataResponse {
+  bool success = 1;
+  optional Error error = 2;
+  bytes data = 3;
+}
+
 message UpdateMetadataRequest {
   string disk = 1;
   string volume = 2;
   string path = 3;
   string file_info = 4;
   string opts = 5;
+  bytes file_info_bin = 6;
+  bytes opts_bin = 7;
 }
 
 message UpdateMetadataResponse {
@@ -329,6 +345,7 @@ message WriteMetadataRequest {
   string volume = 2;
   string path = 3;
   string file_info = 4;
+  bytes file_info_bin = 5;
 }
 
 message WriteMetadataResponse {
@@ -342,12 +359,14 @@ message ReadVersionRequest {
   string path = 3;
   string version_id = 4;
   string opts = 5;
+  bytes opts_bin = 6;
 }
 
 message ReadVersionResponse {
   bool success = 1;
   string file_info = 2;
   optional Error error = 3;
+  bytes file_info_bin = 4;
 }
 
 message ReadXLRequest {
@@ -361,6 +380,7 @@ message ReadXLResponse {
   bool success = 1;
   string raw_file_info = 2;
   optional Error error = 3;
+  bytes raw_file_info_bin = 4;
 }
 
 message DeleteVersionRequest {
@@ -394,12 +414,14 @@ message DeleteVersionsResponse {
 message ReadMultipleRequest {
   string disk = 1;
   string read_multiple_req = 2;
+  bytes read_multiple_req_bin = 3;
 }
 
 message ReadMultipleResponse {
   bool success = 1;
   repeated string read_multiple_resps = 2;
   optional Error error = 3;
+  repeated bytes read_multiple_resps_bin = 4;
 }
 
 message DeleteVolumeRequest {
@@ -431,6 +453,21 @@ message GenerallyLockRequest {
 message GenerallyLockResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional string lock_info = 3; // JSON serialized LockInfo
+}
+
+message BatchGenerallyLockRequest {
+  repeated string args = 1;
+}
+
+message GenerallyLockResult {
+  bool success = 1;
+  optional string error_info = 2;
+  optional string lock_info = 3; // JSON serialized LockInfo
+}
+
+message BatchGenerallyLockResponse {
+  repeated GenerallyLockResult results = 1;
 }
 
 message Mss {
@@ -750,6 +787,19 @@ message LoadTransitionTierConfigResponse {
   optional string error_info = 2;
 }
 
+message GetLiveEventsRequest {
+  uint64 after_sequence = 1;
+  uint32 limit = 2;
+}
+
+message GetLiveEventsResponse {
+  bool success = 1;
+  bytes events = 2;
+  uint64 next_sequence = 3;
+  bool truncated = 4;
+  optional string error_info = 5;
+}
+
 /* -------------------------------------------------------------------- */
 
 service NodeService {
@@ -784,6 +834,7 @@ service NodeService {
   rpc StatVolume(StatVolumeRequest) returns (StatVolumeResponse) {};
   rpc DeletePaths(DeletePathsRequest) returns (DeletePathsResponse) {};
   rpc UpdateMetadata(UpdateMetadataRequest) returns (UpdateMetadataResponse) {};
+  rpc ReadMetadata(ReadMetadataRequest) returns (ReadMetadataResponse) {};
   rpc WriteMetadata(WriteMetadataRequest) returns (WriteMetadataResponse) {};
   rpc ReadVersion(ReadVersionRequest) returns (ReadVersionResponse) {};
   rpc ReadXL(ReadXLRequest) returns (ReadXLResponse) {};
@@ -792,15 +843,16 @@ service NodeService {
   rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {};
   rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {};
   rpc DiskInfo(DiskInfoRequest) returns (DiskInfoResponse) {};
+  
 
 /* -------------------------------lock service-------------------------- */
 
   rpc Lock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc UnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
-  rpc RLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
-  rpc RUnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc ForceUnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
   rpc Refresh(GenerallyLockRequest) returns (GenerallyLockResponse) {};
+  rpc LockBatch(BatchGenerallyLockRequest) returns (BatchGenerallyLockResponse) {};
+  rpc UnLockBatch(BatchGenerallyLockRequest) returns (BatchGenerallyLockResponse) {};
 
 /* -------------------------------peer rest service-------------------------- */
 
@@ -842,4 +894,5 @@ service NodeService {
   rpc StopRebalance(StopRebalanceRequest) returns (StopRebalanceResponse) {};
   rpc LoadRebalanceMeta(LoadRebalanceMetaRequest) returns (LoadRebalanceMetaResponse) {};
   rpc LoadTransitionTierConfig(LoadTransitionTierConfigRequest) returns (LoadTransitionTierConfigResponse) {};
+  rpc GetLiveEvents(GetLiveEventsRequest) returns (GetLiveEventsResponse) {};
 }

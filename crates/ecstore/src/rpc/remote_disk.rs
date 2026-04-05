@@ -12,65 +12,301 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::PathBuf;
-
-use bytes::Bytes;
-use futures::lock::Mutex;
-use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
-use rustfs_protos::{
-    node_service_time_out_client,
-    proto_gen::node_service::{
-        CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
-        DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
-        ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest,
-        StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-    },
-};
-
 use crate::disk::{
-    CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions,
-    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader,
+    FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    disk_store::{
+        CHECK_EVERY, CHECK_TIMEOUT_DURATION, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING,
+        SKIP_IF_SUCCESS_BEFORE, get_max_timeout_duration,
+    },
     endpoint::Endpoint,
 };
-use crate::disk::{FileReader, FileWriter};
+use crate::disk::{disk_store::DiskHealthTracker, error::DiskError, local::ScanGuard};
+use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
+use crate::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use crate::{
     disk::error::{Error, Result},
     rpc::build_auth_headers,
 };
+use bytes::Bytes;
+use futures::lock::Mutex;
+use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
+use rustfs_protos::proto_gen::node_service::{
+    CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
+    DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
+    ReadMetadataRequest, ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest,
+    RenameFileRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+    node_service_client::NodeServiceClient,
+};
 use rustfs_rio::{HttpReader, HttpWriter};
-use tokio::io::AsyncWrite;
-use tonic::Request;
-use tracing::info;
+use serde::{Serialize, de::DeserializeOwned};
+use std::{
+    io::Cursor,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
+use tokio::time;
+use tokio::{
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::TcpStream,
+    time::timeout,
+};
+use tokio_util::sync::CancellationToken;
+use tonic::{Request, service::interceptor::InterceptedService, transport::Channel};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+async fn copy_stream_with_buffer<R, W>(reader: &mut R, writer: &mut W, buffer_size: usize) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; buffer_size];
+
+    loop {
+        let bytes_read = reader.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            writer.flush().await?;
+            return Ok(copied);
+        }
+
+        writer.write_all(&buffer[..bytes_read]).await?;
+        copied += bytes_read as u64;
+    }
+}
 
 #[derive(Debug)]
 pub struct RemoteDisk {
     pub id: Mutex<Option<Uuid>>,
     pub addr: String,
-    pub url: url::Url,
-    pub root: PathBuf,
     endpoint: Endpoint,
+    pub scanning: Arc<AtomicU32>,
+    /// Whether health checking is enabled
+    health_check: bool,
+    /// Health tracker for connection monitoring
+    health: Arc<DiskHealthTracker>,
+    /// Cancellation token for monitoring tasks
+    cancel_token: CancellationToken,
 }
 
 impl RemoteDisk {
-    pub async fn new(ep: &Endpoint, _opt: &DiskOption) -> Result<Self> {
-        // let root = fs::canonicalize(ep.url.path()).await?;
-        let root = PathBuf::from(ep.get_file_path());
+    pub async fn new(ep: &Endpoint, opt: &DiskOption) -> Result<Self> {
         let addr = if let Some(port) = ep.url.port() {
             format!("{}://{}:{}", ep.url.scheme(), ep.url.host_str().unwrap(), port)
         } else {
             format!("{}://{}", ep.url.scheme(), ep.url.host_str().unwrap())
         };
-        Ok(Self {
+
+        let env_health_check =
+            rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING);
+
+        let disk = Self {
             id: Mutex::new(None),
-            addr,
-            url: ep.url.clone(),
-            root,
+            addr: addr.clone(),
             endpoint: ep.clone(),
-        })
+            scanning: Arc::new(AtomicU32::new(0)),
+            health_check: opt.health_check && env_health_check,
+            health: Arc::new(DiskHealthTracker::new()),
+            cancel_token: CancellationToken::new(),
+        };
+
+        Ok(disk)
     }
+
+    /// Enable health monitoring after disk creation.
+    /// Used to defer health checks until after startup format loading completes,
+    /// so that remote peers have time to come online.
+    pub fn enable_health_check(&self) {
+        if !self.health_check {
+            return;
+        }
+        let health = Arc::clone(&self.health);
+        let cancel_token = self.cancel_token.clone();
+        let addr = self.addr.clone();
+
+        tokio::spawn(async move {
+            Self::monitor_remote_disk_health(addr, health, cancel_token).await;
+        });
+    }
+
+    /// Monitor remote disk health periodically
+    async fn monitor_remote_disk_health(addr: String, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
+        let mut interval = time::interval(CHECK_EVERY);
+
+        // Perform basic connectivity check
+        if Self::perform_connectivity_check(&addr).await.is_err() && health.swap_ok_to_faulty() {
+            warn!("Remote disk health check failed for {}: marking as faulty", addr);
+
+            // Start recovery monitoring
+            let health_clone = Arc::clone(&health);
+            let addr_clone = addr.clone();
+            let cancel_clone = cancel_token.clone();
+
+            tokio::spawn(async move {
+                Self::monitor_remote_disk_recovery(addr_clone, health_clone, cancel_clone).await;
+            });
+        }
+
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    debug!("Health monitoring cancelled for remote disk: {}", addr);
+                    return;
+                }
+                _ = interval.tick() => {
+                    if cancel_token.is_cancelled() {
+                        return;
+                    }
+
+                    // Skip health check if disk is already marked as faulty
+                    if health.is_faulty() {
+                        continue;
+                    }
+
+                    let last_success_nanos = health.last_success.load(Ordering::Relaxed);
+                    let elapsed = Duration::from_nanos(
+                        (std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_nanos() as i64 - last_success_nanos) as u64
+                    );
+
+                    if elapsed < SKIP_IF_SUCCESS_BEFORE {
+                        continue;
+                    }
+
+                    // Perform basic connectivity check
+                    if Self::perform_connectivity_check(&addr).await.is_err() && health.swap_ok_to_faulty() {
+                        warn!("Remote disk health check failed for {}: marking as faulty", addr);
+
+                        // Start recovery monitoring
+                        let health_clone = Arc::clone(&health);
+                        let addr_clone = addr.clone();
+                        let cancel_clone = cancel_token.clone();
+
+                        tokio::spawn(async move {
+                            Self::monitor_remote_disk_recovery(addr_clone, health_clone, cancel_clone).await;
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Monitor remote disk recovery and mark as healthy when recovered
+    async fn monitor_remote_disk_recovery(addr: String, health: Arc<DiskHealthTracker>, cancel_token: CancellationToken) {
+        let mut interval = time::interval(CHECK_EVERY);
+
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    return;
+                }
+                _ = interval.tick() => {
+                    if Self::perform_connectivity_check(&addr).await.is_ok() {
+                        info!("Remote disk recovered: {}", addr);
+                        health.set_ok();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Perform basic connectivity check for remote disk
+    async fn perform_connectivity_check(addr: &str) -> Result<()> {
+        let url = url::Url::parse(addr).map_err(|e| Error::other(format!("Invalid URL: {e}")))?;
+
+        let Some(host) = url.host_str() else {
+            return Err(Error::other("No host in URL".to_string()));
+        };
+
+        let port = url.port_or_known_default().unwrap_or(80);
+
+        // Try to establish TCP connection
+        match timeout(CHECK_TIMEOUT_DURATION, TcpStream::connect((host, port))).await {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                Ok(())
+            }
+            _ => Err(Error::other(format!("Cannot connect to {host}:{port}"))),
+        }
+    }
+
+    /// Execute operation with timeout and health tracking
+    async fn execute_with_timeout<T, F, Fut>(&self, operation: F, timeout_duration: Duration) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        // Check if disk is faulty
+        if self.health.is_faulty() {
+            warn!("remote disk {} health is faulty, returning error", self.to_string());
+            return Err(DiskError::FaultyDisk);
+        }
+
+        // Record operation start
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        self.health.last_started.store(now, std::sync::atomic::Ordering::Relaxed);
+        self.health.increment_waiting();
+
+        // Execute operation with timeout
+        let result = time::timeout(timeout_duration, operation()).await;
+
+        match result {
+            Ok(operation_result) => {
+                // Log success and decrement waiting counter
+                if operation_result.is_ok() {
+                    self.health.log_success();
+                }
+                self.health.decrement_waiting();
+                operation_result
+            }
+            Err(_) => {
+                // Timeout occurred, mark disk as potentially faulty
+                self.health.decrement_waiting();
+                warn!("Remote disk operation timeout after {:?}", timeout_duration);
+                Err(Error::other(format!("Remote disk operation timeout after {timeout_duration:?}")))
+            }
+        }
+    }
+
+    async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>> {
+        node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
+            .await
+            .map_err(|err| Error::other(format!("can not get client, err: {err}")))
+    }
+
+    async fn disk_ref(&self) -> String {
+        (*self.id.lock().await)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| self.endpoint.to_string())
+    }
+}
+
+fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut serializer = rmp_serde::Serializer::new(Vec::new());
+    value.serialize(&mut serializer)?;
+    Ok(serializer.into_inner())
+}
+
+fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str) -> Result<T> {
+    if !binary.is_empty() {
+        let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
+        return T::deserialize(&mut deserializer).map_err(Error::from);
+    }
+
+    serde_json::from_str(json).map_err(Error::from)
 }
 
 // TODO: all api need to handle errors
@@ -83,11 +319,8 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(skip(self))]
     async fn is_online(&self) -> bool {
-        // TODO: connection status tracking
-        if node_service_time_out_client(&self.addr).await.is_ok() {
-            return true;
-        }
-        false
+        // If disk is marked as faulty, consider it offline
+        !self.health.is_faulty()
     }
 
     #[tracing::instrument(skip(self))]
@@ -104,6 +337,7 @@ impl DiskAPI for RemoteDisk {
     }
     #[tracing::instrument(skip(self))]
     async fn close(&self) -> Result<()> {
+        self.cancel_token.cancel();
         Ok(())
     }
     #[tracing::instrument(skip(self))]
@@ -121,7 +355,7 @@ impl DiskAPI for RemoteDisk {
 
     #[tracing::instrument(skip(self))]
     fn path(&self) -> PathBuf {
-        self.root.clone()
+        PathBuf::from(self.endpoint.get_file_path())
     }
 
     #[tracing::instrument(skip(self))]
@@ -154,108 +388,148 @@ impl DiskAPI for RemoteDisk {
     #[tracing::instrument(skip(self))]
     async fn make_volume(&self, volume: &str) -> Result<()> {
         info!("make_volume");
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(MakeVolumeRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-        });
 
-        let response = client.make_volume(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(MakeVolumeRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.make_volume(request).await?.into_inner();
 
-        Ok(())
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
         info!("make_volumes");
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(MakeVolumesRequest {
-            disk: self.endpoint.to_string(),
-            volumes: volumes.iter().map(|s| (*s).to_string()).collect(),
-        });
 
-        let response = client.make_volumes(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(MakeVolumesRequest {
+                    disk: self.endpoint.to_string(),
+                    volumes: volumes.iter().map(|s| (*s).to_string()).collect(),
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.make_volumes(request).await?.into_inner();
 
-        Ok(())
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
         info!("list_volumes");
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(ListVolumesRequest {
-            disk: self.endpoint.to_string(),
-        });
 
-        let response = client.list_volumes(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(ListVolumesRequest {
+                    disk: self.endpoint.to_string(),
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.list_volumes(request).await?.into_inner();
 
-        let infos = response
-            .volume_infos
-            .into_iter()
-            .filter_map(|json_str| serde_json::from_str::<VolumeInfo>(&json_str).ok())
-            .collect();
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
 
-        Ok(infos)
+                let infos = response
+                    .volume_infos
+                    .into_iter()
+                    .filter_map(|json_str| serde_json::from_str::<VolumeInfo>(&json_str).ok())
+                    .collect();
+
+                Ok(infos)
+            },
+            Duration::ZERO,
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
         info!("stat_volume");
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(StatVolumeRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-        });
 
-        let response = client.stat_volume(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(StatVolumeRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.stat_volume(request).await?.into_inner();
 
-        let volume_info = serde_json::from_str::<VolumeInfo>(&response.volume_info)?;
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
 
-        Ok(volume_info)
+                let volume_info = serde_json::from_str::<VolumeInfo>(&response.volume_info)?;
+
+                Ok(volume_info)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn delete_volume(&self, volume: &str) -> Result<()> {
         info!("delete_volume {}/{}", self.endpoint.to_string(), volume);
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(DeleteVolumeRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-        });
 
-        let response = client.delete_volume(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(DeleteVolumeRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.delete_volume(request).await?.into_inner();
 
-        Ok(())
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                Ok(())
+            },
+            Duration::ZERO,
+        )
+        .await
     }
 
     // // FIXME: TODO: use writer
@@ -318,35 +592,47 @@ impl DiskAPI for RemoteDisk {
         opts: DeleteOptions,
     ) -> Result<()> {
         info!("delete_version");
-        let file_info = serde_json::to_string(&fi)?;
-        let opts = serde_json::to_string(&opts)?;
 
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(DeleteVersionRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-            file_info,
-            force_del_marker,
-            opts,
-        });
+        self.execute_with_timeout(
+            || async {
+                let file_info = serde_json::to_string(&fi)?;
+                let opts = serde_json::to_string(&opts)?;
 
-        let response = client.delete_version(request).await?.into_inner();
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(DeleteVersionRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    file_info,
+                    force_del_marker,
+                    opts,
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.delete_version(request).await?.into_inner();
 
-        // let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
 
-        Ok(())
+                // let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
+
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
         info!("delete_versions");
+
+        if self.health.is_faulty() {
+            return vec![Some(DiskError::FaultyDisk); versions.len()];
+        }
 
         let opts = match serde_json::to_string(&opts) {
             Ok(opts) => opts,
@@ -371,7 +657,7 @@ impl DiskAPI for RemoteDisk {
                 }
             });
         }
-        let mut client = match node_service_time_out_client(&self.addr).await {
+        let mut client = match self.get_client().await {
             Ok(client) => client,
             Err(err) => {
                 let mut errors = Vec::with_capacity(versions.len());
@@ -391,12 +677,24 @@ impl DiskAPI for RemoteDisk {
 
         // TODO: use Error not string
 
-        let response = match client.delete_versions(request).await {
+        let result = self
+            .execute_with_timeout(
+                || async {
+                    client
+                        .delete_versions(request)
+                        .await
+                        .map_err(|err| Error::other(format!("delete_versions failed: {err}")))
+                },
+                get_max_timeout_duration(),
+            )
+            .await;
+
+        let response = match result {
             Ok(response) => response,
             Err(err) => {
                 let mut errors = Vec::with_capacity(versions.len());
                 for _ in 0..versions.len() {
-                    errors.push(Some(Error::other(err.to_string())));
+                    errors.push(Some(err.clone()));
                 }
                 return errors;
             }
@@ -427,71 +725,123 @@ impl DiskAPI for RemoteDisk {
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
         info!("delete_paths");
         let paths = paths.to_owned();
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(DeletePathsRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            paths,
-        });
 
-        let response = client.delete_paths(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(DeletePathsRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    paths: paths.clone(),
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.delete_paths(request).await?.into_inner();
 
-        Ok(())
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         info!("write_metadata {}/{}", volume, path);
         let file_info = serde_json::to_string(&fi)?;
-        let mut client = node_service_time_out_client(&self.addr)
+        let file_info_bin = encode_msgpack(&fi)?;
+
+        self.execute_with_timeout(
+            || async {
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(WriteMetadataRequest {
+                    disk,
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    file_info: file_info.clone(),
+                    file_info_bin: file_info_bin.clone(),
+                });
+
+                let response = client.write_metadata(request).await?.into_inner();
+
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes> {
+        let disk = self.disk_ref().await;
+        let mut client = self
+            .get_client()
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(WriteMetadataRequest {
-            disk: self.endpoint.to_string(),
+        let request = Request::new(ReadMetadataRequest {
             volume: volume.to_string(),
             path: path.to_string(),
-            file_info,
+            disk,
         });
 
-        let response = client.write_metadata(request).await?.into_inner();
+        let response = client.read_metadata(request).await?.into_inner();
 
         if !response.success {
             return Err(response.error.unwrap_or_default().into());
         }
 
-        Ok(())
+        Ok(response.data)
     }
 
     #[tracing::instrument(skip(self))]
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
         info!("update_metadata");
         let file_info = serde_json::to_string(&fi)?;
-        let opts = serde_json::to_string(&opts)?;
+        let opts_str = serde_json::to_string(&opts)?;
+        let file_info_bin = encode_msgpack(&fi)?;
+        let opts_bin = encode_msgpack(opts)?;
 
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(UpdateMetadataRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-            file_info,
-            opts,
-        });
+        self.execute_with_timeout(
+            || async {
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(UpdateMetadataRequest {
+                    disk,
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    file_info: file_info.clone(),
+                    opts: opts_str.clone(),
+                    file_info_bin: file_info_bin.clone(),
+                    opts_bin: opts_bin.clone(),
+                });
 
-        let response = client.update_metadata(request).await?.into_inner();
+                let response = client.update_metadata(request).await?.into_inner();
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
 
-        Ok(())
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -504,51 +854,71 @@ impl DiskAPI for RemoteDisk {
         opts: &ReadOptions,
     ) -> Result<FileInfo> {
         info!("read_version");
-        let opts = serde_json::to_string(opts)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(ReadVersionRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-            version_id: version_id.to_string(),
-            opts,
-        });
+        let opts_str = serde_json::to_string(opts)?;
+        let opts_bin = encode_msgpack(opts)?;
 
-        let response = client.read_version(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(ReadVersionRequest {
+                    disk,
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    version_id: version_id.to_string(),
+                    opts: opts_str.clone(),
+                    opts_bin: opts_bin.clone(),
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.read_version(request).await?.into_inner();
 
-        let file_info = serde_json::from_str::<FileInfo>(&response.file_info)?;
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
 
-        Ok(file_info)
+                let file_info = decode_msgpack_or_json::<FileInfo>(&response.file_info_bin, &response.file_info)?;
+
+                Ok(file_info)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
         info!("read_xl {}/{}/{}", self.endpoint.to_string(), volume, path);
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(ReadXlRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-            read_data,
-        });
 
-        let response = client.read_xl(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(ReadXlRequest {
+                    disk,
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    read_data,
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.read_xl(request).await?.into_inner();
 
-        let raw_file_info = serde_json::from_str::<RawFileInfo>(&response.raw_file_info)?;
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
 
-        Ok(raw_file_info)
+                let raw_file_info = decode_msgpack_or_json::<RawFileInfo>(&response.raw_file_info_bin, &response.raw_file_info)?;
+
+                Ok(raw_file_info)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -561,39 +931,56 @@ impl DiskAPI for RemoteDisk {
         dst_path: &str,
     ) -> Result<RenameDataResp> {
         info!("rename_data {}/{}/{}/{}", self.addr, self.endpoint.to_string(), dst_volume, dst_path);
-        let file_info = serde_json::to_string(&fi)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(RenameDataRequest {
-            disk: self.endpoint.to_string(),
-            src_volume: src_volume.to_string(),
-            src_path: src_path.to_string(),
-            file_info,
-            dst_volume: dst_volume.to_string(),
-            dst_path: dst_path.to_string(),
-        });
 
-        let response = client.rename_data(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let file_info = serde_json::to_string(&fi)?;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(RenameDataRequest {
+                    disk: self.endpoint.to_string(),
+                    src_volume: src_volume.to_string(),
+                    src_path: src_path.to_string(),
+                    file_info,
+                    dst_volume: dst_volume.to_string(),
+                    dst_path: dst_path.to_string(),
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.rename_data(request).await?.into_inner();
 
-        let rename_data_resp = serde_json::from_str::<RenameDataResp>(&response.rename_data_resp)?;
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
 
-        Ok(rename_data_resp)
+                let rename_data_resp = serde_json::from_str::<RenameDataResp>(&response.rename_data_resp)?;
+
+                Ok(rename_data_resp)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
-    async fn list_dir(&self, _origvolume: &str, volume: &str, _dir_path: &str, _count: i32) -> Result<Vec<String>> {
-        info!("list_dir {}/{}", volume, _dir_path);
-        let mut client = node_service_time_out_client(&self.addr)
+    async fn list_dir(&self, _origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
+        debug!("list_dir {}/{}", volume, dir_path);
+
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        let disk = self.disk_ref().await;
+
+        let mut client = self
+            .get_client()
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
         let request = Request::new(ListDirRequest {
-            disk: self.endpoint.to_string(),
+            disk,
             volume: volume.to_string(),
+            dir_path: dir_path.to_string(),
+            count,
         });
 
         let response = client.list_dir(request).await?.into_inner();
@@ -609,11 +996,12 @@ impl DiskAPI for RemoteDisk {
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         info!("walk_dir {}", self.endpoint.to_string());
 
-        let url = format!(
-            "{}/rustfs/rpc/walk_dir?disk={}",
-            self.endpoint.grid_host(),
-            urlencoding::encode(self.endpoint.to_string().as_str()),
-        );
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        let disk = self.disk_ref().await;
+
+        let url = format!("{}/rustfs/rpc/walk_dir?disk={}", self.endpoint.grid_host(), urlencoding::encode(&disk),);
 
         let opts = serde_json::to_vec(&opts)?;
 
@@ -623,29 +1011,14 @@ impl DiskAPI for RemoteDisk {
 
         let mut reader = HttpReader::new(url, Method::GET, headers, Some(opts)).await?;
 
-        tokio::io::copy(&mut reader, wr).await?;
+        copy_stream_with_buffer(&mut reader, wr, DEFAULT_READ_BUFFER_SIZE).await?;
 
         Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
-        info!("read_file {}/{}", volume, path);
-
-        let url = format!(
-            "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
-            self.endpoint.grid_host(),
-            urlencoding::encode(self.endpoint.to_string().as_str()),
-            urlencoding::encode(volume),
-            urlencoding::encode(path),
-            0,
-            0
-        );
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        build_auth_headers(&url, &Method::GET, &mut headers);
-        Ok(Box::new(HttpReader::new(url, Method::GET, headers, None).await?))
+        self.read_file_stream(volume, path, 0, 0).await
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -658,10 +1031,16 @@ impl DiskAPI for RemoteDisk {
         //     offset,
         //     length
         // );
+
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        let disk = self.disk_ref().await;
+
         let url = format!(
             "{}/rustfs/rpc/read_file_stream?disk={}&volume={}&path={}&offset={}&length={}",
             self.endpoint.grid_host(),
-            urlencoding::encode(self.endpoint.to_string().as_str()),
+            urlencoding::encode(&disk),
             urlencoding::encode(volume),
             urlencoding::encode(path),
             offset,
@@ -674,14 +1053,37 @@ impl DiskAPI for RemoteDisk {
         Ok(Box::new(HttpReader::new(url, Method::GET, headers, None).await?))
     }
 
+    /// Zero-copy read for remote disks falls back to efficient network read.
+    /// Note: True zero-copy is not possible over network, but we avoid extra copies
+    /// by reading directly into Bytes.
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        // For remote disks, use the regular reader and read into Bytes
+        let reader = self.read_file_stream(volume, path, offset, length).await?;
+
+        use tokio::io::AsyncReadExt;
+        let mut reader = reader;
+
+        // Read all data into Bytes (single allocation)
+        let mut buffer = Vec::with_capacity(length);
+        reader.read_to_end(&mut buffer).await?;
+
+        Ok(Bytes::from(buffer))
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         info!("append_file {}/{}", volume, path);
 
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        let disk = self.disk_ref().await;
+
         let url = format!(
             "{}/rustfs/rpc/put_file_stream?disk={}&volume={}&path={}&append={}&size={}",
             self.endpoint.grid_host(),
-            urlencoding::encode(self.endpoint.to_string().as_str()),
+            urlencoding::encode(&disk),
             urlencoding::encode(volume),
             urlencoding::encode(path),
             true,
@@ -704,10 +1106,15 @@ impl DiskAPI for RemoteDisk {
         //     file_size
         // );
 
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        let disk = self.disk_ref().await;
+
         let url = format!(
             "{}/rustfs/rpc/put_file_stream?disk={}&volume={}&path={}&append={}&size={}",
             self.endpoint.grid_host(),
-            urlencoding::encode(self.endpoint.to_string().as_str()),
+            urlencoding::encode(&disk),
             urlencoding::encode(volume),
             urlencoding::encode(path),
             false,
@@ -723,218 +1130,307 @@ impl DiskAPI for RemoteDisk {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         info!("rename_file");
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(RenameFileRequest {
-            disk: self.endpoint.to_string(),
-            src_volume: src_volume.to_string(),
-            src_path: src_path.to_string(),
-            dst_volume: dst_volume.to_string(),
-            dst_path: dst_path.to_string(),
-        });
 
-        let response = client.rename_file(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(RenameFileRequest {
+                    disk: self.endpoint.to_string(),
+                    src_volume: src_volume.to_string(),
+                    src_path: src_path.to_string(),
+                    dst_volume: dst_volume.to_string(),
+                    dst_path: dst_path.to_string(),
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.rename_file(request).await?.into_inner();
 
-        Ok(())
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         info!("rename_part {}/{}", src_volume, src_path);
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(RenamePartRequest {
-            disk: self.endpoint.to_string(),
-            src_volume: src_volume.to_string(),
-            src_path: src_path.to_string(),
-            dst_volume: dst_volume.to_string(),
-            dst_path: dst_path.to_string(),
-            meta,
-        });
 
-        let response = client.rename_part(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(RenamePartRequest {
+                    disk: self.endpoint.to_string(),
+                    src_volume: src_volume.to_string(),
+                    src_path: src_path.to_string(),
+                    dst_volume: dst_volume.to_string(),
+                    dst_path: dst_path.to_string(),
+                    meta,
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.rename_part(request).await?.into_inner();
 
-        Ok(())
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
         info!("delete {}/{}/{}", self.endpoint.to_string(), volume, path);
-        let options = serde_json::to_string(&opt)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(DeleteRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-            options,
-        });
 
-        let response = client.delete(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let options = serde_json::to_string(&opt)?;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(DeleteRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    options,
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.delete(request).await?.into_inner();
 
-        Ok(())
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         info!("verify_file");
-        let file_info = serde_json::to_string(&fi)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(VerifyFileRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-            file_info,
-        });
 
-        let response = client.verify_file(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let file_info = serde_json::to_string(&fi)?;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(VerifyFileRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    file_info,
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.verify_file(request).await?.into_inner();
 
-        let check_parts_resp = serde_json::from_str::<CheckPartsResp>(&response.check_parts_resp)?;
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
 
-        Ok(check_parts_resp)
+                let check_parts_resp = serde_json::from_str::<CheckPartsResp>(&response.check_parts_resp)?;
+
+                Ok(check_parts_resp)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(ReadPartsRequest {
-            disk: self.endpoint.to_string(),
-            bucket: bucket.to_string(),
-            paths: paths.to_vec(),
-        });
+        self.execute_with_timeout(
+            || async {
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(ReadPartsRequest {
+                    disk: self.endpoint.to_string(),
+                    bucket: bucket.to_string(),
+                    paths: paths.to_vec(),
+                });
 
-        let response = client.read_parts(request).await?.into_inner();
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.read_parts(request).await?.into_inner();
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
 
-        let read_parts_resp = rmp_serde::from_slice::<Vec<ObjectPartInfo>>(&response.object_part_infos)?;
+                let read_parts_resp = rmp_serde::from_slice::<Vec<ObjectPartInfo>>(&response.object_part_infos)?;
 
-        Ok(read_parts_resp)
+                Ok(read_parts_resp)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         info!("check_parts");
-        let file_info = serde_json::to_string(&fi)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(CheckPartsRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-            file_info,
-        });
 
-        let response = client.check_parts(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let file_info = serde_json::to_string(&fi)?;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(CheckPartsRequest {
+                    disk: self.endpoint.to_string(),
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    file_info,
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.check_parts(request).await?.into_inner();
 
-        let check_parts_resp = serde_json::from_str::<CheckPartsResp>(&response.check_parts_resp)?;
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
 
-        Ok(check_parts_resp)
+                let check_parts_resp = serde_json::from_str::<CheckPartsResp>(&response.check_parts_resp)?;
+
+                Ok(check_parts_resp)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
         info!("read_multiple {}/{}/{}", self.endpoint.to_string(), req.bucket, req.prefix);
-        let read_multiple_req = serde_json::to_string(&req)?;
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(ReadMultipleRequest {
-            disk: self.endpoint.to_string(),
-            read_multiple_req,
-        });
 
-        let response = client.read_multiple(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let read_multiple_req = serde_json::to_string(&req)?;
+                let read_multiple_req_bin = encode_msgpack(&req)?;
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(ReadMultipleRequest {
+                    disk,
+                    read_multiple_req,
+                    read_multiple_req_bin,
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.read_multiple(request).await?.into_inner();
 
-        let read_multiple_resps = response
-            .read_multiple_resps
-            .into_iter()
-            .filter_map(|json_str| serde_json::from_str::<ReadMultipleResp>(&json_str).ok())
-            .collect();
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
 
-        Ok(read_multiple_resps)
+                let read_multiple_resps = if !response.read_multiple_resps_bin.is_empty() {
+                    response
+                        .read_multiple_resps_bin
+                        .into_iter()
+                        .filter_map(|buf| decode_msgpack_or_json::<ReadMultipleResp>(&buf, "").ok())
+                        .collect()
+                } else {
+                    response
+                        .read_multiple_resps
+                        .into_iter()
+                        .filter_map(|json_str| serde_json::from_str::<ReadMultipleResp>(&json_str).ok())
+                        .collect()
+                };
+
+                Ok(read_multiple_resps)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
         info!("write_all");
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(WriteAllRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-            data,
-        });
 
-        let response = client.write_all(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(WriteAllRequest {
+                    disk,
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                    data,
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.write_all(request).await?.into_inner();
 
-        Ok(())
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                Ok(())
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         info!("read_all {}/{}", volume, path);
-        let mut client = node_service_time_out_client(&self.addr)
-            .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-        let request = Request::new(ReadAllRequest {
-            disk: self.endpoint.to_string(),
-            volume: volume.to_string(),
-            path: path.to_string(),
-        });
 
-        let response = client.read_all(request).await?.into_inner();
+        self.execute_with_timeout(
+            || async {
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(ReadAllRequest {
+                    disk,
+                    volume: volume.to_string(),
+                    path: path.to_string(),
+                });
 
-        if !response.success {
-            return Err(response.error.unwrap_or_default().into());
-        }
+                let response = client.read_all(request).await?.into_inner();
 
-        Ok(response.data)
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                Ok(response.data)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+
         let opts = serde_json::to_string(&opts)?;
-        let mut client = node_service_time_out_client(&self.addr)
+        let mut client = self
+            .get_client()
             .await
             .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
         let request = Request::new(DiskInfoRequest {
@@ -952,12 +1448,35 @@ impl DiskAPI for RemoteDisk {
 
         Ok(disk_info)
     }
+
+    #[tracing::instrument(skip(self))]
+    fn start_scan(&self) -> ScanGuard {
+        self.scanning.fetch_add(1, Ordering::Relaxed);
+        ScanGuard(Arc::clone(&self.scanning))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Once;
+    use tokio::io::duplex;
+    use tokio::net::TcpListener;
+    use tracing::Level;
     use uuid::Uuid;
+
+    static INIT: Once = Once::new();
+
+    fn init_tracing(filter_level: Level) {
+        INIT.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_max_level(filter_level)
+                .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
+                .with_thread_names(true)
+                .try_init();
+        });
+    }
 
     #[tokio::test]
     async fn test_remote_disk_creation() {
@@ -1041,6 +1560,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_remote_disk_is_online_detects_active_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let url = url::Url::parse(&format!("http://{}:{}/data/rustfs0", addr.ip(), addr.port())).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        assert!(remote_disk.is_online().await);
+
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_is_online_detects_missing_listener() {
+        init_tracing(Level::ERROR);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ip = addr.ip();
+        let port = addr.port();
+
+        drop(listener);
+
+        let url = url::Url::parse(&format!("http://{ip}:{port}/data/rustfs0")).unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: true,
+        };
+
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        remote_disk.enable_health_check();
+
+        // wait for health check connect timeout
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        assert!(!remote_disk.is_online().await);
+    }
+
+    #[tokio::test]
+    async fn test_copy_stream_with_buffer_copies_full_payload() {
+        let payload = b"walk-dir-stream".repeat(1024);
+        let expected = payload.clone();
+        let (mut write_half, mut read_half) = duplex(128);
+
+        let copy_task = tokio::spawn(async move {
+            let mut cursor = Cursor::new(payload);
+            copy_stream_with_buffer(&mut cursor, &mut write_half, 4 * 1024).await.unwrap();
+        });
+
+        let mut copied = Vec::new();
+        read_half.read_to_end(&mut copied).await.unwrap();
+        copy_task.await.unwrap();
+
+        assert_eq!(copied, expected);
+    }
+
+    #[tokio::test]
     async fn test_remote_disk_disk_id() {
         let url = url::Url::parse("http://remote-server:9000").unwrap();
         let endpoint = Endpoint {
@@ -1074,6 +1670,30 @@ mod tests {
         remote_disk.set_disk_id(None).await.unwrap();
         let cleared_id = remote_disk.get_disk_id().await.unwrap();
         assert!(cleared_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_ref_prefers_disk_id() {
+        let url = url::Url::parse("http://remote-server:9000").unwrap();
+        let endpoint = Endpoint {
+            url,
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        };
+        let disk_option = DiskOption {
+            cleanup: false,
+            health_check: false,
+        };
+
+        let remote_disk = RemoteDisk::new(&endpoint, &disk_option).await.unwrap();
+        assert_eq!(remote_disk.disk_ref().await, endpoint.to_string());
+
+        let disk_id = Uuid::new_v4();
+        remote_disk.set_disk_id(Some(disk_id)).await.unwrap();
+
+        assert_eq!(remote_disk.disk_ref().await, disk_id.to_string());
     }
 
     #[tokio::test]

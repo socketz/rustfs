@@ -34,6 +34,13 @@ pub struct KmsCache {
 
 impl KmsCache {
     /// Create a new KMS cache with the specified capacity
+    ///
+    /// # Arguments
+    /// * `capacity` - Maximum number of entries in the cache
+    ///
+    /// # Returns
+    /// A new instance of `KmsCache`
+    ///
     pub fn new(capacity: u64) -> Self {
         Self {
             key_metadata_cache: Cache::builder()
@@ -48,22 +55,47 @@ impl KmsCache {
     }
 
     /// Get key metadata from cache
+    ///
+    /// # Arguments
+    /// * `key_id` - The ID of the key to retrieve metadata for
+    ///
+    /// # Returns
+    /// An `Option` containing the `KeyMetadata` if found, or `None` if not found
+    ///
     pub async fn get_key_metadata(&self, key_id: &str) -> Option<KeyMetadata> {
         self.key_metadata_cache.get(key_id).await
     }
 
     /// Put key metadata into cache
+    ///
+    /// # Arguments
+    /// * `key_id` - The ID of the key to store metadata for
+    /// * `metadata` - The `KeyMetadata` to store in the cache
+    ///
     pub async fn put_key_metadata(&mut self, key_id: &str, metadata: &KeyMetadata) {
         self.key_metadata_cache.insert(key_id.to_string(), metadata.clone()).await;
         self.key_metadata_cache.run_pending_tasks().await;
     }
 
     /// Get data key from cache
+    ///
+    /// # Arguments
+    /// * `key_id` - The ID of the key to retrieve the data key for
+    ///
+    /// # Returns
+    /// An `Option` containing the `CachedDataKey` if found, or `None` if not found
+    ///
     pub async fn get_data_key(&self, key_id: &str) -> Option<CachedDataKey> {
         self.data_key_cache.get(key_id).await
     }
 
     /// Put data key into cache
+    ///
+    /// # Arguments
+    /// * `key_id` - The ID of the key to store the data key for
+    /// * `plaintext` - The plaintext data key bytes
+    /// * `ciphertext` - The ciphertext data key bytes
+    ///
     pub async fn put_data_key(&mut self, key_id: &str, plaintext: &[u8], ciphertext: &[u8]) {
         let cached_key = CachedDataKey {
             plaintext: plaintext.to_vec(),
@@ -75,11 +107,19 @@ impl KmsCache {
     }
 
     /// Remove key metadata from cache
+    ///
+    /// # Arguments
+    /// * `key_id` - The ID of the key to remove metadata for
+    ///
     pub async fn remove_key_metadata(&mut self, key_id: &str) {
         self.key_metadata_cache.remove(key_id).await;
     }
 
     /// Remove data key from cache
+    ///
+    /// # Arguments
+    /// * `key_id` - The ID of the key to remove the data key for
+    ///
     pub async fn remove_data_key(&mut self, key_id: &str) {
         self.data_key_cache.remove(key_id).await;
     }
@@ -95,6 +135,10 @@ impl KmsCache {
     }
 
     /// Get cache statistics (hit count, miss count)
+    ///
+    /// # Returns
+    /// A tuple containing total entries and total misses
+    ///
     pub fn stats(&self) -> (u64, u64) {
         let metadata_stats = (
             self.key_metadata_cache.entry_count(),
@@ -110,6 +154,7 @@ impl KmsCache {
 mod tests {
     use super::*;
     use crate::types::{KeyState, KeyUsage};
+    use jiff::Zoned;
     use std::time::Duration;
 
     #[derive(Debug, Clone)]
@@ -158,7 +203,7 @@ mod tests {
             key_state: KeyState::Enabled,
             key_usage: KeyUsage::EncryptDecrypt,
             description: Some("Test key".to_string()),
-            creation_date: chrono::Utc::now(),
+            creation_date: Zoned::now(),
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
@@ -208,7 +253,7 @@ mod tests {
             key_state: KeyState::Enabled,
             key_usage: KeyUsage::EncryptDecrypt,
             description: Some("TTL test key".to_string()),
-            creation_date: chrono::Utc::now(),
+            creation_date: Zoned::now(),
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),
@@ -239,7 +284,7 @@ mod tests {
             key_state: KeyState::Enabled,
             key_usage: KeyUsage::EncryptDecrypt,
             description: None,
-            creation_date: chrono::Utc::now(),
+            creation_date: Zoned::now(),
             deletion_date: None,
             origin: "KMS".to_string(),
             key_manager: "CUSTOMER".to_string(),

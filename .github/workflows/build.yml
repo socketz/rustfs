@@ -23,28 +23,13 @@
 #
 # Manual Parameters:
 # - build_docker: Build and push Docker images (default: true)
+# - platforms: Comma-separated platform IDs or 'all' (default: all)
 
 name: Build and Release
 
 on:
   push:
     tags: [ "*.*.*" ]
-    branches: [ main ]
-    paths-ignore:
-      - "**.md"
-      - "**.txt"
-      - ".github/**"
-      - "docs/**"
-      - "deploy/**"
-      - "scripts/dev_*.sh"
-      - "LICENSE*"
-      - "README*"
-      - "**/*.png"
-      - "**/*.jpg"
-      - "**/*.svg"
-      - ".gitignore"
-      - ".dockerignore"
-  pull_request:
     branches: [ main ]
     paths-ignore:
       - "**.md"
@@ -69,6 +54,11 @@ on:
         required: false
         default: true
         type: boolean
+      platforms:
+        description: "Comma-separated targets or 'all' (e.g. linux-x86_64-musl,macos-aarch64)"
+        required: false
+        default: "all"
+        type: string
 
 permissions:
   contents: read
@@ -83,7 +73,7 @@ jobs:
   # Build strategy check - determine build type based on trigger
   build-check:
     name: Build Strategy Check
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       build_type: ${{ steps.check.outputs.build_type }}
@@ -92,7 +82,7 @@ jobs:
       is_prerelease: ${{ steps.check.outputs.is_prerelease }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -154,56 +144,77 @@ jobs:
           echo "  - Is prerelease: $is_prerelease"
 
   # Build RustFS binaries
+  prepare-platform-matrix:
+    name: Prepare Platform Matrix
+    runs-on: ubicloud-standard-2
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      selected: ${{ steps.select.outputs.selected }}
+    steps:
+      - name: Select target platforms
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          selected="${{ github.event_name == 'workflow_dispatch' && github.event.inputs.platforms || 'all' }}"
+          selected="$(echo "${selected}" | tr -d '[:space:]')"
+          if [[ -z "${selected}" ]]; then
+            selected="all"
+          fi
+
+          all='{"include":[
+            {"target_id":"linux-x86_64-musl","os":"ubicloud-standard-2","target":"x86_64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":""},
+            {"target_id":"linux-aarch64-musl","os":"ubicloud-standard-2","target":"aarch64-unknown-linux-musl","cross":true,"platform":"linux","rustflags":""},
+            {"target_id":"linux-x86_64-gnu","os":"ubicloud-standard-2","target":"x86_64-unknown-linux-gnu","cross":false,"platform":"linux","rustflags":""},
+            {"target_id":"linux-aarch64-gnu","os":"ubicloud-standard-2","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":""},
+            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
+            {"target_id":"macos-x86_64","os":"macos-latest","target":"x86_64-apple-darwin","cross":false,"platform":"macos","rustflags":""},
+            {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":""}
+          ]}'
+
+          if [[ "${selected}" == "all" ]]; then
+            matrix="$(jq -c . <<<"${all}")"
+          else
+            unknown="$(jq -rn --arg selected "${selected}" --argjson all "${all}" '
+              ($selected | split(",") | map(select(length > 0))) as $req
+              | ($all.include | map(.target_id)) as $known
+              | [$req[] | select(( $known | index(.) ) == null)]
+            ')"
+            if [[ "$(jq 'length' <<<"${unknown}")" -gt 0 ]]; then
+              echo "Unknown platforms: $(jq -r 'join(\",\")' <<<"${unknown}")" >&2
+              echo "Allowed: $(jq -r '.include[].target_id' <<<"${all}" | paste -sd ',' -)" >&2
+              exit 1
+            fi
+
+            matrix="$(jq -c --arg selected "${selected}" '
+              ($selected | split(",") | map(select(length > 0))) as $req
+              | .include |= map(select(.target_id as $id | ($req | index($id))))
+            ' <<<"${all}")"
+          fi
+
+          echo "selected=${selected}" >> "$GITHUB_OUTPUT"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "Selected platforms: ${selected}"
+
   build-rustfs:
     name: Build RustFS
-    needs: [ build-check ]
-    if: needs.build-check.outputs.should_build == 'true'
+    needs: [ build-check, prepare-platform-matrix ]
+    if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
-      RUSTFLAGS: ${{ matrix.cross == 'false' && '-C target-cpu=native' || '' }}
+      # Always enable Tokio unstable features (required by dial9-tokio-telemetry).
+      # The RUSTFLAGS env var takes precedence over .cargo/config.toml [build] rustflags,
+      # so we must include --cfg tokio_unstable here explicitly; otherwise an empty
+      # RUSTFLAGS value would shadow the config-file flag and silently break tracing.
+      RUSTFLAGS: "--cfg tokio_unstable ${{ matrix.rustflags }}"
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # Linux builds
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            cross: false
-            platform: linux
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            cross: true
-            platform: linux
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            cross: false
-            platform: linux
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            cross: true
-            platform: linux
-          # macOS builds
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            cross: false
-            platform: macos
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            cross: false
-            platform: macos
-          # Windows builds (temporarily disabled)
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cross: false
-            platform: windows
-          #- os: windows-latest
-          #  target: aarch64-pc-windows-msvc
-          #  cross: true
-          #  platform: windows
+      matrix: ${{ fromJson(needs.prepare-platform-matrix.outputs.matrix) }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -442,7 +453,7 @@ jobs:
           echo "📊 Version: ${VERSION}"
 
       - name: Upload to GitHub artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.package.outputs.package_name }}
           path: "rustfs-*.zip"
@@ -454,7 +465,7 @@ jobs:
           OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
           OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
           OSS_REGION: cn-beijing
-          OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+          OSS_ENDPOINT: https://oss-accelerate.aliyuncs.com
         shell: bash
         run: |
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
@@ -532,7 +543,7 @@ jobs:
     name: Build Summary
     needs: [ build-check, build-rustfs ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Build completion summary
         shell: bash
@@ -584,7 +595,7 @@ jobs:
     name: Create GitHub Release
     needs: [ build-check, build-rustfs ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     permissions:
       contents: write
     outputs:
@@ -592,7 +603,7 @@ jobs:
       release_url: ${{ steps.create.outputs.release_url }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -670,16 +681,16 @@ jobs:
     name: Upload Release Assets
     needs: [ build-check, build-rustfs, create-release ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     permissions:
       contents: write
       actions: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
           path: ./artifacts
           pattern: rustfs-*
@@ -751,7 +762,7 @@ jobs:
     name: Update Latest Version
     needs: [ build-check, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Update latest.json
         env:
@@ -801,12 +812,12 @@ jobs:
     name: Publish Release
     needs: [ build-check, create-release, upload-release-assets ]
     if: startsWith(github.ref, 'refs/tags/') && needs.build-check.outputs.build_type != 'development'
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     permissions:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Update release notes and publish
         env:

@@ -29,6 +29,10 @@ base64-simd = { workspace = true }
 rsa = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
+rand.workspace = true
 
 [lints]
 workspace = true
+
+[lib]
+doctest = false

@@ -13,8 +13,37 @@
 // limitations under the License.
 
 pub mod access;
+pub mod backpressure;
+pub mod concurrency;
+pub mod deadlock_detector;
 pub mod ecfs;
 pub(crate) mod entity;
 pub(crate) mod helper;
+pub mod lock_optimizer;
 pub mod options;
+pub mod request_context;
+pub mod rpc;
+pub(crate) mod s3_api;
+mod sse;
+pub mod timeout_wrapper;
 pub mod tonic_service;
+
+#[cfg(test)]
+mod concurrent_fix_test;
+#[cfg(test)]
+mod concurrent_get_object_test;
+mod ecfs_extend;
+#[cfg(test)]
+mod ecfs_test;
+pub(crate) mod head_prefix;
+#[cfg(test)]
+mod multi_factor_scheduler_integration_test;
+#[cfg(test)]
+mod sse_test;
+
+pub(crate) use ecfs_extend::*;
+pub(crate) use sse::{
+    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, extract_server_side_encryption_from_headers,
+    extract_ssec_params_from_headers, sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata,
+    validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+};

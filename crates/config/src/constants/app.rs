@@ -25,7 +25,7 @@ pub const VERSION: &str = "1.0.0";
 
 /// Default configuration logger level
 /// Default value: error
-/// Environment variable: RUSTFS_LOG_LEVEL
+/// Environment variable: RUSTFS_OBS_LOGGER_LEVEL
 pub const DEFAULT_LOG_LEVEL: &str = "error";
 
 /// Default configuration use stdout
@@ -49,21 +49,6 @@ pub const SERVICE_VERSION: &str = "1.0.0";
 /// Default value: production
 pub const ENVIRONMENT: &str = "production";
 
-/// Default Access Key
-/// Default value: rustfsadmin
-/// Environment variable: RUSTFS_ACCESS_KEY
-/// Command line argument: --access-key
-/// Example: RUSTFS_ACCESS_KEY=rustfsadmin
-/// Example: --access-key rustfsadmin
-pub const DEFAULT_ACCESS_KEY: &str = "rustfsadmin";
-/// Default Secret Key
-/// Default value: rustfsadmin
-/// Environment variable: RUSTFS_SECRET_KEY
-/// Command line argument: --secret-key
-/// Example: RUSTFS_SECRET_KEY=rustfsadmin
-/// Example: --secret-key rustfsadmin
-pub const DEFAULT_SECRET_KEY: &str = "rustfsadmin";
-
 /// Default console enable
 /// This is the default value for the console server.
 /// It is used to enable or disable the console server.
@@ -77,8 +62,8 @@ pub const DEFAULT_CONSOLE_ENABLE: bool = true;
 /// Default OBS configuration endpoint
 /// Environment variable: DEFAULT_OBS_ENDPOINT
 /// Command line argument: --obs-endpoint
-/// Example: DEFAULT_OBS_ENDPOINT="http://localost:4317"
-/// Example: --obs-endpoint http://localost:4317
+/// Example: DEFAULT_OBS_ENDPOINT="http://localost:4318"
+/// Example: --obs-endpoint http://localost:4318
 pub const DEFAULT_OBS_ENDPOINT: &str = "";
 
 /// Default TLS key for rustfs
@@ -88,6 +73,121 @@ pub const RUSTFS_TLS_KEY: &str = "rustfs_key.pem";
 /// Default TLS cert for rustfs
 /// This is the default cert for TLS.
 pub const RUSTFS_TLS_CERT: &str = "rustfs_cert.pem";
+
+/// Default public certificate filename for rustfs
+/// This is the default public certificate filename for rustfs.
+/// It is used to store the public certificate of the application.
+/// Default value: public.crt
+pub const RUSTFS_PUBLIC_CERT: &str = "public.crt";
+
+/// Default CA certificate filename for rustfs
+/// This is the default CA certificate filename for rustfs.
+/// It is used to store the CA certificate of the application.
+/// Default value: ca.crt
+pub const RUSTFS_CA_CERT: &str = "ca.crt";
+
+/// Default HTTP prefix for rustfs
+/// This is the default HTTP prefix for rustfs.
+/// It is used to identify HTTP URLs.
+/// Default value: http://
+pub const RUSTFS_HTTP_PREFIX: &str = "http://";
+
+/// Default HTTPS prefix for rustfs
+/// This is the default HTTPS prefix for rustfs.
+/// It is used to identify HTTPS URLs.
+/// Default value: https://
+pub const RUSTFS_HTTPS_PREFIX: &str = "https://";
+
+/// Default documentation URL for rustfs
+/// This is the default documentation URL for rustfs.
+/// It is used to provide the documentation of the application.
+/// Default value: https://docs.rustfs.com
+pub const RUSTFS_DOCS_URL: &str = "https://docs.rustfs.com";
+
+/// Default GitHub URL for rustfs
+/// This is the default GitHub URL for rustfs.
+/// It is used to provide the source code of the application.
+/// Default value: https://github.com/rustfs/rustfs
+pub const RUSTFS_GITHUB_URL: &str = "https://github.com/rustfs/rustfs";
+
+/// Default license for rustfs
+/// This is the default license for rustfs.
+/// It is used to provide the license of the application.
+/// Default value: Apache-2.0
+pub const RUSTFS_LICENSE: &str = "Apache-2.0";
+
+/// Default license URL for rustfs
+/// This is the default license URL for rustfs.
+/// It is used to provide the license URL of the application.
+/// Default value: https://www.apache.org/licenses/LICENSE-2.0
+pub const RUSTFS_LICENSE_URL: &str = "https://www.apache.org/licenses/LICENSE-2.0";
+
+/// Environment variable for rustfs address
+/// This is the environment variable for rustfs address.
+/// It is used to bind the server to a specific address.
+/// Example: RUSTFS_ADDRESS=":9000"
+pub const ENV_RUSTFS_ADDRESS: &str = "RUSTFS_ADDRESS";
+
+/// Environment variable for server volumes.
+pub const ENV_RUSTFS_VOLUMES: &str = "RUSTFS_VOLUMES";
+
+/// Environment variable for server access key.
+pub const ENV_RUSTFS_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
+
+/// Environment variable for server access key file.
+pub const ENV_RUSTFS_ACCESS_KEY_FILE: &str = "RUSTFS_ACCESS_KEY_FILE";
+
+/// Environment variable for server root user.
+pub const ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
+
+/// Environment variable for server secret key.
+pub const ENV_RUSTFS_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
+
+/// Environment variable for server secret key file.
+pub const ENV_RUSTFS_SECRET_KEY_FILE: &str = "RUSTFS_SECRET_KEY_FILE";
+
+/// Environment variable for server root password.
+pub const ENV_RUSTFS_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
+
+/// Environment variable for server OBS endpoint.
+pub const ENV_RUSTFS_OBS_ENDPOINT: &str = "RUSTFS_OBS_ENDPOINT";
+
+/// Environment variable for console server enable.
+pub const ENV_RUSTFS_CONSOLE_ENABLE: &str = "RUSTFS_CONSOLE_ENABLE";
+
+/// Environment variable for console server address.
+pub const ENV_RUSTFS_CONSOLE_ADDRESS: &str = "RUSTFS_CONSOLE_ADDRESS";
+
+/// Environment variable for server tls path.
+pub const ENV_RUSTFS_TLS_PATH: &str = "RUSTFS_TLS_PATH";
+
+/// Environment variable for server KMS enable.
+pub const ENV_RUSTFS_KMS_ENABLE: &str = "RUSTFS_KMS_ENABLE";
+
+/// Default KMS enable for server-side encryption
+/// This is the default value for enabling KMS encryption for server-side encryption.
+/// Default value: false
+pub const DEFAULT_KMS_ENABLE: bool = false;
+
+/// Environment variable for server KMS backend.
+pub const ENV_RUSTFS_KMS_BACKEND: &str = "RUSTFS_KMS_BACKEND";
+
+/// Default KMS backend for server-side encryption
+/// This is the default KMS backend for server-side encryption.
+/// Default value: local
+pub const DEFAULT_KMS_BACKEND: &str = "local";
+
+/// Environment variable for selecting the buffer profile used for adaptive buffer sizing.
+pub const ENV_RUSTFS_BUFFER_PROFILE: &str = "RUSTFS_BUFFER_PROFILE";
+
+/// Default buffer profile for adaptive buffer sizing
+/// This is the default buffer profile for adaptive buffer sizing.
+/// It is used to identify the workload profile for adaptive buffer sizing.
+/// Default value: GeneralPurpose
+pub const DEFAULT_BUFFER_PROFILE: &str = "GeneralPurpose";
+
+/// Default value for the server TLS path if `ENV_RUSTFS_TLS_PATH` is not set.
+pub const DEFAULT_RUSTFS_TLS_PATH: &str = "";
 
 /// Default port for rustfs
 /// This is the default port for rustfs.
@@ -104,20 +204,34 @@ pub const DEFAULT_CONSOLE_PORT: u16 = 9001;
 
 /// Default address for rustfs console
 /// This is the default address for rustfs console.
+/// This is used to bind the console server to a specific address.
+/// Default value: :9001
 pub const DEFAULT_CONSOLE_ADDRESS: &str = concat!(":", DEFAULT_CONSOLE_PORT);
+
+/// Default region for rustfs
+/// This is the default region for rustfs.
+/// It is used to identify the region of the application.
+/// Default value: us-east-1
+pub const RUSTFS_REGION: &str = "us-east-1";
+
+/// Environment variable for server region.
+pub const ENV_RUSTFS_REGION: &str = "RUSTFS_REGION";
+
+/// Environment variable for server license.
+pub const ENV_RUSTFS_LICENSE: &str = "RUSTFS_LICENSE";
 
 /// Default log filename for rustfs
 /// This is the default log filename for rustfs.
 /// It is used to store the logs of the application.
 /// Default value: rustfs.log
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_FILENAME
+/// Environment variable: RUSTFS_OBS_LOG_FILENAME
 pub const DEFAULT_LOG_FILENAME: &str = "rustfs";
 
 /// Default OBS log filename for rustfs
 /// This is the default log filename for OBS.
 /// It is used to store the logs of the application.
 /// Default value: rustfs.log
-pub const DEFAULT_OBS_LOG_FILENAME: &str = concat!(DEFAULT_LOG_FILENAME, "");
+pub const DEFAULT_OBS_LOG_FILENAME: &str = concat!(DEFAULT_LOG_FILENAME, ".log");
 
 /// Default log directory for rustfs
 /// This is the default log directory for rustfs.
@@ -136,9 +250,9 @@ pub const DEFAULT_LOG_ROTATION_SIZE_MB: u64 = 100;
 /// Default log rotation time for rustfs
 /// This is the default log rotation time for rustfs.
 /// It is used to rotate the logs of the application.
-/// Default value: hour, eg: day,hour,minute,second
+/// Default value: hour, eg: daily,hourly,minutely
 /// Environment variable: RUSTFS_OBS_LOG_ROTATION_TIME
-pub const DEFAULT_LOG_ROTATION_TIME: &str = "hour";
+pub const DEFAULT_LOG_ROTATION_TIME: &str = "hourly";
 
 /// Default log keep files for rustfs
 /// This is the default log keep files for rustfs.
@@ -147,11 +261,35 @@ pub const DEFAULT_LOG_ROTATION_TIME: &str = "hour";
 /// Environment variable: RUSTFS_OBS_LOG_KEEP_FILES
 pub const DEFAULT_LOG_KEEP_FILES: usize = 30;
 
+/// Default trace export enabled
+/// It is used to enable or disable exporting traces
+/// Default value: true
+/// Environment variable: RUSTFS_OBS_TRACES_EXPORT_ENABLED
+pub const DEFAULT_OBS_TRACES_EXPORT_ENABLED: bool = true;
+
+/// Default metrics export enabled
+/// It is used to enable or disable exporting metrics
+/// Default value: true
+/// Environment variable: RUSTFS_OBS_METRICS_EXPORT_ENABLED
+pub const DEFAULT_OBS_METRICS_EXPORT_ENABLED: bool = true;
+
+/// Default logs export enabled
+/// It is used to enable or disable exporting logs
+/// Default value: true
+/// Environment variable: RUSTFS_OBS_LOGS_EXPORT_ENABLED
+pub const DEFAULT_OBS_LOGS_EXPORT_ENABLED: bool = true;
+
+/// Default profiling export enabled
+/// It is used to enable or disable exporting profiles
+/// Default value: true
+/// Environment variable: RUSTFS_OBS_PROFILING_EXPORT_ENABLED
+pub const DEFAULT_OBS_PROFILING_EXPORT_ENABLED: bool = true;
+
 /// Default log local logging enabled for rustfs
 /// This is the default log local logging enabled for rustfs.
 /// It is used to enable or disable local logging of the application.
 /// Default value: false
-/// Environment variable: RUSTFS_OBS_LOGL_STDOUT_ENABLED
+/// Environment variable: RUSTFS_OBS_LOG_STDOUT_ENABLED
 pub const DEFAULT_OBS_LOG_STDOUT_ENABLED: bool = false;
 
 /// Constant representing 1 Kibibyte (1024 bytes)
@@ -159,7 +297,7 @@ pub const DEFAULT_OBS_LOG_STDOUT_ENABLED: bool = false;
 pub const KI_B: usize = 1024;
 /// Constant representing 1 Mebibyte (1024 * 1024 bytes)
 /// Default value: 1048576
-pub const MI_B: usize = 1024 * 1024;
+pub const MI_B: usize = 1024 * KI_B;
 
 #[cfg(test)]
 mod tests {
@@ -199,20 +337,6 @@ mod tests {
             ["development", "staging", "production", "test"].contains(&ENVIRONMENT),
             "Environment should be a standard environment name"
         );
-    }
-
-    #[test]
-    fn test_security_constants() {
-        // Test security related constants
-        assert_eq!(DEFAULT_ACCESS_KEY, "rustfsadmin");
-        assert!(DEFAULT_ACCESS_KEY.len() >= 8, "Access key should be at least 8 characters");
-
-        assert_eq!(DEFAULT_SECRET_KEY, "rustfsadmin");
-        assert!(DEFAULT_SECRET_KEY.len() >= 8, "Secret key should be at least 8 characters");
-
-        // In production environment, access key and secret key should be different
-        // These are default values, so being the same is acceptable, but should be warned in documentation
-        println!("Warning: Default access key and secret key are the same. Change them in production!");
     }
 
     #[test]
@@ -276,8 +400,6 @@ mod tests {
             DEFAULT_LOG_LEVEL,
             SERVICE_VERSION,
             ENVIRONMENT,
-            DEFAULT_ACCESS_KEY,
-            DEFAULT_SECRET_KEY,
             RUSTFS_TLS_KEY,
             RUSTFS_TLS_CERT,
             DEFAULT_ADDRESS,
@@ -305,29 +427,6 @@ mod tests {
         // These are const non-zero values, so zero checks are redundant
         assert_ne!(DEFAULT_PORT, 0, "Default port should not be zero");
         assert_ne!(DEFAULT_CONSOLE_PORT, 0, "Console port should not be zero");
-    }
-
-    #[test]
-    fn test_security_best_practices() {
-        // Test security best practices
-
-        // These are default values, should be changed in production environments
-        println!("Security Warning: Default credentials detected!");
-        println!("Access Key: {DEFAULT_ACCESS_KEY}");
-        println!("Secret Key: {DEFAULT_SECRET_KEY}");
-        println!("These should be changed in production environments!");
-
-        // Verify that key lengths meet minimum security requirements
-        assert!(DEFAULT_ACCESS_KEY.len() >= 8, "Access key should be at least 8 characters");
-        assert!(DEFAULT_SECRET_KEY.len() >= 8, "Secret key should be at least 8 characters");
-
-        // Check if default credentials contain common insecure patterns
-        let _insecure_patterns = ["admin", "password", "123456", "default"];
-        let _access_key_lower = DEFAULT_ACCESS_KEY.to_lowercase();
-        let _secret_key_lower = DEFAULT_SECRET_KEY.to_lowercase();
-
-        // Note: More security check logic can be added here
-        // For example, check if keys contain insecure patterns
     }
 
     #[test]

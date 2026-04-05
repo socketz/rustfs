@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{Effect, Error as IamError, ID, Statement, action::Action, statement::BPStatement};
+use super::{
+    ClaimLookup, Effect, Error as IamError, Functions, ID, Statement, action::Action, get_claim_case_insensitive,
+    statement::BPStatement, statement::variable_resolver_for_policy_args,
+};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -55,26 +58,35 @@ impl Args<'_> {
 pub struct Policy {
     #[serde(default, rename = "ID")]
     pub id: ID,
-    #[serde(rename = "Version")]
+    #[serde(default, rename = "Version")]
     pub version: String,
-    #[serde(rename = "Statement")]
+    #[serde(default, rename = "Statement")]
     pub statements: Vec<Statement>,
 }
 
 impl Policy {
-    pub fn is_allowed(&self, args: &Args) -> bool {
+    pub async fn is_allowed(&self, args: &Args<'_>) -> bool {
+        // First, check all Deny statements - if any Deny matches, deny the request
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Deny)) {
-            if !statement.is_allowed(args) {
+            if !statement.is_allowed(args).await {
                 return false;
             }
         }
 
-        if args.deny_only || args.is_owner {
+        // DenyOnly mode: only validate explicit Deny statements.
+        // If no Deny matched above, allow the request.
+        if args.deny_only {
             return true;
         }
 
+        // Owner has all permissions
+        if args.is_owner {
+            return true;
+        }
+
+        // Check Allow statements
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Allow)) {
-            if statement.is_allowed(args) {
+            if statement.is_allowed(args).await {
                 return true;
             }
         }
@@ -82,9 +94,9 @@ impl Policy {
         false
     }
 
-    pub fn match_resource(&self, resource: &str) -> bool {
+    pub async fn match_resource(&self, resource: &str) -> bool {
         for statement in self.statements.iter() {
-            if statement.resources.match_resource(resource) {
+            if statement.resources.match_resource(resource).await {
                 return true;
             }
         }
@@ -177,9 +189,11 @@ pub struct BucketPolicyArgs<'a> {
     pub object: &'a str,
 }
 
+/// Bucket Policy with AWS S3-compatible JSON serialization.
+/// Empty optional fields are omitted from output to match AWS format.
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct BucketPolicy {
-    #[serde(default, rename = "ID")]
+    #[serde(default, rename = "Id", skip_serializing_if = "ID::is_empty")]
     pub id: ID,
     #[serde(rename = "Version")]
     pub version: String,
@@ -188,9 +202,9 @@ pub struct BucketPolicy {
 }
 
 impl BucketPolicy {
-    pub fn is_allowed(&self, args: &BucketPolicyArgs) -> bool {
+    pub async fn is_allowed(&self, args: &BucketPolicyArgs<'_>) -> bool {
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Deny)) {
-            if !statement.is_allowed(args) {
+            if !statement.is_allowed(args).await {
                 return false;
             }
         }
@@ -200,7 +214,7 @@ impl BucketPolicy {
         }
 
         for statement in self.statements.iter().filter(|s| matches!(s.effect, Effect::Allow)) {
-            if statement.is_allowed(args) {
+            if statement.is_allowed(args).await {
                 return true;
             }
         }
@@ -227,29 +241,35 @@ impl Validator for BucketPolicy {
 
 fn get_values_from_claims(claims: &HashMap<String, Value>, claim_name: &str) -> (HashSet<String>, bool) {
     let mut s = HashSet::new();
-    if let Some(pname) = claims.get(claim_name) {
-        if let Some(pnames) = pname.as_array() {
-            for pname in pnames {
-                if let Some(pname_str) = pname.as_str() {
-                    for pname in pname_str.split(',') {
-                        let pname = pname.trim();
-                        if !pname.is_empty() {
-                            s.insert(pname.to_string());
+    match get_claim_case_insensitive(claims, claim_name) {
+        ClaimLookup::Found(pname) => {
+            if let Some(pnames) = pname.as_array() {
+                for pname in pnames {
+                    if let Some(pname_str) = pname.as_str() {
+                        for pname in pname_str.split(',') {
+                            let pname = pname.trim();
+                            if !pname.is_empty() {
+                                s.insert(pname.to_string());
+                            }
                         }
                     }
                 }
+                return (s, true);
             }
-            return (s, true);
-        } else if let Some(pname_str) = pname.as_str() {
-            for pname in pname_str.split(',') {
-                let pname = pname.trim();
-                if !pname.is_empty() {
-                    s.insert(pname.to_string());
+
+            if let Some(pname_str) = pname.as_str() {
+                for pname in pname_str.split(',') {
+                    let pname = pname.trim();
+                    if !pname.is_empty() {
+                        s.insert(pname.to_string());
+                    }
                 }
+                return (s, true);
             }
-            return (s, true);
         }
+        ClaimLookup::Missing | ClaimLookup::Ambiguous => {}
     }
+
     (s, false)
 }
 
@@ -258,7 +278,78 @@ pub fn get_policies_from_claims(claims: &HashMap<String, Value>, policy_claim_na
 }
 
 pub fn iam_policy_claim_name_sa() -> String {
-    "sa-policy".to_string()
+    rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string()
+}
+
+#[inline]
+pub fn is_existing_object_tag_condition_key(key: &str) -> bool {
+    matches!(key, "ExistingObjectTag" | "s3:ExistingObjectTag")
+        || key.starts_with("ExistingObjectTag/")
+        || key.starts_with("s3:ExistingObjectTag/")
+}
+
+pub fn value_uses_existing_object_tag_condition_key(value: &Value) -> bool {
+    match value {
+        Value::Object(obj) => obj
+            .iter()
+            .any(|(key, value)| is_existing_object_tag_condition_key(key) || value_uses_existing_object_tag_condition_key(value)),
+        Value::Array(items) => items.iter().any(value_uses_existing_object_tag_condition_key),
+        _ => false,
+    }
+}
+
+/// True if `conditions` JSON references `s3:ExistingObjectTag` / `ExistingObjectTag/...` keys.
+pub fn functions_use_existing_object_tag(conditions: &Functions) -> bool {
+    serde_json::to_value(conditions)
+        .map(|v| value_uses_existing_object_tag_condition_key(&v))
+        .unwrap_or(false)
+}
+
+pub fn policy_uses_existing_object_tag_conditions(policy: &Policy) -> bool {
+    policy
+        .statements
+        .iter()
+        .any(|statement| functions_use_existing_object_tag(&statement.conditions))
+}
+
+pub fn bucket_policy_uses_existing_object_tag_conditions(policy: &BucketPolicy) -> bool {
+    policy
+        .statements
+        .iter()
+        .any(|statement| functions_use_existing_object_tag(&statement.conditions))
+}
+
+/// True when at least one statement that applies to `args` may evaluate ExistingObjectTag conditions.
+pub async fn policy_needs_existing_object_tag_for_args(policy: &Policy, args: &Args<'_>) -> bool {
+    if !policy_uses_existing_object_tag_conditions(policy) {
+        return false;
+    }
+    let resolver = variable_resolver_for_policy_args(args);
+    for statement in &policy.statements {
+        if !functions_use_existing_object_tag(&statement.conditions) {
+            continue;
+        }
+        if statement.request_reaches_condition_eval(args, &resolver).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when at least one bucket-policy statement that applies to `args` may evaluate ExistingObjectTag conditions.
+pub async fn bucket_policy_needs_existing_object_tag_for_args(policy: &BucketPolicy, args: &BucketPolicyArgs<'_>) -> bool {
+    if !bucket_policy_uses_existing_object_tag_conditions(policy) {
+        return false;
+    }
+    for statement in &policy.statements {
+        if !functions_use_existing_object_tag(&statement.conditions) {
+            continue;
+        }
+        if statement.request_reaches_condition_eval(args).await {
+            return true;
+        }
+    }
+    false
 }
 
 pub mod default {
@@ -311,6 +402,7 @@ pub mod default {
                             let mut hash_set = HashSet::new();
                             hash_set.insert(Action::S3Action(S3Action::GetBucketLocationAction));
                             hash_set.insert(Action::S3Action(S3Action::GetObjectAction));
+                            hash_set.insert(Action::S3Action(S3Action::GetBucketQuotaAction));
                             hash_set
                         }),
                         not_actions: ActionSet(Default::default()),
@@ -524,5 +616,1149 @@ mod test {
 
         // assert_eq!(p, p2);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_policy_with_single_string_action_and_resource() -> Result<()> {
+        // Test policy with single string Action and Resource (AWS IAM allows both formats)
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::test/analytics/customers/*"
+    }
+  ]
+}
+"#;
+
+        let p = Policy::parse_config(data.as_bytes())?;
+        assert!(!p.statements.is_empty());
+        assert!(!p.statements[0].actions.is_empty());
+        assert!(!p.statements[0].resources.is_empty());
+
+        // Test with array format (should still work)
+        let data_array = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::test/analytics/customers/*"]
+    }
+  ]
+}
+"#;
+
+        let p2 = Policy::parse_config(data_array.as_bytes())?;
+        assert!(!p2.statements.is_empty());
+        assert!(!p2.statements[0].actions.is_empty());
+        assert!(!p2.statements[0].resources.is_empty());
+
+        // Verify that both formats produce equivalent results
+        assert_eq!(
+            p.statements.len(),
+            p2.statements.len(),
+            "Both policies should have the same number of statements"
+        );
+        assert_eq!(
+            p.statements[0].actions, p2.statements[0].actions,
+            "ActionSet from string format should equal ActionSet from array format"
+        );
+        assert_eq!(
+            p.statements[0].resources, p2.statements[0].resources,
+            "ResourceSet from string format should equal ResourceSet from array format"
+        );
+        assert_eq!(
+            p.statements[0].effect, p2.statements[0].effect,
+            "Effect should be the same in both formats"
+        );
+
+        // Verify specific content
+        assert_eq!(p.statements[0].actions.len(), 1, "ActionSet should contain exactly one action");
+        assert_eq!(p.statements[0].resources.len(), 1, "ResourceSet should contain exactly one resource");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deny_only_checks_only_deny_statements() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::bucket1/*"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+
+        // deny_only=true should allow if no Deny statement matches,
+        // even when no Allow statement matches.
+        let args_deny_only = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "bucket2",
+            conditions: &conditions,
+            is_owner: false,
+            object: "test.txt",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        assert!(
+            policy.is_allowed(&args_deny_only).await,
+            "deny_only should allow when no Deny statement matches"
+        );
+
+        // deny_only=true should also allow when action matches Allow statement.
+        let args_deny_only_allowed = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::GetObjectAction),
+            bucket: "bucket1",
+            conditions: &conditions,
+            is_owner: false,
+            object: "test.txt",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        assert!(
+            policy.is_allowed(&args_deny_only_allowed).await,
+            "deny_only should allow when no Deny statement matches, even if Allow exists"
+        );
+
+        // Normal policy evaluation remains unchanged when deny_only=false.
+        let args_normal = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::GetObjectAction),
+            bucket: "bucket1",
+            conditions: &conditions,
+            is_owner: false,
+            object: "test.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        // Should return true because there's an Allow statement
+        assert!(
+            policy.is_allowed(&args_normal).await,
+            "normal policy evaluation should allow with matching Allow statement"
+        );
+
+        // Explicit Deny must still block request in deny_only mode.
+        let deny_policy_data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Deny",
+      "Action": ["s3:PutObject"],
+      "Resource": ["arn:aws:s3:::bucket2/*"]
+    }
+  ]
+}
+"#;
+        let deny_policy = Policy::parse_config(deny_policy_data.as_bytes())?;
+        assert!(
+            !deny_policy.is_allowed(&args_deny_only).await,
+            "deny_only should reject request when an explicit Deny matches"
+        );
+
+        let args_owner_deny_only = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "bucket2",
+            conditions: &conditions,
+            is_owner: true,
+            object: "test.txt",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        assert!(
+            policy.is_allowed(&args_owner_deny_only).await,
+            "deny_only should allow when no Deny statement matches, including owner requests"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aws_username_policy_variable() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${aws:username}-*"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+
+        let conditions = HashMap::new();
+
+        // Test allowed case - user testuser accessing testuser-bucket
+        let mut claims1 = HashMap::new();
+        claims1.insert("username".to_string(), Value::String("testuser".to_string()));
+
+        let args1 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "testuser-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims1,
+            deny_only: false,
+        };
+
+        // Test denied case - user otheruser accessing testuser-bucket
+        let mut claims2 = HashMap::new();
+        claims2.insert("username".to_string(), Value::String("otheruser".to_string()));
+
+        let args2 = Args {
+            account: "otheruser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "testuser-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims2,
+            deny_only: false,
+        };
+
+        assert!(pollster::block_on(policy.is_allowed(&args1)));
+        assert!(!pollster::block_on(policy.is_allowed(&args2)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aws_userid_policy_variable() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${aws:userid}-bucket"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), Value::String("AIDACKCEVSQ6C2EXAMPLE".to_string()));
+
+        let conditions = HashMap::new();
+
+        // Test allowed case
+        let args1 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "AIDACKCEVSQ6C2EXAMPLE-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        // Test denied case
+        let args2 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "OTHERUSER-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(pollster::block_on(policy.is_allowed(&args1)));
+        assert!(!pollster::block_on(policy.is_allowed(&args2)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aws_policy_variables_concatenation() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${aws:username}-${aws:userid}-bucket"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+
+        let mut claims = HashMap::new();
+        claims.insert("username".to_string(), Value::String("testuser".to_string()));
+        claims.insert("sub".to_string(), Value::String("AIDACKCEVSQ6C2EXAMPLE".to_string()));
+
+        let conditions = HashMap::new();
+
+        // Test allowed case
+        let args1 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "testuser-AIDACKCEVSQ6C2EXAMPLE-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        // Test denied case
+        let args2 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "otheruser-AIDACKCEVSQ6C2EXAMPLE-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(pollster::block_on(policy.is_allowed(&args1)));
+        assert!(!pollster::block_on(policy.is_allowed(&args2)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aws_policy_variables_nested() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${${aws:PrincipalType}-${aws:userid}}"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+
+        let mut claims = HashMap::new();
+        claims.insert("sub".to_string(), Value::String("AIDACKCEVSQ6C2EXAMPLE".to_string()));
+        // For PrincipalType, it will default to "User" when not explicitly set
+
+        let conditions = HashMap::new();
+
+        // Test allowed case
+        let args1 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "User-AIDACKCEVSQ6C2EXAMPLE",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        // Test denied case
+        let args2 = Args {
+            account: "testuser",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "User-OTHERUSER",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        assert!(pollster::block_on(policy.is_allowed(&args1)));
+        assert!(!pollster::block_on(policy.is_allowed(&args2)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_aws_policy_variables_multi_value() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::${aws:username}-bucket"]
+    }
+  ]
+}
+"#;
+
+        let policy = Policy::parse_config(data.as_bytes())?;
+
+        let mut claims = HashMap::new();
+        // Test with array value for username
+        claims.insert(
+            "username".to_string(),
+            Value::Array(vec![Value::String("user1".to_string()), Value::String("user2".to_string())]),
+        );
+
+        let conditions = HashMap::new();
+
+        let args1 = Args {
+            account: "user1",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "user1-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let args2 = Args {
+            account: "user2",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::ListBucketAction),
+            bucket: "user2-bucket",
+            conditions: &conditions,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        // Either user1 or user2 should be allowed
+        assert!(pollster::block_on(policy.is_allowed(&args1)) || pollster::block_on(policy.is_allowed(&args2)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_statement_with_only_notresource_is_valid() {
+        // Test: A statement with only NotResource (and no Resource) is valid
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "NotResource": ["arn:aws:s3:::mybucket/private/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_ok(), "Statement with only NotResource should be valid");
+    }
+
+    #[test]
+    fn test_statement_with_both_resource_and_notresource_is_invalid() {
+        // Test: A statement with both Resource and NotResource returns BothResourceAndNotResource error
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::mybucket/public/*"],
+      "NotResource": ["arn:aws:s3:::mybucket/private/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with both Resource and NotResource should be invalid");
+
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::BothResourceAndNotResource)),
+            "Error should be BothResourceAndNotResource, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_statement_with_only_notaction_is_valid() {
+        // IAM allows a statement with only NotAction (no Action). Deserialization should accept
+        // missing "Action" (default to empty) and validate when exactly one of Action/NotAction is set.
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "NotAction": ["s3:DeleteBucket", "s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::mybucket/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_ok(), "Statement with only NotAction should be valid, got: {:?}", result.err());
+        let policy = result.unwrap();
+        assert_eq!(policy.statements.len(), 1);
+        assert!(policy.statements[0].actions.is_empty());
+        assert!(!policy.statements[0].not_actions.is_empty());
+
+        // Round-trip: serialization must omit empty Action so re-parse does not violate both-Action-and-NotAction
+        let json = serde_json::to_string(&policy).expect("Should serialize");
+        let round_tripped = Policy::parse_config(json.as_bytes());
+        assert!(
+            round_tripped.is_ok(),
+            "NotAction-only statement must round-trip without gaining Action: {}",
+            round_tripped.unwrap_err()
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("JSON valid");
+        let stmt = &parsed["Statement"][0];
+        assert!(
+            !stmt
+                .get("Action")
+                .is_some_and(|v| v.as_array().map(|a| a.is_empty()).unwrap_or(false)),
+            "Serialized JSON must not contain empty Action for NotAction-only statement"
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_policy_object_as_implied_policy() {
+        let policy = Policy::parse_config(b"{}").expect("empty JSON object should parse");
+
+        assert!(policy.version.is_empty());
+        assert!(policy.statements.is_empty());
+    }
+
+    #[test]
+    fn test_statement_with_both_action_and_notaction_is_invalid() {
+        // Test: A statement with both Action and NotAction returns BothActionAndNotAction error
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "NotAction": ["s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::mybucket/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with both Action and NotAction should be invalid");
+
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::BothActionAndNotAction)),
+            "Error should be BothActionAndNotAction, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_statement_with_neither_action_nor_notaction_is_invalid() {
+        // Statement with both Action and NotAction omitted (both default to empty) fails validation.
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Resource": ["arn:aws:s3:::mybucket/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with neither Action nor NotAction should be invalid");
+
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::NonAction)),
+            "Error should be NonAction, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_statement_with_neither_resource_nor_notresource_is_invalid() {
+        // Test: A statement with neither Resource nor NotResource returns NonResource error
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with neither Resource nor NotResource should be invalid");
+
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::NonResource)),
+            "Error should be NonResource, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_bucket_policy_serialize_omits_empty_fields() {
+        use crate::policy::action::{Action, ActionSet, S3Action};
+        use crate::policy::resource::{Resource, ResourceSet};
+        use crate::policy::{Effect, Functions, Principal};
+
+        // Create a BucketPolicy with empty optional fields
+        // Use JSON deserialization to create Principal (since aws field is private)
+        let principal: Principal = serde_json::from_str(r#"{"AWS": "*"}"#).expect("Should parse principal");
+
+        let mut policy = BucketPolicy {
+            id: ID::default(), // Empty ID
+            version: "2012-10-17".to_string(),
+            statements: vec![BPStatement {
+                sid: ID::default(), // Empty Sid
+                effect: Effect::Allow,
+                principal,
+                actions: ActionSet::default(),
+                not_actions: ActionSet::default(), // Empty NotAction
+                resources: ResourceSet::default(),
+                not_resources: ResourceSet::default(), // Empty NotResource
+                conditions: Functions::default(),      // Empty Condition
+            }],
+        };
+
+        // Set actions and resources (required fields)
+        policy.statements[0]
+            .actions
+            .0
+            .insert(Action::S3Action(S3Action::ListBucketAction));
+        policy.statements[0]
+            .resources
+            .0
+            .insert(Resource::try_from("arn:aws:s3:::test/*").unwrap());
+
+        let json = serde_json::to_string(&policy).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+
+        // Verify empty fields are omitted
+        assert!(!parsed.as_object().unwrap().contains_key("ID"), "Empty ID should be omitted");
+
+        let statement = &parsed["Statement"][0];
+        assert!(!statement.as_object().unwrap().contains_key("Sid"), "Empty Sid should be omitted");
+        assert!(
+            !statement.as_object().unwrap().contains_key("NotAction"),
+            "Empty NotAction should be omitted"
+        );
+        assert!(
+            !statement.as_object().unwrap().contains_key("NotResource"),
+            "Empty NotResource should be omitted"
+        );
+        assert!(
+            !statement.as_object().unwrap().contains_key("Condition"),
+            "Empty Condition should be omitted"
+        );
+
+        // Verify required fields are present
+        assert_eq!(parsed["Version"], "2012-10-17");
+        assert_eq!(statement["Effect"], "Allow");
+        assert_eq!(statement["Principal"]["AWS"], "*");
+    }
+
+    #[test]
+    fn test_existing_object_tag_condition_helpers() {
+        let identity_policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"],
+    "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+  }]
+}"#,
+        )
+        .expect("identity policy with ExistingObjectTag key should parse");
+        assert!(
+            policy_uses_existing_object_tag_conditions(&identity_policy),
+            "identity policy ExistingObjectTag key should be detected"
+        );
+
+        let identity_value_only = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"],
+    "Condition":{"StringEquals":{"s3:prefix":"ExistingObjectTag/security"}}
+  }]
+}"#,
+        )
+        .expect("identity policy with value-only marker should parse");
+        assert!(
+            !policy_uses_existing_object_tag_conditions(&identity_value_only),
+            "value-only marker must not be treated as ExistingObjectTag condition key"
+        );
+
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version":"2012-10-17",
+  "Statement":[{
+    "Effect":"Allow",
+    "Principal":"*",
+    "Action":["s3:GetObject"],
+    "Resource":["arn:aws:s3:::bucket/*"],
+    "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+  }]
+}"#,
+        )
+        .expect("bucket policy with ExistingObjectTag key should parse");
+        assert!(
+            bucket_policy_uses_existing_object_tag_conditions(&bucket_policy),
+            "bucket policy ExistingObjectTag key should be detected"
+        );
+    }
+
+    #[test]
+    fn test_bucket_policy_serialize_single_action_as_array() {
+        use crate::policy::action::{Action, ActionSet, S3Action};
+        use crate::policy::resource::{Resource, ResourceSet};
+        use crate::policy::{Effect, Principal};
+
+        // Use JSON deserialization to create Principal (since aws field is private)
+        let principal: Principal = serde_json::from_str(r#"{"AWS": "*"}"#).expect("Should parse principal");
+
+        let mut policy = BucketPolicy {
+            version: "2012-10-17".to_string(),
+            statements: vec![BPStatement {
+                effect: Effect::Allow,
+                principal,
+                actions: ActionSet::default(),
+                resources: ResourceSet::default(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // Single action
+        policy.statements[0]
+            .actions
+            .0
+            .insert(Action::S3Action(S3Action::ListBucketAction));
+        policy.statements[0]
+            .resources
+            .0
+            .insert(Resource::try_from("arn:aws:s3:::test/*").unwrap());
+
+        let json = serde_json::to_string(&policy).expect("Should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
+        let action = &parsed["Statement"][0]["Action"];
+
+        // Single action should be serialized as array for S3 specification compliance
+        assert!(action.is_array(), "Single action should serialize as array");
+        let arr = action.as_array().expect("Should be array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].as_str().unwrap(), "s3:ListBucket");
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_deny_with_string_not_equals() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Deny",
+      "Action": "s3:PutObject",
+      "Principal": {"AWS": "*"},
+      "Resource": "arn:aws:s3:::mybucket/*",
+      "Condition": {
+        "StringNotEquals": {
+          "s3:x-amz-server-side-encryption": "aws:kms"
+        }
+      }
+    },
+    {
+      "Effect": "Deny",
+      "Action": "s3:PutObject",
+      "Principal": {"AWS": "*"},
+      "Resource": "arn:aws:s3:::mybucket/*",
+      "Condition": {
+        "Null": {
+          "s3:x-amz-server-side-encryption": "true"
+        }
+      }
+    }
+  ]
+}
+"#;
+
+        let bp: BucketPolicy = serde_json::from_slice(data.as_bytes())?;
+
+        // Request with wrong encryption → should be DENIED (StringNotEquals matches)
+        let mut cond_wrong_enc = HashMap::new();
+        cond_wrong_enc.insert("x-amz-server-side-encryption".to_string(), vec!["AES256".to_string()]);
+
+        let args_wrong = BucketPolicyArgs {
+            account: "testowner",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "mybucket",
+            conditions: &cond_wrong_enc,
+            is_owner: true,
+            object: "testobj",
+        };
+        assert!(
+            !bp.is_allowed(&args_wrong).await,
+            "Should deny PutObject with AES256 when policy requires aws:kms"
+        );
+
+        // Request with correct encryption → should be ALLOWED
+        let mut cond_correct_enc = HashMap::new();
+        cond_correct_enc.insert("x-amz-server-side-encryption".to_string(), vec!["aws:kms".to_string()]);
+
+        let args_correct = BucketPolicyArgs {
+            account: "testowner",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "mybucket",
+            conditions: &cond_correct_enc,
+            is_owner: true,
+            object: "testobj",
+        };
+        assert!(
+            bp.is_allowed(&args_correct).await,
+            "Should allow PutObject with aws:kms matching the policy"
+        );
+
+        // Request with no encryption header → should be DENIED (Null condition matches)
+        let cond_no_enc = HashMap::new();
+
+        let args_no_enc = BucketPolicyArgs {
+            account: "testowner",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "mybucket",
+            conditions: &cond_no_enc,
+            is_owner: true,
+            object: "testobj",
+        };
+        assert!(!bp.is_allowed(&args_no_enc).await, "Should deny PutObject with no encryption header");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_policy_needs_existing_object_tag_narrows_by_action() {
+        use crate::policy::Args;
+        use crate::policy::action::{Action, S3Action};
+        use std::collections::HashMap;
+
+        let split_policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Action":["s3:DeleteObject"],
+      "Resource":["arn:aws:s3:::bucket/*"]
+    },
+    {
+      "Effect":"Allow",
+      "Action":["s3:DeleteObjectVersion"],
+      "Resource":["arn:aws:s3:::bucket/*"],
+      "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+    }
+  ]
+}"#,
+        )
+        .expect("split-action policy should parse");
+
+        let groups: Option<Vec<String>> = None;
+        let cond = HashMap::new();
+        let claims = HashMap::new();
+
+        let args_get = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "k",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy_needs_existing_object_tag_for_args(&split_policy, &args_get).await,
+            "GetObject should not match statements with DeleteObject/DeleteObjectVersion"
+        );
+
+        let args_del = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::DeleteObjectAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "k",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy_needs_existing_object_tag_for_args(&split_policy, &args_del).await,
+            "DeleteObject matches only the statement without ExistingObjectTag"
+        );
+
+        let args_delv = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::DeleteObjectVersionAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "k",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy_needs_existing_object_tag_for_args(&split_policy, &args_delv).await,
+            "DeleteObjectVersion matches the statement with ExistingObjectTag"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_policy_needs_existing_object_tag_narrows_by_resource() {
+        use crate::policy::Args;
+        use crate::policy::action::{Action, S3Action};
+        use std::collections::HashMap;
+
+        let policy = Policy::parse_config(
+            br#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Action":["s3:GetObject"],
+      "Resource":["arn:aws:s3:::bucket/private/*"],
+      "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+    }
+  ]
+}"#,
+        )
+        .expect("policy should parse");
+
+        let groups: Option<Vec<String>> = None;
+        let cond = HashMap::new();
+        let claims = HashMap::new();
+
+        let args_public = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "public/a.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            !policy_needs_existing_object_tag_for_args(&policy, &args_public).await,
+            "resource mismatch should skip ExistingObjectTag fetch hint"
+        );
+
+        let args_private = Args {
+            account: "user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "bucket",
+            conditions: &cond,
+            is_owner: false,
+            object: "private/a.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(
+            policy_needs_existing_object_tag_for_args(&policy, &args_private).await,
+            "resource match should keep ExistingObjectTag fetch hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_needs_existing_object_tag_narrows_by_principal() {
+        use crate::policy::BucketPolicyArgs;
+        use crate::policy::action::{Action, S3Action};
+        use std::collections::HashMap;
+
+        let bucket_policy: BucketPolicy = serde_json::from_str(
+            r#"{
+  "Version":"2012-10-17",
+  "Statement":[
+    {
+      "Effect":"Allow",
+      "Principal":{"AWS":["alice"]},
+      "Action":["s3:GetObject"],
+      "Resource":["arn:aws:s3:::bucket/private/*"],
+      "Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}
+    }
+  ]
+}"#,
+        )
+        .expect("bucket policy should parse");
+
+        let groups: Option<Vec<String>> = None;
+        let cond = HashMap::new();
+
+        let args_bob = BucketPolicyArgs {
+            bucket: "bucket",
+            action: Action::S3Action(S3Action::GetObjectAction),
+            is_owner: false,
+            account: "bob",
+            groups: &groups,
+            conditions: &cond,
+            object: "private/a.txt",
+        };
+        assert!(
+            !bucket_policy_needs_existing_object_tag_for_args(&bucket_policy, &args_bob).await,
+            "principal mismatch should skip ExistingObjectTag fetch hint"
+        );
+
+        let args_alice_public = BucketPolicyArgs {
+            bucket: "bucket",
+            action: Action::S3Action(S3Action::GetObjectAction),
+            is_owner: false,
+            account: "alice",
+            groups: &groups,
+            conditions: &cond,
+            object: "public/a.txt",
+        };
+        assert!(
+            !bucket_policy_needs_existing_object_tag_for_args(&bucket_policy, &args_alice_public).await,
+            "resource mismatch should skip ExistingObjectTag fetch hint"
+        );
+
+        let args_alice_private = BucketPolicyArgs {
+            bucket: "bucket",
+            action: Action::S3Action(S3Action::GetObjectAction),
+            is_owner: false,
+            account: "alice",
+            groups: &groups,
+            conditions: &cond,
+            object: "private/a.txt",
+        };
+        assert!(
+            bucket_policy_needs_existing_object_tag_for_args(&bucket_policy, &args_alice_private).await,
+            "principal and resource match should keep ExistingObjectTag fetch hint"
+        );
+    }
+
+    #[test]
+    fn test_get_values_from_claims_case_insensitive() {
+        let mut claims = HashMap::new();
+        claims.insert("policyminio".to_string(), Value::Array(vec![Value::String("consoleAdmin".to_string())]));
+
+        let (policies, found) = get_values_from_claims(&claims, "policyMinio");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+
+        let (policies, found) = get_values_from_claims(&claims, "POLICYMINIO");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+
+        let (policies, found) = get_values_from_claims(&claims, "policyminio");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+    }
+
+    #[test]
+    fn test_get_values_from_claims_exact_match_preferred() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::Array(vec![Value::String("exact_match".to_string())]));
+        claims.insert("policy".to_string(), Value::Array(vec![Value::String("lowercase".to_string())]));
+
+        let (policies, _) = get_values_from_claims(&claims, "Policy");
+        assert!(policies.contains("exact_match"));
+        assert!(!policies.contains("lowercase"));
+    }
+
+    #[test]
+    fn test_get_policies_from_claims_case_insensitive_string() {
+        let mut claims = HashMap::new();
+        claims.insert("policyminio".to_string(), Value::String("consoleAdmin,readwrite".to_string()));
+
+        let (policies, found) = get_policies_from_claims(&claims, "policyMinio");
+        assert!(found);
+        assert!(policies.contains("consoleAdmin"));
+        assert!(policies.contains("readwrite"));
+    }
+
+    #[test]
+    fn test_get_values_from_claims_ambiguous_case_insensitive_match_returns_missing() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::Array(vec![Value::String("exact_match".to_string())]));
+        claims.insert("policy".to_string(), Value::Array(vec![Value::String("lowercase".to_string())]));
+
+        let (policies, found) = get_values_from_claims(&claims, "POLICY");
+        assert!(!found);
+        assert!(policies.is_empty());
+    }
+
+    #[test]
+    fn test_get_policies_from_claims_ambiguous_case_insensitive_match_returns_missing() {
+        let mut claims = HashMap::new();
+        claims.insert("Policy".to_string(), Value::String("consoleAdmin".to_string()));
+        claims.insert("policy".to_string(), Value::String("readwrite".to_string()));
+
+        let (policies, found) = get_policies_from_claims(&claims, "POLICY");
+        assert!(!found);
+        assert!(policies.is_empty());
     }
 }

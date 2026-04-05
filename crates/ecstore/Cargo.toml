@@ -34,17 +34,26 @@ workspace = true
 default = []
 
 [dependencies]
+rustfs-filemeta.workspace = true
+rustfs-utils = { workspace = true, features = ["full"] }
+rustfs-rio.workspace = true
+rustfs-signer.workspace = true
+rustfs-checksums.workspace = true
 rustfs-config = { workspace = true, features = ["constants", "notify", "audit"] }
+rustfs-credentials = { workspace = true }
+rustfs-common.workspace = true
+rustfs-policy.workspace = true
+rustfs-protos.workspace = true
+rustfs-s3-common = { workspace = true }
 async-trait.workspace = true
 bytes.workspace = true
 byteorder = { workspace = true }
-rustfs-common.workspace = true
-rustfs-policy.workspace = true
 chrono.workspace = true
 glob = { workspace = true }
 thiserror.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
+futures-util.workspace = true
 tracing.workspace = true
 serde.workspace = true
 time.workspace = true
@@ -53,14 +62,17 @@ serde_json.workspace = true
 quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
 s3s.workspace = true
 http.workspace = true
+http-body = { workspace = true }
+http-body-util.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
+reed-solomon-erasure = { workspace = true }
 reed-solomon-simd = { workspace = true }
 lazy_static.workspace = true
 rustfs-lock.workspace = true
+rustfs-io-metrics.workspace = true
 regex = { workspace = true }
 path-absolutize = { workspace = true }
-rustfs-protos.workspace = true
 rmp.workspace = true
 rmp-serde.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
@@ -84,6 +96,7 @@ num_cpus = { workspace = true }
 rand.workspace = true
 pin-project-lite.workspace = true
 md-5.workspace = true
+memmap2 = { workspace = true }
 rustfs-madmin.workspace = true
 rustfs-workers.workspace = true
 reqwest = { workspace = true }
@@ -91,33 +104,28 @@ aws-sdk-s3 = { workspace = true }
 urlencoding = { workspace = true }
 smallvec = { workspace = true }
 shadow-rs.workspace = true
-rustfs-filemeta.workspace = true
-rustfs-utils = { workspace = true, features = ["full"] }
-rustfs-rio.workspace = true
-rustfs-signer.workspace = true
-rustfs-checksums.workspace = true
 async-recursion.workspace = true
 aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }
 parking_lot = { workspace = true }
-moka = { workspace = true }
 base64-simd.workspace = true
 serde_urlencoded.workspace = true
 google-cloud-storage = { workspace = true }
 google-cloud-auth = { workspace = true }
 aws-config = { workspace = true }
+faster-hex = { workspace = true }
+ratelimit = { workspace = true }
+aws-smithy-http-client.workspace = true
 
-[target.'cfg(not(windows))'.dependencies]
-nix = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
-winapi = { workspace = true }
-
+# Observability and Metrics
+metrics = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { workspace = true, features = ["html_reports"] }
 temp-env = { workspace = true }
+tracing-subscriber = { workspace = true }
+serial_test = { workspace = true }
 
 [build-dependencies]
 shadow-rs = { workspace = true, features = ["build", "metadata"] }
@@ -129,3 +137,6 @@ harness = false
 [[bench]]
 name = "comparison_benchmark"
 harness = false
+
+[lib]
+doctest = false

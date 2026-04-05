@@ -17,6 +17,7 @@ use crate::admin_server_info::get_commit_id;
 use crate::error::{Error, Result};
 use crate::global::{GLOBAL_BOOT_TIME, get_global_endpoints};
 use crate::metrics_realtime::{CollectMetricsOpts, MetricType};
+use crate::rebalance::RebalSaveOpt;
 use crate::rpc::PeerRestClient;
 use crate::{endpoints::EndpointServerPools, new_object_layer_fn};
 use futures::future::join_all;
@@ -26,9 +27,11 @@ use rustfs_madmin::metrics::RealtimeMetrics;
 use rustfs_madmin::net::NetInfo;
 use rustfs_madmin::{ItemState, ServerProperties};
 use std::collections::hash_map::DefaultHasher;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+use tokio::time::timeout;
 use tracing::{error, warn};
 
 lazy_static! {
@@ -188,16 +191,32 @@ impl NotificationSys {
 
     pub async fn storage_info<S: StorageAPI>(&self, api: &S) -> rustfs_madmin::StorageInfo {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
+        let endpoints = get_global_endpoints();
+        let peer_timeout = Duration::from_secs(2); // Same timeout as server_info
 
         for client in self.peer_clients.iter() {
+            let endpoints = endpoints.clone();
             futures.push(async move {
                 if let Some(client) = client {
-                    match client.local_storage_info().await {
-                        Ok(info) => Some(info),
-                        Err(_) => Some(rustfs_madmin::StorageInfo {
-                            disks: get_offline_disks(&client.host.to_string(), &get_global_endpoints()),
-                            ..Default::default()
-                        }),
+                    let host = client.host.to_string();
+                    // Wrap in timeout to ensure we don't hang on dead peers
+                    match timeout(peer_timeout, client.local_storage_info()).await {
+                        Ok(Ok(info)) => Some(info),
+                        Ok(Err(err)) => {
+                            warn!("peer {} storage_info failed: {}", host, err);
+                            Some(rustfs_madmin::StorageInfo {
+                                disks: get_offline_disks(&host, &endpoints),
+                                ..Default::default()
+                            })
+                        }
+                        Err(_) => {
+                            warn!("peer {} storage_info timed out after {:?}", host, peer_timeout);
+                            client.evict_connection().await;
+                            Some(rustfs_madmin::StorageInfo {
+                                disks: get_offline_disks(&host, &endpoints),
+                                ..Default::default()
+                            })
+                        }
                     }
                 } else {
                     None
@@ -220,23 +239,26 @@ impl NotificationSys {
 
     pub async fn server_info(&self) -> Vec<ServerProperties> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
+        let endpoints = get_global_endpoints();
+        let peer_timeout = Duration::from_secs(2);
 
         for client in self.peer_clients.iter() {
+            let endpoints = endpoints.clone();
             futures.push(async move {
                 if let Some(client) = client {
-                    match client.server_info().await {
-                        Ok(info) => info,
-                        Err(_) => ServerProperties {
-                            uptime: SystemTime::now()
-                                .duration_since(*GLOBAL_BOOT_TIME.get().unwrap())
-                                .unwrap_or_default()
-                                .as_secs(),
-                            version: get_commit_id(),
-                            endpoint: client.host.to_string(),
-                            state: ItemState::Offline.to_string().to_owned(),
-                            disks: get_offline_disks(&client.host.to_string(), &get_global_endpoints()),
-                            ..Default::default()
-                        },
+                    let host = client.host.to_string();
+                    match timeout(peer_timeout, client.server_info()).await {
+                        Ok(Ok(info)) => info,
+                        Ok(Err(err)) => {
+                            warn!("peer {} server_info failed: {}", host, err);
+                            // client.server_info handles eviction internally on error, but fallback needed
+                            offline_server_properties(&host, &endpoints)
+                        }
+                        Err(_) => {
+                            warn!("peer {} server_info timed out after {:?}", host, peer_timeout);
+                            client.evict_connection().await;
+                            offline_server_properties(&host, &endpoints)
+                        }
                     }
                 } else {
                     ServerProperties::default()
@@ -355,67 +377,112 @@ impl NotificationSys {
         join_all(futures).await
     }
 
-    pub async fn reload_pool_meta(&self) {
+    pub async fn reload_pool_meta(&self) -> Result<()> {
+        let mut failures = Vec::new();
         let mut futures = Vec::with_capacity(self.peer_clients.len());
-        for client in self.peer_clients.iter().flatten() {
-            futures.push(client.reload_pool_meta());
-        }
-
-        let results = join_all(futures).await;
-        for result in results {
-            if let Err(err) = result {
-                error!("notification reload_pool_meta err {:?}", err);
+        for (idx, client) in self.peer_clients.iter().enumerate() {
+            if let Some(client) = client {
+                let host = client.grid_host.clone();
+                futures.push(async move { client.reload_pool_meta().await.map_err(|err| (host, err)) });
+            } else {
+                failures.push(format!("peer[{idx}] reload_pool_meta failed: peer is not reachable"));
             }
         }
+
+        for result in join_all(futures).await {
+            if let Err((host, err)) = result {
+                let failure = format!("peer {host} reload_pool_meta failed: {err}");
+                error!("notification reload_pool_meta err {}", failure);
+                failures.push(failure);
+            }
+        }
+
+        aggregate_notification_failures("reload_pool_meta", failures)
     }
 
     #[tracing::instrument(skip(self))]
-    pub async fn load_rebalance_meta(&self, start: bool) {
+    pub async fn load_rebalance_meta(&self, start: bool) -> Result<()> {
+        let operation = format!("load_rebalance_meta(start={start})");
+        let mut failures = Vec::new();
         let mut futures = Vec::with_capacity(self.peer_clients.len());
-        for (i, client) in self.peer_clients.iter().flatten().enumerate() {
-            warn!(
-                "notification load_rebalance_meta start: {}, index: {}, client: {:?}",
-                start, i, client.host
-            );
-            futures.push(client.load_rebalance_meta(start));
+        for (idx, client) in self.peer_clients.iter().enumerate() {
+            if let Some(client) = client {
+                warn!(
+                    "notification load_rebalance_meta start: {}, index: {}, client: {:?}",
+                    start, idx, client.host
+                );
+                let host = client.grid_host.clone();
+                futures.push(async move { client.load_rebalance_meta(start).await.map_err(|err| (host, err)) });
+            } else {
+                failures.push(format!("peer[{idx}] {operation} failed: peer is not reachable"));
+            }
         }
 
-        let results = join_all(futures).await;
-        for result in results {
-            if let Err(err) = result {
-                error!("notification load_rebalance_meta err {:?}", err);
+        for result in join_all(futures).await {
+            if let Err((host, err)) = result {
+                let failure = format!("peer {host} {operation} failed: {err}");
+                error!("notification load_rebalance_meta err {}", failure);
+                failures.push(failure);
             } else {
                 warn!("notification load_rebalance_meta success");
             }
         }
+
+        aggregate_notification_failures("load_rebalance_meta", failures)
     }
 
-    pub async fn stop_rebalance(&self) {
+    pub async fn stop_rebalance(&self) -> Result<()> {
         warn!("notification stop_rebalance start");
         let Some(store) = new_object_layer_fn() else {
             error!("stop_rebalance: not init");
-            return;
+            return Err(Error::other("stop_rebalance: object layer not initialized"));
         };
 
         // warn!("notification stop_rebalance load_rebalance_meta");
         // self.load_rebalance_meta(false).await;
         // warn!("notification stop_rebalance load_rebalance_meta done");
 
+        let mut failures = Vec::new();
+
         let mut futures = Vec::with_capacity(self.peer_clients.len());
-        for client in self.peer_clients.iter().flatten() {
-            futures.push(client.stop_rebalance());
+        for (idx, client) in self.peer_clients.iter().enumerate() {
+            if let Some(client) = client {
+                let host = client.grid_host.clone();
+                futures.push(async move { client.stop_rebalance().await.map_err(|err| (host, err)) });
+            } else {
+                failures.push(format!("peer[{idx}] stop_rebalance failed: peer is not reachable"));
+            }
         }
 
-        let results = join_all(futures).await;
-        for result in results {
-            if let Err(err) = result {
-                error!("notification stop_rebalance err {:?}", err);
+        for result in join_all(futures).await {
+            if let Err((host, err)) = result {
+                let failure = format!("peer {host} stop_rebalance failed: {err}");
+                error!("notification stop_rebalance err {}", failure);
+                failures.push(failure);
             }
         }
 
         warn!("notification stop_rebalance stop_rebalance start");
-        let _ = store.stop_rebalance().await;
+        match store.stop_rebalance().await {
+            Ok(_) => {
+                if let Err(err) = store.save_rebalance_stats(usize::MAX, RebalSaveOpt::StoppedAt).await {
+                    error!("notification stop_rebalance local save err {:?}", err);
+                    return Err(Error::other(format!(
+                        "local stop_rebalance save_rebalance_stats(stopped_at) failed: {err}"
+                    )));
+                }
+            }
+            Err(err) => {
+                error!("notification stop_rebalance local stop err {:?}", err);
+                return Err(Error::other(format!("local stop_rebalance stop failed: {err}")));
+            }
+        }
+
+        if let Err(err) = aggregate_notification_failures("stop_rebalance", failures) {
+            warn!("{err}");
+        }
         warn!("notification stop_rebalance stop_rebalance done");
+        Ok(())
     }
 
     pub async fn load_bucket_metadata(&self, bucket: &str) -> Vec<NotificationPeerErr> {
@@ -694,6 +761,43 @@ impl NotificationSys {
     }
 }
 
+async fn call_peer_with_timeout<F, Fut>(
+    timeout_dur: Duration,
+    host_label: &str,
+    op: F,
+    fallback: impl FnOnce() -> ServerProperties,
+) -> ServerProperties
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<ServerProperties>> + Send,
+{
+    match timeout(timeout_dur, op()).await {
+        Ok(Ok(info)) => info,
+        Ok(Err(err)) => {
+            warn!("peer {host_label} server_info failed: {err}");
+            fallback()
+        }
+        Err(_) => {
+            warn!("peer {host_label} server_info timed out after {:?}", timeout_dur);
+            fallback()
+        }
+    }
+}
+
+fn offline_server_properties(host: &str, endpoints: &EndpointServerPools) -> ServerProperties {
+    ServerProperties {
+        uptime: SystemTime::now()
+            .duration_since(*GLOBAL_BOOT_TIME.get().unwrap())
+            .unwrap_or_default()
+            .as_secs(),
+        version: get_commit_id(),
+        endpoint: host.to_string(),
+        state: ItemState::Offline.to_string().to_owned(),
+        disks: get_offline_disks(host, endpoints),
+        ..Default::default()
+    }
+}
+
 fn get_offline_disks(offline_host: &str, endpoints: &EndpointServerPools) -> Vec<rustfs_madmin::Disk> {
     let mut offline_disks = Vec::new();
 
@@ -713,4 +817,90 @@ fn get_offline_disks(offline_host: &str, endpoints: &EndpointServerPools) -> Vec
     }
 
     offline_disks
+}
+
+fn aggregate_notification_failures(operation: &str, failures: Vec<String>) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::other(format!(
+        "{operation} encountered {} failure(s): {}",
+        failures.len(),
+        failures.join(" | ")
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_props(endpoint: &str) -> ServerProperties {
+        ServerProperties {
+            endpoint: endpoint.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn call_peer_with_timeout_returns_value_when_fast() {
+        let result = call_peer_with_timeout(
+            Duration::from_millis(50),
+            "peer-1",
+            || async { Ok::<_, Error>(build_props("fast")) },
+            || build_props("fallback"),
+        )
+        .await;
+
+        assert_eq!(result.endpoint, "fast");
+    }
+
+    #[tokio::test]
+    async fn call_peer_with_timeout_uses_fallback_on_error() {
+        let result = call_peer_with_timeout(
+            Duration::from_millis(50),
+            "peer-2",
+            || async { Err::<ServerProperties, _>(Error::other("boom")) },
+            || build_props("fallback"),
+        )
+        .await;
+
+        assert_eq!(result.endpoint, "fallback");
+    }
+
+    #[tokio::test]
+    async fn call_peer_with_timeout_uses_fallback_on_timeout() {
+        let result = call_peer_with_timeout(
+            Duration::from_millis(5),
+            "peer-3",
+            || async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                Ok::<_, Error>(build_props("slow"))
+            },
+            || build_props("fallback"),
+        )
+        .await;
+
+        assert_eq!(result.endpoint, "fallback");
+    }
+
+    #[test]
+    fn aggregate_notification_failures_returns_ok_when_empty() {
+        assert!(aggregate_notification_failures("stop_rebalance", Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn aggregate_notification_failures_returns_joined_error_when_non_empty() {
+        let err = aggregate_notification_failures(
+            "load_rebalance_meta",
+            vec!["peer-1 failed".to_string(), "local save failed".to_string()],
+        )
+        .expect_err("non-empty failures should return error");
+
+        let msg = err.to_string();
+        assert!(msg.contains("load_rebalance_meta"));
+        assert!(msg.contains("2 failure(s)"));
+        assert!(msg.contains("peer-1 failed"));
+        assert!(msg.contains("local save failed"));
+    }
 }

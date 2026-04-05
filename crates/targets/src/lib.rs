@@ -15,18 +15,18 @@
 pub mod arn;
 mod check;
 pub mod error;
-mod event_name;
 pub mod store;
 pub mod target;
 
 pub use check::check_mqtt_broker_available;
 pub use error::{StoreError, TargetError};
-pub use event_name::EventName;
+pub use rustfs_s3_common::EventName;
 use serde::{Deserialize, Serialize};
 pub use target::Target;
 
 /// Represents a log of events for sending to targets
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct TargetLog<E> {
     /// The event name
     pub event_name: EventName,

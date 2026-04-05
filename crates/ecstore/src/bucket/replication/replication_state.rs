@@ -1,4 +1,19 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::error::Error;
+use crate::global::get_global_bucket_monitor;
 use rustfs_filemeta::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -49,13 +64,13 @@ impl ExponentialMovingAverage {
     pub fn update_exponential_moving_average(&self, now: SystemTime) {
         if let Ok(mut last_update_guard) = self.last_update.try_lock() {
             let last_update = *last_update_guard;
-            if let Ok(duration) = now.duration_since(last_update) {
-                if duration.as_secs() > 0 {
-                    let decay = (-duration.as_secs_f64() / 60.0).exp(); // 1 minute decay
-                    let current_value = f64::from_bits(self.value.load(AtomicOrdering::Relaxed));
-                    self.value.store((current_value * decay).to_bits(), AtomicOrdering::Relaxed);
-                    *last_update_guard = now;
-                }
+            if let Ok(duration) = now.duration_since(last_update)
+                && duration.as_secs() > 0
+            {
+                let decay = (-duration.as_secs_f64() / 60.0).exp(); // 1 minute decay
+                let current_value = f64::from_bits(self.value.load(AtomicOrdering::Relaxed));
+                self.value.store((current_value * decay).to_bits(), AtomicOrdering::Relaxed);
+                *last_update_guard = now;
             }
         }
     }
@@ -571,6 +586,8 @@ pub struct BucketReplicationStat {
     pub latency: LatencyStats,
     pub xfer_rate_lrg: XferStats,
     pub xfer_rate_sml: XferStats,
+    pub bandwidth_limit_bytes_per_sec: i64,
+    pub current_bandwidth_bytes_per_sec: f64,
 }
 
 impl BucketReplicationStat {
@@ -757,10 +774,10 @@ impl ReplicationStats {
 
     /// Check if bucket replication statistics have usage
     pub fn has_replication_usage(&self, bucket: &str) -> bool {
-        if let Ok(cache) = self.cache.try_read() {
-            if let Some(stats) = cache.get(bucket) {
-                return stats.has_replication_usage();
-            }
+        if let Ok(cache) = self.cache.try_read()
+            && let Some(stats) = cache.get(bucket)
+        {
+            return stats.has_replication_usage();
         }
         false
     }
@@ -1005,6 +1022,9 @@ impl ReplicationStats {
                     latency: stat.latency.merge(&old_stat.latency),
                     xfer_rate_lrg: lrg,
                     xfer_rate_sml: sml,
+                    bandwidth_limit_bytes_per_sec: stat.bandwidth_limit_bytes_per_sec,
+                    current_bandwidth_bytes_per_sec: stat.current_bandwidth_bytes_per_sec
+                        + old_stat.current_bandwidth_bytes_per_sec,
                 };
 
                 tot_replicated_size += stat.replicated_size;
@@ -1055,23 +1075,42 @@ impl ReplicationStats {
         // In actual implementation, statistics would be obtained from cluster
         // This is simplified to get from local cache
         let cache = self.cache.read().await;
-        if let Some(stats) = cache.get(bucket) {
-            BucketStats {
-                uptime: SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64,
-                replication_stats: stats.clone_stats(),
-                queue_stats: Default::default(),
-                proxy_stats: ProxyMetric::default(),
-            }
+        let mut replication_stats = if let Some(stats) = cache.get(bucket) {
+            stats.clone_stats()
         } else {
-            BucketStats {
-                uptime: 0,
-                replication_stats: BucketReplicationStats::new(),
-                queue_stats: Default::default(),
-                proxy_stats: ProxyMetric::default(),
+            BucketReplicationStats::new()
+        };
+        let uptime = if cache.contains_key(bucket) {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        } else {
+            0
+        };
+        drop(cache);
+
+        if let Some(monitor) = get_global_bucket_monitor() {
+            let bw_report = monitor.get_report(|name| name == bucket);
+            for (opts, bw) in bw_report.bucket_stats {
+                let stat = replication_stats
+                    .stats
+                    .entry(opts.replication_arn)
+                    .or_insert_with(|| BucketReplicationStat {
+                        xfer_rate_lrg: XferStats::new(),
+                        xfer_rate_sml: XferStats::new(),
+                        ..Default::default()
+                    });
+                stat.bandwidth_limit_bytes_per_sec = bw.limit_bytes_per_sec;
+                stat.current_bandwidth_bytes_per_sec = bw.current_bandwidth_bytes_per_sec;
             }
+        }
+
+        BucketStats {
+            uptime,
+            replication_stats,
+            queue_stats: Default::default(),
+            proxy_stats: ProxyMetric::default(),
         }
     }
 

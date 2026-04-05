@@ -15,66 +15,102 @@
 receivers:
   otlp:
     protocols:
-      grpc: # OTLP gRPC 接收器
+      grpc:
         endpoint: 0.0.0.0:4317
-      http: # OTLP HTTP 接收器
+      http:
         endpoint: 0.0.0.0:4318
 
 processors:
-  batch: # 批处理处理器，提升吞吐量
-    timeout: 5s
-    send_batch_size: 1000
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
   memory_limiter:
     check_interval: 1s
-    limit_mib: 512
+    limit_mib: 1024
+    spike_limit_mib: 256
+  transform/logs:
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["message"], body.string)
+          - set(attributes["log.body"], body.string)
 
 exporters:
-  otlp/traces: # OTLP 导出器，用于跟踪数据
-    endpoint: "jaeger:4317"  # Jaeger 的 OTLP gRPC 端点
-    tls:
-      insecure: true  # 开发环境禁用 TLS，生产环境需配置证书
-  otlp/tempo: # OTLP 导出器，用于跟踪数据
-    endpoint: "tempo:4317"  # tempo 的 OTLP gRPC 端点
-    tls:
-      insecure: true  # 开发环境禁用 TLS，生产环境需配置证书
-  prometheus: # Prometheus 导出器，用于指标数据
-    endpoint: "0.0.0.0:8889"  # Prometheus 刮取端点
-    namespace: "rustfs"  # 指标前缀
-    send_timestamps: true  # 发送时间戳
-    # enable_open_metrics: true
-  otlphttp/loki: # Loki 导出器，用于日志数据
-    endpoint: "http://loki:3100/otlp/v1/logs"
+  otlp/tempo:
+    endpoint: "tempo:4317"
     tls:
       insecure: true
+    compression: gzip
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 5000
+
+  otlp/jaeger:
+    endpoint: "jaeger:4317"
+    tls:
+      insecure: true
+    compression: gzip
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 5000
+
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    send_timestamps: true
+    metric_expiration: 5m
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  otlphttp/loki:
+    endpoint: "http://loki:3100/otlp"
+    tls:
+      insecure: true
+    compression: gzip
+
 extensions:
   health_check:
+    endpoint: 0.0.0.0:13133
   pprof:
+    endpoint: 0.0.0.0:1888
   zpages:
+    endpoint: 0.0.0.0:55679
+
 service:
-  extensions: [ health_check, pprof, zpages ]  # 启用扩展
+  extensions: [ health_check, pprof, zpages ]
   pipelines:
     traces:
       receivers: [ otlp ]
-      processors: [ memory_limiter,batch ]
-      exporters: [ otlp/traces,otlp/tempo ]
+      processors: [ memory_limiter, batch ]
+      exporters: [ otlp/tempo, otlp/jaeger ]
     metrics:
       receivers: [ otlp ]
       processors: [ batch ]
       exporters: [ prometheus ]
     logs:
       receivers: [ otlp ]
-      processors: [ batch ]
+      processors: [ batch, transform/logs ]
       exporters: [ otlphttp/loki ]
   telemetry:
     logs:
-      level: "info"  # Collector 日志级别
+      level: "info"
+      encoding: "json"
     metrics:
-      level: "detailed" # 可以是 basic, normal, detailed
+      level: "normal"
       readers:
-        - periodic:
+        - pull:
             exporter:
-              otlp:
-                protocol: http/protobuf
-                endpoint: http://otel-collector:4318
-
-
+              prometheus:
+                host: '0.0.0.0'
+                port: 8888

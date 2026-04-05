@@ -12,14 +12,138 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::console::is_console_path;
+use crate::server::cors;
 use crate::server::hybrid::HybridBody;
-use http::{Request as HttpRequest, Response, StatusCode};
+use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX};
+use crate::storage::apply_cors_headers;
+use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
+use bytes::Bytes;
+use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode};
+use http_body::Body;
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use opentelemetry::global;
+use opentelemetry::trace::TraceContextExt;
+use rustfs_utils::get_env_opt_str;
+use rustfs_utils::http::headers::AMZ_REQUEST_ID;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tower::{Layer, Service};
 use tracing::debug;
+
+/// A carrier that adapts [`HeaderMap`] for OpenTelemetry trace context propagation.
+struct HeaderMapCarrier<'a>(&'a HeaderMap);
+
+impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+
+    fn get_all(&self, key: &str) -> Option<Vec<&str>> {
+        let headers = self
+            .0
+            .get_all(key)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+
+        if headers.is_empty() { None } else { Some(headers) }
+    }
+}
+
+/// Tower middleware layer that creates a canonical [`RequestContext`] from HTTP headers
+/// and injects it into `request.extensions()`.
+///
+/// This layer must be placed after `SetRequestIdLayer` in the middleware stack,
+/// as it reads the `x-request-id` header that `SetRequestIdLayer` generates.
+///
+/// Additionally, it sets the `x-amz-request-id` request header for S3 compatibility
+/// if not already present.
+#[derive(Clone, Default)]
+pub struct RequestContextLayer;
+
+impl<S> Layer<S> for RequestContextLayer {
+    type Service = RequestContextService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestContextService { inner }
+    }
+}
+
+/// Service that injects [`RequestContext`] into every request.
+#[derive(Clone)]
+pub struct RequestContextService<S> {
+    inner: S,
+}
+
+impl<S, B> Service<HttpRequest<B>> for RequestContextService<S>
+where
+    S: Service<HttpRequest<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: HttpRequest<B>) -> Self::Future {
+        let request_id = extract_request_id_from_headers(req.headers());
+
+        // Extract OpenTelemetry trace/span context from incoming headers
+        let parent_cx = global::get_text_map_propagator(|propagator| propagator.extract(&HeaderMapCarrier(req.headers())));
+        let span_ref = parent_cx.span();
+        let span_context = span_ref.span_context();
+        let trace_id = if span_context.is_valid() {
+            Some(span_context.trace_id().to_string())
+        } else {
+            None
+        };
+        let span_id = if span_context.is_valid() {
+            Some(span_context.span_id().to_string())
+        } else {
+            None
+        };
+
+        // Preserve the upstream x-amz-request-id if present (S3 client forwarding),
+        // otherwise fall back to the canonical request_id.
+        let x_amz_request_id = req
+            .headers()
+            .get(AMZ_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+            .unwrap_or_else(|| request_id.clone());
+
+        let ctx = RequestContext {
+            request_id: request_id.clone(),
+            x_amz_request_id,
+            trace_id,
+            span_id,
+            start_time: Instant::now(),
+        };
+
+        req.extensions_mut().insert(ctx);
+
+        // Set x-amz-request-id for S3 compatibility downstream
+        if !req.headers().contains_key(AMZ_REQUEST_ID)
+            && let Ok(val) = HeaderValue::from_str(&request_id)
+        {
+            req.headers_mut()
+                .insert(http::header::HeaderName::from_static(AMZ_REQUEST_ID), val);
+        }
+
+        self.inner.call(req)
+    }
+}
 
 /// Redirect layer that redirects browser requests to the console
 #[derive(Clone)]
@@ -87,5 +211,677 @@ where
         // Otherwise, forward to the next service
         let mut inner = self.inner.clone();
         Box::pin(async move { inner.call(req).await.map_err(Into::into) })
+    }
+}
+
+#[derive(Clone)]
+pub struct AdminChunkedContentLengthCompatLayer;
+
+impl<S> Layer<S> for AdminChunkedContentLengthCompatLayer {
+    type Service = AdminChunkedContentLengthCompatService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AdminChunkedContentLengthCompatService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct AdminChunkedContentLengthCompatService<S> {
+    inner: S,
+}
+
+impl<S, ResBody> Service<HttpRequest<Incoming>> for AdminChunkedContentLengthCompatService<S>
+where
+    S: Service<HttpRequest<Incoming>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    ResBody: Send + 'static,
+{
+    type Response = Response<ResBody>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, mut req: HttpRequest<Incoming>) -> Self::Future {
+        if should_force_zero_content_length_for_admin_empty_body(&req) {
+            req.headers_mut()
+                .insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+        }
+
+        let mut inner = self.inner.clone();
+        Box::pin(async move { inner.call(req).await.map_err(Into::into) })
+    }
+}
+
+fn should_force_zero_content_length_for_admin_empty_body<B>(req: &HttpRequest<B>) -> bool {
+    req.method() == Method::PUT
+        && is_empty_body_admin_put_path(req.uri().path())
+        && !req.headers().contains_key(http::header::CONTENT_LENGTH)
+}
+
+fn is_empty_body_admin_put_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/minio/admin/v3/set-user-status"
+            | "/minio/admin/v3/set-group-status"
+            | "/rustfs/admin/v3/set-user-status"
+            | "/rustfs/admin/v3/set-group-status"
+    )
+}
+
+#[derive(Clone)]
+pub struct ObjectAttributesEtagFixLayer;
+
+impl<S> Layer<S> for ObjectAttributesEtagFixLayer {
+    type Service = ObjectAttributesEtagFixService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ObjectAttributesEtagFixService { inner }
+    }
+}
+
+#[derive(Clone)]
+pub struct ObjectAttributesEtagFixService<S> {
+    inner: S,
+}
+
+impl<S, RestBody, GrpcBody> Service<HttpRequest<Incoming>> for ObjectAttributesEtagFixService<S>
+where
+    S: Service<HttpRequest<Incoming>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    RestBody: Body<Data = Bytes> + From<Bytes> + Send + 'static,
+    RestBody::Error: Into<S::Error> + Send + 'static,
+    GrpcBody: Send + 'static,
+{
+    type Response = Response<HybridBody<RestBody, GrpcBody>>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+        let is_target = is_object_attributes_request(&req);
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let response = inner.call(req).await?;
+            let (parts, body) = response.into_parts();
+            let should_fix = is_target && parts.status.is_success() && is_xml_response(&parts.headers);
+
+            let response = match body {
+                HybridBody::Rest { rest_body } => {
+                    if !should_fix {
+                        Response::from_parts(parts, HybridBody::Rest { rest_body })
+                    } else {
+                        let rest_body = fix_object_attributes_etag_in_xml(rest_body).await.map_err(Into::into)?;
+
+                        let mut parts = parts;
+                        parts.headers.remove(http::header::CONTENT_LENGTH);
+
+                        Response::from_parts(parts, HybridBody::Rest { rest_body })
+                    }
+                }
+                HybridBody::Grpc { grpc_body } => Response::from_parts(parts, HybridBody::Grpc { grpc_body }),
+            };
+
+            Ok(response)
+        })
+    }
+}
+
+fn is_xml_response(headers: &HeaderMap) -> bool {
+    let is_xml = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|content_type| content_type.to_ascii_lowercase().contains("xml"))
+        .unwrap_or(false);
+    if !is_xml {
+        return false;
+    }
+
+    match headers
+        .get(http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(encoding) => encoding.trim().is_empty() || encoding.eq_ignore_ascii_case("identity"),
+        None => true,
+    }
+}
+
+async fn fix_object_attributes_etag_in_xml<RestBody>(body: RestBody) -> Result<RestBody, RestBody::Error>
+where
+    RestBody: Body<Data = Bytes> + From<Bytes>,
+{
+    let bytes = BodyExt::collect(body).await?.to_bytes();
+    let xml = String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
+    let fixed = strip_quotes_from_first_etag(xml);
+    Ok(RestBody::from(Bytes::from(fixed)))
+}
+
+fn strip_quotes_from_first_etag(xml: String) -> String {
+    let Some(start) = xml.find("<ETag>") else {
+        return xml;
+    };
+    let value_start = start + "<ETag>".len();
+    let value_rest = &xml[value_start..];
+    let Some(end_offset) = value_rest.find("</ETag>") else {
+        return xml;
+    };
+    let value_end = value_start + end_offset;
+    let raw = &xml[value_start..value_end];
+
+    let Some(trimmed) = raw.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
+        return xml;
+    };
+
+    let mut fixed = String::with_capacity(xml.len() - 2);
+    fixed.push_str(&xml[..value_start]);
+    fixed.push_str(trimmed);
+    fixed.push_str(&xml[value_end..]);
+    fixed
+}
+
+fn is_object_attributes_request(req: &HttpRequest<Incoming>) -> bool {
+    if req.method() != Method::GET {
+        return false;
+    }
+
+    let path = req.uri().path();
+    if path.starts_with(ADMIN_PREFIX)
+        || path.starts_with(MINIO_ADMIN_PREFIX)
+        || path.starts_with(RUSTFS_ADMIN_PREFIX)
+        || path.starts_with(MINIO_ADMIN_V3_PREFIX)
+        || path.starts_with(CONSOLE_PREFIX)
+        || path.starts_with(RPC_PREFIX)
+    {
+        return false;
+    }
+
+    let has_object_attributes_query = req.uri().query().is_some_and(|query| {
+        query.split('&').any(|part| {
+            let (name, _value) = part.split_once('=').unwrap_or((part, ""));
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "attributes" | "object-attributes" | "x-amz-object-attributes"
+            )
+        })
+    });
+    let has_object_attributes_header = req
+        .headers()
+        .get(http::header::HeaderName::from_static("x-amz-object-attributes"))
+        .is_some();
+
+    has_object_attributes_query || has_object_attributes_header
+}
+
+/// Conditional CORS layer that only applies to S3 API requests
+/// (not Admin, not Console, not RPC)
+#[derive(Clone)]
+pub struct ConditionalCorsLayer {
+    cors_origins: Option<String>,
+}
+
+impl ConditionalCorsLayer {
+    pub fn new() -> Self {
+        let cors_origins = get_env_opt_str("RUSTFS_CORS_ALLOWED_ORIGINS").filter(|s| !s.is_empty());
+        Self { cors_origins }
+    }
+
+    /// Exact paths that should be excluded from being treated as S3 paths.
+    const EXCLUDED_EXACT_PATHS: &'static [&'static str] = &["/health", "/health/ready", "/profile/cpu", "/profile/memory"];
+
+    fn is_s3_path(path: &str) -> bool {
+        // Exclude Admin, Console, RPC, and configured special paths
+        !path.starts_with(ADMIN_PREFIX)
+            && !path.starts_with(MINIO_ADMIN_PREFIX)
+            && !path.starts_with(RPC_PREFIX)
+            && !is_console_path(path)
+            && !Self::EXCLUDED_EXACT_PATHS.contains(&path)
+    }
+
+    fn apply_cors_headers(&self, request_headers: &HeaderMap, response_headers: &mut HeaderMap) {
+        let origin = request_headers
+            .get(cors::standard::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let allowed_origin = match (origin, &self.cors_origins) {
+            (Some(orig), Some(config)) if config == "*" => Some(orig),
+            (Some(orig), Some(config)) => {
+                let origins: Vec<&str> = config.split(',').map(|s| s.trim()).collect();
+                if origins.contains(&orig.as_str()) { Some(orig) } else { None }
+            }
+            (Some(orig), None) => Some(orig), // Default: allow all if not configured
+            _ => None,
+        };
+
+        // Track whether we're using a specific origin (not wildcard)
+        let using_specific_origin = if let Some(origin) = &allowed_origin {
+            if let Ok(header_value) = HeaderValue::from_str(origin) {
+                response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, header_value);
+                true // Using specific origin, credentials allowed
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Allow all methods by default (S3-compatible set)
+        response_headers.insert(
+            cors::response::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS, HEAD"),
+        );
+
+        // Allow all headers by default
+        response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("*"));
+
+        // Expose common headers
+        response_headers.insert(
+            cors::response::ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static("x-request-id, content-type, content-length, etag"),
+        );
+
+        // Only set credentials when using a specific origin (not wildcard)
+        // CORS spec: credentials cannot be used with wildcard origins
+        if using_specific_origin {
+            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
+        }
+    }
+}
+
+impl Default for ConditionalCorsLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<S> Layer<S> for ConditionalCorsLayer {
+    type Service = ConditionalCorsService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ConditionalCorsService {
+            inner,
+            cors_origins: Arc::new(self.cors_origins.clone()),
+        }
+    }
+}
+
+/// Service implementation for conditional CORS
+#[derive(Clone)]
+pub struct ConditionalCorsService<S> {
+    inner: S,
+    cors_origins: Arc<Option<String>>,
+}
+
+async fn resolve_s3_options_cors_headers(bucket: &str, request_headers: &HeaderMap) -> Option<HeaderMap> {
+    apply_cors_headers(bucket, &http::Method::OPTIONS, request_headers).await
+}
+
+fn clear_cors_response_headers(headers: &mut HeaderMap) {
+    headers.remove(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN);
+    headers.remove(cors::response::ACCESS_CONTROL_ALLOW_METHODS);
+    headers.remove(cors::response::ACCESS_CONTROL_ALLOW_HEADERS);
+    headers.remove(cors::response::ACCESS_CONTROL_EXPOSE_HEADERS);
+    headers.remove(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS);
+    headers.remove(cors::response::ACCESS_CONTROL_MAX_AGE);
+}
+
+fn apply_bucket_cors_result(response_headers: &mut HeaderMap, bucket_cors_headers: &HeaderMap) {
+    // Bucket-level CORS is authoritative for S3 object/bucket paths.
+    // Clear any previously-populated CORS response headers (e.g. generic/system defaults),
+    // then apply the evaluated bucket result (which may be intentionally empty).
+    clear_cors_response_headers(response_headers);
+    for (key, value) in bucket_cors_headers.iter() {
+        response_headers.insert(key, value.clone());
+    }
+}
+
+impl<S, ResBody> Service<HttpRequest<Incoming>> for ConditionalCorsService<S>
+where
+    S: Service<HttpRequest<Incoming>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
+    ResBody: Default + Send + 'static,
+{
+    type Response = Response<ResBody>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+        let path = req.uri().path().to_string();
+        let method = req.method().clone();
+        let request_headers = req.headers().clone();
+        let cors_origins = self.cors_origins.clone();
+        let is_s3 = ConditionalCorsLayer::is_s3_path(&path);
+        let is_root = path == "/";
+
+        if method == Method::OPTIONS {
+            let has_acrm = request_headers.contains_key(cors::request::ACCESS_CONTROL_REQUEST_METHOD);
+
+            if is_root {
+                return Box::pin(async move {
+                    if !has_acrm || !request_headers.contains_key(cors::standard::ORIGIN) {
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(ResBody::default())
+                            .unwrap());
+                    }
+
+                    let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
+                    let cors_layer = ConditionalCorsLayer {
+                        cors_origins: (*cors_origins).clone(),
+                    };
+                    cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
+                    Ok(response)
+                });
+            }
+
+            if is_s3 {
+                let path_trimmed = path.trim_start_matches('/');
+                let bucket = path_trimmed.split('/').next().unwrap_or("").to_string();
+
+                return Box::pin(async move {
+                    if !has_acrm || !request_headers.contains_key(cors::standard::ORIGIN) {
+                        return Ok(Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(ResBody::default())
+                            .unwrap());
+                    }
+
+                    let cors_layer = ConditionalCorsLayer {
+                        cors_origins: (*cors_origins).clone(),
+                    };
+
+                    if let Some(cors_headers) = resolve_s3_options_cors_headers(&bucket, &request_headers).await {
+                        let cors_allowed = cors_headers.contains_key(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN);
+                        let status = if cors_allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
+
+                        let mut response = Response::builder().status(status).body(ResBody::default()).unwrap();
+                        if cors_allowed {
+                            for (key, value) in cors_headers.iter() {
+                                response.headers_mut().insert(key, value.clone());
+                            }
+                        }
+                        return Ok(response);
+                    }
+
+                    // No bucket-level CORS config: fall back to global/default CORS behavior.
+                    let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
+                    cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
+                    Ok(response)
+                });
+            }
+
+            let request_headers_clone = request_headers.clone();
+            return Box::pin(async move {
+                let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
+                let cors_layer = ConditionalCorsLayer {
+                    cors_origins: (*cors_origins).clone(),
+                };
+                cors_layer.apply_cors_headers(&request_headers_clone, response.headers_mut());
+                Ok(response)
+            });
+        }
+
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let mut response = inner.call(req).await.map_err(Into::into)?;
+
+            if request_headers.contains_key(cors::standard::ORIGIN)
+                && !response.headers().contains_key(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN)
+            {
+                let cors_layer = ConditionalCorsLayer {
+                    cors_origins: (*cors_origins).clone(),
+                };
+
+                if is_s3 {
+                    let bucket = path.trim_start_matches('/').split('/').next().unwrap_or("");
+                    if path == "/" {
+                        cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
+                    } else if !bucket.is_empty() {
+                        match apply_cors_headers(bucket, &method, &request_headers).await {
+                            Some(bucket_cors_headers) => {
+                                // Bucket-level CORS is authoritative when configured, even if it
+                                // intentionally resolves to an empty header set (no rule match).
+                                apply_bucket_cors_result(response.headers_mut(), &bucket_cors_headers);
+                            }
+                            None => {
+                                // No bucket-level CORS config: fall back to global/default policy.
+                                cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
+                            }
+                        }
+                    } else {
+                        cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
+                    }
+                } else {
+                    cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
+                }
+            }
+
+            Ok(response)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::Request;
+    use http_body_util::BodyExt;
+    use http_body_util::Full;
+    use temp_env::with_var;
+
+    #[test]
+    fn admin_chunked_put_without_content_length_is_normalized() {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/minio/admin/v3/set-user-status?accessKey=test&status=enabled")
+            .body(())
+            .expect("request");
+
+        assert!(should_force_zero_content_length_for_admin_empty_body(&request));
+    }
+
+    #[test]
+    fn admin_request_with_explicit_content_length_is_left_unchanged() {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/minio/admin/v3/set-group-status?group=test&status=enabled")
+            .header(http::header::CONTENT_LENGTH, "0")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_admin_empty_body(&request));
+    }
+
+    #[test]
+    fn non_admin_chunked_put_is_not_normalized() {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/bucket/object")
+            .body(())
+            .expect("request");
+
+        assert!(!should_force_zero_content_length_for_admin_empty_body(&request));
+    }
+
+    #[test]
+    fn test_strip_quotes_from_first_etag_removes_quotes() {
+        let input = String::from("<GetObjectAttributesOutput><ETag>\"abc\"</ETag></GetObjectAttributesOutput>");
+        let output = strip_quotes_from_first_etag(input);
+
+        assert_eq!(output, "<GetObjectAttributesOutput><ETag>abc</ETag></GetObjectAttributesOutput>");
+    }
+
+    #[test]
+    fn test_strip_quotes_from_first_etag_keeps_non_quoted_value() {
+        let input = String::from("<GetObjectAttributesOutput><ETag>abc</ETag></GetObjectAttributesOutput>");
+        let output = strip_quotes_from_first_etag(input.clone());
+
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_strip_quotes_from_first_etag_only_first_occurrence() {
+        let input =
+            String::from("<GetObjectAttributesOutput><ETag>\"first\"</ETag><ETag>\"second\"</ETag></GetObjectAttributesOutput>");
+        let output = strip_quotes_from_first_etag(input);
+
+        assert_eq!(
+            output,
+            "<GetObjectAttributesOutput><ETag>first</ETag><ETag>\"second\"</ETag></GetObjectAttributesOutput>"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fix_object_attributes_etag_in_xml() {
+        let body = Full::from(Bytes::from(
+            "<GetObjectAttributesOutput><ETag>\"abc\"</ETag><Checksum>CRC32C</Checksum></GetObjectAttributesOutput>",
+        ));
+        let fixed = fix_object_attributes_etag_in_xml(body).await.unwrap();
+        let bytes = BodyExt::collect(fixed).await.unwrap().to_bytes();
+
+        assert_eq!(
+            bytes,
+            Bytes::from_static(
+                b"<GetObjectAttributesOutput><ETag>abc</ETag><Checksum>CRC32C</Checksum></GetObjectAttributesOutput>",
+            ),
+        );
+    }
+
+    #[test]
+    fn test_is_s3_path_excludes_admin_and_special_paths() {
+        assert!(ConditionalCorsLayer::is_s3_path("/my-bucket/key"));
+        assert!(ConditionalCorsLayer::is_s3_path("/"));
+        assert!(!ConditionalCorsLayer::is_s3_path("/rustfs/admin/v3/info"));
+        assert!(!ConditionalCorsLayer::is_s3_path("/minio/admin/v3/info"));
+        assert!(!ConditionalCorsLayer::is_s3_path("/health"));
+        assert!(!ConditionalCorsLayer::is_s3_path("/health/ready"));
+    }
+
+    #[test]
+    fn test_generic_cors_layer_echoes_allowed_origin() {
+        let cors = ConditionalCorsLayer { cors_origins: None };
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert("origin", "https://example.com".parse().unwrap());
+
+        let mut resp_headers = HeaderMap::new();
+        cors.apply_cors_headers(&req_headers, &mut resp_headers);
+
+        assert_eq!(
+            resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn test_generic_cors_layer_respects_configured_origins() {
+        let cors = ConditionalCorsLayer {
+            cors_origins: Some("https://allowed.com".to_string()),
+        };
+
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert("origin", "https://denied.com".parse().unwrap());
+        let mut resp_headers = HeaderMap::new();
+        cors.apply_cors_headers(&req_headers, &mut resp_headers);
+        assert!(resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert("origin", "https://allowed.com".parse().unwrap());
+        let mut resp_headers = HeaderMap::new();
+        cors.apply_cors_headers(&req_headers, &mut resp_headers);
+        assert_eq!(
+            resp_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://allowed.com"
+        );
+    }
+
+    #[test]
+    fn test_conditional_cors_layer_reads_env() {
+        with_var("RUSTFS_CORS_ALLOWED_ORIGINS", Some("https://allowed.com"), || {
+            let cors = ConditionalCorsLayer::new();
+            assert_eq!(cors.cors_origins.as_deref(), Some("https://allowed.com"));
+        });
+    }
+
+    #[tokio::test]
+    async fn test_resolve_s3_options_cors_headers_no_headers_without_match() {
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert("origin", "https://example.com".parse().unwrap());
+        req_headers.insert("access-control-request-method", "GET".parse().unwrap());
+
+        let headers = resolve_s3_options_cors_headers("bbb", &req_headers).await;
+        assert!(headers.is_none());
+    }
+
+    #[test]
+    fn test_apply_bucket_cors_result_clears_existing_cors_headers_with_empty_result() {
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(
+            cors::response::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("https://foo.example"),
+        );
+        response_headers.insert(
+            cors::response::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS, HEAD"),
+        );
+        response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("*"));
+        response_headers.insert(cors::response::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("etag"));
+        response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
+        response_headers.insert(cors::response::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("3600"));
+
+        let bucket_cors_headers = HeaderMap::new();
+        apply_bucket_cors_result(&mut response_headers, &bucket_cors_headers);
+
+        assert!(response_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+        assert!(response_headers.get(cors::response::ACCESS_CONTROL_ALLOW_METHODS).is_none());
+        assert!(response_headers.get(cors::response::ACCESS_CONTROL_ALLOW_HEADERS).is_none());
+        assert!(response_headers.get(cors::response::ACCESS_CONTROL_EXPOSE_HEADERS).is_none());
+        assert!(
+            response_headers
+                .get(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none()
+        );
+        assert!(response_headers.get(cors::response::ACCESS_CONTROL_MAX_AGE).is_none());
+    }
+
+    #[test]
+    fn test_apply_bucket_cors_result_replaces_existing_cors_headers() {
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(
+            cors::response::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("https://foo.example"),
+        );
+        response_headers.insert(
+            cors::response::ACCESS_CONTROL_ALLOW_METHODS,
+            HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS, HEAD"),
+        );
+
+        let mut bucket_cors_headers = HeaderMap::new();
+        bucket_cors_headers.insert(
+            cors::response::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("https://allowed.example"),
+        );
+        bucket_cors_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET"));
+
+        apply_bucket_cors_result(&mut response_headers, &bucket_cors_headers);
+
+        assert_eq!(
+            response_headers.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://allowed.example"
+        );
+        assert_eq!(response_headers.get(cors::response::ACCESS_CONTROL_ALLOW_METHODS).unwrap(), "GET");
     }
 }

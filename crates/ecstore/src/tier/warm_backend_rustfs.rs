@@ -29,7 +29,7 @@ use crate::client::{
 };
 use crate::tier::{
     tier_config::TierRustFS,
-    warm_backend::{WarmBackend, WarmBackendGetOpts},
+    warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
     warm_backend_s3::WarmBackendS3,
 };
 
@@ -72,12 +72,10 @@ impl WarmBackendRustFS {
         };
         let scheme = u.scheme();
         let default_port = if scheme == "https" { 443 } else { 80 };
-        let client = TransitionClient::new(
-            &format!("{}:{}", u.host_str().expect("err"), u.port().unwrap_or(default_port)),
-            opts,
-            "rustfs",
-        )
-        .await?;
+        let host = u
+            .host_str()
+            .ok_or_else(|| std::io::Error::other("endpoint URL must include a host"))?;
+        let client = TransitionClient::new(&format!("{host}:{}", u.port().unwrap_or(default_port)), opts, "rustfs").await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));
@@ -103,19 +101,12 @@ impl WarmBackend for WarmBackendRustFS {
         let part_size = optimal_part_size(length)?;
         let client = self.0.client.clone();
         let res = client
-            .put_object(
-                &self.0.bucket,
-                &self.0.get_dest(object),
-                r,
-                length,
-                &PutObjectOptions {
-                    storage_class: self.0.storage_class.clone(),
-                    part_size: part_size as u64,
-                    disable_content_sha256: true,
-                    user_metadata: meta,
-                    ..Default::default()
-                },
-            )
+            .put_object(&self.0.bucket, &self.0.get_dest(object), r, length, &{
+                let mut opts = build_transition_put_options(self.0.storage_class.clone(), meta);
+                opts.part_size = part_size as u64;
+                opts.disable_content_sha256 = true;
+                opts
+            })
             .await?;
         //self.ToObjectError(err, object)
         Ok(res.version_id)
@@ -157,4 +148,36 @@ fn optimal_part_size(object_size: i64) -> Result<i64, std::io::Error> {
         return Ok(MIN_PART_SIZE);
     }
     Ok(part_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    use super::*;
+
+    fn rustfs_tier(endpoint: &str) -> TierRustFS {
+        TierRustFS {
+            endpoint: endpoint.to_string(),
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            bucket: "bucket".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn new_returns_error_when_endpoint_has_no_host() {
+        let conf = rustfs_tier("rustfs://");
+
+        let outcome = AssertUnwindSafe(WarmBackendRustFS::new(&conf, "tier")).catch_unwind().await;
+
+        let result = outcome.expect("initialization should return an error instead of panicking");
+        let err = match result {
+            Ok(_) => panic!("endpoint without host must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("host"), "expected host validation error, got: {err}");
+    }
 }

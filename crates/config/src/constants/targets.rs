@@ -16,6 +16,8 @@ pub const WEBHOOK_ENDPOINT: &str = "endpoint";
 pub const WEBHOOK_AUTH_TOKEN: &str = "auth_token";
 pub const WEBHOOK_CLIENT_CERT: &str = "client_cert";
 pub const WEBHOOK_CLIENT_KEY: &str = "client_key";
+pub const WEBHOOK_CLIENT_CA: &str = "client_ca";
+pub const WEBHOOK_SKIP_TLS_VERIFY: &str = "skip_tls_verify";
 pub const WEBHOOK_BATCH_SIZE: &str = "batch_size";
 pub const WEBHOOK_QUEUE_LIMIT: &str = "queue_limit";
 pub const WEBHOOK_QUEUE_DIR: &str = "queue_dir";
@@ -32,3 +34,10 @@ pub const MQTT_RECONNECT_INTERVAL: &str = "reconnect_interval";
 pub const MQTT_KEEP_ALIVE_INTERVAL: &str = "keep_alive_interval";
 pub const MQTT_QUEUE_DIR: &str = "queue_dir";
 pub const MQTT_QUEUE_LIMIT: &str = "queue_limit";
+
+/// Environment variable controlling whether target queue files are Snappy-compressed.
+/// Applies to both notify and audit target queue stores.
+pub const ENV_TARGET_STORE_COMPRESS: &str = "RUSTFS_TARGET_STORE_COMPRESS";
+
+/// Queue-store compression is enabled by default to reduce disk footprint.
+pub const DEFAULT_TARGET_STORE_COMPRESS: bool = true;

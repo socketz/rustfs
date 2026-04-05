@@ -22,19 +22,20 @@ use crate::bucket::lifecycle::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc}
 use crate::bucket::lifecycle::lifecycle::{self, ExpirationOptions, Lifecycle, TransitionOptions};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier};
-use crate::bucket::object_lock::objectlock_sys::enforce_retention_for_deletion;
+use crate::bucket::object_lock::objectlock_sys::check_object_lock_for_deletion;
 use crate::bucket::{metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::error::Error;
 use crate::error::StorageError;
 use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_version_not_found, is_network_or_host_down};
-use crate::event::name::EventName;
 use crate::event_notification::{EventArgs, send_event};
 use crate::global::GLOBAL_LocalNodeName;
 use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
 use crate::store::ECStore;
 use crate::store_api::StorageAPI;
-use crate::store_api::{GetObjectReader, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete};
+use crate::store_api::{
+    GetObjectReader, HTTPRangeSpec, ListOperations, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete,
+};
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use bytes::BytesMut;
@@ -44,9 +45,9 @@ use lazy_static::lazy_static;
 use rustfs_common::data_usage::TierStats;
 use rustfs_common::heal_channel::rep_has_active_rules;
 use rustfs_common::metrics::{IlmAction, Metrics};
-use rustfs_filemeta::{NULL_VERSION_ID, RestoreStatusOps, is_restored_object_on_disk};
-use rustfs_utils::path::encode_dir_object;
-use rustfs_utils::string::strings_has_prefix_fold;
+use rustfs_filemeta::{FileInfo, NULL_VERSION_ID, RestoreStatusOps, is_restored_object_on_disk};
+use rustfs_s3_common::EventName;
+use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::Body;
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration, RestoreRequest, RestoreRequestType, RestoreStatus,
@@ -65,7 +66,7 @@ use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh64;
 
@@ -97,12 +98,18 @@ impl LifecycleSys {
     }
 
     pub async fn get(&self, bucket: &str) -> Option<BucketLifecycleConfiguration> {
-        let lc = get_lifecycle_config(bucket).await.expect("get_lifecycle_config err!").0;
-        Some(lc)
+        match get_lifecycle_config(bucket).await {
+            Ok((lc, _)) => Some(lc),
+            Err(err) if err == Error::ConfigNotFound => None,
+            Err(err) => {
+                warn!(bucket, error = ?err, "failed to load lifecycle config");
+                None
+            }
+        }
     }
 
     pub fn trace(_oi: &ObjectInfo) -> TraceFn {
-        todo!();
+        Arc::new(|_oi, _ctx| Box::pin(async move {}))
     }
 }
 
@@ -115,10 +122,9 @@ struct ExpiryTask {
 impl ExpiryOp for ExpiryTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.write(format!("{}", self.obj_info.bucket).as_bytes());
-        let _ = hasher.write(format!("{}", self.obj_info.name).as_bytes());
-        hasher.flush();
-        xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
+        hasher.update(format!("{}", self.obj_info.bucket).as_bytes());
+        hasher.update(format!("{}", self.obj_info.name).as_bytes());
+        xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -171,10 +177,9 @@ struct FreeVersionTask(ObjectInfo);
 impl ExpiryOp for FreeVersionTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.write(format!("{}", self.0.transitioned_object.tier).as_bytes());
-        let _ = hasher.write(format!("{}", self.0.transitioned_object.name).as_bytes());
-        hasher.flush();
-        xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
+        hasher.update(format!("{}", self.0.transitioned_object.tier).as_bytes());
+        hasher.update(format!("{}", self.0.transitioned_object.name).as_bytes());
+        xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -191,10 +196,9 @@ struct NewerNoncurrentTask {
 impl ExpiryOp for NewerNoncurrentTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.write(format!("{}", self.bucket).as_bytes());
-        let _ = hasher.write(format!("{}", self.versions[0].object_name).as_bytes());
-        hasher.flush();
-        xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
+        hasher.update(format!("{}", self.bucket).as_bytes());
+        hasher.update(format!("{}", self.versions[0].object_name).as_bytes());
+        xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -389,16 +393,85 @@ impl ExpiryState {
                         //delete_object_versions(api, &v.bucket, &v.versions, v.event).await;
                     }
                     else if v.as_any().is::<Jentry>() {
-                        //transitionLogIf(es.ctx, deleteObjectFromRemoteTier(es.ctx, v.ObjName, v.VersionID, v.TierName))
+                        let v = v.as_any().downcast_ref::<Jentry>().expect("err!");
+                        if let Err(err) = delete_object_from_remote_tier(&v.obj_name, &v.version_id, &v.tier_name).await {
+                            warn!(
+                                object = %v.obj_name,
+                                version_id = %v.version_id,
+                                tier = %v.tier_name,
+                                error = ?err,
+                                "failed to delete transitioned object from remote tier"
+                            );
+                        }
                     }
                     else if v.as_any().is::<FreeVersionTask>() {
                         let v = v.as_any().downcast_ref::<FreeVersionTask>().expect("err!");
-                        let _oi = v.0.clone();
+                        let oi = v.0.clone();
+                        if let Err(err) = delete_object_from_remote_tier(
+                            &oi.transitioned_object.name,
+                            &oi.transitioned_object.version_id,
+                            &oi.transitioned_object.tier,
+                        )
+                        .await
+                        {
+                            warn!(
+                                bucket = %oi.bucket,
+                                object = %oi.name,
+                                remote_object = %oi.transitioned_object.name,
+                                remote_version_id = %oi.transitioned_object.version_id,
+                                tier = %oi.transitioned_object.tier,
+                                error = ?err,
+                                "failed to sweep transitioned free version from remote tier"
+                            );
+                            continue;
+                        }
 
+                        let mut fi = FileInfo {
+                            name: oi.name.clone(),
+                            version_id: oi.version_id,
+                            deleted: true,
+                            ..Default::default()
+                        };
+                        fi.set_tier_free_version();
+
+                        let mut deleted_locally = false;
+                        for pool in api.pools.iter() {
+                            let set = pool.get_disks_by_key(&oi.name);
+                            match set.delete_object_version(&oi.bucket, &oi.name, &fi, false).await {
+                                Ok(()) => {
+                                    deleted_locally = true;
+                                    break;
+                                }
+                                Err(err) if is_err_version_not_found(&err) || is_err_object_not_found(&err) => continue,
+                                Err(err) => {
+                                    warn!(
+                                        bucket = %oi.bucket,
+                                        object = %oi.name,
+                                        remote_object = %oi.transitioned_object.name,
+                                        remote_version_id = %oi.transitioned_object.version_id,
+                                        tier = %oi.transitioned_object.tier,
+                                        error = ?err,
+                                        "failed to delete transitioned free version after remote tier sweep"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+
+                        if !deleted_locally {
+                            warn!(
+                                bucket = %oi.bucket,
+                                object = %oi.name,
+                                remote_object = %oi.transitioned_object.name,
+                                remote_version_id = %oi.transitioned_object.version_id,
+                                tier = %oi.transitioned_object.tier,
+                                "transitioned free version was not found during local cleanup"
+                            );
+                        }
                     }
                     else {
                         //info!("Invalid work type - {:?}", v);
-                        todo!();
+                        warn!("lifecycle worker received unsupported operation type");
                     }
                 }
             }
@@ -415,10 +488,9 @@ struct TransitionTask {
 impl ExpiryOp for TransitionTask {
     fn op_hash(&self) -> u64 {
         let mut hasher = Sha256::new();
-        let _ = hasher.write(format!("{}", self.obj_info.bucket).as_bytes());
-        //let _ = hasher.write(format!("{}", self.obj_info.versions[0].object_name).as_bytes());
-        hasher.flush();
-        xxh64::xxh64(hasher.clone().finalize().as_slice(), XXHASH_SEED)
+        hasher.update(format!("{}", self.obj_info.bucket).as_bytes());
+        // hasher.update(format!("{}", self.obj_info.versions[0].object_name).as_bytes());
+        xxh64::xxh64(hasher.finalize().as_slice(), XXHASH_SEED)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -475,12 +547,9 @@ impl TransitionState {
     }
 
     pub async fn init(api: Arc<ECStore>) {
-        let max_workers = std::env::var("RUSTFS_MAX_TRANSITION_WORKERS")
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or_else(|| std::cmp::min(num_cpus::get() as i64, 16));
+        let max_workers = get_env_i64("RUSTFS_MAX_TRANSITION_WORKERS", std::cmp::min(num_cpus::get() as i64, 16));
         let mut n = max_workers;
-        let tw = 8; //globalILMConfig.getTransitionWorkers(); 
+        let tw = 8; //globalILMConfig.getTransitionWorkers();
         if tw > 0 {
             n = tw;
         }
@@ -573,17 +642,11 @@ impl TransitionState {
     pub async fn update_workers_inner(api: Arc<ECStore>, n: i64) {
         let mut n = n;
         if n == 0 {
-            let max_workers = std::env::var("RUSTFS_MAX_TRANSITION_WORKERS")
-                .ok()
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or_else(|| std::cmp::min(num_cpus::get() as i64, 16));
+            let max_workers = get_env_i64("RUSTFS_MAX_TRANSITION_WORKERS", std::cmp::min(num_cpus::get() as i64, 16));
             n = max_workers;
         }
         // Allow environment override of maximum workers
-        let absolute_max = std::env::var("RUSTFS_ABSOLUTE_MAX_WORKERS")
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(32);
+        let absolute_max = get_env_i64("RUSTFS_ABSOLUTE_MAX_WORKERS", 32);
         n = std::cmp::min(n, absolute_max);
 
         let mut num_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
@@ -607,10 +670,7 @@ impl TransitionState {
 }
 
 pub async fn init_background_expiry(api: Arc<ECStore>) {
-    let mut workers = std::env::var("RUSTFS_MAX_EXPIRY_WORKERS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(|| std::cmp::min(num_cpus::get(), 16));
+    let mut workers = get_env_usize("RUSTFS_MAX_EXPIRY_WORKERS", std::cmp::min(num_cpus::get(), 16));
     //globalILMConfig.getExpirationWorkers()
     if let Ok(env_expiration_workers) = env::var("_RUSTFS_ILM_EXPIRATION_WORKERS") {
         if let Ok(num_expirations) = env_expiration_workers.parse::<usize>() {
@@ -619,10 +679,7 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
     }
 
     if workers == 0 {
-        workers = std::env::var("RUSTFS_DEFAULT_EXPIRY_WORKERS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(8);
+        workers = get_env_usize("RUSTFS_DEFAULT_EXPIRY_WORKERS", 8);
     }
 
     //let expiry_state = GLOBAL_ExpiryStSate.write().await;
@@ -659,19 +716,55 @@ pub async fn validate_transition_tier(lc: &BucketLifecycleConfiguration) -> Resu
     Ok(())
 }
 
+fn mark_delete_opts_skip_decommissioned_on_remote_success(opts: &mut ObjectOptions, remote_delete_succeeded: bool) {
+    if remote_delete_succeeded {
+        opts.skip_decommissioned = true;
+    }
+}
+
 pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
-    let lc = GLOBAL_LifecycleSys.get(&oi.bucket).await;
-    if !lc.is_none() {
-        let event = lc.expect("err").eval(&oi.to_lifecycle_opts()).await;
-        match event.action {
-            IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
-                if oi.delete_marker || oi.is_dir {
-                    return;
-                }
-                GLOBAL_TransitionState.queue_transition_task(oi, &event, &src).await;
-            }
-            _ => (),
+    if let Some(lc) = GLOBAL_LifecycleSys.get(&oi.bucket).await {
+        enqueue_transition_with_lifecycle(oi, &lc, &src).await;
+    }
+}
+
+pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
+    let Some(lc) = GLOBAL_LifecycleSys.get(bucket).await else {
+        return Ok(());
+    };
+    let mut marker = None;
+    let mut version_marker = None;
+    let src = LcEventSrc::Scanner;
+
+    loop {
+        let page = api
+            .clone()
+            .list_object_versions(bucket, "", marker.clone(), version_marker.clone(), None, 1000)
+            .await?;
+
+        for object in &page.objects {
+            enqueue_transition_with_lifecycle(object, &lc, &src).await;
         }
+
+        if !page.is_truncated {
+            return Ok(());
+        }
+
+        marker = page.next_marker;
+        version_marker = page.next_version_idmarker;
+    }
+}
+
+async fn enqueue_transition_with_lifecycle(oi: &ObjectInfo, lc: &BucketLifecycleConfiguration, src: &LcEventSrc) {
+    let event = lc.eval(&oi.to_lifecycle_opts()).await;
+    match event.action {
+        IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
+            if oi.delete_marker || oi.is_dir {
+                return;
+            }
+            GLOBAL_TransitionState.queue_transition_task(oi, &event, src).await;
+        }
+        _ => (),
     }
 }
 
@@ -693,13 +786,13 @@ pub async fn expire_transitioned_object(
     //let tags = LcAuditEvent::new(src, lcEvent).Tags();
     if lc_event.action == IlmAction::DeleteRestoredAction {
         opts.transition.expire_restored = true;
-        match api.delete_object(&oi.bucket, &oi.name, opts).await {
+        return match api.delete_object(&oi.bucket, &oi.name, opts).await {
             Ok(dobj) => {
                 //audit_log_lifecycle(*oi, ILMExpiry, tags, traceFn);
-                return Ok(dobj);
+                Ok(dobj)
             }
-            Err(err) => return Err(std::io::Error::other(err)),
-        }
+            Err(err) => Err(std::io::Error::other(err)),
+        };
     }
 
     let ret = delete_object_from_remote_tier(
@@ -708,11 +801,10 @@ pub async fn expire_transitioned_object(
         &oi.transitioned_object.tier,
     )
     .await;
-    if ret.is_ok() {
-        opts.skip_decommissioned = true;
-    } else {
+    if ret.is_err() {
         //transitionLogIf(ctx, err);
     }
+    mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, ret.is_ok());
 
     let dobj = match api.delete_object(&oi.bucket, &oi.name, opts).await {
         Ok(obj) => obj,
@@ -725,18 +817,23 @@ pub async fn expire_transitioned_object(
 
     //defer auditLogLifecycle(ctx, *oi, ILMExpiry, tags, traceFn)
 
-    let mut event_name = EventName::ObjectRemovedDelete;
-    if oi.delete_marker {
-        event_name = EventName::ObjectRemovedDeleteMarkerCreated;
-    }
+    let event_name = if oi.delete_marker {
+        EventName::LifecycleExpirationDelete
+    } else if dobj.delete_marker {
+        EventName::LifecycleExpirationDeleteMarkerCreated
+    } else {
+        EventName::LifecycleExpirationDelete
+    };
     let obj_info = ObjectInfo {
+        bucket: oi.bucket.clone(),
         name: oi.name.clone(),
+        size: oi.size,
         version_id: oi.version_id,
         delete_marker: oi.delete_marker,
         ..Default::default()
     };
     send_event(EventArgs {
-        event_name: event_name.as_ref().to_string(),
+        event_name: event_name.to_string(),
         bucket_name: obj_info.bucket.clone(),
         object: obj_info,
         user_agent: "Internal: [ILM-Expiry]".to_string(),
@@ -760,9 +857,8 @@ pub async fn expire_transitioned_object(
 pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
     let us = Uuid::new_v4().to_string();
     let mut hasher = Sha256::new();
-    let _ = hasher.write(format!("{}/{}", get_global_deployment_id().unwrap_or_default(), bucket).as_bytes());
-    hasher.flush();
-    let hash = rustfs_utils::crypto::hex(hasher.clone().finalize().as_slice());
+    hasher.update(format!("{}/{}", get_global_deployment_id().unwrap_or_default(), bucket).as_bytes());
+    let hash = rustfs_utils::crypto::hex(hasher.finalize().as_slice());
     let obj = format!("{}/{}/{}/{}", &hash[0..16], &us[0..2], &us[2..4], &us);
     Ok(obj)
 }
@@ -787,12 +883,13 @@ pub async fn transition_object(api: Arc<ECStore>, oi: &ObjectInfo, lae: LcAuditE
         mod_time: oi.mod_time,
         ..Default::default()
     };
-    time_ilm(1);
-    api.transition_object(&oi.bucket, &oi.name, &opts).await
+    let result = api.transition_object(&oi.bucket, &oi.name, &opts).await;
+    time_ilm(1)();
+    result
 }
 
 pub fn audit_tier_actions(_api: ECStore, _tier: &str, _bytes: i64) -> TimeFn {
-    todo!();
+    Arc::new(|| Box::pin(async move {}))
 }
 
 pub async fn get_transitioned_object_reader(
@@ -851,8 +948,8 @@ pub async fn post_restore_opts(version_id: &str, bucket: &str, object: &str) -> 
         }
     }
     Ok(ObjectOptions {
-        versioned: versioned,
-        version_suspended: version_suspended,
+        versioned,
+        version_suspended,
         version_id: Some(vid.to_string()),
         ..Default::default()
     })
@@ -958,7 +1055,7 @@ impl LifecycleOps for ObjectInfo {
         lifecycle::ObjectOpts {
             name: self.name.clone(),
             user_tags: self.user_tags.clone(),
-            version_id: self.version_id.map(|v| v.to_string()).unwrap_or_default(),
+            version_id: self.version_id.clone(),
             mod_time: self.mod_time,
             size: self.size as usize,
             is_latest: self.is_latest,
@@ -1037,16 +1134,17 @@ pub async fn eval_action_from_lifecycle(
     let lock_enabled = if let Some(lr) = lr { lr.mode.is_some() } else { false };
 
     match event.action {
-        lifecycle::IlmAction::DeleteAllVersionsAction | lifecycle::IlmAction::DelMarkerDeleteAllVersionsAction => {
+        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => {
             if lock_enabled {
                 return lifecycle::Event::default();
             }
         }
-        lifecycle::IlmAction::DeleteVersionAction | lifecycle::IlmAction::DeleteRestoredVersionAction => {
+        IlmAction::DeleteVersionAction | IlmAction::DeleteRestoredVersionAction => {
             if oi.version_id.is_none() {
                 return lifecycle::Event::default();
             }
-            if lock_enabled && enforce_retention_for_deletion(oi) {
+            // Lifecycle operations should never bypass governance retention
+            if lock_enabled && check_object_lock_for_deletion(&oi.bucket, oi, false).await.is_some() {
                 //if serverDebugLog {
                 if oi.version_id.is_some() {
                     info!(
@@ -1072,7 +1170,7 @@ pub async fn eval_action_from_lifecycle(
     event
 }
 
-async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+pub async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     if oi.delete_marker || oi.is_dir {
         return false;
     }
@@ -1086,11 +1184,11 @@ pub async fn apply_expiry_on_transitioned_object(
     lc_event: &lifecycle::Event,
     src: &LcEventSrc,
 ) -> bool {
-    // let time_ilm = ScannerMetrics::time_ilm(lc_event.action.clone());
+    let time_ilm = Metrics::time_ilm(lc_event.action);
     if let Err(_err) = expire_transitioned_object(api, oi, lc_event, src).await {
         return false;
     }
-    // let _ = time_ilm(1);
+    time_ilm(1)();
 
     true
 }
@@ -1118,7 +1216,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         opts.delete_prefix_object = true;
     }
 
-    // let time_ilm = ScannerMetrics::time_ilm(lc_event.action.clone());
+    let time_ilm = Metrics::time_ilm(lc_event.action);
 
     //debug!("lc_event.action: {:?}", lc_event.action);
     //debug!("opts: {:?}", opts);
@@ -1137,17 +1235,14 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     //let tags = LcAuditEvent::new(lc_event.clone(), src.clone()).tags();
     //tags["version-id"] = dobj.version_id;
 
-    let mut event_name = EventName::ObjectRemovedDelete;
-    if oi.delete_marker {
-        event_name = EventName::ObjectRemovedDeleteMarkerCreated;
-    }
-    match lc_event.action {
-        lifecycle::IlmAction::DeleteAllVersionsAction => event_name = EventName::ObjectRemovedDeleteAllVersions,
-        lifecycle::IlmAction::DelMarkerDeleteAllVersionsAction => event_name = EventName::ILMDelMarkerExpirationDelete,
-        _ => (),
-    }
+    let event_name = match lc_event.action {
+        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => EventName::LifecycleExpirationDelete,
+        _ if oi.delete_marker => EventName::LifecycleExpirationDelete,
+        _ if dobj.delete_marker => EventName::LifecycleExpirationDeleteMarkerCreated,
+        _ => EventName::LifecycleExpirationDelete,
+    };
     send_event(EventArgs {
-        event_name: event_name.as_ref().to_string(),
+        event_name: event_name.to_string(),
         bucket_name: dobj.bucket.clone(),
         object: dobj,
         user_agent: "Internal: [ILM-Expiry]".to_string(),
@@ -1155,18 +1250,18 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         ..Default::default()
     });
 
-    if lc_event.action != lifecycle::IlmAction::NoneAction {
-        // let mut num_versions = 1_u64;
-        // if lc_event.action.delete_all() {
-        //     num_versions = oi.num_versions as u64;
-        // }
-        // let _ = time_ilm(num_versions);
+    if lc_event.action != IlmAction::NoneAction {
+        let mut num_versions = 1_u64;
+        if lc_event.action.delete_all() {
+            num_versions = oi.num_versions as u64;
+        }
+        time_ilm(num_versions)();
     }
 
     true
 }
 
-async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
+pub async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     let mut expiry_state = GLOBAL_ExpiryState.write().await;
     expiry_state.enqueue_by_days(oi, event, src).await;
     true
@@ -1175,18 +1270,54 @@ async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &Obje
 pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
     let mut success = false;
     match event.action {
-        lifecycle::IlmAction::DeleteVersionAction
-        | lifecycle::IlmAction::DeleteAction
-        | lifecycle::IlmAction::DeleteRestoredAction
-        | lifecycle::IlmAction::DeleteRestoredVersionAction
-        | lifecycle::IlmAction::DeleteAllVersionsAction
-        | lifecycle::IlmAction::DelMarkerDeleteAllVersionsAction => {
+        IlmAction::DeleteVersionAction
+        | IlmAction::DeleteAction
+        | IlmAction::DeleteRestoredAction
+        | IlmAction::DeleteRestoredVersionAction
+        | IlmAction::DeleteAllVersionsAction
+        | IlmAction::DelMarkerDeleteAllVersionsAction => {
             success = apply_expiry_rule(event, src, oi).await;
         }
-        lifecycle::IlmAction::TransitionAction | lifecycle::IlmAction::TransitionVersionAction => {
+        IlmAction::TransitionAction | IlmAction::TransitionVersionAction => {
             success = apply_transition_rule(event, src, oi).await;
         }
         _ => (),
     }
     success
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mark_delete_opts_skip_decommissioned_on_remote_success;
+    use crate::store_api::ObjectOptions;
+
+    #[test]
+    fn mark_delete_opts_skip_decommissioned_on_remote_success_sets_flag_on_success() {
+        let mut opts = ObjectOptions::default();
+
+        mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, true);
+
+        assert!(opts.skip_decommissioned);
+    }
+
+    #[test]
+    fn mark_delete_opts_skip_decommissioned_on_remote_success_preserves_false_on_failure() {
+        let mut opts = ObjectOptions::default();
+
+        mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, false);
+
+        assert!(!opts.skip_decommissioned);
+    }
+
+    #[test]
+    fn mark_delete_opts_skip_decommissioned_on_remote_success_preserves_existing_true_on_failure() {
+        let mut opts = ObjectOptions {
+            skip_decommissioned: true,
+            ..ObjectOptions::default()
+        };
+
+        mark_delete_opts_skip_decommissioned_on_remote_success(&mut opts, false);
+
+        assert!(opts.skip_decommissioned);
+    }
 }

@@ -20,7 +20,6 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 pub mod local;
-
 pub mod vault;
 
 /// Abstract KMS client interface that all backends must implement
@@ -37,7 +36,7 @@ pub trait KmsClient: Send + Sync {
     ///
     /// # Returns
     /// Returns a DataKey containing both plaintext and encrypted key material
-    async fn generate_data_key(&self, request: &GenerateKeyRequest, context: Option<&OperationContext>) -> Result<DataKey>;
+    async fn generate_data_key(&self, request: &GenerateKeyRequest, context: Option<&OperationContext>) -> Result<DataKeyInfo>;
 
     /// Encrypt data directly using a master key
     ///
@@ -68,7 +67,7 @@ pub trait KmsClient: Send + Sync {
     /// * `key_id` - Unique identifier for the new key
     /// * `algorithm` - Key algorithm (e.g., "AES_256")
     /// * `context` - Optional operation context for auditing
-    async fn create_key(&self, key_id: &str, algorithm: &str, context: Option<&OperationContext>) -> Result<MasterKey>;
+    async fn create_key(&self, key_id: &str, algorithm: &str, context: Option<&OperationContext>) -> Result<MasterKeyInfo>;
 
     /// Get information about a specific key
     ///
@@ -140,7 +139,7 @@ pub trait KmsClient: Send + Sync {
     /// # Arguments
     /// * `key_id` - The key identifier
     /// * `context` - Optional operation context for auditing
-    async fn rotate_key(&self, key_id: &str, context: Option<&OperationContext>) -> Result<MasterKey>;
+    async fn rotate_key(&self, key_id: &str, context: Option<&OperationContext>) -> Result<MasterKeyInfo>;
 
     /// Health check
     ///
@@ -201,6 +200,16 @@ pub struct BackendInfo {
 
 impl BackendInfo {
     /// Create a new backend info
+    ///
+    /// # Arguments
+    /// * `backend_type` - The type of the backend
+    /// * `version` - The version of the backend
+    /// * `endpoint` - The endpoint or location of the backend
+    /// * `healthy` - Whether the backend is healthy
+    ///
+    /// # Returns
+    /// A new BackendInfo instance
+    ///
     pub fn new(backend_type: String, version: String, endpoint: String, healthy: bool) -> Self {
         Self {
             backend_type,
@@ -212,6 +221,14 @@ impl BackendInfo {
     }
 
     /// Add metadata to the backend info
+    ///
+    /// # Arguments
+    /// * `key` - Metadata key
+    /// * `value` - Metadata value
+    ///
+    /// # Returns
+    /// Updated BackendInfo instance
+    ///
     pub fn with_metadata(mut self, key: String, value: String) -> Self {
         self.metadata.insert(key, value);
         self

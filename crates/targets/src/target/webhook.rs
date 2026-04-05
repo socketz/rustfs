@@ -12,19 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::target::{ChannelTargetType, EntityTarget, TargetType};
 use crate::{
     StoreError, Target, TargetLog,
     arn::TargetID,
     error::TargetError,
-    store::{Key, Store},
+    store::{Key, QueueStore, Store},
+    target::{ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetType},
 };
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, Url};
-use rustfs_config::notify::STORE_EXTENSION;
+use rustfs_config::audit::AUDIT_STORE_EXTENSION;
+use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::{
+    marker::PhantomData,
     path::PathBuf,
     sync::{
         Arc,
@@ -32,10 +34,8 @@ use std::{
     },
     time::Duration,
 };
-use tokio::net::lookup_host;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, instrument};
-use urlencoding;
+use tracing::{debug, error, info, instrument, warn};
 
 /// Arguments for configuring a Webhook target
 #[derive(Debug, Clone)]
@@ -54,6 +54,10 @@ pub struct WebhookArgs {
     pub client_cert: String,
     /// The client key for TLS (PEM format)
     pub client_key: String,
+    /// The path to a custom client root CA certificate file (PEM format) to trust the server.
+    pub client_ca: String,
+    /// Skip TLS certificate verification. DANGEROUS: for testing only.
+    pub skip_tls_verify: bool,
     /// the target type
     pub target_type: TargetType,
 }
@@ -82,6 +86,12 @@ impl WebhookArgs {
             return Err(TargetError::Configuration("cert and key must be specified as a pair".to_string()));
         }
 
+        if self.skip_tls_verify && !self.client_ca.is_empty() {
+            return Err(TargetError::Configuration(
+                "skip_tls_verify and client_ca are mutually exclusive; remove client_ca or disable skip_tls_verify".to_string(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -95,10 +105,10 @@ where
     args: WebhookArgs,
     http_client: Arc<Client>,
     // Add Send + Sync constraints to ensure thread safety
-    store: Option<Box<dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync>>,
+    store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     initialized: AtomicBool,
-    addr: String,
     cancel_sender: mpsc::Sender<()>,
+    _phantom: PhantomData<E>,
 }
 
 impl<E> WebhookTarget<E>
@@ -107,14 +117,14 @@ where
 {
     /// Clones the WebhookTarget, creating a new instance with the same configuration
     pub fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
-        Box::new(WebhookTarget {
+        Box::new(WebhookTarget::<E> {
             id: self.id.clone(),
             args: self.args.clone(),
             http_client: Arc::clone(&self.http_client),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             initialized: AtomicBool::new(self.initialized.load(Ordering::SeqCst)),
-            addr: self.addr.clone(),
             cancel_sender: self.cancel_sender.clone(),
+            _phantom: PhantomData,
         })
     }
 
@@ -125,29 +135,9 @@ where
         args.validate()?;
         // Create a TargetID
         let target_id = TargetID::new(id, ChannelTargetType::Webhook.as_str().to_string());
-        // Build HTTP client
-        let mut client_builder = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .user_agent(rustfs_utils::get_user_agent(rustfs_utils::ServiceType::Basis));
 
-        // Supplementary certificate processing logic
-        if !args.client_cert.is_empty() && !args.client_key.is_empty() {
-            // Add client certificate
-            let cert = std::fs::read(&args.client_cert)
-                .map_err(|e| TargetError::Configuration(format!("Failed to read client cert: {e}")))?;
-            let key = std::fs::read(&args.client_key)
-                .map_err(|e| TargetError::Configuration(format!("Failed to read client key: {e}")))?;
-
-            let identity = reqwest::Identity::from_pem(&[cert, key].concat())
-                .map_err(|e| TargetError::Configuration(format!("Failed to create identity: {e}")))?;
-            client_builder = client_builder.identity(identity);
-        }
-
-        let http_client = Arc::new(
-            client_builder
-                .build()
-                .map_err(|e| TargetError::Configuration(format!("Failed to build HTTP client: {e}")))?,
-        );
+        // Build HTTP client using the helper function
+        let http_client = Arc::new(Self::build_http_client(&args)?);
 
         // Build storage
         let queue_store = if !args.queue_dir.is_empty() {
@@ -155,11 +145,11 @@ where
                 PathBuf::from(&args.queue_dir).join(format!("rustfs-{}-{}", ChannelTargetType::Webhook.as_str(), target_id.id));
 
             let extension = match args.target_type {
-                TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
-                TargetType::NotifyEvent => STORE_EXTENSION,
+                TargetType::AuditLog => AUDIT_STORE_EXTENSION,
+                TargetType::NotifyEvent => NOTIFY_STORE_EXTENSION,
             };
 
-            let store = crate::store::QueueStore::<EntityTarget<E>>::new(queue_dir, args.queue_limit, extension);
+            let store = QueueStore::<QueuedPayload>::new(queue_dir, args.queue_limit, extension);
 
             if let Err(e) = store.open() {
                 error!("Failed to open store for Webhook target {}: {}", target_id.id, e);
@@ -167,82 +157,139 @@ where
             }
 
             // Make sure that the Store trait implemented by QueueStore matches the expected error type
-            Some(Box::new(store) as Box<dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync>)
+            Some(Box::new(store) as Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>)
         } else {
             None
-        };
-
-        // resolved address
-        let addr = {
-            let host = args.endpoint.host_str().unwrap_or("localhost");
-            let port = args
-                .endpoint
-                .port()
-                .unwrap_or_else(|| if args.endpoint.scheme() == "https" { 443 } else { 80 });
-            format!("{host}:{port}")
         };
 
         // Create a cancel channel
         let (cancel_sender, _) = mpsc::channel(1);
         info!(target_id = %target_id.id, "Webhook target created");
-        Ok(WebhookTarget {
+        Ok(WebhookTarget::<E> {
             id: target_id,
             args,
             http_client,
             store: queue_store,
             initialized: AtomicBool::new(false),
-            addr,
             cancel_sender,
+            _phantom: PhantomData,
         })
     }
 
-    async fn init(&self) -> Result<(), TargetError> {
-        // Use CAS operations to ensure thread-safe initialization
-        if !self.initialized.load(Ordering::SeqCst) {
-            // Check the connection
-            match self.is_active().await {
-                Ok(true) => {
-                    info!("Webhook target {} is active", self.id);
-                }
-                Ok(false) => {
-                    return Err(TargetError::NotConnected);
-                }
-                Err(e) => {
-                    error!("Failed to check if Webhook target {} is active: {}", self.id, e);
-                    return Err(e);
+    fn build_http_client(args: &WebhookArgs) -> Result<Client, TargetError> {
+        let mut client_builder = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent(rustfs_utils::get_user_agent(rustfs_utils::ServiceType::Basis));
+
+        // 1. Configure server certificate verification
+        if args.skip_tls_verify {
+            // DANGEROUS: For testing only, skip all certificate verification
+            client_builder = client_builder.danger_accept_invalid_certs(true);
+            warn!(
+                "Webhook target '{}' is configured to skip TLS verification. This is insecure and should not be used in production.",
+                args.endpoint
+            );
+        } else if !args.client_ca.is_empty() {
+            // Use user-provided custom CA certificate
+            let ca_cert_pem = std::fs::read(&args.client_ca)
+                .map_err(|e| TargetError::Configuration(format!("Failed to read root CA cert: {e}")))?;
+            let ca_cert = reqwest::Certificate::from_pem(&ca_cert_pem)
+                .map_err(|e| TargetError::Configuration(format!("Failed to parse root CA cert: {e}")))?;
+            client_builder = client_builder.add_root_certificate(ca_cert);
+        }
+        // If neither is set, use the system's default trust store
+
+        // 2. Configure client certificate (mTLS)
+        if !args.client_cert.is_empty() && !args.client_key.is_empty() {
+            let cert = std::fs::read(&args.client_cert)
+                .map_err(|e| TargetError::Configuration(format!("Failed to read client cert: {e}")))?;
+            let key = std::fs::read(&args.client_key)
+                .map_err(|e| TargetError::Configuration(format!("Failed to read client key: {e}")))?;
+
+            let identity = reqwest::Identity::from_pem(&[cert, key].concat())
+                .map_err(|e| TargetError::Configuration(format!("Failed to create identity for mTLS: {e}")))?;
+            client_builder = client_builder.identity(identity);
+        }
+
+        client_builder
+            .build()
+            .map_err(|e| TargetError::Configuration(format!("Failed to build HTTP client: {e}")))
+    }
+
+    async fn init_inner(&self) -> Result<(), TargetError> {
+        if self.initialized.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // HTTP HEAD probe: verifies the full request path (proxy, TLS, firewall)
+        // unlike TCP connect which can't detect proxy issues.
+        let probe_timeout = Duration::from_secs(5);
+        match tokio::time::timeout(probe_timeout, self.http_client.head(self.args.endpoint.as_str()).send()).await {
+            Ok(Ok(resp)) => {
+                let status = resp.status();
+                if status.is_success() || status == StatusCode::NOT_FOUND {
+                    // NOT_FOUND is acceptable for HEAD probes — the endpoint may not
+                    // exist as a HEAD route, but the server is reachable.
+                    debug!("Webhook target {} HEAD probe returned {}", self.id, status);
+                } else if status == StatusCode::METHOD_NOT_ALLOWED {
+                    // Server is reachable but doesn't support HEAD — still valid.
+                    debug!("Webhook target {} HEAD probe: METHOD_NOT_ALLOWED (reachable)", self.id);
+                } else {
+                    warn!("Webhook target {} HEAD probe returned {}", self.id, status);
                 }
             }
-            self.initialized.store(true, Ordering::SeqCst);
-            info!("Webhook target {} initialized", self.id);
+            Ok(Err(e)) => {
+                // Connection-level error (DNS, TLS, refused, timeout)
+                return Err(if e.is_timeout() || e.is_connect() {
+                    TargetError::NotConnected
+                } else {
+                    TargetError::Network(format!("Webhook HEAD probe failed: {e}"))
+                });
+            }
+            Err(_) => {
+                return Err(TargetError::Timeout("Webhook HEAD probe timed out".to_string()));
+            }
         }
+
+        self.initialized.store(true, Ordering::SeqCst);
+        info!("Webhook target {} initialized", self.id);
         Ok(())
     }
 
-    async fn send(&self, event: &EntityTarget<E>) -> Result<(), TargetError> {
-        info!("Webhook Sending event to webhook target: {}", self.id);
-        let object_name = urlencoding::decode(&event.object_name)
-            .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))?;
-
+    fn build_queued_payload(&self, event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError> {
+        let object_name = crate::target::decode_object_name(&event.object_name)?;
         let key = format!("{}/{}", event.bucket_name, object_name);
-
         let log = TargetLog {
             event_name: event.event_name,
             key,
             records: vec![event.data.clone()],
         };
+        let body = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
+        let meta = QueuedPayloadMeta::new(
+            event.event_name,
+            event.bucket_name.clone(),
+            event.object_name.clone(),
+            "application/json",
+            body.len(),
+        );
+        Ok(QueuedPayload::new(meta, body))
+    }
 
-        let data = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
+    async fn send_body(&self, body: Vec<u8>, meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
+        info!("Webhook sending queued payload to target: {}", self.id);
+        debug!(
+            target = %self.id,
+            bucket = %meta.bucket_name,
+            object = %meta.object_name,
+            event = %meta.event_name,
+            preview = %meta.best_effort_preview(&body, 256),
+            "Sending webhook payload"
+        );
 
-        // Vec<u8> Convert to String
-        let data_string = String::from_utf8(data.clone())
-            .map_err(|e| TargetError::Encoding(format!("Failed to convert event data to UTF-8: {e}")))?;
-        debug!("Sending event to webhook target: {}, event log: {}", self.id, data_string);
-
-        // build request
         let mut req_builder = self
             .http_client
             .post(self.args.endpoint.as_str())
-            .header("Content-Type", "application/json");
+            .header("Content-Type", meta.content_type.as_str());
 
         if !self.args.auth_token.is_empty() {
             // Split auth_token string to check if the authentication type is included
@@ -263,7 +310,7 @@ where
         }
 
         // Send a request
-        let resp = req_builder.body(data).send().await.map_err(|e| {
+        let resp = req_builder.body(body).send().await.map_err(|e| {
             if e.is_timeout() || e.is_connect() {
                 TargetError::NotConnected
             } else {
@@ -299,34 +346,39 @@ where
     }
 
     async fn is_active(&self) -> Result<bool, TargetError> {
-        let socket_addr = lookup_host(&self.addr)
-            .await
-            .map_err(|e| TargetError::Network(format!("Failed to resolve host: {e}")))?
-            .next()
-            .ok_or_else(|| TargetError::Network("No address found".to_string()))?;
-        debug!("is_active socket addr: {},target id:{}", socket_addr, self.id.id);
-        match tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(socket_addr)).await {
-            Ok(Ok(_)) => {
-                debug!("Connection to {} is active", self.addr);
-                Ok(true)
-            }
-            Ok(Err(e)) => {
-                debug!("Connection to {} failed: {}", self.addr, e);
-                if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                    Err(TargetError::NotConnected)
+        match tokio::time::timeout(Duration::from_secs(5), self.http_client.head(self.args.endpoint.as_str()).send()).await {
+            Ok(Ok(resp)) => {
+                let status = resp.status();
+                if status.is_server_error() {
+                    debug!("Webhook {} server error: {}", self.id, status);
+                    Ok(false)
                 } else {
-                    Err(TargetError::Network(format!("Connection failed: {e}")))
+                    debug!("Webhook {} is reachable (status: {})", self.id, status);
+                    Ok(true)
                 }
             }
-            Err(_) => Err(TargetError::Timeout("Connection timed out".to_string())),
+            Ok(Err(e)) => {
+                debug!("Webhook {} request failed: {}", self.id, e);
+                if e.is_timeout() || e.is_connect() {
+                    Err(TargetError::NotConnected)
+                } else {
+                    Err(TargetError::Network(format!("Webhook health check failed: {e}")))
+                }
+            }
+            Err(_) => Err(TargetError::Timeout("Webhook health check timed out".to_string())),
         }
     }
 
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
+        let queued = self.build_queued_payload(&event)?;
+
         if let Some(store) = &self.store {
-            // Call the store method directly, no longer need to acquire the lock
             store
-                .put(event)
+                .put_raw(
+                    &queued
+                        .encode()
+                        .map_err(|e| TargetError::Storage(format!("Failed to encode queued payload: {e}")))?,
+                )
                 .map_err(|e| TargetError::Storage(format!("Failed to save event to store: {e}")))?;
             debug!("Event saved to store for target: {}", self.id);
             Ok(())
@@ -338,12 +390,12 @@ where
                     return Err(TargetError::NotConnected);
                 }
             }
-            self.send(&event).await
+            self.send_body(queued.body, &queued.meta).await
         }
     }
 
-    async fn send_from_store(&self, key: Key) -> Result<(), TargetError> {
-        debug!("Sending event from store for target: {}", self.id);
+    async fn send_raw_from_store(&self, key: Key, body: Vec<u8>, meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+        debug!("Sending queued payload from store for target: {}, key: {}", self.id, key);
         match self.init().await {
             Ok(_) => {
                 debug!("Event sent to store for target: {}", self.name());
@@ -354,35 +406,11 @@ where
             }
         }
 
-        let store = self
-            .store
-            .as_ref()
-            .ok_or_else(|| TargetError::Configuration("No store configured".to_string()))?;
-
-        // Get events directly from the store, no longer need to acquire locks
-        let event = match store.get(&key) {
-            Ok(event) => event,
-            Err(StoreError::NotFound) => return Ok(()),
-            Err(e) => {
-                return Err(TargetError::Storage(format!("Failed to get event from store: {e}")));
-            }
-        };
-
-        if let Err(e) = self.send(&event).await {
+        if let Err(e) = self.send_body(body, &meta).await {
             if let TargetError::NotConnected = e {
                 return Err(TargetError::NotConnected);
             }
             return Err(e);
-        }
-
-        // Use the immutable reference of the store to delete the event content corresponding to the key
-        debug!("Deleting event from store for target: {}, key:{}, start", self.id, key.to_string());
-        match store.del(&key) {
-            Ok(_) => debug!("Event deleted from store for target: {}, key:{}, end", self.id, key.to_string()),
-            Err(e) => {
-                error!("Failed to delete event from store: {}", e);
-                return Err(TargetError::Storage(format!("Failed to delete event from store: {e}")));
-            }
         }
 
         debug!("Event sent from store and deleted for target: {}", self.id);
@@ -396,7 +424,7 @@ where
         Ok(())
     }
 
-    fn store(&self) -> Option<&(dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync)> {
+    fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
         // Returns the reference to the internal store
         self.store.as_deref()
     }
@@ -406,17 +434,113 @@ where
     }
 
     async fn init(&self) -> Result<(), TargetError> {
-        // If the target is disabled, return to success directly
         if !self.is_enabled() {
             debug!("Webhook target {} is disabled, skipping initialization", self.id);
             return Ok(());
         }
-
-        // Use existing initialization logic
-        WebhookTarget::init(self).await
+        self.init_inner().await
     }
 
     fn is_enabled(&self) -> bool {
         self.args.enable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WebhookArgs;
+    use crate::target::{TargetType, decode_object_name};
+    use url::Url;
+    use url::form_urlencoded;
+
+    fn base_args() -> WebhookArgs {
+        WebhookArgs {
+            enable: true,
+            endpoint: Url::parse("https://example.com/hook").unwrap(),
+            auth_token: String::new(),
+            queue_dir: String::new(),
+            queue_limit: 0,
+            client_cert: String::new(),
+            client_key: String::new(),
+            client_ca: String::new(),
+            skip_tls_verify: false,
+            target_type: TargetType::NotifyEvent,
+        }
+    }
+
+    #[test]
+    fn test_validate_skip_tls_verify_and_client_ca_mutually_exclusive() {
+        let args = WebhookArgs {
+            skip_tls_verify: true,
+            client_ca: "/path/to/ca.pem".to_string(),
+            ..base_args()
+        };
+        let result = args.validate();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("skip_tls_verify") && err_msg.contains("client_ca"),
+            "Error message should mention both fields, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_skip_tls_verify_without_client_ca_is_ok() {
+        let args = WebhookArgs {
+            skip_tls_verify: true,
+            ..base_args()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_client_ca_without_skip_tls_verify_is_ok() {
+        let args = WebhookArgs {
+            client_ca: "/path/to/ca.pem".to_string(),
+            ..base_args()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_decode_object_name_with_spaces() {
+        // Test case from the issue: "greeting file (2).csv"
+        let object_name = "greeting file (2).csv";
+
+        // Simulate what event.rs does: form-urlencoded encoding (spaces become +)
+        let form_encoded = form_urlencoded::byte_serialize(object_name.as_bytes()).collect::<String>();
+        assert_eq!(form_encoded, "greeting+file+%282%29.csv");
+
+        // Test the decode_object_name helper function
+        let decoded = decode_object_name(&form_encoded).unwrap();
+        assert_eq!(decoded, object_name);
+        assert!(!decoded.contains('+'), "Decoded string should not contain + symbols");
+    }
+
+    #[test]
+    fn test_decode_object_name_with_special_chars() {
+        // Test with various special characters
+        let test_cases = vec![
+            ("folder/greeting file (2).csv", "folder%2Fgreeting+file+%282%29.csv"),
+            ("test file.txt", "test+file.txt"),
+            ("my file (copy).pdf", "my+file+%28copy%29.pdf"),
+            ("file with spaces and (parentheses).doc", "file+with+spaces+and+%28parentheses%29.doc"),
+        ];
+
+        for (original, form_encoded) in test_cases {
+            // Test the decode_object_name helper function
+            let decoded = decode_object_name(form_encoded).unwrap();
+            assert_eq!(decoded, original, "Failed to decode: {}", form_encoded);
+        }
+    }
+
+    #[test]
+    fn test_decode_object_name_without_spaces() {
+        // Test that files without spaces still work correctly
+        let object_name = "simple-file.txt";
+        let form_encoded = form_urlencoded::byte_serialize(object_name.as_bytes()).collect::<String>();
+
+        let decoded = decode_object_name(&form_encoded).unwrap();
+        assert_eq!(decoded, object_name);
     }
 }

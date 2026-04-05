@@ -1,26 +1,76 @@
+{{- $logDir := .Values.config.rustfs.obs_log_directory }}
+
+{{- if .Values.mode.distributed.enabled }}
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: {{ include "rustfs.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rustfs.labels" . | nindent 4 }}
+    {{- with .Values.commonLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 spec:
   serviceName: {{ include "rustfs.fullname" . }}-headless
   replicas: {{ .Values.replicaCount }}
   podManagementPolicy: Parallel
   selector:
     matchLabels:
-      app: {{ include "rustfs.name" . }}
+      {{- include "rustfs.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        app: {{ include "rustfs.name" . }}
+        {{- include "rustfs.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
+      enableServiceLinks: {{ .Values.enableServiceLinks }}
+      {{- with include "chart.imagePullSecrets" . }}
+      imagePullSecrets:
+        {{- . | nindent 8 }}
+      {{- end }}
+      {{- if and .Values.nodeSelector (not .Values.affinity.nodeAffinity) }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        nodeAffinity:
+        {{- if .Values.affinity.nodeAffinity }}
+          {{- toYaml .Values.affinity.nodeAffinity | nindent 10 }}
+        {{- else }}
+          {}
+        {{- end }}
+        {{- if .Values.affinity.podAntiAffinity.enabled }}
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                      - {{ include "rustfs.name" . }}
+              topologyKey: {{ .Values.affinity.podAntiAffinity.topologyKey }}
+        {{- end }}
+      {{- end }}
+      {{- if .Values.tolerations }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       initContainers:
         - name: init-step
-          image: busybox
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          image: "{{ .Values.image.initImage.repository }}:{{ .Values.image.initImage.tag }}"
+          imagePullPolicy: {{ .Values.image.initImage.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           env:
             - name: REPLICA_COUNT
-              value: "{{ .Values.replicaCount }}"
+              value: {{ .Values.replicaCount | quote }}
           command:
             - sh
             - -c
@@ -32,9 +82,8 @@ spec:
               elif [ "$REPLICA_COUNT" -eq 16 ]; then
                 mkdir -p /data
               fi
-
-              chown -R 1000:1000 /data
-              chown -R 1000:1000 /logs
+              mkdir -p /mnt/rustfs/logs
+              chmod 755 /mnt/rustfs/logs
           volumeMounts:
             {{- if eq (int .Values.replicaCount) 4 }}
             {{- range $i := until (int .Values.replicaCount) }}
@@ -46,56 +95,64 @@ spec:
               mountPath: /data
             {{- end }}
             - name: logs
-              mountPath: /logs
+              mountPath: /mnt/rustfs
       containers:
         - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.rustfs.repository }}:{{ .Values.image.rustfs.tag | default .Chart.AppVersion }}"
           command: ["/usr/bin/rustfs"]
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.image.rustfs.pullPolicy }}
           securityContext:
-            runAsUser: 1000
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           ports:
-            - containerPort: {{ .Values.service.ep_port }}
-              name: endpoint
-            - containerPort: {{ .Values.service.console_port }}
-              name: console
+            - name: endpoint
+              containerPort: {{ .Values.service.endpoint.port }}
+            - name: console
+              containerPort: {{ .Values.service.console.port }}
+          {{- with .Values.extraEnv }}
           env:
-            - name: REPLICA_COUNT
-              value: "{{ .Values.replicaCount }}"
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           envFrom:
             - configMapRef:
                 name: {{ include "rustfs.fullname" . }}-config
             - secretRef:
-                name: {{ include "rustfs.fullname" . }}-secret
+                name: {{ include "rustfs.secretName" . }}
           resources:
-            requests:
-              memory: {{ .Values.resources.requests.memory }}
-              cpu: {{ .Values.resources.requests.cpu }}
-            limits:
-              memory: {{ .Values.resources.limits.memory }}
-              cpu: {{ .Values.resources.limits.cpu }}
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.livenessProbe.enabled }}
           livenessProbe:
-            httpGet:
-              path: /health
-              port: 9000
-            initialDelaySeconds: 10
-            periodSeconds: 5
-            timeoutSeconds: 3
-            successThreshold: 1
-            failureThreshold: 3
+            {{- omit .Values.livenessProbe "enabled" | toYaml | nindent 12 }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
           readinessProbe:
-            httpGet:
-              path: /health
-              port: 9000
-            exec:
-            initialDelaySeconds: 30
-            periodSeconds: 5
-            timeoutSeconds: 3
-            successThreshold: 1
-            failureThreshold: 3
+            {{- omit .Values.readinessProbe "enabled" | toYaml | nindent 12 }}
+          {{- end }}
           volumeMounts:
+            {{- if .Values.mtls.enabled }}
+            {{- if not .Values.mtls.serverOnly }}
+            - name: client-cert
+              mountPath: /opt/tls/client_cert.pem
+              subPath: client_cert.pem
+            - name: client-cert
+              mountPath: /opt/tls/client_key.pem
+              subPath: client_key.pem
+            - name: client-cert
+              mountPath: /opt/tls/client_ca.crt
+              subPath: client_ca.crt
+            {{- end }}
+            - name: server-cert
+              mountPath: /opt/tls/rustfs_cert.pem
+              subPath: rustfs_cert.pem
+            - name: server-cert
+              mountPath: /opt/tls/rustfs_key.pem
+              subPath: rustfs_key.pem
+            - name: server-cert
+              mountPath: /opt/tls/ca.crt
+              subPath: ca.crt
+            {{- end }}
             - name: logs
-              mountPath: /logs
+              mountPath: {{ $logDir }}
+              subPath: logs
             {{- if eq (int .Values.replicaCount) 4 }}
             {{- range $i := until (int .Values.replicaCount) }}
             - name: data-rustfs-{{ $i }}
@@ -105,28 +162,65 @@ spec:
             - name: data
               mountPath: /data
             {{- end }}
+      {{- if .Values.mtls.enabled }}
       volumes:
-        - name: logs
-          emptyDir: {}
+        - name: server-cert
+          secret:
+            secretName: rustfs-server-tls
+            items:
+              - key: tls.crt
+                path: rustfs_cert.pem
+              - key: tls.key
+                path: rustfs_key.pem
+              - key: ca.crt
+                path: ca.crt
+        {{- if not .Values.mtls.serverOnly }}
+        - name: client-cert
+          secret:
+            secretName: rustfs-client-tls
+            items:
+              - key: tls.crt
+                path: client_cert.pem
+              - key: tls.key
+                path: client_key.pem
+              - key: ca.crt
+                path: client_ca.crt
+        {{- end }}
+      {{- end }}
   volumeClaimTemplates:
-  {{- if eq (int .Values.replicaCount) 4 }}
-  {{- range $i := until (int .Values.replicaCount) }}
+    - metadata:
+        name: logs
+        labels:
+          {{- toYaml .Values.commonLabels | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.storageclass.name }}
+        resources:
+          requests:
+            storage: {{ .Values.storageclass.logStorageSize }}
+    {{- if eq (int .Values.replicaCount) 4 }}
+    {{- range $i := until (int .Values.replicaCount) }}
     - metadata:
         name: data-rustfs-{{ $i }}
+        labels:
+          {{- toYaml $.Values.commonLabels | nindent 10 }}
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: {{ $.Values.storageclass.name }}
         resources:
           requests:
-            storage: {{ $.Values.storageclass.size}}
-  {{- end }}
-  {{- else if eq (int .Values.replicaCount) 16 }}
+            storage: {{ $.Values.storageclass.dataStorageSize }}
+    {{- end }}
+    {{- else if eq (int .Values.replicaCount) 16 }}
     - metadata:
         name: data
+        labels:
+          {{- toYaml .Values.commonLabels | nindent 10 }}
       spec:
         accessModes: ["ReadWriteOnce"]
-        storageClassName: {{ $.Values.storageclass.name }}
+        storageClassName: {{ .Values.storageclass.name }}
         resources:
           requests:
-            storage: {{ $.Values.storageclass.size}}
-  {{- end }}
+            storage: {{ .Values.storageclass.dataStorageSize }}
+    {{- end }}
+{{- end }}

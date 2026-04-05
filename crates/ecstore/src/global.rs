@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::bandwidth::monitor::Monitor;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
     disk::DiskStore,
@@ -21,7 +22,7 @@ use crate::{
     tier::tier::TierConfigMgr,
 };
 use lazy_static::lazy_static;
-use rustfs_policy::auth::Credentials;
+use rustfs_lock::client::LockClient;
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
@@ -29,6 +30,7 @@ use std::{
 };
 use tokio::sync::{OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use uuid::Uuid;
 
 pub const DISK_ASSUME_UNKNOWN_SIZE: u64 = 1 << 30;
@@ -40,11 +42,11 @@ lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
     static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
-    pub static ref GLOBAL_LOCAL_DISK: Arc<RwLock<Vec<Option<DiskStore>>>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_IsErasure: RwLock<bool> = RwLock::new(false);
     pub static ref GLOBAL_IsDistErasure: RwLock<bool> = RwLock::new(false);
     pub static ref GLOBAL_IsErasureSD: RwLock<bool> = RwLock::new(false);
     pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
+    pub static ref GLOBAL_LOCAL_DISK_ID_MAP: Arc<RwLock<HashMap<Uuid, String>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
     pub static ref GLOBAL_Endpoints: OnceLock<EndpointServerPools> = OnceLock::new();
     pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
@@ -55,54 +57,27 @@ lazy_static! {
     pub static ref GLOBAL_LocalNodeName: String = "127.0.0.1:9000".to_string();
     pub static ref GLOBAL_LocalNodeNameHex: String = rustfs_utils::crypto::hex(GLOBAL_LocalNodeName.as_bytes());
     pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();
-    pub static ref GLOBAL_REGION: OnceLock<String> = OnceLock::new();
+    pub static ref GLOBAL_REGION: OnceLock<s3s::region::Region> = OnceLock::new();
+    pub static ref GLOBAL_LOCAL_LOCK_CLIENT: OnceLock<Arc<dyn LockClient>> = OnceLock::new();
+    pub static ref GLOBAL_LOCK_CLIENTS: OnceLock<HashMap<String, Arc<dyn LockClient>>> = OnceLock::new();
+    pub static ref GLOBAL_BUCKET_MONITOR: OnceLock<Arc<Monitor>> = OnceLock::new();
+}
+
+pub fn init_global_bucket_monitor(num_nodes: u64) {
+    if GLOBAL_BUCKET_MONITOR.set(Monitor::new(num_nodes)).is_err() {
+        warn!(
+            "global bucket monitor already initialized, ignoring re-initialization with num_nodes={}",
+            num_nodes
+        );
+    }
+}
+
+pub fn get_global_bucket_monitor() -> Option<Arc<Monitor>> {
+    GLOBAL_BUCKET_MONITOR.get().cloned()
 }
 
 /// Global cancellation token for background services (data scanner and auto heal)
 static GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
-
-/// Global active credentials
-static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
-
-/// Initialize the global action credentials
-///
-/// # Arguments
-/// * `ak` - Optional access key
-/// * `sk` - Optional secret key
-///
-/// # Returns
-/// * None
-///
-pub fn init_global_action_credentials(ak: Option<String>, sk: Option<String>) {
-    let ak = {
-        if let Some(k) = ak {
-            k
-        } else {
-            rustfs_utils::string::gen_access_key(20).unwrap_or_default()
-        }
-    };
-
-    let sk = {
-        if let Some(k) = sk {
-            k
-        } else {
-            rustfs_utils::string::gen_secret_key(32).unwrap_or_default()
-        }
-    };
-
-    GLOBAL_ACTIVE_CRED
-        .set(Credentials {
-            access_key: ak,
-            secret_key: sk,
-            ..Default::default()
-        })
-        .unwrap();
-}
-
-/// Get the global action credentials
-pub fn get_global_action_cred() -> Option<Credentials> {
-    GLOBAL_ACTIVE_CRED.get().cloned()
-}
 
 /// Get the global rustfs port
 ///
@@ -173,6 +148,18 @@ pub fn get_global_endpoints() -> EndpointServerPools {
     } else {
         EndpointServerPools::default()
     }
+}
+
+pub fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
+    GLOBAL_Endpoints.get().cloned()
+}
+
+pub async fn is_first_cluster_node_local() -> bool {
+    get_global_endpoints().first_local()
+}
+
+pub fn get_global_tier_config_mgr() -> Arc<RwLock<TierConfigMgr>> {
+    GLOBAL_TierConfigMgr.clone()
 }
 
 /// Create a new object layer instance
@@ -260,20 +247,20 @@ type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;
 /// Set the global region
 ///
 /// # Arguments
-/// * `region` - The region string to set globally
+/// * `region` - The Region instance to set globally
 ///
 /// # Returns
 /// * None
-pub fn set_global_region(region: String) {
+pub fn set_global_region(region: s3s::region::Region) {
     GLOBAL_REGION.set(region).unwrap();
 }
 
 /// Get the global region
 ///
 /// # Returns
-/// * `Option<String>` - The global region string, if set
+/// * `Option<s3s::region::Region>` - The global region, if set
 ///
-pub fn get_global_region() -> Option<String> {
+pub fn get_global_region() -> Option<s3s::region::Region> {
     GLOBAL_REGION.get().cloned()
 }
 
@@ -318,4 +305,52 @@ pub fn shutdown_background_services() {
     if let Some(cancel_token) = GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN.get() {
         cancel_token.cancel();
     }
+}
+
+/// Set the global lock client (first LocalClient created)
+///
+/// # Arguments
+/// * `client` - The LockClient instance to set globally
+///
+/// # Returns
+/// * `Ok(())` if successful
+/// * `Err(Arc<dyn LockClient>)` if setting fails (client already set)
+///
+pub fn set_global_lock_client(
+    client: Arc<dyn rustfs_lock::client::LockClient>,
+) -> Result<(), Arc<dyn rustfs_lock::client::LockClient>> {
+    GLOBAL_LOCAL_LOCK_CLIENT.set(client)
+}
+
+/// Get the global lock client
+///
+/// # Returns
+/// * `Option<Arc<dyn LockClient>>` - The global lock client, if set
+///
+pub fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
+    GLOBAL_LOCAL_LOCK_CLIENT.get().cloned()
+}
+
+/// Set the global lock clients map
+///
+/// # Arguments
+/// * `clients` - The HashMap of lock clients to set globally
+///
+/// # Returns
+/// * `Ok(())` if successful
+/// * `Err(HashMap<String, Arc<dyn LockClient>>)` if setting fails (clients already set)
+///
+pub fn set_global_lock_clients(
+    clients: HashMap<String, Arc<dyn LockClient>>,
+) -> Result<(), HashMap<String, Arc<dyn LockClient>>> {
+    GLOBAL_LOCK_CLIENTS.set(clients)
+}
+
+/// Get the global lock clients map
+///
+/// # Returns
+/// * `Option<&HashMap<String, Arc<dyn LockClient>>>` - The global lock clients map, if set
+///
+pub fn get_global_lock_clients() -> Option<&'static HashMap<String, Arc<dyn LockClient>>> {
+    GLOBAL_LOCK_CLIENTS.get()
 }

@@ -12,16 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::store::Key;
-use crate::target::{ChannelTargetType, EntityTarget, TargetType};
-use crate::{StoreError, Target, TargetLog, arn::TargetID, error::TargetError, store::Store};
+use crate::{
+    StoreError, Target, TargetLog,
+    arn::TargetID,
+    error::TargetError,
+    store::{Key, QueueStore, Store},
+    target::{ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetType},
+};
 use async_trait::async_trait;
-use rumqttc::{AsyncClient, EventLoop, MqttOptions, Outgoing, Packet, QoS};
-use rumqttc::{ConnectionError, mqttbytes::Error as MqttBytesError};
+use rumqttc::{AsyncClient, ConnectionError, EventLoop, MqttOptions, Outgoing, Packet, QoS, mqttbytes::Error as MqttBytesError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::{
+    marker::PhantomData,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -29,7 +33,6 @@ use std::{
 use tokio::sync::{Mutex, OnceCell, mpsc};
 use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
-use urlencoding;
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 const EVENT_LOOP_POLL_TIMEOUT: Duration = Duration::from_secs(10); // For initial connection check in task
@@ -108,9 +111,10 @@ where
     id: TargetID,
     args: MQTTArgs,
     client: Arc<Mutex<Option<AsyncClient>>>,
-    store: Option<Box<dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync>>,
+    store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     connected: Arc<AtomicBool>,
     bg_task_manager: Arc<BgTaskManager>,
+    _phantom: PhantomData<E>,
 }
 
 impl<E> MQTTTarget<E>
@@ -130,10 +134,10 @@ where
             debug!(target_id = %target_id, path = %specific_queue_path.display(), "Initializing queue store for MQTT target");
             let extension = match args.target_type {
                 TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
-                TargetType::NotifyEvent => rustfs_config::notify::STORE_EXTENSION,
+                TargetType::NotifyEvent => rustfs_config::notify::NOTIFY_STORE_EXTENSION,
             };
 
-            let store = crate::store::QueueStore::<EntityTarget<E>>::new(specific_queue_path, args.queue_limit, extension);
+            let store = QueueStore::<QueuedPayload>::new(specific_queue_path, args.queue_limit, extension);
             if let Err(e) = store.open() {
                 error!(
                     target_id = %target_id,
@@ -142,7 +146,7 @@ where
                 );
                 return Err(TargetError::Storage(format!("{e}")));
             }
-            Some(Box::new(store) as Box<dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync>)
+            Some(Box::new(store) as Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>)
         } else {
             None
         };
@@ -155,13 +159,14 @@ where
         });
 
         info!(target_id = %target_id, "MQTT target created");
-        Ok(MQTTTarget {
+        Ok(MQTTTarget::<E> {
             id: target_id,
             args,
             client: Arc::new(Mutex::new(None)),
             store: queue_store,
             connected: Arc::new(AtomicBool::new(false)),
             bg_task_manager,
+            _phantom: PhantomData,
         })
     }
 
@@ -223,17 +228,20 @@ where
 
         match tokio::time::timeout(DEFAULT_CONNECTION_TIMEOUT, async {
             while !self.connected.load(Ordering::SeqCst) {
-                if let Some(handle) = self.bg_task_manager.init_cell.get() {
-                    if handle.is_finished() && !self.connected.load(Ordering::SeqCst) {
-                        error!(target_id = %self.id, "MQTT background task exited prematurely before connection was established.");
-                        return Err(TargetError::Network("MQTT background task exited prematurely".to_string()));
-                    }
+                if let Some(handle) = self.bg_task_manager.init_cell.get()
+                    && handle.is_finished()
+                    && !self.connected.load(Ordering::SeqCst)
+                {
+                    error!(target_id = %self.id, "MQTT background task exited prematurely before connection was established.");
+                    return Err(TargetError::Network("MQTT background task exited prematurely".to_string()));
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             debug!(target_id = %self.id, "MQTT target connected successfully.");
             Ok(())
-        }).await {
+        })
+        .await
+        {
             Ok(Ok(_)) => {
                 info!(target_id = %self.id, "MQTT target initialized and connected.");
                 Ok(())
@@ -241,22 +249,13 @@ where
             Ok(Err(e)) => Err(e),
             Err(_) => {
                 error!(target_id = %self.id, "Timeout waiting for MQTT connection after task spawn.");
-                Err(TargetError::Network(
-                    "Timeout waiting for MQTT connection".to_string(),
-                ))
+                Err(TargetError::Network("Timeout waiting for MQTT connection".to_string()))
             }
         }
     }
 
-    #[instrument(skip(self, event), fields(target_id = %self.id))]
-    async fn send(&self, event: &EntityTarget<E>) -> Result<(), TargetError> {
-        let client_guard = self.client.lock().await;
-        let client = client_guard
-            .as_ref()
-            .ok_or_else(|| TargetError::Configuration("MQTT client not initialized".to_string()))?;
-
-        let object_name = urlencoding::decode(&event.object_name)
-            .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))?;
+    fn build_queued_payload(&self, event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError> {
+        let object_name = crate::target::decode_object_name(&event.object_name)?;
 
         let key = format!("{}/{}", event.bucket_name, object_name);
 
@@ -266,14 +265,35 @@ where
             records: vec![event.clone()],
         };
 
-        let data = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
+        let body = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
+        let meta = QueuedPayloadMeta::new(
+            event.event_name,
+            event.bucket_name.clone(),
+            event.object_name.clone(),
+            "application/json",
+            body.len(),
+        );
+        Ok(QueuedPayload::new(meta, body))
+    }
 
-        let data_string = String::from_utf8(data.clone())
-            .map_err(|e| TargetError::Encoding(format!("Failed to convert event data to UTF-8: {e}")))?;
-        debug!("Sending event to mqtt target: {}, event log: {}", self.id, data_string);
+    #[instrument(skip(self, body, meta), fields(target_id = %self.id))]
+    async fn send_body(&self, body: Vec<u8>, meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
+        let client_guard = self.client.lock().await;
+        let client = client_guard
+            .as_ref()
+            .ok_or_else(|| TargetError::Configuration("MQTT client not initialized".to_string()))?;
+
+        debug!(
+            target = %self.id,
+            bucket = %meta.bucket_name,
+            object = %meta.object_name,
+            event = %meta.event_name,
+            preview = %meta.best_effort_preview(&body, 256),
+            "Sending MQTT payload"
+        );
 
         client
-            .publish(&self.args.topic, self.args.qos, false, data)
+            .publish(&self.args.topic, self.args.qos, false, body)
             .await
             .map_err(|e| {
                 if e.to_string().contains("Connection") || e.to_string().contains("Timeout") {
@@ -290,13 +310,14 @@ where
     }
 
     pub fn clone_target(&self) -> Box<dyn Target<E> + Send + Sync> {
-        Box::new(MQTTTarget {
+        Box::new(MQTTTarget::<E> {
             id: self.id.clone(),
             args: self.args.clone(),
             client: self.client.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             connected: self.connected.clone(),
             bg_task_manager: self.bg_task_manager.clone(),
+            _phantom: PhantomData,
         })
     }
 }
@@ -468,11 +489,11 @@ where
         debug!(target_id = %self.id, "Checking if MQTT target is active.");
         if self.client.lock().await.is_none() && !self.connected.load(Ordering::SeqCst) {
             // Check if the background task is running and has not panicked
-            if let Some(handle) = self.bg_task_manager.init_cell.get() {
-                if handle.is_finished() {
-                    error!(target_id = %self.id, "MQTT background task has finished, possibly due to an error. Target is not active.");
-                    return Err(TargetError::Network("MQTT background task terminated".to_string()));
-                }
+            if let Some(handle) = self.bg_task_manager.init_cell.get()
+                && handle.is_finished()
+            {
+                error!(target_id = %self.id, "MQTT background task has finished, possibly due to an error. Target is not active.");
+                return Err(TargetError::Network("MQTT background task terminated".to_string()));
             }
             debug!(target_id = %self.id, "MQTT client not yet initialized or task not running/connected.");
             return Err(TargetError::Configuration(
@@ -491,11 +512,15 @@ where
 
     #[instrument(skip(self, event), fields(target_id = %self.id))]
     async fn save(&self, event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
+        let queued = self.build_queued_payload(&event)?;
+
         if let Some(store) = &self.store {
             debug!(target_id = %self.id, "Event saved to store start");
-            // If store is configured, ONLY put the event into the store.
-            // Do NOT send it directly here.
-            match store.put(event.clone()) {
+            match store.put_raw(
+                &queued
+                    .encode()
+                    .map_err(|e| TargetError::Storage(format!("Failed to encode queued payload: {e}")))?,
+            ) {
                 Ok(_) => {
                     debug!(target_id = %self.id, "Event saved to store for MQTT target successfully.");
                     Ok(())
@@ -513,7 +538,7 @@ where
             if !self.connected.load(Ordering::SeqCst) {
                 warn!(target_id = %self.id, "Attempting to send directly but not connected; trying to init.");
                 // Call the struct's init method, not the trait's default
-                match MQTTTarget::init(self).await {
+                match MQTTTarget::<E>::init(self).await {
                     Ok(_) => debug!(target_id = %self.id, "MQTT target initialized successfully."),
                     Err(e) => {
                         error!(target_id = %self.id, error = %e, "Failed to initialize MQTT target.");
@@ -525,13 +550,13 @@ where
                     return Err(TargetError::NotConnected);
                 }
             }
-            self.send(&event).await
+            self.send_body(queued.body, &queued.meta).await
         }
     }
 
-    #[instrument(skip(self), fields(target_id = %self.id))]
-    async fn send_from_store(&self, key: Key) -> Result<(), TargetError> {
-        debug!(target_id = %self.id, ?key, "Attempting to send event from store with key.");
+    #[instrument(skip(self, body, meta), fields(target_id = %self.id))]
+    async fn send_raw_from_store(&self, key: Key, body: Vec<u8>, meta: QueuedPayloadMeta) -> Result<(), TargetError> {
+        debug!(target_id = %self.id, ?key, "Attempting to send queued payload from store.");
 
         if !self.is_enabled() {
             return Err(TargetError::Disabled);
@@ -539,7 +564,7 @@ where
 
         if !self.connected.load(Ordering::SeqCst) {
             warn!(target_id = %self.id, "Not connected; trying to init before sending from store.");
-            match MQTTTarget::init(self).await {
+            match MQTTTarget::<E>::init(self).await {
                 Ok(_) => debug!(target_id = %self.id, "MQTT target initialized successfully."),
                 Err(e) => {
                     error!(target_id = %self.id, error = %e, "Failed to initialize MQTT target.");
@@ -552,33 +577,8 @@ where
             }
         }
 
-        let store = self
-            .store
-            .as_ref()
-            .ok_or_else(|| TargetError::Configuration("No store configured".to_string()))?;
-
-        let event = match store.get(&key) {
-            Ok(event) => {
-                debug!(target_id = %self.id, ?key, "Retrieved event from store for sending.");
-                event
-            }
-            Err(StoreError::NotFound) => {
-                // Assuming NotFound takes the key
-                debug!(target_id = %self.id, ?key, "Event not found in store for sending.");
-                return Ok(());
-            }
-            Err(e) => {
-                error!(
-                    target_id = %self.id,
-                    error = %e,
-                    "Failed to get event from store"
-                );
-                return Err(TargetError::Storage(format!("Failed to get event from store: {e}")));
-            }
-        };
-
         debug!(target_id = %self.id, ?key, "Sending event from store.");
-        if let Err(e) = self.send(&event).await {
+        if let Err(e) = self.send_body(body, &meta).await {
             if matches!(e, TargetError::NotConnected) {
                 warn!(target_id = %self.id, "Failed to send event from store: Not connected. Event remains in store.");
                 return Err(TargetError::NotConnected);
@@ -586,22 +586,7 @@ where
             error!(target_id = %self.id, error = %e, "Failed to send event from store with an unexpected error.");
             return Err(e);
         }
-        debug!(target_id = %self.id, ?key, "Event sent from store successfully. deleting from store. ");
-
-        match store.del(&key) {
-            Ok(_) => {
-                debug!(target_id = %self.id, ?key, "Event deleted from store after successful send.")
-            }
-            Err(StoreError::NotFound) => {
-                debug!(target_id = %self.id, ?key, "Event already deleted from store.");
-            }
-            Err(e) => {
-                error!(target_id = %self.id, error = %e, "Failed to delete event from store after send.");
-                return Err(TargetError::Storage(format!("Failed to delete event from store: {e}")));
-            }
-        }
-
-        debug!(target_id = %self.id, ?key, "Event deleted from store.");
+        debug!(target_id = %self.id, ?key, "Event sent from store successfully.");
         Ok(())
     }
 
@@ -634,7 +619,7 @@ where
         Ok(())
     }
 
-    fn store(&self) -> Option<&(dyn Store<EntityTarget<E>, Error = StoreError, Key = Key> + Send + Sync)> {
+    fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
         self.store.as_deref()
     }
 
@@ -648,7 +633,7 @@ where
             return Ok(());
         }
         // Call the internal init logic
-        MQTTTarget::init(self).await
+        MQTTTarget::<E>::init(self).await
     }
 
     fn is_enabled(&self) -> bool {

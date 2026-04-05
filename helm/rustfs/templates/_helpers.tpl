@@ -60,3 +60,75 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Return the secret name
+*/}}
+{{- define "rustfs.secretName" -}}
+{{- if .Values.secret.existingSecret }}
+{{- .Values.secret.existingSecret }}
+{{- else }}
+{{- printf "%s-secret" (include "rustfs.fullname" .) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Return image pull secret content
+*/}}
+{{- define "imagePullSecret" }}
+{{- with .Values.imageRegistryCredentials }}
+{{- printf "{\"auths\":{\"%s\":{\"username\":\"%s\",\"password\":\"%s\",\"email\":\"%s\",\"auth\":\"%s\"}}}" .registry .username .password .email (printf "%s:%s" .username .password | b64enc) | b64enc }}
+{{- end }}
+{{- end }}
+
+{{/*
+Return the default imagePullSecret name
+*/}}
+{{- define "rustfs.imagePullSecret.name" -}}
+{{- printf "%s-registry-secret" (include "rustfs.fullname" .) }}
+{{- end }}
+
+{{/*
+Render imagePullSecrets for workloads - appends registry secret
+*/}}
+{{- define "chart.imagePullSecrets" -}}
+{{- $secrets := .Values.imagePullSecrets | default list }}
+{{- if .Values.imageRegistryCredentials.enabled }}
+{{- $secrets = append $secrets (dict "name" (include "rustfs.imagePullSecret.name" .)) }}
+{{- end }}
+{{- toYaml $secrets }}
+{{- end }}
+
+{{/*
+Render RUSTFS_VOLUMES
+*/}}
+{{- define "rustfs.volumes" -}}
+
+{{- $protocol := "http" -}}
+{{- if .Values.mtls.enabled -}}
+  {{- $protocol = "https" -}}
+{{- end -}}
+
+{{- if eq (int .Values.replicaCount) 4 }}
+{{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.cluster.local:%d/data/rustfs{0...%d}" $protocol (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" . ) .Release.Namespace (.Values.service.endpoint.port | int) (sub (.Values.replicaCount | int) 1) }}
+{{- end }}
+{{- if eq (int .Values.replicaCount) 16 }}
+{{- printf "%s://%s-{0...%d}.%s-headless.%s.svc.cluster.local:%d/data" $protocol (include "rustfs.fullname" .) (sub (.Values.replicaCount | int) 1) (include "rustfs.fullname" .) .Release.Namespace (.Values.service.endpoint.port | int) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Render RUSTFS_SERVER_DOMAINS
+*/}}
+
+{{- define "rustfs.serverDomains" -}}
+{{- $domains := list .Values.config.rustfs.domains -}}
+{{- $fullname := include "rustfs.fullname" . -}}
+{{- $replicaCount := int .Values.replicaCount -}}
+{{- $servicePort := .Values.service.endpoint.port | default 9000 -}}
+{{- range $i := until $replicaCount -}}
+  {{- $podDomain := printf "%s-%d.%s-headless:%d" $fullname $i $fullname (int $servicePort) -}}
+  {{- $domains = append $domains $podDomain -}}
+{{- end -}}
+{{- join "," $domains -}}
+{{- end -}}

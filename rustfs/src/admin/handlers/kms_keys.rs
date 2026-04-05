@@ -14,12 +14,16 @@
 
 //! KMS key management admin API handlers
 
-use super::Operation;
 use crate::admin::auth::validate_admin_request;
+use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::app::context::resolve_kms_runtime_service_manager;
 use crate::auth::{check_key_valid, get_session_token};
-use hyper::{HeaderMap, StatusCode};
+use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use base64::Engine;
+use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
-use rustfs_kms::{KmsError, get_global_kms_service_manager, types::*};
+use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
+use rustfs_kms::{KmsError, init_global_kms_service_manager, types::*};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -44,6 +48,45 @@ pub struct CreateKmsKeyResponse {
     pub key_metadata: Option<KeyMetadata>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateKeyApiRequest {
+    pub key_usage: Option<KeyUsage>,
+    pub description: Option<String>,
+    pub tags: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateKeyApiResponse {
+    pub key_id: String,
+    pub key_metadata: KeyMetadata,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DescribeKeyApiResponse {
+    pub key_metadata: KeyMetadata,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ListKeysApiResponse {
+    pub keys: Vec<KeyInfo>,
+    pub truncated: bool,
+    pub next_marker: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenerateDataKeyApiRequest {
+    pub key_id: String,
+    pub key_spec: KeySpec,
+    pub encryption_context: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenerateDataKeyApiResponse {
+    pub key_id: String,
+    pub plaintext_key: String,   // Base64 encoded
+    pub ciphertext_blob: String, // Base64 encoded
+}
+
 fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
     let mut params = HashMap::new();
     if let Some(query) = uri.query() {
@@ -57,6 +100,365 @@ fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
         });
     }
     params
+}
+
+fn extract_key_id(uri: &hyper::Uri) -> Option<String> {
+    let query_params = extract_query_params(uri);
+    ["keyId", "key-id", "key"]
+        .into_iter()
+        .find_map(|name| query_params.get(name).filter(|value| !value.is_empty()).cloned())
+}
+
+fn kms_service_manager_from_context() -> Option<std::sync::Arc<rustfs_kms::KmsServiceManager>> {
+    resolve_kms_runtime_service_manager()
+}
+
+async fn kms_encryption_service_from_context() -> Option<std::sync::Arc<rustfs_kms::ObjectEncryptionService>> {
+    let manager = kms_service_manager_from_context().unwrap_or_else(init_global_kms_service_manager);
+    manager.get_encryption_service().await
+}
+
+pub fn register_kms_key_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
+        AdminOperation(&CreateKmsKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::DELETE,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/delete").as_str(),
+        AdminOperation(&DeleteKmsKeyHandler {}),
+    )?;
+
+    r.insert(
+        Method::POST,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/cancel-deletion").as_str(),
+        AdminOperation(&CancelKmsKeyDeletionHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys").as_str(),
+        AdminOperation(&ListKmsKeysHandler {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/kms/keys/{key_id}").as_str(),
+        AdminOperation(&DescribeKmsKeyHandler {}),
+    )?;
+
+    Ok(())
+}
+
+/// Create a new KMS master key (legacy endpoint)
+pub struct CreateKeyHandler {}
+
+#[async_trait::async_trait]
+impl Operation for CreateKeyHandler {
+    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "authentication required"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)], // TODO: Add specific KMS action
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
+
+        let body = req
+            .input
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
+            .await
+            .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
+
+        let request: CreateKeyApiRequest = if body.is_empty() {
+            CreateKeyApiRequest {
+                key_usage: Some(KeyUsage::EncryptDecrypt),
+                description: None,
+                tags: None,
+            }
+        } else {
+            serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?
+        };
+
+        let Some(service) = kms_encryption_service_from_context().await else {
+            return Err(s3_error!(InternalError, "KMS service not initialized"));
+        };
+
+        // Extract key name from tags if provided
+        let tags = request.tags.unwrap_or_default();
+        let key_name = tags.get("name").cloned();
+
+        let kms_request = CreateKeyRequest {
+            key_name,
+            key_usage: request.key_usage.unwrap_or(KeyUsage::EncryptDecrypt),
+            description: request.description,
+            tags,
+            origin: Some("AWS_KMS".to_string()),
+            policy: None,
+        };
+
+        match service.create_key(kms_request).await {
+            Ok(response) => {
+                let api_response = CreateKeyApiResponse {
+                    key_id: response.key_id,
+                    key_metadata: response.key_metadata,
+                };
+
+                let data = serde_json::to_vec(&api_response)
+                    .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+                Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+            }
+            Err(e) => {
+                error!("Failed to create KMS key: {}", e);
+                Err(s3_error!(InternalError, "failed to create key: {}", e))
+            }
+        }
+    }
+}
+
+/// Describe a KMS key (legacy endpoint)
+pub struct DescribeKeyHandler {}
+
+#[async_trait::async_trait]
+impl Operation for DescribeKeyHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "authentication required"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
+
+        let Some(key_id) = extract_key_id(&req.uri) else {
+            return Err(s3_error!(InvalidRequest, "missing keyId parameter"));
+        };
+
+        let Some(service) = kms_encryption_service_from_context().await else {
+            return Err(s3_error!(InternalError, "KMS service not initialized"));
+        };
+
+        let request = DescribeKeyRequest { key_id: key_id.clone() };
+
+        match service.describe_key(request).await {
+            Ok(response) => {
+                let api_response = DescribeKeyApiResponse {
+                    key_metadata: response.key_metadata,
+                };
+
+                let data = serde_json::to_vec(&api_response)
+                    .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+                Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+            }
+            Err(e) => {
+                error!("Failed to describe KMS key {}: {}", key_id, e);
+                Err(s3_error!(InternalError, "failed to describe key: {}", e))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_key_id;
+    use http::Uri;
+
+    #[test]
+    fn test_extract_key_id_supports_minio_aliases() {
+        for (uri, expected) in [
+            ("/rustfs/admin/v3/kms/key/status?keyId=legacy-key", "legacy-key"),
+            ("/rustfs/admin/v3/kms/key/status?key-id=minio-key", "minio-key"),
+            ("/rustfs/admin/v3/kms/key/status?key=fallback-key", "fallback-key"),
+        ] {
+            let uri: Uri = uri.parse().expect("uri should parse");
+            assert_eq!(extract_key_id(&uri).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_extract_key_id_skips_empty_values_and_uses_next_alias() {
+        let uri: Uri = "/rustfs/admin/v3/kms/key/status?keyId=&key-id=minio-key&key=fallback-key"
+            .parse()
+            .expect("uri should parse");
+
+        assert_eq!(extract_key_id(&uri).as_deref(), Some("minio-key"));
+    }
+
+    #[test]
+    fn test_extract_key_id_prefers_legacy_name_over_aliases() {
+        let uri: Uri = "/rustfs/admin/v3/kms/key/status?keyId=legacy-key&key-id=minio-key&key=fallback-key"
+            .parse()
+            .expect("uri should parse");
+
+        assert_eq!(extract_key_id(&uri).as_deref(), Some("legacy-key"));
+    }
+    #[test]
+    fn test_extract_key_id_skips_empty_aliases() {
+        for (uri, expected) in [
+            ("/rustfs/admin/v3/kms/key/status?keyId=&key-id=minio-key", Some("minio-key")),
+            ("/rustfs/admin/v3/kms/key/status?keyId=&key-id=&key=fallback-key", Some("fallback-key")),
+            ("/rustfs/admin/v3/kms/key/status?keyId=&key-id=&key=", None),
+        ] {
+            let uri: Uri = uri.parse().expect("uri should parse");
+            assert_eq!(extract_key_id(&uri).as_deref(), expected);
+        }
+    }
+}
+
+/// List KMS keys (legacy endpoint)
+pub struct ListKeysHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ListKeysHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "authentication required"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
+
+        let query_params = extract_query_params(&req.uri);
+        let limit = query_params.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
+        let marker = query_params.get("marker").cloned();
+
+        let Some(service) = kms_encryption_service_from_context().await else {
+            return Err(s3_error!(InternalError, "KMS service not initialized"));
+        };
+
+        let request = ListKeysRequest {
+            limit: Some(limit),
+            marker,
+            status_filter: None,
+            usage_filter: None,
+        };
+
+        match service.list_keys(request).await {
+            Ok(response) => {
+                let api_response = ListKeysApiResponse {
+                    keys: response.keys,
+                    truncated: response.truncated,
+                    next_marker: response.next_marker,
+                };
+
+                let data = serde_json::to_vec(&api_response)
+                    .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+                Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+            }
+            Err(e) => {
+                error!("Failed to list KMS keys: {}", e);
+                Err(s3_error!(InternalError, "failed to list keys: {}", e))
+            }
+        }
+    }
+}
+
+/// Generate data encryption key (legacy endpoint)
+pub struct GenerateDataKeyHandler {}
+
+#[async_trait::async_trait]
+impl Operation for GenerateDataKeyHandler {
+    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(cred) = req.credentials else {
+            return Err(s3_error!(InvalidRequest, "authentication required"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
+
+        let body = req
+            .input
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
+            .await
+            .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
+
+        let request: GenerateDataKeyApiRequest =
+            serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?;
+
+        let Some(service) = kms_encryption_service_from_context().await else {
+            return Err(s3_error!(InternalError, "KMS service not initialized"));
+        };
+
+        let kms_request = GenerateDataKeyRequest {
+            key_id: request.key_id,
+            key_spec: request.key_spec,
+            encryption_context: request.encryption_context.unwrap_or_default(),
+        };
+
+        match service.generate_data_key(kms_request).await {
+            Ok(response) => {
+                let api_response = GenerateDataKeyApiResponse {
+                    key_id: response.key_id,
+                    plaintext_key: base64::prelude::BASE64_STANDARD.encode(&response.plaintext_key),
+                    ciphertext_blob: base64::prelude::BASE64_STANDARD.encode(&response.ciphertext_blob),
+                };
+
+                let data = serde_json::to_vec(&api_response)
+                    .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+                Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
+            }
+            Err(e) => {
+                error!("Failed to generate data key: {}", e);
+                Err(s3_error!(InternalError, "failed to generate data key: {}", e))
+            }
+        }
+    }
 }
 
 /// Create a new KMS key
@@ -78,12 +480,13 @@ impl Operation for CreateKmsKeyHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
         let body = req
             .input
-            .store_all_unlimited()
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -97,7 +500,7 @@ impl Operation for CreateKmsKeyHandler {
             serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?
         };
 
-        let Some(service_manager) = get_global_kms_service_manager() else {
+        let Some(service_manager) = kms_service_manager_from_context() else {
             let response = CreateKmsKeyResponse {
                 success: false,
                 message: "KMS service manager not initialized".to_string(),
@@ -211,12 +614,13 @@ impl Operation for DeleteKmsKeyHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
         let body = req
             .input
-            .store_all_unlimited()
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -249,7 +653,7 @@ impl Operation for DeleteKmsKeyHandler {
             serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?
         };
 
-        let Some(service_manager) = get_global_kms_service_manager() else {
+        let Some(service_manager) = kms_service_manager_from_context() else {
             let response = DeleteKmsKeyResponse {
                 success: false,
                 message: "KMS service manager not initialized".to_string(),
@@ -359,12 +763,13 @@ impl Operation for CancelKmsKeyDeletionHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
         let body = req
             .input
-            .store_all_unlimited()
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
@@ -388,7 +793,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
             serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))?
         };
 
-        let Some(service_manager) = get_global_kms_service_manager() else {
+        let Some(service_manager) = kms_service_manager_from_context() else {
             let response = CancelKmsKeyDeletionResponse {
                 success: false,
                 message: "KMS service manager not initialized".to_string(),
@@ -487,6 +892,7 @@ impl Operation for ListKmsKeysHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -494,7 +900,7 @@ impl Operation for ListKmsKeysHandler {
         let limit = query_params.get("limit").and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
         let marker = query_params.get("marker").cloned();
 
-        let Some(service_manager) = get_global_kms_service_manager() else {
+        let Some(service_manager) = kms_service_manager_from_context() else {
             let response = ListKmsKeysResponse {
                 success: false,
                 message: "KMS service manager not initialized".to_string(),
@@ -598,6 +1004,7 @@ impl Operation for DescribeKmsKeyHandler {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -614,7 +1021,7 @@ impl Operation for DescribeKmsKeyHandler {
             return Ok(S3Response::with_headers((StatusCode::BAD_REQUEST, Body::from(data)), headers));
         };
 
-        let Some(service_manager) = get_global_kms_service_manager() else {
+        let Some(service_manager) = kms_service_manager_from_context() else {
             let response = DescribeKmsKeyResponse {
                 success: false,
                 message: "KMS service manager not initialized".to_string(),
