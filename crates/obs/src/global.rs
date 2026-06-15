@@ -17,6 +17,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
 
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_GLOBAL: &str = "global";
+const EVENT_OBS_GLOBAL_STATE: &str = "obs_global_state";
+
 /// Global guard for OpenTelemetry tracing
 static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
 
@@ -24,16 +28,16 @@ static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
 pub(crate) static OBSERVABILITY_METRIC_ENABLED: OnceCell<bool> = OnceCell::const_new();
 
 /// Namespaced metrics for cleaner and rolling logging.
-pub(crate) const METRIC_LOG_CLEANER_DELETED_FILES_TOTAL: &str = "rustfs.log_cleaner.deleted_files_total";
-pub(crate) const METRIC_LOG_CLEANER_FREED_BYTES_TOTAL: &str = "rustfs.log_cleaner.freed_bytes_total";
-pub(crate) const METRIC_LOG_CLEANER_COMPRESS_DURATION_SECONDS: &str = "rustfs.log_cleaner.compress_duration_seconds";
-pub(crate) const METRIC_LOG_CLEANER_STEAL_SUCCESS_RATE: &str = "rustfs.log_cleaner.steal_success_rate";
-pub(crate) const METRIC_LOG_CLEANER_RUNS_TOTAL: &str = "rustfs.log_cleaner.runs_total";
-pub(crate) const METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL: &str = "rustfs.log_cleaner.run_failures_total";
-pub(crate) const METRIC_LOG_CLEANER_ROTATION_TOTAL: &str = "rustfs.log_cleaner.rotation_total";
-pub(crate) const METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL: &str = "rustfs.log_cleaner.rotation_failures_total";
-pub(crate) const METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS: &str = "rustfs.log_cleaner.rotation_duration_seconds";
-pub(crate) const METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES: &str = "rustfs.log_cleaner.active_file_size_bytes";
+pub(crate) const METRIC_LOG_CLEANER_DELETED_FILES_TOTAL: &str = "rustfs_log_cleaner_deleted_files_total";
+pub(crate) const METRIC_LOG_CLEANER_FREED_BYTES_TOTAL: &str = "rustfs_log_cleaner_freed_bytes_total";
+pub(crate) const METRIC_LOG_CLEANER_COMPRESS_DURATION_SECONDS: &str = "rustfs_log_cleaner_compress_duration_seconds";
+pub(crate) const METRIC_LOG_CLEANER_STEAL_SUCCESS_RATE: &str = "rustfs_log_cleaner_steal_success_rate";
+pub(crate) const METRIC_LOG_CLEANER_RUNS_TOTAL: &str = "rustfs_log_cleaner_runs_total";
+pub(crate) const METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL: &str = "rustfs_log_cleaner_run_failures_total";
+pub(crate) const METRIC_LOG_CLEANER_ROTATION_TOTAL: &str = "rustfs_log_cleaner_rotation_total";
+pub(crate) const METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL: &str = "rustfs_log_cleaner_rotation_failures_total";
+pub(crate) const METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS: &str = "rustfs_log_cleaner_rotation_duration_seconds";
+pub(crate) const METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES: &str = "rustfs_log_cleaner_active_file_size_bytes";
 
 /// Check whether Observability metric is enabled
 pub fn observability_metric_enabled() -> bool {
@@ -50,9 +54,13 @@ pub(crate) fn set_observability_metric_enabled(enabled: bool) {
         && *current != enabled
     {
         warn!(
+            event = EVENT_OBS_GLOBAL_STATE,
+            component = LOG_COMPONENT_OBS,
+            subsystem = LOG_SUBSYSTEM_GLOBAL,
             current = *current,
             requested = enabled,
-            "OBSERVABILITY_METRIC_ENABLED was already initialized; keeping original value"
+            result = "metrics_flag_already_initialized",
+            "obs global state changed"
         );
     }
 }
@@ -116,8 +124,7 @@ pub async fn init_obs(endpoint: Option<String>) -> Result<OtelGuard, GlobalError
 /// ```
 pub async fn init_obs_with_config(config: &OtelConfig) -> Result<OtelGuard, GlobalError> {
     let otel_guard = init_telemetry(config)?;
-    // Note: System monitoring has been migrated to rustfs-metrics
-    // Use rustfs_metrics::init_metrics_collectors() for system metrics
+    // Metrics runtime scheduling is exposed by rustfs_obs::init_metrics_runtime().
     Ok(otel_guard)
 }
 
@@ -144,7 +151,13 @@ pub async fn init_obs_with_config(config: &OtelConfig) -> Result<OtelGuard, Glob
 /// # }
 /// ```
 pub fn set_global_guard(guard: OtelGuard) -> Result<(), GlobalError> {
-    info!("Initializing global guard");
+    info!(
+        event = EVENT_OBS_GLOBAL_STATE,
+        component = LOG_COMPONENT_OBS,
+        subsystem = LOG_SUBSYSTEM_GLOBAL,
+        state = "guard_initializing",
+        "obs global state changed"
+    );
     GLOBAL_GUARD.set(Arc::new(Mutex::new(guard))).map_err(GlobalError::SetError)
 }
 
@@ -199,8 +212,8 @@ mod tests {
 
         for metric in metrics {
             assert!(
-                metric.starts_with("rustfs.log_cleaner."),
-                "metric '{metric}' should use rustfs.log_cleaner.* namespace"
+                metric.starts_with("rustfs_log_cleaner_"),
+                "metric '{metric}' should use rustfs_log_cleaner_* namespace"
             );
         }
     }

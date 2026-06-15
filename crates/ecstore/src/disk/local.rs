@@ -17,20 +17,21 @@ use crate::data_usage::local_snapshot::ensure_data_usage_layout;
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
-    FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts,
-    VolumeInfo, WalkDirOptions, conv_part_err_to_int,
+    FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
     format::FormatV3,
     fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
     os,
-    os::{check_path_length, is_empty_dir, is_root_disk, rename_all},
+    os::{check_path_length, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
 };
 use crate::erasure_coding::bitrot_verify;
 use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
 use bytes::Bytes;
+use metrics::counter;
 use parking_lot::RwLock as ParkingLotRwLock;
 use rustfs_filemeta::{
     Cache, FileInfo, FileInfoOpts, FileMeta, MetaCacheEntry, MetacacheWriter, ObjectPartInfo, Opts, RawFileInfo, UpdateFn,
@@ -45,7 +46,7 @@ use rustfs_utils::path::{
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::io::SeekFrom;
+use std::io::{Error as IoError, SeekFrom};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -56,10 +57,64 @@ use std::{
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
-use tokio::sync::RwLock;
-use tokio::time::interval;
+use tokio::sync::{Notify, RwLock};
+use tokio::time::{Instant, interval_at, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+const DELETED_OBJECTS_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 5);
+const STALE_TMP_OBJECT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+const RUSTFS_META_TMP_OLD_BUCKET: &str = ".rustfs.sys/tmp-old";
+const STARTUP_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_COUNT";
+const ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS";
+const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT: u64 = 2;
+const DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: u64 = 100;
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_DISK_LOCAL: &str = "disk_local";
+const EVENT_DISK_LOCAL_STARTUP_CLEANUP: &str = "disk_local_startup_cleanup";
+const EVENT_DISK_LOCAL_BACKGROUND_CLEANUP: &str = "disk_local_background_cleanup";
+const EVENT_DISK_LOCAL_SCAN_FAILED: &str = "disk_local_scan_failed";
+const EVENT_DISK_LOCAL_RENAME_REJECTED: &str = "disk_local_rename_rejected";
+const EVENT_DISK_LOCAL_READ_VERSION_FALLBACK: &str = "disk_local_read_version_fallback";
+const EVENT_DISK_LOCAL_DELETE_FAILED: &str = "disk_local_delete_failed";
+const EVENT_DISK_LOCAL_CHECK_PARTS: &str = "disk_local_check_parts";
+const EVENT_DISK_LOCAL_ACCESS_FAILED: &str = "disk_local_access_failed";
+const EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED: &str = "disk_local_volume_setup_failed";
+const EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED: &str = "disk_local_format_decode_failed";
+
+fn log_startup_disk_io_error(stage: &str, path: &Path, err: &IoError) {
+    warn!(
+        event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+        stage,
+        path = %path.display(),
+        error_kind = ?err.kind(),
+        raw_os_error = ?err.raw_os_error(),
+        error = ?err,
+        state = "io_failed",
+        "Disk local startup filesystem operation failed"
+    );
+}
+
+fn log_startup_disk_error(stage: &str, path: &Path, err: &DiskError) {
+    if let DiskError::Io(io_err) = err {
+        log_startup_disk_io_error(stage, path, io_err);
+        return;
+    }
+
+    warn!(
+        event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+        stage,
+        path = %path.display(),
+        error = ?err,
+        state = "failed",
+        "Disk local startup operation failed"
+    );
+}
 
 #[derive(Debug, Clone)]
 pub struct FormatInfo {
@@ -73,6 +128,253 @@ pub struct FormatInfo {
 pub enum InternalBuf<'a> {
     Ref(&'a [u8]),
     Owned(Bytes),
+}
+
+struct FileCacheReclaimWriter {
+    inner: File,
+    reclaim_len: usize,
+    reclaim_on_shutdown: bool,
+    reclaimed: bool,
+}
+
+struct FileCacheReclaimReader {
+    inner: File,
+    reclaim_offset: u64,
+    reclaim_len: usize,
+    reclaim_on_drop: bool,
+    reclaimed: bool,
+}
+
+fn record_file_cache_reclaim_success(kind: &'static str, reclaim_len: usize, started: std::time::Instant) {
+    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind.to_string(), "result" => "ok".to_string()).increment(1);
+    counter!("rustfs_page_cache_reclaim_bytes_total", "kind" => kind.to_string()).increment(reclaim_len as u64);
+    metrics::histogram!("rustfs_page_cache_reclaim_duration_seconds", "kind" => kind.to_string())
+        .record(started.elapsed().as_secs_f64());
+}
+
+fn record_file_cache_reclaim_error(kind: &'static str) {
+    counter!("rustfs_page_cache_reclaim_requests_total", "kind" => kind.to_string(), "result" => "err".to_string()).increment(1);
+}
+
+fn bitrot_size_mismatch_retry_count() -> usize {
+    rustfs_utils::get_env_u64(ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT, DEFAULT_BITROT_SIZE_MISMATCH_RETRY_COUNT) as usize
+}
+
+fn bitrot_size_mismatch_retry_delay() -> Duration {
+    Duration::from_millis(rustfs_utils::get_env_u64(
+        ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS,
+        DEFAULT_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS,
+    ))
+}
+
+fn is_bitrot_size_mismatch_error(err: &std::io::Error) -> bool {
+    err.to_string().contains("bitrot shard file size mismatch")
+}
+
+impl FileCacheReclaimReader {
+    fn new(inner: File, reclaim_offset: u64, reclaim_len: usize, reclaim_on_drop: bool) -> Self {
+        #[cfg(target_os = "macos")]
+        if reclaim_on_drop {
+            let _ = set_fd_nocache(&inner);
+        }
+
+        Self {
+            inner,
+            reclaim_offset,
+            reclaim_len,
+            reclaim_on_drop,
+            reclaimed: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
+        use core::num::NonZeroU64;
+        use rustix::fs::{Advice, fadvise};
+
+        if !self.reclaim_on_drop || self.reclaimed || self.reclaim_len == 0 {
+            return Ok(());
+        }
+
+        let started = std::time::Instant::now();
+        let reclaim_len =
+            NonZeroU64::new(self.reclaim_len as u64).expect("reclaim_len is guaranteed non-zero by the early return");
+        fadvise(&self.inner, self.reclaim_offset, Some(reclaim_len), Advice::DontNeed).map_err(std::io::Error::from)?;
+
+        self.reclaimed = true;
+        record_file_cache_reclaim_success("read", self.reclaim_len, started);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn set_fd_nocache(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `fcntl` is called on a valid file descriptor owned by `file`.
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    if ret == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn set_std_fd_nocache(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `fcntl` is called on a valid file descriptor owned by `file`.
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+    if ret == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+impl Drop for FileCacheReclaimReader {
+    fn drop(&mut self) {
+        if let Err(err) = self.reclaim_file_cache() {
+            record_file_cache_reclaim_error("read");
+            debug!(error = ?err, reclaim_offset = self.reclaim_offset, reclaim_len = self.reclaim_len, "failed to reclaim file cache after read");
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for FileCacheReclaimReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl FileCacheReclaimWriter {
+    fn new(inner: File, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+        #[cfg(target_os = "macos")]
+        if reclaim_on_shutdown {
+            let _ = set_fd_nocache(&inner);
+        }
+
+        Self {
+            inner,
+            reclaim_len,
+            reclaim_on_shutdown,
+            reclaimed: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
+        use core::num::NonZeroU64;
+        use rustix::fs::{Advice, fadvise};
+
+        if !self.reclaim_on_shutdown || self.reclaimed || self.reclaim_len == 0 {
+            return Ok(());
+        }
+
+        let started = std::time::Instant::now();
+        let reclaim_len =
+            NonZeroU64::new(self.reclaim_len as u64).expect("reclaim_len is guaranteed non-zero by the early return");
+        fadvise(&self.inner, 0, Some(reclaim_len), Advice::DontNeed).map_err(std::io::Error::from)?;
+
+        self.reclaimed = true;
+        record_file_cache_reclaim_success("write", self.reclaim_len, started);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reclaim_file_cache(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl AsyncWrite for FileCacheReclaimWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match std::pin::Pin::new(&mut self.inner).poll_shutdown(cx) {
+            std::task::Poll::Ready(Ok(())) => {
+                if let Err(err) = self.reclaim_file_cache() {
+                    record_file_cache_reclaim_error("write");
+                    debug!(error = ?err, reclaim_len = self.reclaim_len, "failed to reclaim file cache after write");
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+fn should_reclaim_file_cache_after_write(file_size: i64) -> bool {
+    if file_size <= 0 {
+        return false;
+    }
+
+    if !rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE,
+    ) {
+        return false;
+    }
+
+    let threshold = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
+    );
+    file_size as usize >= threshold
+}
+
+fn should_reclaim_file_cache_after_read(length: usize) -> bool {
+    if length == 0 {
+        return false;
+    }
+
+    if !rustfs_utils::get_env_bool(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE,
+    ) {
+        return false;
+    }
+
+    let threshold = rustfs_utils::get_env_usize(
+        rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
+        rustfs_config::DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD,
+    );
+    length >= threshold
 }
 
 pub struct LocalDisk {
@@ -94,6 +396,8 @@ pub struct LocalDisk {
     // pub format_data: Mutex<Vec<u8>>,
     // pub format_file_info: Mutex<Option<Metadata>>,
     // pub format_last_check: Mutex<Option<OffsetDateTime>>,
+    startup_cleanup_ready: Arc<AtomicU32>,
+    startup_cleanup_notify: Arc<Notify>,
     exit_signal: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
@@ -116,31 +420,113 @@ impl Debug for LocalDisk {
     }
 }
 
+/// Resolve the local disk root path from an endpoint path.
+///
+/// Tries `canonicalize` first (fast path). On Windows, if canonicalization reports
+/// `NotFound` for paths that may still be valid mount roots, falls back to
+/// `absolutize` + metadata check to accept valid local directory roots that
+/// don't support full canonicalization.
+fn resolve_local_disk_root(ep_path: &str) -> Result<PathBuf> {
+    match rustfs_utils::canonicalize(ep_path) {
+        Ok(path) => Ok(path),
+        Err(err) => {
+            if err.kind() != ErrorKind::NotFound {
+                return Err(to_file_error(err).into());
+            }
+
+            #[cfg(windows)]
+            {
+                // On Windows, canonicalize can fail for ZFS volumes, junction points,
+                // subst drives, and other non-standard filesystem mounts. Try a fallback
+                // path resolution using absolutize + metadata check.
+                let absolute = match crate::disk::endpoint::windows_fallback_local_path(ep_path, &err, "local disk root") {
+                    Ok(path) => path,
+                    Err(_) => {
+                        return Err(DiskError::VolumeNotFound);
+                    }
+                };
+
+                match std::fs::metadata(&absolute) {
+                    Ok(metadata) => {
+                        if !metadata.is_dir() {
+                            return Err(DiskError::DiskNotDir);
+                        }
+                        return Ok(absolute);
+                    }
+                    Err(meta_err) => {
+                        if meta_err.kind() == ErrorKind::NotFound {
+                            return Err(DiskError::VolumeNotFound);
+                        }
+                        return Err(to_file_error(meta_err).into());
+                    }
+                }
+            }
+
+            #[cfg(not(windows))]
+            {
+                Err(DiskError::VolumeNotFound)
+            }
+        }
+    }
+}
+
 impl LocalDisk {
     pub async fn new(ep: &Endpoint, cleanup: bool) -> Result<Self> {
-        debug!("Creating local disk");
-        // Use optimized path resolution instead of absolutize() for better performance
-        // Use dunce::canonicalize instead of std::fs::canonicalize to avoid UNC paths on Windows
-        let root = match rustfs_utils::canonicalize(ep.get_file_path()) {
-            Ok(path) => path,
-            Err(e) => {
-                if e.kind() == ErrorKind::NotFound {
-                    return Err(DiskError::VolumeNotFound);
-                }
-                return Err(to_file_error(e).into());
-            }
-        };
+        debug!(
+            event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            endpoint = %ep,
+            state = "create_started",
+            cleanup,
+            "Local disk creation started"
+        );
+        let endpoint_path = ep.get_file_path();
+        let root = resolve_local_disk_root(&endpoint_path).inspect_err(|err| {
+            log_startup_disk_error("resolve_local_disk_root", Path::new(&endpoint_path), err);
+        })?;
 
-        ensure_data_usage_layout(&root).await.map_err(DiskError::from)?;
+        ensure_data_usage_layout(&root)
+            .await
+            .map_err(DiskError::from)
+            .inspect_err(|err| {
+                log_startup_disk_error("ensure_data_usage_layout", &root, err);
+            })?;
 
-        if cleanup {
-            // TODO: remove temporary data
+        let startup_cleanup_ready = Arc::new(AtomicU32::new(u32::from(!cleanup)));
+        let startup_cleanup_notify = Arc::new(Notify::new());
+
+        if cleanup
+            && let Err(err) =
+                Self::cleanup_tmp_on_startup(&root, startup_cleanup_ready.clone(), startup_cleanup_notify.clone()).await
+        {
+            startup_cleanup_ready.store(1, Ordering::Release);
+            startup_cleanup_notify.notify_waiters();
+            warn!(
+                event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                root = ?root,
+                state = "failed",
+                error = ?err,
+                "Local disk startup cleanup failed"
+            );
         }
 
         // Use optimized path resolution instead of absolutize_virtually
         let format_path = root.join(RUSTFS_META_BUCKET).join(super::FORMAT_CONFIG_FILE);
-        debug!("format_path: {:?}", format_path);
-        let (format_data, format_meta) = read_file_exists(&format_path).await?;
+        debug!(
+            event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            root = ?root,
+            format_path = ?format_path,
+            state = "format_path_resolved",
+            "Local disk format path resolved"
+        );
+        let (format_data, format_meta) = read_file_exists(&format_path).await.inspect_err(|err| {
+            log_startup_disk_error("read_format_json", &format_path, err);
+        })?;
 
         let mut id = None;
         // let mut format_legacy = false;
@@ -172,17 +558,34 @@ impl LocalDisk {
             let root = root_clone.clone();
             Box::pin(async move {
                 match get_disk_info(root.clone()).await {
-                    Ok((info, root)) => {
+                    Ok((info, is_root_disk)) => {
+                        let physical_device_ids = match rustfs_utils::os::get_physical_device_ids(root.to_string_lossy().as_ref())
+                        {
+                            Ok(ids) => ids,
+                            Err(err) => {
+                                warn!(
+                                    event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                    root = ?root,
+                                    state = "physical_device_id_lookup_failed",
+                                    error = ?err,
+                                    "Disk local startup metadata lookup failed"
+                                );
+                                Vec::new()
+                            }
+                        };
                         let disk_info = DiskInfo {
                             total: info.total,
                             free: info.free,
                             used: info.used,
-                            used_inodes: info.files - info.ffree,
+                            used_inodes: info.files.saturating_sub(info.ffree),
                             free_inodes: info.ffree,
                             major: info.major,
                             minor: info.minor,
                             fs_type: info.fstype,
-                            root_disk: root,
+                            root_disk: is_root_disk,
+                            physical_device_ids,
                             id: disk_id,
                             ..Default::default()
                         };
@@ -220,9 +623,13 @@ impl LocalDisk {
             // format_last_check: Mutex::new(format_last_check),
             path_cache: Arc::new(ParkingLotRwLock::new(HashMap::with_capacity(2048))),
             current_dir: Arc::new(OnceLock::new()),
+            startup_cleanup_ready,
+            startup_cleanup_notify,
             exit_signal: None,
         };
-        let (info, _root) = get_disk_info(root).await?;
+        let (info, _root) = get_disk_info(root.clone()).await.inspect_err(|err| {
+            log_startup_disk_error("get_disk_info", &root, err);
+        })?;
         disk.major = info.major;
         disk.minor = info.minor;
         disk.fstype = info.fstype;
@@ -239,41 +646,186 @@ impl LocalDisk {
             disk.rotational = true;
         }
 
-        disk.make_meta_volumes().await?;
+        disk.make_meta_volumes().await.inspect_err(|err| {
+            log_startup_disk_error("make_meta_volumes", &disk.root, err);
+        })?;
 
         let (exit_tx, exit_rx) = tokio::sync::broadcast::channel(1);
         disk.exit_signal = Some(exit_tx);
 
         let root = disk.root.clone();
         tokio::spawn(Self::cleanup_deleted_objects_loop(root, exit_rx));
-        debug!("LocalDisk created: {:?}", disk);
+        debug!(
+            event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+            endpoint = %disk.endpoint,
+            root = ?disk.root,
+            state = "created",
+            "Local disk created"
+        );
         Ok(disk)
     }
 
     async fn cleanup_deleted_objects_loop(root: PathBuf, mut exit_rx: tokio::sync::broadcast::Receiver<()>) {
-        let mut interval = interval(Duration::from_secs(60 * 5));
+        let start_at = Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
+        let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(err) = Self::cleanup_deleted_objects(root.clone()).await {
-                        error!("cleanup_deleted_objects error: {:?}", err);
+                        error!(
+                            event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            task = "deleted_objects",
+                            state = "failed",
+                            error = ?err,
+                            "Disk local background cleanup failed"
+                        );
+                    }
+                    if let Err(err) = Self::cleanup_stale_tmp_objects(root.clone()).await {
+                        error!(
+                            event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            task = "stale_tmp_objects",
+                            state = "failed",
+                            error = ?err,
+                            "Disk local background cleanup failed"
+                        );
                     }
                 }
                 _ = exit_rx.recv() => {
-                    info!("cleanup_deleted_objects_loop exit");
+                    info!(
+                        event = EVENT_DISK_LOCAL_BACKGROUND_CLEANUP,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        task = "deleted_objects_loop",
+                        state = "stopped",
+                        "Disk local background cleanup loop stopped"
+                    );
                     break;
                 }
             }
         }
     }
 
-    async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
+    fn meta_path(root: &Path, meta_path: &str) -> PathBuf {
         #[cfg(windows)]
-        let trash_path = RUSTFS_META_TMP_DELETED_BUCKET.replace('/', "\\");
+        let meta_path = meta_path.replace('/', "\\");
         #[cfg(not(windows))]
-        let trash_path = RUSTFS_META_TMP_DELETED_BUCKET.to_string();
+        let meta_path = meta_path.to_string();
 
-        let trash = root.join(trash_path);
+        root.join(meta_path)
+    }
+
+    async fn cleanup_tmp_on_startup(
+        root: &Path,
+        startup_cleanup_ready: Arc<AtomicU32>,
+        startup_cleanup_notify: Arc<Notify>,
+    ) -> Result<()> {
+        let tmp_path = Self::meta_path(root, RUSTFS_META_TMP_BUCKET);
+        let tmp_old_path = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET).join(Uuid::new_v4().to_string());
+
+        rename_all(&tmp_path, &tmp_old_path, root).await.inspect_err(|err| {
+            log_startup_disk_error("cleanup_tmp_rename_all", &tmp_path, err);
+        })?;
+
+        let tmp_deleted_path = Self::meta_path(root, RUSTFS_META_TMP_DELETED_BUCKET);
+        tokio::fs::create_dir_all(&tmp_deleted_path).await.inspect_err(|err| {
+            log_startup_disk_io_error("cleanup_tmp_create_deleted_dir", &tmp_deleted_path, err);
+        })?;
+
+        let tmp_old_root = Self::meta_path(root, RUSTFS_META_TMP_OLD_BUCKET);
+        tokio::spawn(async move {
+            if let Err(err) = tokio::fs::remove_dir_all(&tmp_old_root).await
+                && err.kind() != ErrorKind::NotFound
+            {
+                log_startup_disk_io_error("cleanup_tmp_remove_old_dir", &tmp_old_root, &err);
+            }
+            startup_cleanup_ready.store(1, Ordering::Release);
+            startup_cleanup_notify.notify_waiters();
+        });
+
+        Ok(())
+    }
+
+    async fn wait_for_startup_cleanup(&self) {
+        if self.startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+            return;
+        }
+
+        if wait_for_startup_cleanup_signal(
+            self.startup_cleanup_ready.as_ref(),
+            self.startup_cleanup_notify.as_ref(),
+            STARTUP_CLEANUP_WAIT_TIMEOUT,
+        )
+        .await
+        {
+            debug!(disk = %self.endpoint, "startup cleanup barrier released before walk_dir");
+        } else {
+            warn!(
+                event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                disk = %self.endpoint,
+                timeout_ms = STARTUP_CLEANUP_WAIT_TIMEOUT.as_millis(),
+                state = "timed_out",
+                "Disk local startup cleanup barrier timed out"
+            );
+        }
+    }
+
+    async fn cleanup_stale_tmp_objects(root: PathBuf) -> Result<()> {
+        Self::cleanup_stale_tmp_objects_with_expiry(root, STALE_TMP_OBJECT_EXPIRY).await
+    }
+
+    async fn cleanup_stale_tmp_objects_with_expiry(root: PathBuf, expiry: Duration) -> Result<()> {
+        let tmp_path = Self::meta_path(&root, RUSTFS_META_TMP_BUCKET);
+        let mut entries = match fs::read_dir(&tmp_path).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                if e.kind() == ErrorKind::NotFound {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.is_empty() || name == "." || name == ".." || name == ".trash" {
+                continue;
+            }
+
+            let file_type = entry.file_type().await?;
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let Some(age) = entry
+                .metadata()
+                .await?
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+            else {
+                continue;
+            };
+            if age <= expiry {
+                continue;
+            }
+
+            let target_path = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET).join(Uuid::new_v4().to_string());
+            rename_all(entry.path(), target_path, Self::meta_path(&root, RUSTFS_META_BUCKET)).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_deleted_objects(root: PathBuf) -> Result<()> {
+        let trash = Self::meta_path(&root, RUSTFS_META_TMP_DELETED_BUCKET);
         let mut entries = match fs::read_dir(&trash).await {
             Ok(entries) => entries,
             Err(e) => {
@@ -527,19 +1079,20 @@ impl LocalDisk {
         // }
 
         let err = if recursive {
-            rename_all(delete_path, trash_path, self.get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?)
+            rename_all_ignore_missing_source(delete_path, trash_path, self.get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?)
                 .await
                 .err()
         } else {
-            rename(&delete_path, &trash_path)
-                .await
-                .map_err(|e| to_file_error(e).into())
-                .err()
+            match rename(&delete_path, &trash_path).await {
+                Ok(()) => None,
+                Err(err) if err.kind() == ErrorKind::NotFound => None,
+                Err(err) => Some(to_file_error(err).into()),
+            }
         };
 
         if immediate_purge || delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR) {
             let trash_path2 = self.get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, Uuid::new_v4().to_string().as_str())?;
-            let _ = rename_all(
+            let _ = rename_all_ignore_missing_source(
                 encode_dir_object(delete_path.to_string_lossy().as_ref()),
                 trash_path2,
                 self.get_bucket_path(RUSTFS_META_TMP_DELETED_BUCKET)?,
@@ -593,7 +1146,15 @@ impl LocalDisk {
                     ErrorKind::NotFound => (),
                     ErrorKind::DirectoryNotEmpty => (),
                     kind => {
-                        warn!("delete_file remove_dir {:?} err {}", &delete_path, kind.to_string());
+                        warn!(
+                            event = EVENT_DISK_LOCAL_DELETE_FAILED,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            path = ?delete_path,
+                            operation = "remove_dir",
+                            error_kind = %kind,
+                            "Disk local delete failed"
+                        );
                         return Err(Error::other(FileAccessDeniedWithContext {
                             path: delete_path.clone(),
                             source: err,
@@ -607,7 +1168,15 @@ impl LocalDisk {
             match err.kind() {
                 ErrorKind::NotFound => (),
                 _ => {
-                    warn!("delete_file remove_file {:?}  err {:?}", &delete_path, &err);
+                    warn!(
+                        event = EVENT_DISK_LOCAL_DELETE_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = ?delete_path,
+                        operation = "remove_file",
+                        error = ?err,
+                        "Disk local delete failed"
+                    );
                     return Err(Error::other(FileAccessDeniedWithContext {
                         path: delete_path.clone(),
                         source: err,
@@ -716,7 +1285,14 @@ impl LocalDisk {
                     && let Err(er) = access(volume_dir.as_ref()).await
                     && er.kind() == ErrorKind::NotFound
                 {
-                    warn!("read_all_data_with_dmtime os err {:?}", &er);
+                    warn!(
+                        event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        reason = "read_all_data_with_dmtime_volume_not_found",
+                        error = ?er,
+                        "Disk local read fallback failed"
+                    );
                     return Err(DiskError::VolumeNotFound);
                 }
 
@@ -844,32 +1420,44 @@ impl LocalDisk {
     }
     // write_all_internal do write file
     async fn write_all_internal(&self, file_path: &Path, data: InternalBuf<'_>, sync: bool, skip_parent: &Path) -> Result<()> {
-        let flags = O_CREATE | O_WRONLY | O_TRUNC;
-
-        let mut f = {
-            if sync {
-                // TODO: support sync
-                self.open_file(file_path, flags, skip_parent).await?
-            } else {
-                self.open_file(file_path, flags, skip_parent).await?
-            }
+        let skip_parent = if skip_parent.as_os_str().is_empty() {
+            self.root.as_path()
+        } else {
+            skip_parent
         };
 
         match data {
             InternalBuf::Ref(buf) => {
+                let mut f = self.open_file(file_path, O_CREATE | O_WRONLY | O_TRUNC, skip_parent).await?;
                 f.write_all(buf).await.map_err(to_file_error)?;
             }
             InternalBuf::Owned(buf) => {
-                // Reduce one copy by using the owned buffer directly.
-                // It may be more efficient for larger writes.
-                let mut f = f.into_std().await;
-                let task = tokio::task::spawn_blocking(move || {
-                    use std::io::Write as _;
-                    f.write_all(buf.as_ref()).map_err(to_file_error)
-                });
-                task.await??;
+                let path = file_path.to_path_buf();
+                if let Some(parent) = path.parent()
+                    && parent != skip_parent
+                {
+                    os::make_dir_all(parent, skip_parent).await?;
+                }
+
+                tokio::task::spawn_blocking(move || {
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(path)
+                        .map_err(to_file_error)?;
+
+                    std::io::Write::write_all(&mut f, buf.as_ref()).map_err(to_file_error)?;
+
+                    Ok::<(), std::io::Error>(())
+                })
+                .await
+                .map_err(DiskError::from)??;
             }
         }
+
+        // Keep existing durability contract: this path intentionally ignores `sync`.
+        let _ = sync;
 
         Ok(())
     }
@@ -880,12 +1468,19 @@ impl LocalDisk {
             skip_parent = self.root.as_path();
         }
 
-        if let Some(parent) = path.as_ref().parent() {
+        if let Some(parent) = path.as_ref().parent()
+            && parent != skip_parent
+        {
             os::make_dir_all(parent, skip_parent).await?;
         }
 
         let f = super::fs::open_file(path.as_ref(), mode).await.map_err(to_file_error)?;
 
+        Ok(f)
+    }
+
+    async fn open_file_read_only(&self, path: impl AsRef<Path>) -> Result<File> {
+        let f = super::fs::open_file(path.as_ref(), O_RDONLY).await.map_err(to_file_error)?;
         Ok(f)
     }
 
@@ -902,19 +1497,50 @@ impl LocalDisk {
         sum: &[u8],
         shard_size: usize,
     ) -> Result<()> {
-        let file = super::fs::open_file(part_path, O_RDONLY).await.map_err(to_file_error)?;
+        let retry_count = bitrot_size_mismatch_retry_count();
+        let retry_delay = bitrot_size_mismatch_retry_delay();
 
-        let meta = file.metadata().await.map_err(to_file_error)?;
-        let file_size = meta.len() as usize;
+        for attempt in 0..=retry_count {
+            let file = super::fs::open_file(part_path, O_RDONLY).await.map_err(to_file_error)?;
+            let meta = file.metadata().await.map_err(to_file_error)?;
+            let file_size = meta.len() as usize;
 
-        bitrot_verify(Box::new(file), file_size, part_size, algo, Bytes::copy_from_slice(sum), shard_size)
+            match bitrot_verify(
+                Box::new(file),
+                file_size,
+                part_size,
+                algo.clone(),
+                Bytes::copy_from_slice(sum),
+                shard_size,
+            )
             .await
-            .map_err(to_file_error)?;
+            {
+                Ok(()) => return Ok(()),
+                Err(err) if attempt < retry_count && is_bitrot_size_mismatch_error(&err) => {
+                    info!(
+                        event = EVENT_DISK_LOCAL_CHECK_PARTS,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = %part_path.display(),
+                        expected_size = part_size,
+                        actual_size = file_size,
+                        retry_attempt = attempt + 1,
+                        retry_count,
+                        retry_delay_ms = retry_delay.as_millis(),
+                        state = "bitrot_retry",
+                        "Disk local check_parts state changed"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                }
+                Err(err) => return Err(to_file_error(err).into()),
+            }
+        }
 
-        Ok(())
+        Err(DiskError::other("bitrot size mismatch retry loop exhausted"))
     }
 
     #[async_recursion::async_recursion]
+    #[allow(clippy::too_many_arguments)]
     async fn scan_dir<W>(
         &self,
         mut current: String,
@@ -923,34 +1549,22 @@ impl LocalDisk {
         out: &mut MetacacheWriter<W>,
         objs_returned: &mut i32,
         skip_current_dir_object: bool,
+        multipart_dir_to_skip: Option<HashSet<String>>,
     ) -> Result<()>
     where
         W: AsyncWrite + Unpin + Send,
     {
         let forward = {
-            opts.forward_to.as_ref().filter(|v| v.starts_with(&*current)).map(|v| {
-                let forward = v.trim_start_matches(&*current);
-                if let Some(idx) = forward.find('/') {
-                    forward[..idx].to_owned()
-                } else {
-                    forward.to_owned()
-                }
-            })
-            // if let Some(forward_to) = &opts.forward_to {
-
-            // } else {
-            //     None
-            // }
-            // if !opts.forward_to.is_empty() && opts.forward_to.starts_with(&*current) {
-            //     let forward = opts.forward_to.trim_start_matches(&*current);
-            //     if let Some(idx) = forward.find('/') {
-            //         &forward[..idx]
-            //     } else {
-            //         forward
-            //     }
-            // } else {
-            //     ""
-            // }
+            opts.forward_to
+                .as_ref()
+                .and_then(|v| v.strip_prefix(&current))
+                .map(|forward| {
+                    if let Some(idx) = forward.find('/') {
+                        forward[..idx].to_owned()
+                    } else {
+                        forward.to_owned()
+                    }
+                })
         };
 
         if opts.limit > 0 && *objs_returned >= opts.limit {
@@ -963,7 +1577,16 @@ impl LocalDisk {
             Ok(res) => res,
             Err(e) => {
                 if e != DiskError::VolumeNotFound && e != Error::FileNotFound {
-                    error!("scan list_dir {}, err {:?}", &current, &e);
+                    error!(
+                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = %current,
+                        operation = "list_dir",
+                        error = ?e,
+                        "Disk local scan failed"
+                    );
+                    return Err(e);
                 }
 
                 if opts.report_notfound && e == Error::FileNotFound && current == opts.base_dir {
@@ -990,6 +1613,14 @@ impl LocalDisk {
             // check limit
             if opts.limit > 0 && *objs_returned >= opts.limit {
                 return Ok(());
+            }
+            // check multipart dir
+            if skip_current_dir_object
+                && let Some(ref dir_to_skip) = multipart_dir_to_skip
+                && dir_to_skip.contains(entry.trim_end_matches(SLASH_SEPARATOR))
+            {
+                *item = "".to_owned();
+                continue;
             }
             // check prefix
             if !prefix.is_empty() && !entry.starts_with(prefix.as_str()) {
@@ -1031,12 +1662,9 @@ impl LocalDisk {
                 let name = entry.trim_end_matches(SLASH_SEPARATOR);
                 let name = decode_dir_object(format!("{}/{}", &current, &name).as_str());
 
-                // if opts.limit > 0
-                //     && let Ok(meta) = FileMeta::load(&metadata)
-                //     && !meta.all_hidden(true)
-                // {
-                *objs_returned += 1;
-                // }
+                if opts.limit <= 0 || metadata_counts_toward_limit(&metadata) {
+                    *objs_returned += 1;
+                }
 
                 out.write_obj(&MetaCacheEntry {
                     name: name.clone(),
@@ -1060,7 +1688,27 @@ impl LocalDisk {
             }
         }
 
-        let mut dir_stack: Vec<(String, bool)> = Vec::with_capacity(5);
+        let mut dir_stack: Vec<(String, bool, Option<HashSet<String>>)> = Vec::with_capacity(5);
+        // Explicit directory markers and real directories can resolve to the same logical path.
+        let schedule_dir = |dir_stack: &mut Vec<(String, bool, Option<HashSet<String>>)>,
+                            dir_name: String,
+                            skip_object: bool,
+                            dir_to_skip: Option<HashSet<String>>| {
+            if let Some((last_dir_name, existing_skip_object, existing_dir_to_skip)) = dir_stack.last_mut()
+                && *last_dir_name == dir_name
+            {
+                *existing_skip_object |= skip_object;
+                if let Some(existing_dir_to_skip) = existing_dir_to_skip {
+                    if let Some(new_dir_to_skip) = &dir_to_skip {
+                        existing_dir_to_skip.extend(new_dir_to_skip.iter().cloned());
+                    }
+                } else {
+                    *existing_dir_to_skip = dir_to_skip;
+                }
+            } else {
+                dir_stack.push((dir_name, skip_object, dir_to_skip));
+            }
+        };
         prefix = "".to_owned();
 
         for entry in entries.iter() {
@@ -1074,21 +1722,31 @@ impl LocalDisk {
 
             let name = path_join_buf(&[current.as_str(), entry.as_str()]);
 
-            while let Some((pop, skip_object)) = dir_stack.last().cloned()
-                && pop < name
+            while let Some((last_name, _, _)) = dir_stack.last()
+                && *last_name < name
             {
+                let (pop, skip_object, dir_to_skip) = dir_stack.pop().unwrap();
                 out.write_obj(&MetaCacheEntry {
                     name: pop.clone(),
                     ..Default::default()
                 })
                 .await?;
 
+                let scan_path = pop.clone();
                 if opts.recursive
-                    && let Err(er) = Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object)).await
+                    && let Err(er) =
+                        Box::pin(self.scan_dir(pop, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
                 {
-                    error!("scan_dir err {:?}", er);
+                    error!(
+                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = %scan_path,
+                        operation = "scan_dir",
+                        error = ?er,
+                        "Disk local scan failed"
+                    );
                 }
-                dir_stack.pop();
             }
 
             let mut meta = MetaCacheEntry {
@@ -1118,18 +1776,35 @@ impl LocalDisk {
 
                     out.write_obj(&meta).await?;
 
-                    // if let Ok(meta) = FileMeta::load(&meta.metadata)
-                    //     && !meta.all_hidden(true)
-                    // {
-                    *objs_returned += 1;
-                    // }
+                    let file_meta = if opts.limit > 0 || opts.recursive {
+                        FileMeta::load(&res).ok()
+                    } else {
+                        None
+                    };
+
+                    if opts.limit <= 0 || file_meta.as_ref().is_none_or(file_meta_counts_toward_limit) {
+                        *objs_returned += 1;
+                    }
 
                     if opts.recursive {
+                        let mut dir_to_skip = HashSet::new();
+                        if let Some(file_meta) = file_meta.as_ref()
+                            && let Ok(data_dirs) = file_meta.get_data_dirs()
+                        {
+                            for data_dir in data_dirs.iter().flatten() {
+                                dir_to_skip.insert(data_dir.to_string());
+                            }
+                        }
                         let mut dir_name = meta.name.clone();
                         if !dir_name.ends_with(SLASH_SEPARATOR) {
                             dir_name.push_str(SLASH_SEPARATOR);
                         }
-                        dir_stack.push((dir_name, true));
+                        schedule_dir(
+                            &mut dir_stack,
+                            dir_name,
+                            true,
+                            if dir_to_skip.is_empty() { None } else { Some(dir_to_skip) },
+                        );
                     }
                 }
                 Err(err) => {
@@ -1138,7 +1813,7 @@ impl LocalDisk {
                         // If dirObject, but no metadata (which is unexpected) we skip it.
                         if !is_dir_obj && !is_empty_dir(self.get_object_path(&opts.bucket, &meta.name)?).await {
                             meta.name.push_str(SLASH_SEPARATOR);
-                            dir_stack.push((meta.name, false));
+                            schedule_dir(&mut dir_stack, meta.name, false, None);
                         }
                     }
 
@@ -1147,7 +1822,7 @@ impl LocalDisk {
             };
         }
 
-        while let Some((dir, skip_object)) = dir_stack.pop() {
+        while let Some((dir, skip_object, dir_to_skip)) = dir_stack.pop() {
             if opts.limit > 0 && *objs_returned >= opts.limit {
                 return Ok(());
             }
@@ -1158,10 +1833,20 @@ impl LocalDisk {
             })
             .await?;
 
+            let scan_path = dir.clone();
             if opts.recursive
-                && let Err(er) = Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object)).await
+                && let Err(er) =
+                    Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
             {
-                warn!("scan_dir err {:?}", &er);
+                warn!(
+                    event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    path = %scan_path,
+                    operation = "scan_dir",
+                    error = ?er,
+                    "Disk local recursive scan failed"
+                );
             }
         }
 
@@ -1179,6 +1864,15 @@ impl Drop for ScanGuard {
 
 fn is_root_path(path: impl AsRef<Path>) -> bool {
     path.as_ref().components().count() == 1 && path.as_ref().has_root()
+}
+
+fn metadata_counts_toward_limit(metadata: &[u8]) -> bool {
+    FileMeta::load(metadata).map_or(true, |meta| file_meta_counts_toward_limit(&meta))
+}
+
+fn file_meta_counts_toward_limit(meta: &FileMeta) -> bool {
+    meta.into_fileinfo("", "", "", false, true, false)
+        .map_or_else(|_| !meta.all_hidden(true), |latest| !latest.deleted && !latest.tier_free_version())
 }
 
 // Filter std::io::ErrorKind::NotFound
@@ -1207,13 +1901,26 @@ async fn read_file_all(path: impl AsRef<Path>) -> Result<(Bytes, Metadata)> {
     let p = path.as_ref();
     let meta = read_file_metadata(&path).await?;
 
-    let data = fs::read(&p).await.map_err(to_file_error)?;
+    let data = fs::read(&p)
+        .await
+        .inspect_err(|err| {
+            log_startup_disk_io_error("read_file_all", p, err);
+        })
+        .map_err(to_file_error)?;
 
     Ok((data.into(), meta))
 }
 
 async fn read_file_metadata(p: impl AsRef<Path>) -> Result<Metadata> {
-    let meta = fs::metadata(&p).await.map_err(to_file_error)?;
+    let path = p.as_ref();
+    let meta = fs::metadata(path)
+        .await
+        .inspect_err(|err| {
+            if err.kind() != ErrorKind::NotFound {
+                log_startup_disk_io_error("read_file_metadata", path, err);
+            }
+        })
+        .map_err(to_file_error)?;
 
     Ok(meta)
 }
@@ -1328,20 +2035,28 @@ impl DiskAPI for LocalDisk {
 
         let id = format_info.id;
 
-        // if format_info.last_check_valid() {
-        //     return Ok(id);
-        // }
-
         if format_info.file_info.is_some() && id.is_some() {
-            // check last check time
+            // Reuse the cached disk id only when the cached format check is fresh.
             if let Some(last_check) = format_info.last_check
-                && last_check.unix_timestamp() + 1 < OffsetDateTime::now_utc().unix_timestamp()
+                && last_check.unix_timestamp() + 1 >= OffsetDateTime::now_utc().unix_timestamp()
             {
                 return Ok(id);
             }
         }
 
-        let file_meta = self.check_format_json().await?;
+        let file_meta = match self.check_format_json().await {
+            Ok(meta) => meta,
+            Err(err) => {
+                if matches!(err, DiskError::UnformattedDisk | DiskError::DiskNotFound) {
+                    let mut format_info = self.format_info.write().await;
+                    format_info.id = None;
+                    format_info.data = Bytes::new();
+                    format_info.file_info = None;
+                    format_info.last_check = None;
+                }
+                return Err(err);
+            }
+        };
 
         if let Some(file_info) = &format_info.file_info
             && super::fs::same_file(&file_meta, file_info)
@@ -1358,7 +2073,13 @@ impl DiskAPI for LocalDisk {
         let b = fs::read(&self.format_path).await.map_err(to_unformatted_disk_error)?;
 
         let fm = FormatV3::try_from(b.as_slice()).map_err(|e| {
-            warn!("decode format.json  err {:?}", e);
+            warn!(
+                event = EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                error = ?e,
+                "Disk local format decode failed"
+            );
             DiskError::CorruptedBackend
         })?;
 
@@ -1451,7 +2172,7 @@ impl DiskAPI for LocalDisk {
                 volume,
                 path_join_buf(&[
                     path,
-                    &fi.data_dir.map_or("".to_string(), |dir| dir.to_string()),
+                    &fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()),
                     &format!("part.{}", part.number),
                 ])
                 .as_str(),
@@ -1470,11 +2191,29 @@ impl DiskAPI for LocalDisk {
             if resp.results[i] == CHECK_PART_UNKNOWN
                 && let Some(err) = err
             {
-                error!("verify_file: failed to bitrot verify file: {:?}, error: {:?}", &part_path, &err);
+                error!(
+                    event = EVENT_DISK_LOCAL_CHECK_PARTS,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    path = ?part_path,
+                    part_number = part.number,
+                    state = "bitrot_verify_failed",
+                    error = ?err,
+                    "Disk local check_parts state changed"
+                );
                 if err == DiskError::FileAccessDenied {
                     continue;
                 }
-                info!("part unknown, disk: {}, path: {:?}", self.to_string(), part_path);
+                info!(
+                    event = EVENT_DISK_LOCAL_CHECK_PARTS,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    endpoint = %self.endpoint,
+                    path = ?part_path,
+                    part_number = part.number,
+                    state = "unknown",
+                    "Disk local check_parts state changed"
+                );
             }
         }
 
@@ -1500,7 +2239,7 @@ impl DiskAPI for LocalDisk {
                 self.get_object_path(
                     bucket,
                     path_join_buf(&[
-                        path.parent().unwrap_or(Path::new("")).to_string_lossy().as_ref(),
+                        path.parent().unwrap_or_else(|| Path::new("")).to_string_lossy().as_ref(),
                         &format!("part.{num}"),
                     ])
                     .as_str(),
@@ -1561,13 +2300,21 @@ impl DiskAPI for LocalDisk {
                 volume,
                 path_join_buf(&[
                     path,
-                    &fi.data_dir.map_or("".to_string(), |dir| dir.to_string()),
+                    &fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()),
                     &format!("part.{}", part.number),
                 ])
                 .as_str(),
             )?;
 
-            info!("check_parts: part_path: {:?}", &part_path);
+            debug!(
+                event = EVENT_DISK_LOCAL_CHECK_PARTS,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                path = ?part_path,
+                part_number = part.number,
+                state = "checking",
+                "Disk local check_parts state changed"
+            );
 
             match lstat(&part_path).await {
                 Ok(st) => {
@@ -1583,7 +2330,16 @@ impl DiskAPI for LocalDisk {
                     resp.results[i] = CHECK_PART_SUCCESS;
                 }
                 Err(err) => {
-                    info!("check_parts: failed to stat file: {:?}, error: {:?}", &part_path, &err);
+                    debug!(
+                        event = EVENT_DISK_LOCAL_CHECK_PARTS,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = ?part_path,
+                        part_number = part.number,
+                        state = "part_stat_failed",
+                        error = ?err,
+                        "Disk local check_parts state changed"
+                    );
 
                     let e: DiskError = to_file_error(err).into();
 
@@ -1597,7 +2353,16 @@ impl DiskAPI for LocalDisk {
                         }
                         resp.results[i] = CHECK_PART_FILE_NOT_FOUND;
                     } else {
-                        error!("check_parts: failed to stat file: {:?}, error: {:?}", &file_path, &e);
+                        error!(
+                            event = EVENT_DISK_LOCAL_CHECK_PARTS,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                            path = ?file_path,
+                            part_number = part.number,
+                            state = "file_stat_failed",
+                            error = ?e,
+                            "Disk local check_parts state changed"
+                        );
                     }
                     continue;
                 }
@@ -1623,8 +2388,13 @@ impl DiskAPI for LocalDisk {
 
         if !src_is_dir && dst_is_dir || src_is_dir && !dst_is_dir {
             warn!(
-                "rename_part src and dst must be both dir or file src_is_dir:{}, dst_is_dir:{}",
-                src_is_dir, dst_is_dir
+                event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                reason = "src_dst_type_mismatch",
+                src_is_dir,
+                dst_is_dir,
+                "Disk local rename rejected"
             );
             return Err(DiskError::FileAccessDenied);
         }
@@ -1641,25 +2411,54 @@ impl DiskAPI for LocalDisk {
             let meta_op = match lstat_std(&src_file_path).map_err(|e| to_file_error(e).into()) {
                 Ok(meta) => Some(meta),
                 Err(e) => {
-                    if e != DiskError::FileNotFound {
-                        return Err(e);
-                    }
-
-                    None
+                    return Err(e);
                 }
             };
 
             if let Some(meta) = meta_op
                 && !meta.is_dir()
             {
-                warn!("rename_part src is not dir {:?}", &src_file_path);
+                warn!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "src_expected_dir_missing",
+                    path = ?src_file_path,
+                    "Disk local rename rejected"
+                );
                 return Err(DiskError::FileAccessDenied);
             }
 
             remove_std(&dst_file_path).map_err(to_file_error)?;
+        } else {
+            let meta = lstat_std(&src_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
+            if meta.is_dir() {
+                warn!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "src_unexpected_dir",
+                    path = ?src_file_path,
+                    "Disk local rename rejected"
+                );
+                return Err(DiskError::FileAccessDenied);
+            }
         }
 
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
+
+        let dst_meta = lstat_std(&dst_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
+        if src_is_dir != dst_meta.is_dir() {
+            warn!(
+                event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                reason = "dst_type_changed_after_rename",
+                path = ?dst_file_path,
+                "Disk local rename rejected"
+            );
+            return Err(DiskError::FileAccessDenied);
+        }
 
         self.write_all(dst_volume, format!("{dst_path}.meta").as_str(), meta).await?;
 
@@ -1751,8 +2550,9 @@ impl DiskAPI for LocalDisk {
         let f = super::fs::open_file(&file_path, O_CREATE | O_WRONLY)
             .await
             .map_err(to_file_error)?;
+        let reclaim_on_shutdown = should_reclaim_file_cache_after_write(_file_size);
 
-        Ok(Box::new(f))
+        Ok(Box::new(FileCacheReclaimWriter::new(f, _file_size.max(0) as usize, reclaim_on_shutdown)))
 
         // Ok(())
     }
@@ -1789,7 +2589,7 @@ impl DiskAPI for LocalDisk {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        let f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
+        let f = self.open_file_read_only(file_path).await?;
 
         Ok(Box::new(f))
     }
@@ -1806,16 +2606,22 @@ impl DiskAPI for LocalDisk {
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
 
-        let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
+        let mut f = self.open_file_read_only(file_path).await?;
 
         let meta = f.metadata().await?;
         let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
         if meta.len() < end_offset as u64 {
             error!(
-                "read_file_stream: file size is less than offset + length {} + {} = {}",
+                event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                volume,
+                path,
                 offset,
                 length,
-                meta.len()
+                actual_size = meta.len(),
+                reason = "read_file_stream_out_of_bounds",
+                "Disk local read fallback failed"
             );
             return Err(DiskError::FileCorrupt);
         }
@@ -1824,17 +2630,17 @@ impl DiskAPI for LocalDisk {
             f.seek(SeekFrom::Start(offset as u64)).await?;
         }
 
-        Ok(Box::new(f))
+        let reclaim_on_drop = should_reclaim_file_cache_after_read(length);
+        Ok(Box::new(FileCacheReclaimReader::new(f, offset as u64, length, reclaim_on_drop)))
     }
 
     /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
     /// Returns Bytes that can be shared without copying.
+    // SAFETY: Unix unsafe calls in this function only query page size and mmap
+    // a read-only file region after bounds and alignment are validated.
     #[allow(unsafe_code)]
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
-        use std::time::Instant;
-
-        let start = Instant::now();
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             access(&volume_dir)
@@ -1854,10 +2660,16 @@ impl DiskAPI for LocalDisk {
         let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
         if meta.len() < end_offset as u64 {
             error!(
-                "read_file_zero_copy: file size is less than offset + length {} + {} = {}",
+                event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                volume,
+                path,
                 offset,
                 length,
-                meta.len()
+                actual_size = meta.len(),
+                reason = "read_file_zero_copy_out_of_bounds",
+                "Disk local read fallback failed"
             );
             return Err(DiskError::FileCorrupt);
         }
@@ -1867,21 +2679,64 @@ impl DiskAPI for LocalDisk {
         #[cfg(unix)]
         {
             use memmap2::MmapOptions;
-            let file_path_clone = file_path.clone();
-            let offset_u64 = offset as u64;
+            use std::time::Instant;
 
+            let start = Instant::now();
+            let file_path_clone = file_path.clone();
+
+            let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
             let bytes = tokio::task::spawn_blocking(move || {
                 let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
 
-                // Create memory map for the specified region
-                // SAFETY: The file is opened as read-only, and we're mapping a region
-                // that we've already verified exists and is within file bounds.
-                let mmap = unsafe { MmapOptions::new().offset(offset_u64).len(length).map(&file) }.map_err(DiskError::other)?;
+                #[cfg(target_os = "macos")]
+                if should_reclaim_after_read {
+                    let _ = set_std_fd_nocache(&file);
+                }
 
-                // Copy the mapped region into a Bytes buffer. This avoids undefined
-                // behavior from treating OS-managed mmap memory as allocator-managed
-                // Vec storage, at the cost of an extra copy.
-                Ok::<Bytes, DiskError>(Bytes::copy_from_slice(&mmap))
+                // mmap offsets on Unix must be page-size aligned. Align the
+                // mapping down to the nearest page boundary, then slice out the
+                // originally requested logical range.
+                // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and
+                // only queries process-global OS configuration.
+                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                if page_size <= 0 {
+                    return Err(DiskError::other("failed to determine system page size"));
+                }
+                let page_size = page_size as u64;
+                let offset_u64 = offset as u64;
+                let aligned_offset = offset_u64 - (offset_u64 % page_size);
+                let logical_offset = (offset_u64 - aligned_offset) as usize;
+                let map_len = logical_offset
+                    .checked_add(length)
+                    .ok_or_else(|| DiskError::other("mmap length overflow"))?;
+
+                // SAFETY: The file is opened as read-only, and we're mapping a region
+                // that we've already verified exists and is within file bounds. The
+                // file offset passed to mmap is page-size aligned as required on Unix.
+                let mmap =
+                    unsafe { MmapOptions::new().offset(aligned_offset).len(map_len).map(&file) }.map_err(DiskError::other)?;
+
+                // Copy only the requested logical range into a Bytes buffer. This
+                // avoids undefined behavior from treating OS-managed mmap memory as
+                // allocator-managed Vec storage, at the cost of an extra copy.
+                let end = logical_offset
+                    .checked_add(length)
+                    .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
+                let bytes = Bytes::copy_from_slice(&mmap[logical_offset..end]);
+
+                #[cfg(target_os = "linux")]
+                if should_reclaim_after_read {
+                    use core::num::NonZeroU64;
+                    use rustix::fs::{Advice, fadvise};
+
+                    let reclaim_len =
+                        NonZeroU64::new(map_len as u64).ok_or_else(|| DiskError::other("mmap reclaim length overflow"))?;
+                    fadvise(&file, aligned_offset, Some(reclaim_len), Advice::DontNeed)
+                        .map_err(std::io::Error::from)
+                        .map_err(DiskError::from)?;
+                }
+
+                Ok::<Bytes, DiskError>(bytes)
             })
             .await
             .map_err(DiskError::from)??;
@@ -1911,8 +2766,7 @@ impl DiskAPI for LocalDisk {
                 f.seek(SeekFrom::Start(offset as u64)).await?;
             }
 
-            let mut buffer = Vec::with_capacity(length);
-            buffer.resize(length, 0);
+            let mut buffer = vec![0; length];
             f.read_exact(&mut buffer).await?;
 
             Ok(Bytes::from(buffer))
@@ -1953,6 +2807,8 @@ impl DiskAPI for LocalDisk {
     // FIXME: TODO: io.writer TODO cancel
     #[tracing::instrument(level = "debug", skip(self, wr))]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
+        self.wait_for_startup_cleanup().await;
+
         let volume_dir = self.get_bucket_path(&opts.bucket)?;
 
         if !skip_access_checks(&opts.bucket)
@@ -1967,6 +2823,8 @@ impl DiskAPI for LocalDisk {
 
         let mut objs_returned = 0;
 
+        let mut skip_current_dir_object = false;
+        let mut multipart_dir_to_skip: HashSet<String> = HashSet::new();
         if opts.base_dir.ends_with(SLASH_SEPARATOR) {
             if let Ok(data) = self
                 .read_metadata(
@@ -1990,10 +2848,23 @@ impl DiskAPI for LocalDisk {
                 let fpath =
                     self.get_object_path(&opts.bucket, path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str())?;
 
-                if let Ok(meta) = tokio::fs::metadata(fpath).await
+                if let Ok(meta) = tokio::fs::metadata(&fpath).await
                     && meta.is_file()
                 {
-                    return Err(DiskError::FileNotFound);
+                    skip_current_dir_object = true;
+                    if let Ok(meta_bytes) = self
+                        .read_metadata(
+                            opts.bucket.as_str(),
+                            path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str(),
+                        )
+                        .await
+                        && let Ok(file_meta) = FileMeta::load(&meta_bytes)
+                        && let Ok(data_dirs) = file_meta.get_data_dirs()
+                    {
+                        for data_dir in data_dirs.iter().flatten() {
+                            multipart_dir_to_skip.insert(data_dir.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -2004,7 +2875,12 @@ impl DiskAPI for LocalDisk {
             &opts,
             &mut out,
             &mut objs_returned,
-            false,
+            skip_current_dir_object,
+            if multipart_dir_to_skip.is_empty() {
+                None
+            } else {
+                Some(multipart_dir_to_skip)
+            },
         )
         .await?;
 
@@ -2024,7 +2900,15 @@ impl DiskAPI for LocalDisk {
         if !skip_access_checks(src_volume)
             && let Err(e) = super::fs::access_std(&src_volume_dir)
         {
-            info!("access checks failed, src_volume_dir: {:?}, err: {}", src_volume_dir, e.to_string());
+            info!(
+                event = EVENT_DISK_LOCAL_ACCESS_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                path = ?src_volume_dir,
+                operation = "rename_data_src_access",
+                error = %e,
+                "Disk local access check failed"
+            );
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
@@ -2032,7 +2916,15 @@ impl DiskAPI for LocalDisk {
         if !skip_access_checks(dst_volume)
             && let Err(e) = super::fs::access_std(&dst_volume_dir)
         {
-            info!("access checks failed, dst_volume_dir: {:?}, err: {}", dst_volume_dir, e.to_string());
+            info!(
+                event = EVENT_DISK_LOCAL_ACCESS_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                path = ?dst_volume_dir,
+                operation = "rename_data_dst_access",
+                error = %e,
+                "Disk local access check failed"
+            );
             return Err(to_access_error(e, DiskError::VolumeAccessDenied).into());
         }
 
@@ -2070,115 +2962,210 @@ impl DiskAPI for LocalDisk {
         check_path_length(src_file_path.to_string_lossy().to_string().as_str())?;
         check_path_length(dst_file_path.to_string_lossy().to_string().as_str())?;
 
-        // Read the previous xl.meta
+        let no_inline = fi.data.is_none() && fi.size > 0;
 
-        let has_dst_buf = match super::fs::read_file(&dst_file_path).await {
-            Ok(res) => Some(res),
-            Err(e) => {
-                let e: DiskError = to_file_error(e).into();
-
-                if e != DiskError::FileNotFound {
-                    return Err(e);
+        if no_inline {
+            // Non-inline: read xl.meta, parse, write, rename data dir, rename xl.meta
+            let has_dst_buf = match super::fs::read_file(&dst_file_path).await {
+                Ok(res) => Some(res),
+                Err(e) => {
+                    let e: DiskError = to_file_error(e).into();
+                    if e != DiskError::FileNotFound {
+                        return Err(e);
+                    }
+                    None
                 }
+            };
 
-                None
+            let mut xlmeta = FileMeta::new();
+            if let Some(dst_buf) = has_dst_buf.as_ref()
+                && FileMeta::is_xl2_v1_format(dst_buf)
+                && let Ok(nmeta) = FileMeta::load(dst_buf)
+            {
+                xlmeta = nmeta
             }
-        };
 
-        let mut xlmeta = FileMeta::new();
+            let mut skip_parent = dst_volume_dir.clone();
+            if has_dst_buf.as_ref().is_some()
+                && let Some(parent) = dst_file_path.parent()
+            {
+                skip_parent = parent.to_path_buf();
+            }
 
-        if let Some(dst_buf) = has_dst_buf.as_ref()
-            && FileMeta::is_xl2_v1_format(dst_buf)
-            && let Ok(nmeta) = FileMeta::load(dst_buf)
-        {
-            xlmeta = nmeta
-        }
+            let version_id = fi.version_id.unwrap_or_default();
+            let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
+            if let Some(old_data_dir) = has_old_data_dir.as_ref() {
+                let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
+            }
+            xlmeta.add_version(fi)?;
+            let new_dst_buf = xlmeta.marshal_msg()?;
 
-        let mut skip_parent = dst_volume_dir.clone();
-        if has_dst_buf.as_ref().is_some()
-            && let Some(parent) = dst_file_path.parent()
-        {
-            skip_parent = parent.to_path_buf();
-        }
-
-        // TODO: Healing
-
-        let search_version_id = fi.version_id.or(Some(Uuid::nil()));
-
-        // Check if there's an existing version with the same version_id that has a data_dir to clean up
-        let has_old_data_dir = {
-            xlmeta.find_version(search_version_id).ok().and_then(|(_, ver)| {
-                // shard_count == 0 means no other version shares this data_dir
-                ver.get_data_dir()
-                    .filter(|&data_dir| xlmeta.shard_data_dir_count(&search_version_id, &Some(data_dir)) == 0)
-            })
-        };
-        if let Some(old_data_dir) = has_old_data_dir.as_ref() {
-            let _ = xlmeta.data.remove(vec![search_version_id.unwrap_or_default(), *old_data_dir]);
-        }
-
-        xlmeta.add_version(fi.clone())?;
-
-        if xlmeta.versions.len() <= 10 {
-            // TODO: Sign
-        }
-
-        let new_dst_buf = xlmeta.marshal_msg()?;
-
-        self.write_all(src_volume, format!("{}/{}", &src_path, STORAGE_FORMAT_FILE).as_str(), new_dst_buf.into())
+            let src_file_parent = src_file_path.parent().unwrap_or(src_volume_dir.as_path());
+            self.write_all_private(
+                src_volume,
+                &format!("{}/{}", &src_path, STORAGE_FORMAT_FILE),
+                new_dst_buf.into(),
+                true,
+                src_file_parent,
+            )
             .await?;
-        if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref() {
-            let no_inline = fi.data.is_none() && fi.size > 0;
-            if no_inline && let Err(err) = rename_all(&src_data_path, &dst_data_path, &skip_parent).await {
+
+            if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref()
+                && let Err(err) = rename_all(src_data_path, dst_data_path, &skip_parent).await
+            {
                 let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
                 info!(
-                    "rename all failed src_data_path: {:?}, dst_data_path: {:?}, err: {:?}",
-                    src_data_path, dst_data_path, err
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "rename_all_data_path_failed",
+                    src_path = ?src_data_path,
+                    dst_path = ?dst_data_path,
+                    error = ?err,
+                    "Disk local rename flow failed"
                 );
                 return Err(err);
             }
-        }
 
-        if let Some(old_data_dir) = has_old_data_dir {
-            // preserve current xl.meta inside the oldDataDir.
-            if let Some(dst_buf) = has_dst_buf
+            if let Err(err) = rename_all(&src_file_path, &dst_file_path, &skip_parent).await {
+                if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
+                    let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
+                }
+                info!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "rename_all_metadata_failed",
+                    src_path = ?src_file_path,
+                    dst_path = ?dst_file_path,
+                    error = ?err,
+                    "Disk local rename flow failed"
+                );
+                return Err(err);
+            }
+
+            if let Some(old_data_dir) = has_old_data_dir
+                && let Some(dst_buf) = has_dst_buf
                 && let Err(err) = self
                     .write_all_private(
                         dst_volume,
-                        format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE).as_str(),
+                        &format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE),
                         dst_buf.into(),
                         true,
                         &skip_parent,
                     )
                     .await
             {
-                info!("write_all_private failed err: {:?}", err);
+                info!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "write_old_metadata_failed",
+                    error = ?err,
+                    "Disk local rename flow failed"
+                );
                 return Err(err);
             }
-        }
 
-        if let Err(err) = rename_all(&src_file_path, &dst_file_path, &skip_parent).await {
-            if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
-                let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
+            if let Some(src_file_path_parent) = src_file_path.parent() {
+                if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
+                    let _ = remove_std(src_file_path_parent);
+                } else {
+                    let _ = self
+                        .delete_file(&dst_volume_dir, &src_file_path_parent.to_path_buf(), true, false)
+                        .await;
+                }
             }
-            info!("rename all failed err: {:?}", err);
-            return Err(err);
-        }
 
-        if let Some(src_file_path_parent) = src_file_path.parent() {
-            if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
-                let _ = remove_std(src_file_path_parent);
+            Ok(RenameDataResp {
+                old_data_dir: has_old_data_dir,
+                sign: None,
+            })
+        } else {
+            // Inline: merge read + parse + write + rename into single spawn_blocking
+            let src = src_file_path.clone();
+            let dst = dst_file_path.clone();
+            let cleanup_path = if src_volume == super::RUSTFS_META_MULTIPART_BUCKET {
+                src_file_path.parent().map(|p| p.to_path_buf())
             } else {
-                let _ = self
-                    .delete_file(&dst_volume_dir, &src_file_path_parent.to_path_buf(), true, false)
-                    .await;
-            }
-        }
+                None
+            };
 
-        Ok(RenameDataResp {
-            old_data_dir: has_old_data_dir,
-            sign: None, // TODO:
-        })
+            let (old_data_dir, _dst_buf) = tokio::task::spawn_blocking(move || {
+                // Read existing xl.meta
+                let has_dst_buf = match std::fs::read(&dst) {
+                    Ok(buf) => Some(Bytes::from(buf)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(to_file_error(e)),
+                };
+
+                let mut xlmeta = FileMeta::new();
+                if let Some(ref buf) = has_dst_buf
+                    && FileMeta::is_xl2_v1_format(buf)
+                    && let Ok(nmeta) = FileMeta::load(buf)
+                {
+                    xlmeta = nmeta
+                }
+
+                let version_id = fi.version_id.unwrap_or_default();
+                let old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
+                if let Some(d) = old_data_dir.as_ref() {
+                    let _ = xlmeta.data.remove_two(version_id, *d);
+                }
+                xlmeta.add_version(fi)?;
+                let new_buf = xlmeta.marshal_msg()?;
+
+                // Write new xl.meta + rename
+                if let Some(parent) = src.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&src)?;
+                std::io::Write::write_all(&mut f, &new_buf)?;
+                match std::fs::rename(&src, &dst) {
+                    Ok(()) => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound && !src.exists() => Ok(()),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        if let Some(parent) = dst.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::rename(&src, &dst).map_err(to_file_error)?;
+                        Ok(())
+                    }
+                    Err(err) => Err(to_file_error(err)),
+                }?;
+
+                if let Some(old_dir) = old_data_dir.as_ref()
+                    && let Some(ref buf) = has_dst_buf
+                    && let Some(dst_parent) = dst.parent()
+                {
+                    let old_path = dst_parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE);
+                    if let Some(old_parent) = old_path.parent() {
+                        std::fs::create_dir_all(old_parent)?;
+                    }
+                    std::fs::write(&old_path, buf).map_err(to_file_error)?;
+                }
+
+                Ok::<(Option<uuid::Uuid>, Option<Bytes>), std::io::Error>((old_data_dir, has_dst_buf))
+            })
+            .await
+            .map_err(DiskError::from)??;
+
+            // Cleanup
+            if let Some(ref cleanup) = cleanup_path {
+                let _ = self.delete_file(&dst_volume_dir, cleanup, true, false).await;
+            } else if let Some(parent) = src_file_path.parent() {
+                let _ = remove_std(parent);
+            }
+
+            Ok(RenameDataResp {
+                old_data_dir,
+                sign: None,
+            })
+        }
     }
 
     #[tracing::instrument(skip(self))]
@@ -2187,7 +3174,15 @@ impl DiskAPI for LocalDisk {
             if let Err(e) = self.make_volume(vol).await
                 && e != DiskError::VolumeExists
             {
-                error!("local disk make volumes failed: {e}");
+                error!(
+                    event = EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    volume = vol,
+                    operation = "make_volumes",
+                    error = %e,
+                    "Disk local volume setup failed"
+                );
                 return Err(e);
             }
             // TODO: health check
@@ -2208,7 +3203,15 @@ impl DiskAPI for LocalDisk {
                 os::make_dir_all(&volume_dir, self.root.as_path()).await?;
                 return Ok(());
             }
-            error!("local disk make volume failed: {e}");
+            error!(
+                event = EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                volume,
+                operation = "make_volume",
+                error = %e,
+                "Disk local volume setup failed"
+            );
             return Err(to_volume_error(e).into());
         }
 
@@ -2295,7 +3298,7 @@ impl DiskAPI for LocalDisk {
 
             let mut xl_meta = FileMeta::load(buf.as_ref())?;
 
-            xl_meta.update_object_version(fi)?;
+            xl_meta.update_object_version_with_opts(fi, opts.replace_user_metadata)?;
 
             let wbuf = xl_meta.marshal_msg()?;
 
@@ -2392,7 +3395,7 @@ impl DiskAPI for LocalDisk {
                     let part_path = format!("part.{}", part.number);
                     let part_path = path_join_buf(&[
                         path,
-                        fi.data_dir.map_or("".to_string(), |dir| dir.to_string()).as_str(),
+                        fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()).as_str(),
                         part_path.as_str(),
                     ]);
                     let part_path = self.get_object_path(volume, part_path.as_str())?;
@@ -2409,13 +3412,21 @@ impl DiskAPI for LocalDisk {
             if inline && fi.shard_file_size(fi.parts[0].actual_size) < DEFAULT_INLINE_BLOCK as i64 {
                 let part_path = path_join_buf(&[
                     path,
-                    fi.data_dir.map_or("".to_string(), |dir| dir.to_string()).as_str(),
+                    fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()).as_str(),
                     format!("part.{}", fi.parts[0].number).as_str(),
                 ]);
                 let part_path = self.get_object_path(volume, part_path.as_str())?;
 
                 let data = self.read_all_data(volume, volume_dir, part_path.clone()).await.map_err(|e| {
-                    warn!("read_version read_all_data {:?} failed: {e}", part_path);
+                    warn!(
+                        event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = ?part_path,
+                        reason = "inline_data_read_failed",
+                        error = %e,
+                        "Disk local read_version fallback failed"
+                    );
                     e
                 })?;
                 fi.data = Some(Bytes::from(data));
@@ -2575,7 +3586,13 @@ impl DiskAPI for LocalDisk {
                     res.mod_time = match meta.modified() {
                         Ok(md) => Some(OffsetDateTime::from(md)),
                         Err(_) => {
-                            warn!("Not supported modified on this platform");
+                            warn!(
+                                event = EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                                reason = "modified_time_unsupported",
+                                "Disk local modified time is unsupported on this platform"
+                            );
                             None
                         }
                     };
@@ -2623,7 +3640,6 @@ impl DiskAPI for LocalDisk {
     #[tracing::instrument(skip(self))]
     async fn disk_info(&self, _: &DiskInfoOptions) -> Result<DiskInfo> {
         let mut info = Cache::get(self.disk_info_cache.clone()).await?;
-        // TODO: nr_requests, rotational
         info.nr_requests = self.nrrequests;
         info.rotational = self.rotational;
         info.mount_path = self.path().to_str().unwrap().to_string();
@@ -2651,12 +3667,39 @@ impl DiskAPI for LocalDisk {
     }
 }
 
+async fn wait_for_startup_cleanup_signal(
+    startup_cleanup_ready: &AtomicU32,
+    startup_cleanup_notify: &Notify,
+    wait_timeout: Duration,
+) -> bool {
+    if startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+        return true;
+    }
+
+    timeout(wait_timeout, async {
+        loop {
+            if startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            let notified = startup_cleanup_notify.notified();
+            if startup_cleanup_ready.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
 #[tracing::instrument]
 async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInfo, bool)> {
     let drive_path = drive_path.to_string_lossy().to_string();
     check_path_length(&drive_path)?;
 
-    let disk_info = get_info(&drive_path)?;
+    let disk_info = get_info(&drive_path).inspect_err(|err| {
+        log_startup_disk_io_error("get_disk_info_stat", Path::new(&drive_path), err);
+    })?;
     let root_drive = if !*GLOBAL_IsErasureSD.read().await {
         let root_disk_threshold = *GLOBAL_RootDiskThreshold.read().await;
         if root_disk_threshold > 0 {
@@ -2694,6 +3737,168 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_get_disk_id_invalidates_cache_after_format_removal() {
+        use crate::disk::FORMAT_CONFIG_FILE;
+        use crate::disk::format::FormatV3;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let mut endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let meta_dir = dir.path().join(RUSTFS_META_BUCKET);
+        fs::create_dir_all(&meta_dir).await.expect("meta dir should be creatable");
+        let mut format = FormatV3::new(1, 1);
+        format.erasure.this = format.erasure.sets[0][0];
+        let format_json = format.to_json().expect("format should serialize");
+        fs::write(meta_dir.join(FORMAT_CONFIG_FILE), format_json)
+            .await
+            .expect("format.json should be writable");
+
+        let disk = LocalDisk::new(&endpoint, false)
+            .await
+            .expect("local disk should open after seeding format");
+
+        let initial_id = disk.get_disk_id().await.expect("disk id lookup should succeed");
+        assert!(initial_id.is_some(), "new disk should expose a disk id");
+
+        fs::remove_file(&disk.format_path)
+            .await
+            .expect("format.json should be removable");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let err = disk
+            .get_disk_id()
+            .await
+            .expect_err("removed format.json should invalidate the cached disk id");
+        assert!(matches!(err, DiskError::UnformattedDisk));
+
+        let format_info = disk.format_info.read().await.clone();
+        assert!(format_info.id.is_none(), "cached disk id should be cleared");
+        assert!(format_info.data.is_empty(), "cached format bytes should be cleared");
+        assert!(format_info.file_info.is_none(), "cached file metadata should be cleared");
+        assert!(format_info.last_check.is_none(), "cached format timestamp should be cleared");
+    }
+
+    #[tokio::test]
+    async fn cleanup_tmp_on_startup_moves_existing_tmp_and_recreates_trash() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
+        let leftover = tmp.join("leftover").join("data");
+        fs::create_dir_all(leftover.parent().unwrap()).await.unwrap();
+        fs::write(&leftover, b"temporary").await.unwrap();
+
+        LocalDisk::cleanup_tmp_on_startup(dir.path(), Arc::new(AtomicU32::new(0)), Arc::new(Notify::new()))
+            .await
+            .unwrap();
+
+        assert!(!tmp.join("leftover").exists());
+        assert!(LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET).exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_tmp_objects_moves_expired_tmp_dirs_to_trash() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
+        let stale = tmp.join("stale").join("data");
+        let trash = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET);
+        fs::create_dir_all(stale.parent().unwrap()).await.unwrap();
+        fs::create_dir_all(&trash).await.unwrap();
+        fs::write(&stale, b"temporary").await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(!tmp.join("stale").exists());
+        assert!(trash.exists());
+
+        let mut entries = fs::read_dir(&trash).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_tmp_objects_keeps_fresh_dirs_and_regular_files() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
+        let fresh_dir = tmp.join("fresh").join("data");
+        let regular_file = tmp.join("note.txt");
+        let trash = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET);
+
+        fs::create_dir_all(fresh_dir.parent().unwrap()).await.unwrap();
+        fs::create_dir_all(&trash).await.unwrap();
+        fs::write(&fresh_dir, b"temporary").await.unwrap();
+        fs::write(&regular_file, b"keep").await.unwrap();
+
+        LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        assert!(tmp.join("fresh").exists());
+        assert!(regular_file.exists());
+
+        let mut entries = fs::read_dir(&trash).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_loop_interval_does_not_tick_immediately() {
+        let start_at = tokio::time::Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
+        let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
+
+        assert!(tokio::time::timeout(Duration::from_secs(1), interval.tick()).await.is_err());
+
+        tokio::time::advance(DELETED_OBJECTS_CLEANUP_INTERVAL).await;
+        interval.tick().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_cleanup_barrier_waits_for_notification() {
+        let ready = Arc::new(AtomicU32::new(0));
+        let notify = Arc::new(Notify::new());
+
+        let wait = tokio::spawn({
+            let ready = ready.clone();
+            let notify = notify.clone();
+            async move { wait_for_startup_cleanup_signal(ready.as_ref(), notify.as_ref(), Duration::from_secs(2)).await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+
+        ready.store(1, Ordering::Release);
+        notify.notify_waiters();
+
+        assert!(wait.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_cleanup_barrier_times_out() {
+        let ready = Arc::new(AtomicU32::new(0));
+        let notify = Arc::new(Notify::new());
+
+        let wait = tokio::spawn({
+            let ready = ready.clone();
+            let notify = notify.clone();
+            async move { wait_for_startup_cleanup_signal(ready.as_ref(), notify.as_ref(), Duration::from_secs(2)).await }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        assert!(!wait.await.unwrap());
+    }
+
+    #[tokio::test]
     async fn test_scan_dir_includes_nested_object_dirs() {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
@@ -2724,7 +3929,7 @@ mod test {
         };
         let mut objs_returned = 0;
 
-        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false)
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
             .await
             .unwrap();
         out.close().await.unwrap();
@@ -2741,6 +3946,427 @@ mod test {
         assert!(names.contains(&"foo/bar".to_string()));
         assert!(names.contains(&"foo/bar/xyzzy".to_string()));
         assert!(names.contains(&"quux/thud".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_deduplicates_explicit_dir_marker_recursion() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        fs::create_dir_all(bucket_dir.join("marker/file.txt")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join("marker/subdir/file.txt")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join(format!("marker/subdir{GLOBAL_DIR_SUFFIX}")))
+            .await
+            .unwrap();
+
+        fs::write(bucket_dir.join("marker/file.txt/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("marker/subdir/file.txt/xl.meta"), b"meta")
+            .await
+            .unwrap();
+        fs::write(bucket_dir.join(format!("marker/subdir{GLOBAL_DIR_SUFFIX}/xl.meta")), b"meta")
+            .await
+            .unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "marker/".to_string(),
+            recursive: true,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir("marker/".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            .await
+            .unwrap();
+        out.close().await.unwrap();
+
+        let mut reader = MetacacheReader::new(reader);
+        let entries = reader.read_all().await.unwrap();
+        let names: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| !entry.metadata.is_empty())
+            .map(|entry| entry.name)
+            .collect();
+
+        assert_eq!(names.iter().filter(|name| *name == "marker/subdir/file.txt").count(), 1);
+        assert_eq!(names.iter().filter(|name| *name == "marker/subdir/").count(), 1);
+        assert_eq!(names.iter().filter(|name| *name == "marker/file.txt").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_forward_to_repeated_prefix_component() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        for name in [
+            "different/prefix/prefix/repo-0000",
+            "different/prefix/prefix/repo-0001",
+            "different/prefix/prefix/repo-0002",
+            "engineering/alpha-0000",
+            "engineering/engineering/engineering/repo-0000",
+            "engineering/engineering/engineering/repo-0001",
+            "engineering/engineering/repo-0000",
+            "engineering/engineering/repo-0001",
+            "engineering/engineering/repo-0002",
+            "engineering/zulu-0000",
+            "unrelated/engineering/repo-0000",
+        ] {
+            let object_dir = bucket_dir.join(name);
+            fs::create_dir_all(&object_dir).await.unwrap();
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta").await.unwrap();
+        }
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, forward_to: &str) -> (Vec<String>, i32) {
+            let (reader, mut writer) = tokio::io::duplex(4096);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: base_dir.to_string(),
+                recursive: true,
+                forward_to: Some(forward_to.to_string()),
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+
+            disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .unwrap();
+            out.close().await.unwrap();
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            let entries = reader.read_all().await.unwrap();
+            let names: Vec<String> = entries
+                .into_iter()
+                .filter(|entry| !entry.metadata.is_empty())
+                .map(|entry| entry.name)
+                .collect();
+
+            (names, objs_returned)
+        }
+
+        let (engineering_names, engineering_count) =
+            scan_names(&disk, bucket, "engineering/", "engineering/engineering/engineering/repo-0001").await;
+
+        assert_eq!(
+            engineering_names,
+            vec![
+                "engineering/engineering/engineering/repo-0001".to_string(),
+                "engineering/engineering/repo-0000".to_string(),
+                "engineering/engineering/repo-0001".to_string(),
+                "engineering/engineering/repo-0002".to_string(),
+                "engineering/zulu-0000".to_string(),
+            ],
+            "forward_to must resume at the requested triply repeated prefix and preserve lexicographic order"
+        );
+        assert_eq!(engineering_count as usize, engineering_names.len());
+
+        let (different_names, different_count) =
+            scan_names(&disk, bucket, "different/", "different/prefix/prefix/repo-0001").await;
+
+        assert_eq!(
+            different_names,
+            vec![
+                "different/prefix/prefix/repo-0001".to_string(),
+                "different/prefix/prefix/repo-0002".to_string(),
+            ],
+            "forward_to must also work for repeated components unrelated to the engineering prefix"
+        );
+        assert_eq!(different_count as usize, different_names.len());
+
+        let (double_names, double_count) = scan_names(&disk, bucket, "engineering/", "engineering/engineering/repo-0001").await;
+
+        assert_eq!(
+            double_names,
+            vec![
+                "engineering/engineering/repo-0001".to_string(),
+                "engineering/engineering/repo-0002".to_string(),
+                "engineering/zulu-0000".to_string(),
+            ],
+            "forward_to must not skip a child directory whose name repeats the base prefix"
+        );
+        assert_eq!(double_count as usize, double_names.len());
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_hidden_delete_markers_do_not_exhaust_limit() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        fn delete_marker_metadata(version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            fm.add_version(FileInfo {
+                deleted: true,
+                version_id: Some(Uuid::parse_str(version_id).expect("test version id should parse")),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete marker metadata should be valid");
+            fm.marshal_msg().expect("delete marker metadata should encode")
+        }
+
+        fn delete_marker_with_old_object_metadata(delete_version_id: &str, object_version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            fm.add_version({
+                let mut fi = FileInfo::new("hidden", 1, 1);
+                fi.version_id = Some(Uuid::parse_str(object_version_id).expect("test version id should parse"));
+                fi.mod_time = Some(OffsetDateTime::now_utc() - time::Duration::seconds(1));
+                fi
+            })
+            .expect("object metadata should be valid");
+            fm.add_version(FileInfo {
+                deleted: true,
+                version_id: Some(Uuid::parse_str(delete_version_id).expect("test version id should parse")),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete marker metadata should be valid");
+            fm.marshal_msg().expect("delete marker metadata should encode")
+        }
+
+        fn object_metadata(version_id: &str) -> Vec<u8> {
+            let mut fm = FileMeta::default();
+            let mut fi = FileInfo::new("visible", 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            fm.add_version(fi).expect("object metadata should be valid");
+            fm.marshal_msg().expect("object metadata should encode")
+        }
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+
+        for (name, version_id) in [
+            ("shard/aaa-trash-0000", "11111111-1111-1111-1111-111111111111"),
+            ("shard/aaa-trash-0001", "22222222-2222-2222-2222-222222222222"),
+            ("shard/aaa-trash-0002", "33333333-3333-3333-3333-333333333333"),
+        ] {
+            let object_dir = bucket_dir.join(name);
+            fs::create_dir_all(&object_dir).await.unwrap();
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), delete_marker_metadata(version_id))
+                .await
+                .unwrap();
+        }
+
+        let hidden_versioned_dir = bucket_dir.join("shard/aaa-trash-0003");
+        fs::create_dir_all(&hidden_versioned_dir).await.unwrap();
+        fs::write(
+            hidden_versioned_dir.join(STORAGE_FORMAT_FILE),
+            delete_marker_with_old_object_metadata(
+                "44444444-4444-4444-4444-444444444444",
+                "55555555-5555-5555-5555-555555555555",
+            ),
+        )
+        .await
+        .unwrap();
+
+        let visible_dir = bucket_dir.join("shard/bbb-visible-0000");
+        fs::create_dir_all(&visible_dir).await.unwrap();
+        fs::write(
+            visible_dir.join(STORAGE_FORMAT_FILE),
+            object_metadata("66666666-6666-6666-6666-666666666666"),
+        )
+        .await
+        .unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "".to_string(),
+            recursive: true,
+            limit: 1,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            .await
+            .unwrap();
+        out.close().await.unwrap();
+        drop(out);
+        drop(writer);
+
+        let mut reader = MetacacheReader::new(reader);
+        let has_visible_object = reader
+            .read_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .any(|entry| !entry.metadata.is_empty() && entry.name == "shard/bbb-visible-0000");
+
+        assert!(has_visible_object);
+        assert_eq!(objs_returned, 1);
+    }
+
+    #[tokio::test]
+    async fn test_walk_dir_ignore_multipart_dirs() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        const UUID_MULTIPART_1: &str = "8b262d24-fcf9-473d-a4cd-f9b27f24f60e";
+        const UUID_MULTIPART_2: &str = "fbf3183c-63be-45cc-b3bf-424ddb7f95f8";
+        const UUID_OBJ: &str = "db8b9b74-9016-4f9e-83e9-82a772947d28";
+        const VER_ID_1: &str = "c683f9f8-c0a1-4bc5-8a67-0faafa839a1a";
+        const VER_ID_2: &str = "a4b84f6e-c8ba-461b-8f9d-43feb0893efb";
+        const VER_ID_3: &str = "892c9ae7-2bb3-44ee-9a71-bc7ddf08d765";
+        const BASE_DIR: &str = "dir1/obj/";
+        const MULTIPART_DIR: &str = "multipart-file";
+        const DIR_IN_MULTIPART_DIR: &str = "dir-in-multipart";
+        const EMPTY_STR: &str = "";
+
+        let parse_uuid = |s: &str| Uuid::parse_str(s).unwrap();
+        let create_file_info = |version_id: &str, data_dir: &str| FileInfo {
+            version_id: Some(parse_uuid(version_id)),
+            data_dir: Some(parse_uuid(data_dir)),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+
+        let dir = tempdir().unwrap();
+        let obj_base = dir.path().join("test-bucket").join(BASE_DIR);
+        let multipart_base = obj_base.join(MULTIPART_DIR);
+        let dir_in_multipart_base = multipart_base.join(DIR_IN_MULTIPART_DIR);
+
+        fs::create_dir_all(&multipart_base).await.unwrap();
+        for uuid in &[UUID_MULTIPART_1, UUID_MULTIPART_2] {
+            fs::create_dir_all(multipart_base.join(uuid)).await.unwrap();
+            fs::write(multipart_base.join(uuid).join("part.1"), b"part").await.unwrap();
+        }
+        fs::create_dir_all(obj_base.join(UUID_OBJ)).await.unwrap();
+        fs::write(obj_base.join(UUID_OBJ).join("part.1"), b"part").await.unwrap();
+
+        fs::create_dir_all(&dir_in_multipart_base).await.unwrap();
+        fs::write(dir_in_multipart_base.join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .unwrap();
+
+        let mut fm = FileMeta::default();
+        fm.add_version(create_file_info(VER_ID_1, UUID_MULTIPART_1)).unwrap();
+        fm.add_version(create_file_info(VER_ID_2, UUID_MULTIPART_2)).unwrap();
+        fs::write(multipart_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().unwrap())
+            .await
+            .unwrap();
+
+        let mut fm = FileMeta::default();
+        fm.add_version(create_file_info(VER_ID_3, UUID_OBJ)).unwrap();
+        fs::write(obj_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().unwrap())
+            .await
+            .unwrap();
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        disk.walk_dir(
+            WalkDirOptions {
+                bucket: "test-bucket".to_string(),
+                base_dir: BASE_DIR.to_string(),
+                recursive: true,
+                filter_prefix: Some(EMPTY_STR.to_string()),
+                ..Default::default()
+            },
+            &mut writer,
+        )
+        .await
+        .unwrap();
+        MetacacheWriter::new(&mut writer).close().await.unwrap();
+
+        let mut reader = MetacacheReader::new(reader);
+        let entries = reader.read_all().await.unwrap();
+        let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
+
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}", BASE_DIR, MULTIPART_DIR))
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/", BASE_DIR, MULTIPART_DIR))
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}", BASE_DIR, MULTIPART_DIR, DIR_IN_MULTIPART_DIR))
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}/", BASE_DIR, MULTIPART_DIR, DIR_IN_MULTIPART_DIR))
+                .count(),
+            1
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}", BASE_DIR, MULTIPART_DIR, UUID_MULTIPART_1))
+                .count(),
+            0
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}", BASE_DIR, MULTIPART_DIR, UUID_MULTIPART_2))
+                .count(),
+            0
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}", BASE_DIR, UUID_OBJ))
+                .count(),
+            0
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}/", BASE_DIR, MULTIPART_DIR, UUID_MULTIPART_1))
+                .count(),
+            0
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/{}/", BASE_DIR, MULTIPART_DIR, UUID_MULTIPART_2))
+                .count(),
+            0
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| *name == &format!("{}{}/", BASE_DIR, UUID_OBJ))
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -2912,13 +4538,15 @@ mod test {
         let disk_info = disk.disk_info(&disk_info_opts).await.unwrap();
 
         // Basic checks on disk info
-        // Note: On macOS and some other Unix systems, fs_type may be empty
+        // Note: On macOS, Windows, and some other systems, fs_type may be empty
         // because statvfs does not provide filesystem type information.
         // This is a platform limitation, not a bug.
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         assert!(!disk_info.fs_type.is_empty(), "fs_type should not be empty on this platform");
         assert!(disk_info.total > 0);
         assert!(disk_info.free <= disk_info.total);
+        assert_eq!(disk_info.nr_requests, disk.nrrequests);
+        assert_eq!(disk_info.rotational, disk.rotational);
         assert!(!disk_info.mount_path.is_empty());
         assert!(!disk_info.endpoint.is_empty());
 
@@ -3136,5 +4764,39 @@ mod test {
 
             assert_eq!(normalize_path_components("C:\\a\\..\\b"), PathBuf::from("C:\\b"));
         }
+    }
+
+    #[test]
+    fn should_reclaim_file_cache_after_write_respects_env_and_threshold() {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE, || {
+            assert!(!should_reclaim_file_cache_after_write(8 * 1024 * 1024));
+        });
+
+        temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE, Some("true"), || {
+            temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("4194304"), || {
+                assert!(should_reclaim_file_cache_after_write(8 * 1024 * 1024));
+                assert!(!should_reclaim_file_cache_after_write(1024));
+            });
+        });
+    }
+
+    #[test]
+    fn should_reclaim_file_cache_after_read_respects_env_and_threshold() {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, || {
+            assert!(!should_reclaim_file_cache_after_read(8 * 1024 * 1024));
+        });
+
+        temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, Some("true"), || {
+            temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("4194304"), || {
+                assert!(should_reclaim_file_cache_after_read(8 * 1024 * 1024));
+                assert!(!should_reclaim_file_cache_after_read(1024));
+            });
+        });
+    }
+
+    #[test]
+    fn test_is_bitrot_size_mismatch_error_only_matches_target_message() {
+        assert!(is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot shard file size mismatch")));
+        assert!(!is_bitrot_size_mismatch_error(&std::io::Error::other("bitrot hash mismatch")));
     }
 }

@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use super::*;
+use crate::config::get_global_storage_class;
+use rustfs_storage_api::StorageAdminApi;
 
 struct LatestObjectInfoCandidate {
     info: Option<ObjectInfo>,
@@ -20,13 +22,18 @@ struct LatestObjectInfoCandidate {
     err: Option<Error>,
 }
 
+struct RebalanceDeletePoolResult {
+    pool_idx: usize,
+    result: Result<ObjectInfo>,
+}
+
 fn pool_lookup_not_found_error(bucket: &str, object: &str, opts: &ObjectOptions) -> Error {
     let object = decode_dir_object(object);
 
     if let Some(version_id) = &opts.version_id {
-        StorageError::VersionNotFound(bucket.to_owned(), object.to_owned(), version_id.clone())
+        StorageError::VersionNotFound(bucket.to_owned(), object, version_id.clone())
     } else {
-        StorageError::ObjectNotFound(bucket.to_owned(), object.to_owned())
+        StorageError::ObjectNotFound(bucket.to_owned(), object)
     }
 }
 
@@ -36,6 +43,52 @@ fn resolve_store_rebalance_pool_meta_reload_result(result: Result<()>, stage: &s
 
 fn resolve_rebalance_delete_from_all_pools_result(result: Result<ObjectInfo>, bucket: &str, object: &str) -> Result<ObjectInfo> {
     result.map_err(|err| Error::other(format!("failed to delete rebalance source object {bucket}/{object}: {err}")))
+}
+
+fn is_ignorable_rebalance_delete_error(err: &Error) -> bool {
+    is_err_object_not_found(err) || is_err_version_not_found(err)
+}
+
+fn rebalance_delete_pool_error(pool_idx: usize, bucket: &str, object: &str, err: Error) -> Error {
+    Error::other(format!("pool {pool_idx} delete failed for {bucket}/{object}: {err}"))
+}
+
+fn resolve_rebalance_delete_from_all_pools_results(
+    results: Vec<RebalanceDeletePoolResult>,
+    bucket: &str,
+    object: &str,
+) -> Result<ObjectInfo> {
+    let mut deleted = None;
+    let mut ignored_error = None;
+
+    for pool_result in results {
+        let pool_idx = pool_result.pool_idx;
+        match pool_result.result {
+            Ok(info) => {
+                if deleted.is_none() {
+                    deleted = Some(info);
+                }
+            }
+            Err(err) if is_ignorable_rebalance_delete_error(&err) => {
+                ignored_error = Some((pool_idx, err));
+            }
+            Err(err) => {
+                return Err(rebalance_delete_pool_error(pool_idx, bucket, object, err));
+            }
+        }
+    }
+
+    if let Some(info) = deleted {
+        return Ok(info);
+    }
+
+    if let Some((pool_idx, err)) = ignored_error {
+        return Err(rebalance_delete_pool_error(pool_idx, bucket, object, err));
+    }
+
+    Err(Error::other(format!(
+        "failed to delete rebalance source object {bucket}/{object}: no pools were attempted"
+    )))
 }
 
 fn rebalance_disk_set_lookup_error(pool_idx: usize, set_idx: usize, pool_count: usize) -> Error {
@@ -182,17 +235,11 @@ impl ECStore {
         Ok(())
     }
 
-    pub(super) async fn delete_prefix(&self, bucket: &str, object: &str) -> Result<()> {
+    pub(super) async fn delete_prefix(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         for pool in self.pools.iter() {
-            pool.delete_object(
-                bucket,
-                object,
-                ObjectOptions {
-                    delete_prefix: true,
-                    ..Default::default()
-                },
-            )
-            .await?;
+            let mut opts = opts.clone();
+            opts.delete_prefix = true;
+            pool.delete_object(bucket, object, opts).await?;
         }
 
         Ok(())
@@ -225,6 +272,41 @@ impl ECStore {
         None
     }
 
+    pub(super) async fn get_available_pool_idx_excluding(
+        &self,
+        bucket: &str,
+        object: &str,
+        size: i64,
+        excluded_pool_idx: usize,
+    ) -> Option<usize> {
+        let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
+        server_pools.filter_max_used(100 - (100_f64 * DISK_RESERVE_FRACTION) as u64);
+
+        if let Some(pool) = server_pools.0.get_mut(excluded_pool_idx) {
+            pool.available = 0;
+        }
+
+        let total = server_pools.total_available();
+        if total == 0 {
+            return None;
+        }
+
+        let mut rng = rand::rng();
+        let random_u64: u64 = rng.random_range(0..total);
+
+        let choose = random_u64 % total;
+        let mut at_total = 0;
+
+        for pool in server_pools.iter() {
+            at_total += pool.available;
+            if at_total > choose && pool.available > 0 {
+                return Some(pool.index);
+            }
+        }
+
+        None
+    }
+
     async fn get_server_pools_available_space(&self, bucket: &str, object: &str, size: i64) -> ServerPoolsAvailableSpace {
         let mut n_sets = vec![0; self.pools.len()];
         let mut infos = vec![Vec::new(); self.pools.len()];
@@ -233,10 +315,8 @@ impl ECStore {
                 return (idx, 0, Vec::new());
             }
 
-            let disk_infos = match pool.get_disks_by_key(object).get_disks(0, 0).await {
-                Ok(disks) => get_disk_infos(&disks).await,
-                Err(_) => Vec::new(),
-            };
+            let disks = pool.get_disks_by_key(object).disk_inventory().await;
+            let disk_infos = get_disk_infos(&disks).await;
 
             (idx, pool.set_count, disk_infos)
         }))
@@ -418,7 +498,7 @@ impl ECStore {
             if is_err_object_not_found(err)
                 && let Err(err) = opts.precondition_check(&pinfo.object_info)
             {
-                return Err(err.clone());
+                return Err(err);
             }
 
             if !is_err_object_not_found(err) && !is_err_version_not_found(err) {
@@ -512,38 +592,34 @@ impl ECStore {
         opts: &ObjectOptions,
         errs: Vec<PoolErr>,
     ) -> Result<ObjectInfo> {
-        let mut objs = Vec::new();
-        let mut derrs = Vec::new();
+        let mut results = Vec::with_capacity(errs.len());
 
         for pe in errs.iter() {
             if let Some(err) = &pe.err
                 && err == &StorageError::ErasureWriteQuorum
             {
-                objs.push(None);
-                derrs.push(Some(StorageError::ErasureWriteQuorum));
+                if let Some(idx) = pe.index {
+                    results.push(RebalanceDeletePoolResult {
+                        pool_idx: idx,
+                        result: Err(StorageError::ErasureWriteQuorum),
+                    });
+                }
                 continue;
             }
 
             if let Some(idx) = pe.index {
-                match self.pools[idx].delete_object(bucket, object, opts.clone()).await {
-                    Ok(res) => {
-                        objs.push(Some(res));
-
-                        derrs.push(None);
-                    }
-                    Err(err) => {
-                        objs.push(None);
-                        derrs.push(Some(err));
-                    }
-                }
+                results.push(RebalanceDeletePoolResult {
+                    pool_idx: idx,
+                    result: self.pools[idx].delete_object(bucket, object, opts.clone()).await,
+                });
             }
         }
 
-        if let Some(e) = &derrs[0] {
-            return resolve_rebalance_delete_from_all_pools_result(Err(e.clone()), bucket, object);
-        }
-
-        resolve_rebalance_delete_from_all_pools_result(Ok(objs[0].as_ref().unwrap().clone()), bucket, object)
+        resolve_rebalance_delete_from_all_pools_result(
+            resolve_rebalance_delete_from_all_pools_results(results, bucket, object),
+            bucket,
+            object,
+        )
     }
 
     pub async fn reload_pool_meta(&self) -> Result<()> {
@@ -605,7 +681,7 @@ impl ECStore {
     #[instrument(skip(self))]
     pub(super) async fn handle_backend_info(&self) -> rustfs_madmin::BackendInfo {
         let (standard_sc_parity, rr_sc_parity) = {
-            if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
+            if let Some(sc) = get_global_storage_class() {
                 let sc_parity = sc
                     .get_parity_for_sc(storageclass::CLASS_STANDARD)
                     .or(Some(self.pools[0].default_parity_count));
@@ -623,7 +699,7 @@ impl ECStore {
         let mut drives_per_set = Vec::new();
         let mut total_sets = Vec::new();
 
-        for (idx, set_count) in self.set_drive_counts().iter().enumerate() {
+        for (idx, set_count) in StorageAdminApi::set_drive_counts(self).iter().enumerate() {
             if let Some(sc_parity) = standard_sc_parity {
                 standard_sc_data.push(set_count - sc_parity);
             }
@@ -678,7 +754,7 @@ impl ECStore {
         let mut futures = Vec::with_capacity(self.pools.len());
 
         for pool in self.pools.iter() {
-            futures.push(pool.local_storage_info())
+            futures.push(pool.local_storage_info_snapshot())
         }
 
         let results = join_all(futures).await;
@@ -699,14 +775,14 @@ impl ECStore {
             warn!("Local storage info deduplication: {} -> {}", original_count, disks.len());
         }
 
-        let backend = self.backend_info().await;
+        let backend = StorageAdminApi::backend_info(self).await;
         rustfs_madmin::StorageInfo { backend, disks }
     }
 
     #[instrument(skip(self))]
     pub(super) async fn handle_get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
         if pool_idx < self.pools.len() && set_idx < self.pools[pool_idx].disk_set.len() {
-            self.pools[pool_idx].disk_set[set_idx].get_disks(0, 0).await
+            Ok(self.pools[pool_idx].disk_set[set_idx].disk_inventory().await)
         } else {
             Err(rebalance_disk_set_lookup_error(pool_idx, set_idx, self.pools.len()))
         }
@@ -905,6 +981,139 @@ mod tests {
 
         assert!(rendered.contains("failed to delete rebalance source object bucket/object"), "{rendered}");
         assert!(rendered.contains(&Error::SlowDown.to_string()), "{rendered}");
+    }
+
+    #[test]
+    fn resolve_rebalance_delete_from_all_pools_results_fails_on_later_pool_error() {
+        let err = resolve_rebalance_delete_from_all_pools_results(
+            vec![
+                RebalanceDeletePoolResult {
+                    pool_idx: 0,
+                    result: Ok(ObjectInfo {
+                        bucket: "bucket".to_string(),
+                        name: "object".to_string(),
+                        ..Default::default()
+                    }),
+                },
+                RebalanceDeletePoolResult {
+                    pool_idx: 1,
+                    result: Err(Error::SlowDown),
+                },
+            ],
+            "bucket",
+            "object",
+        )
+        .expect_err("non-ignorable errors from later pools must not be hidden");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("pool 1 delete failed for bucket/object"), "{rendered}");
+        assert!(rendered.contains(&Error::SlowDown.to_string()), "{rendered}");
+    }
+
+    #[test]
+    fn resolve_rebalance_delete_from_all_pools_results_ignores_later_not_found_after_success() {
+        let info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            ..Default::default()
+        };
+
+        let resolved = resolve_rebalance_delete_from_all_pools_results(
+            vec![
+                RebalanceDeletePoolResult {
+                    pool_idx: 0,
+                    result: Ok(info.clone()),
+                },
+                RebalanceDeletePoolResult {
+                    pool_idx: 1,
+                    result: Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
+                },
+            ],
+            "bucket",
+            "object",
+        )
+        .expect("not-found errors from other pools should be ignored when a delete succeeds");
+
+        assert_eq!(resolved.bucket, info.bucket);
+        assert_eq!(resolved.name, info.name);
+    }
+
+    #[test]
+    fn resolve_rebalance_delete_from_all_pools_results_accepts_success_after_not_found() {
+        let info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            ..Default::default()
+        };
+
+        let resolved = resolve_rebalance_delete_from_all_pools_results(
+            vec![
+                RebalanceDeletePoolResult {
+                    pool_idx: 0,
+                    result: Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
+                },
+                RebalanceDeletePoolResult {
+                    pool_idx: 1,
+                    result: Ok(info.clone()),
+                },
+            ],
+            "bucket",
+            "object",
+        )
+        .expect("a successful delete should pass even when an earlier pool reports not-found");
+
+        assert_eq!(resolved.bucket, info.bucket);
+        assert_eq!(resolved.name, info.name);
+    }
+
+    #[test]
+    fn resolve_rebalance_delete_from_all_pools_results_fails_when_all_results_are_ignored_errors() {
+        let err = resolve_rebalance_delete_from_all_pools_results(
+            vec![
+                RebalanceDeletePoolResult {
+                    pool_idx: 0,
+                    result: Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
+                },
+                RebalanceDeletePoolResult {
+                    pool_idx: 1,
+                    result: Err(Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())),
+                },
+            ],
+            "bucket",
+            "object",
+        )
+        .expect_err("all ignored errors without any successful delete should still fail");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("pool 1 delete failed for bucket/object"), "{rendered}");
+        assert!(rendered.contains("Version not found"), "{rendered}");
+    }
+
+    #[test]
+    fn resolve_rebalance_delete_from_all_pools_results_fails_on_write_quorum_even_with_success() {
+        let err = resolve_rebalance_delete_from_all_pools_results(
+            vec![
+                RebalanceDeletePoolResult {
+                    pool_idx: 0,
+                    result: Ok(ObjectInfo {
+                        bucket: "bucket".to_string(),
+                        name: "object".to_string(),
+                        ..Default::default()
+                    }),
+                },
+                RebalanceDeletePoolResult {
+                    pool_idx: 1,
+                    result: Err(Error::ErasureWriteQuorum),
+                },
+            ],
+            "bucket",
+            "object",
+        )
+        .expect_err("write quorum failures must fail the aggregate delete");
+        let rendered = err.to_string();
+
+        assert!(rendered.contains("pool 1 delete failed for bucket/object"), "{rendered}");
+        assert!(rendered.contains(&Error::ErasureWriteQuorum.to_string()), "{rendered}");
     }
 
     #[test]

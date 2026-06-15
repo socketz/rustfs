@@ -31,6 +31,7 @@ use crate::client::{
     },
     constants::{UNSIGNED_PAYLOAD, UNSIGNED_PAYLOAD_TRAILER},
     credentials::{CredContext, Credentials, SignatureType, Static},
+    signer_error,
 };
 use crate::{client::checksum::ChecksumMode, store_api::GetObjectReader};
 use futures::{Future, StreamExt};
@@ -50,6 +51,7 @@ use md5::Md5;
 use rand::{Rng, RngExt};
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_rio::HashReader;
+use rustfs_tls_runtime::{load_global_outbound_tls_state, record_tls_generation};
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::{
     net::get_endpoint_url,
@@ -57,6 +59,8 @@ use rustfs_utils::{
         DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, MAX_RETRY, RetryTimer, is_http_status_retryable, is_s3code_retryable,
     },
 };
+use rustls_pki_types::PrivateKeyDer;
+use rustls_pki_types::pem::PemObject;
 use s3s::S3ErrorCode;
 use s3s::dto::Owner;
 use s3s::dto::ReplicationStatus;
@@ -84,6 +88,21 @@ const SUCCESS_STATUS: [StatusCode; 3] = [StatusCode::OK, StatusCode::NO_CONTENT,
 const C_UNKNOWN: i32 = -1;
 const C_OFFLINE: i32 = 0;
 const C_ONLINE: i32 = 1;
+
+fn invalid_utf8_header_error(scope: &str, header_name: &str) -> std::io::Error {
+    signer_error::invalid_utf8_header_error(scope, header_name)
+}
+
+fn validate_header_values(headers: &HeaderMap, scope: &str) -> Result<(), std::io::Error> {
+    for (name, value) in headers {
+        value.to_str().map_err(|_| invalid_utf8_header_error(scope, name.as_str()))?;
+    }
+    Ok(())
+}
+
+fn signer_error_to_io_error(scope: &str, error: rustfs_signer::SignV4Error) -> std::io::Error {
+    signer_error::signer_error_to_io_error(scope, error)
+}
 
 //pub type ReaderImpl = Box<dyn Reader + Send + Sync + 'static>;
 pub enum ReaderImpl {
@@ -136,24 +155,11 @@ pub enum BucketLookupType {
     BucketLookupPath,
 }
 
-fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
-    // Load the root certificate bundle from the path specified by the
-    // RUSTFS_TLS_PATH environment variable.
-    let tp = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
-    // If no TLS path is configured, do not fall back to a CA bundle in the current directory.
-    if tp.is_empty() {
-        return None;
-    }
-    let ca = std::path::Path::new(&tp).join(rustfs_config::RUSTFS_CA_CERT);
-    if !ca.exists() {
-        return None;
-    }
-
-    let der_list = rustfs_utils::load_cert_bundle_der_bytes(ca.to_str().unwrap_or_default()).ok()?;
+fn build_root_store_from_der_list(der_list: Vec<Vec<u8>>) -> Option<rustls::RootCertStore> {
     let mut store = rustls::RootCertStore::empty();
     for der in der_list {
         if let Err(e) = store.add(der.into()) {
-            warn!("Warning: failed to add certificate from '{}' to root store: {e}", ca.display());
+            warn!("Warning: failed to add certificate to root store: {e}");
         }
     }
     Some(store)
@@ -183,18 +189,38 @@ where
     })
 }
 
-fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
-    with_rustls_init_guard(|| {
-        let config = if let Some(store) = load_root_store_from_tls_path() {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(store)
-                .with_no_client_auth()
-        } else {
-            rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth()
-        };
+async fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
+    with_rustls_init_guard(|| Ok(()))?;
 
-        Ok(config)
-    })
+    let outbound_tls = load_global_outbound_tls_state().await;
+    record_tls_generation("ecstore_transition_client", outbound_tls.generation.0);
+    let builder = if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
+        let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
+        let certs_der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| std::io::Error::other(format!("failed to parse published root CA PEM: {e}")))?;
+
+        let root_store = build_root_store_from_der_list(certs_der.into_iter().map(|cert| cert.to_vec()).collect::<Vec<_>>())
+            .ok_or_else(|| std::io::Error::other("published outbound root CA material could not build root store"))?;
+        rustls::ClientConfig::builder().with_root_certificates(root_store)
+    } else {
+        rustls::ClientConfig::builder().with_native_roots()?
+    };
+
+    let config = if let Some(identity) = outbound_tls.mtls_identity.as_ref() {
+        let certs = rustls_pki_types::CertificateDer::pem_reader_iter(&mut std::io::BufReader::new(identity.cert_pem.as_slice()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| std::io::Error::other(format!("failed to parse published client cert PEM: {e}")))?;
+        let key = PrivateKeyDer::from_pem_reader(&mut std::io::BufReader::new(identity.key_pem.as_slice()))
+            .map_err(|e| std::io::Error::other(format!("failed to parse published client key PEM: {e}")))?;
+        builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| std::io::Error::other(format!("failed to build client mTLS identity: {e}")))?
+    } else {
+        builder.with_no_client_auth()
+    };
+
+    Ok(config)
 }
 
 impl TransitionClient {
@@ -218,7 +244,7 @@ impl TransitionClient {
 
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
 
-        let tls = build_tls_config()?;
+        let tls = build_tls_config().await?;
 
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls)
@@ -251,9 +277,10 @@ impl TransitionClient {
         };
 
         {
-            let mut md5_hasher = client.md5_hasher.lock().unwrap();
-            if md5_hasher.is_none() {
-                *md5_hasher = Some(HashAlgorithm::Md5);
+            if let Ok(mut md5_hasher) = client.md5_hasher.lock() {
+                if md5_hasher.is_none() {
+                    *md5_hasher = Some(HashAlgorithm::Md5);
+                }
             }
         }
         if client.sha256_hasher.is_none() {
@@ -275,25 +302,30 @@ impl TransitionClient {
     }
 
     fn trace_errors_only_off(&self) {
-        let mut trace_errors_only = self.trace_errors_only.lock().unwrap();
-        *trace_errors_only = false;
+        if let Ok(mut trace_errors_only) = self.trace_errors_only.lock() {
+            *trace_errors_only = false;
+        }
     }
 
     fn trace_off(&self) {
-        let mut is_trace_enabled = self.is_trace_enabled.lock().unwrap();
-        *is_trace_enabled = false;
-        let mut trace_errors_only = self.trace_errors_only.lock().unwrap();
-        *trace_errors_only = false;
+        if let Ok(mut is_trace_enabled) = self.is_trace_enabled.lock() {
+            *is_trace_enabled = false;
+        }
+        if let Ok(mut trace_errors_only) = self.trace_errors_only.lock() {
+            *trace_errors_only = false;
+        }
     }
 
     fn set_s3_transfer_accelerate(&self, accelerate_endpoint: &str) {
-        let mut endpoint = self.s3_accelerate_endpoint.lock().unwrap();
-        *endpoint = accelerate_endpoint.to_string();
+        if let Ok(mut endpoint) = self.s3_accelerate_endpoint.lock() {
+            *endpoint = accelerate_endpoint.to_string();
+        }
     }
 
     fn set_s3_enable_dual_stack(&self, enabled: bool) {
-        let mut dual_stack = self.s3_dual_stack_enabled.lock().unwrap();
-        *dual_stack = enabled;
+        if let Ok(mut dual_stack) = self.s3_dual_stack_enabled.lock() {
+            *dual_stack = enabled;
+        }
     }
 
     pub fn hash_materials(
@@ -352,7 +384,6 @@ impl TransitionClient {
         let resp;
         let http_client = self.http_client.clone();
         {
-            //let mut http_client = http_client.lock().unwrap();
             req_method = req.method().clone();
             req_uri = req.uri().clone();
             req_headers = req.headers().clone();
@@ -368,7 +399,10 @@ impl TransitionClient {
             return Err(std::io::Error::other(err));
         }
 
-        let resp = resp.unwrap();
+        let resp = match resp {
+            Ok(r) => r,
+            Err(_) => return Err(std::io::Error::other("Unexpected error in response")),
+        };
         debug!("http_resp: {:?}", resp);
 
         //let b = resp.body_mut().store_all_unlimited().await.unwrap().to_vec();
@@ -455,11 +489,13 @@ impl TransitionClient {
                             return Err(std::io::Error::other(err_response));
                         }
                         if metadata.bucket_name != "" {
-                            let mut bucket_loc_cache = self.bucket_loc_cache.lock().unwrap();
-                            let location = bucket_loc_cache.get(&metadata.bucket_name);
-                            if location.is_some() && location.unwrap() != err_response.region {
-                                bucket_loc_cache.set(&metadata.bucket_name, &err_response.region);
-                                //continue;
+                            if let Ok(mut bucket_loc_cache) = self.bucket_loc_cache.lock() {
+                                if let Some(location) = bucket_loc_cache.get(&metadata.bucket_name) {
+                                    if location != err_response.region {
+                                        bucket_loc_cache.set(&metadata.bucket_name, &err_response.region);
+                                        //continue;
+                                    }
+                                }
                             }
                         } else if err_response.region != metadata.bucket_location {
                             metadata.bucket_location = err_response.region.clone();
@@ -518,8 +554,11 @@ impl TransitionClient {
 
         let value;
         {
-            let mut creds_provider = self.creds_provider.lock().unwrap();
-            value = creds_provider.get_with_context(Some(self.cred_context()))?;
+            if let Ok(mut creds_provider) = self.creds_provider.lock() {
+                value = creds_provider.get_with_context(Some(self.cred_context()))?;
+            } else {
+                return Err(std::io::Error::other("Failed to acquire credentials provider lock"));
+            }
         }
 
         let mut signer_type = value.signer_type.clone();
@@ -547,15 +586,18 @@ impl TransitionClient {
                         "extra signed headers for presign with signature v2 is not supported.",
                     )));
                 }
-                let headers = req.headers_mut();
-                for (k, v) in metadata.extra_pre_sign_header.as_ref().unwrap() {
-                    headers.insert(k, v.clone());
+                if let Some(extra_headers) = metadata.extra_pre_sign_header.as_ref() {
+                    validate_header_values(extra_headers, "presign extra header")?;
+                    let headers = req.headers_mut();
+                    for (k, v) in extra_headers {
+                        headers.insert(k, v.clone());
+                    }
                 }
             }
             if signer_type == SignatureType::SignatureV2 {
                 req = rustfs_signer::pre_sign_v2(req, &access_key_id, &secret_access_key, metadata.expires, is_virtual_host);
             } else if signer_type == SignatureType::SignatureV4 {
-                req = rustfs_signer::pre_sign_v4(
+                req = rustfs_signer::try_pre_sign_v4(
                     req,
                     &access_key_id,
                     &secret_access_key,
@@ -563,25 +605,31 @@ impl TransitionClient {
                     &location,
                     metadata.expires,
                     OffsetDateTime::now_utc(),
-                );
+                )
+                .map_err(|err| signer_error_to_io_error("failed to presign v4 request", err))?;
             }
             return Ok(req);
         }
 
         self.set_user_agent(&mut req);
+        validate_header_values(&metadata.custom_header, "request custom header")?;
 
         for (k, v) in metadata.custom_header.clone() {
-            req.headers_mut().insert(k.expect("err"), v);
+            if let Some(key) = k {
+                req.headers_mut().insert(key, v);
+            }
         }
 
         //req.content_length = metadata.content_length;
         if metadata.content_length <= -1 {
-            let chunked_value = HeaderValue::from_str(&vec!["chunked"].join(",")).expect("err");
-            req.headers_mut().insert(http::header::TRANSFER_ENCODING, chunked_value);
+            req.headers_mut()
+                .insert(http::header::TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
         }
 
-        if metadata.content_md5_base64.len() > 0 {
-            let md5_value = HeaderValue::from_str(&metadata.content_md5_base64).expect("err");
+        if !metadata.content_md5_base64.is_empty() {
+            let md5_value = HeaderValue::from_str(&metadata.content_md5_base64).map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("invalid Content-Md5 header value: {err}"))
+            })?;
             req.headers_mut().insert("Content-Md5", md5_value);
         }
 
@@ -607,17 +655,23 @@ impl TransitionClient {
             } else if metadata.trailer.len() > 0 {
                 sha_header = UNSIGNED_PAYLOAD_TRAILER.to_string();
             }
-            req.headers_mut()
-                .insert("X-Amz-Content-Sha256".parse::<HeaderName>().unwrap(), sha_header.parse().expect("err"));
+            let header_name = "X-Amz-Content-Sha256"
+                .parse::<HeaderName>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            let header_value = sha_header
+                .parse()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            req.headers_mut().insert(header_name, header_value);
 
-            req = rustfs_signer::sign_v4_trailer(
+            req = rustfs_signer::try_sign_v4_trailer(
                 req,
                 &access_key_id,
                 &secret_access_key,
                 &session_token,
                 &location,
                 metadata.trailer.clone(),
-            );
+            )
+            .map_err(|err| signer_error_to_io_error("failed to sign v4 request", err))?;
         }
 
         if metadata.content_length > 0 {
@@ -636,7 +690,7 @@ impl TransitionClient {
 
     pub fn set_user_agent(&self, req: &mut Request<s3s::Body>) {
         let headers = req.headers_mut();
-        headers.insert("User-Agent", C_USER_AGENT.parse().expect("err"));
+        headers.insert("User-Agent", HeaderValue::from_static(C_USER_AGENT));
     }
 
     fn make_target_url(
@@ -648,7 +702,10 @@ impl TransitionClient {
         query_values: &HashMap<String, String>,
     ) -> Result<Url, std::io::Error> {
         let scheme = self.endpoint_url.scheme();
-        let host = self.endpoint_url.host().unwrap();
+        let host = self
+            .endpoint_url
+            .host()
+            .ok_or_else(|| std::io::Error::other("Endpoint URL has no host"))?;
         let default_port = if scheme == "https" { 443 } else { 80 };
         let port = self.endpoint_url.port().unwrap_or(default_port);
 
@@ -1155,9 +1212,10 @@ pub fn to_object_info(bucket_name: &str, object_name: &str, h: &HeaderMap) -> Re
         for (name, value) in h.iter() {
             let header_name = name.as_str().to_lowercase();
             if header_name.starts_with("x-amz-meta-") {
-                let key = header_name.strip_prefix("x-amz-meta-").unwrap().to_string();
-                if let Ok(value_str) = value.to_str() {
-                    meta.insert(key, value_str.to_string());
+                if let Some(key) = header_name.strip_prefix("x-amz-meta-") {
+                    if let Ok(value_str) = value.to_str() {
+                        meta.insert(key.to_string(), value_str.to_string());
+                    }
                 }
             }
         }
@@ -1326,7 +1384,8 @@ pub struct CreateBucketConfiguration {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_tls_config, load_root_store_from_tls_path, with_rustls_init_guard};
+    use super::{build_tls_config, signer_error_to_io_error, validate_header_values, with_rustls_init_guard};
+    use http::{HeaderMap, HeaderValue};
 
     #[test]
     fn rustls_guard_converts_panics_to_io_errors() {
@@ -1344,22 +1403,6 @@ mod tests {
         assert!(outcome.is_ok(), "TLS config creation should not panic");
     }
 
-    /// When RUSTFS_TLS_PATH is not set, `load_root_store_from_tls_path` must return `None`
-    /// (i.e. it must not silently look for a CA bundle in the current working directory).
-    #[test]
-    fn tls_path_unset_returns_none() {
-        let result = temp_env::with_var_unset(rustfs_config::ENV_RUSTFS_TLS_PATH, || load_root_store_from_tls_path());
-        assert!(result.is_none(), "expected None when RUSTFS_TLS_PATH is unset, but got a root store");
-    }
-
-    /// When RUSTFS_TLS_PATH is set to an empty string, `load_root_store_from_tls_path` must
-    /// return `None` to avoid accidentally trusting a CA bundle in the current directory.
-    #[test]
-    fn tls_path_empty_returns_none() {
-        let result = temp_env::with_var(rustfs_config::ENV_RUSTFS_TLS_PATH, Some(""), || load_root_store_from_tls_path());
-        assert!(result.is_none(), "expected None when RUSTFS_TLS_PATH is empty, but got a root store");
-    }
-
     /// Installing the rustls crypto provider when one is already set must not panic or return
     /// an error that surfaces to callers (the race-safe `get_default` check guards the install).
     #[test]
@@ -1375,5 +1418,30 @@ mod tests {
             // If a default is already present, the branch above is simply skipped.
         });
         assert!(outcome.is_ok(), "provider install guard must not panic when a provider is already set");
+    }
+
+    #[test]
+    fn validate_header_values_returns_header_name_for_non_utf8_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-meta-invalid",
+            HeaderValue::from_bytes(&[0xFF]).expect("invalid utf8 bytes should be accepted by HeaderValue"),
+        );
+
+        let err =
+            validate_header_values(&headers, "request custom header").expect_err("invalid header value should fail validation");
+        assert!(err.to_string().contains("x-amz-meta-invalid"));
+    }
+
+    #[test]
+    fn signer_error_mapping_preserves_header_name() {
+        let err = signer_error_to_io_error(
+            "failed to sign v4 request",
+            rustfs_signer::SignV4Error::InvalidHeaderValue {
+                name: "x-amz-meta-invalid".to_string(),
+            },
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("x-amz-meta-invalid"));
     }
 }

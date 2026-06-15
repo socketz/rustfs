@@ -15,7 +15,13 @@
 use crate::query::Context;
 use crate::{QueryError, QueryResult, object_store::EcObjectStore};
 use datafusion::{
+    arrow::{
+        array::{Int32Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    },
     execution::{SessionStateBuilder, context::SessionState, runtime_env::RuntimeEnvBuilder},
+    parquet::arrow::ArrowWriter,
     prelude::SessionContext,
 };
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
@@ -66,7 +72,9 @@ impl SessionCtxFactory {
             let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
             // Choose test data format based on what the request serialization specifies.
-            let data_bytes: &[u8] = if context.input.request.input_serialization.json.is_some() {
+            let data_bytes: Vec<u8> = if context.input.request.input_serialization.parquet.is_some() {
+                test_parquet_bytes()?
+            } else if context.input.request.input_serialization.json.is_some() {
                 // NDJSON: one JSON object per line — usable for both LINES and DOCUMENT
                 // requests (DOCUMENT inputs are converted to NDJSON by EcObjectStore, but
                 // in test mode we bypass EcObjectStore, so we put NDJSON here directly).
@@ -80,6 +88,7 @@ impl SessionCtxFactory {
                    {\"id\":8,\"name\":\"Henry\",\"age\":32,\"department\":\"IT\",\"salary\":6200}\n\
                    {\"id\":9,\"name\":\"Ivy\",\"age\":24,\"department\":\"Marketing\",\"salary\":4800}\n\
                    {\"id\":10,\"name\":\"Jack\",\"age\":38,\"department\":\"Finance\",\"salary\":7500}\n"
+                    .to_vec()
             } else {
                 b"id,name,age,department,salary
                 1,Alice,25,HR,5000
@@ -92,6 +101,7 @@ impl SessionCtxFactory {
                 8,Henry,32,IT,6200
                 9,Ivy,24,Marketing,4800
                 10,Jack,38,Finance,7500"
+                    .to_vec()
             };
 
             let path = Path::from(context.input.key.clone());
@@ -111,4 +121,60 @@ impl SessionCtxFactory {
 
         Ok(df_session_ctx)
     }
+}
+
+fn test_parquet_bytes() -> QueryResult<Vec<u8>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+        Field::new("department", DataType::Utf8, false),
+        Field::new("salary", DataType::Int32, false),
+    ]));
+    let first_batch =
+        test_parquet_batch(Arc::clone(&schema), &[1, 2], &["Alice", "Bob"], &[25, 30], &["HR", "IT"], &[5000, 6000])?;
+    let second_batch = test_parquet_batch(
+        Arc::clone(&schema),
+        &[3, 4, 5],
+        &["Charlie", "Diana", "Eve"],
+        &[35, 22, 28],
+        &["Finance", "Marketing", "IT"],
+        &[7000, 4500, 5500],
+    )?;
+
+    let mut bytes = Vec::new();
+    {
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, schema, None).map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+        writer
+            .write(&first_batch)
+            .map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+        writer.flush().map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+        writer
+            .write(&second_batch)
+            .map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+        writer.close().map_err(|e| QueryError::StoreError { e: e.to_string() })?;
+    }
+    Ok(bytes)
+}
+
+fn test_parquet_batch(
+    schema: Arc<Schema>,
+    ids: &[i32],
+    names: &[&str],
+    ages: &[i32],
+    departments: &[&str],
+    salaries: &[i32],
+) -> QueryResult<RecordBatch> {
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(names.to_vec())),
+            Arc::new(Int32Array::from(ages.to_vec())),
+            Arc::new(StringArray::from(departments.to_vec())),
+            Arc::new(Int32Array::from(salaries.to_vec())),
+        ],
+    )
+    .map_err(|e| QueryError::StoreError { e: e.to_string() })
 }

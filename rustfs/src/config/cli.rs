@@ -16,9 +16,10 @@
 //!
 //! This module contains the command-line interface definitions including:
 //! - `Cli`: Main CLI parser
-//! - `Commands`: Subcommands (Server, Info)
+//! - `Commands`: Subcommands (Server, Info, Tls)
 //! - `ServerOpts`: Server subcommand options
 //! - `InfoOpts`: Info subcommand options
+//! - `TlsOpts`: TLS diagnostic subcommand options
 //! - `InfoType`: Information type enum
 //! - `CommandResult`: Result of parsing command line arguments
 
@@ -55,7 +56,7 @@ pub(super) const LONG_VERSION: &str = concat!(
 );
 
 /// Known subcommands. When the first arg matches one of these, it is treated as a subcommand.
-pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info"];
+pub const KNOWN_SUBCOMMANDS: &[&str] = &["server", "info", "tls"];
 
 /// Preprocess argv for legacy compatibility: `rustfs <volume>` and `rustfs --address ...` are
 /// treated as `rustfs server <volume>` and `rustfs server --address ...` respectively.
@@ -70,6 +71,14 @@ pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
     // If first arg looks like a subcommand, do nothing
     if KNOWN_SUBCOMMANDS.contains(&first.as_str()) {
         return args;
+    }
+    // Preserve the traditional `rustfs help` entry point without exposing
+    // Clap's generated `help` subcommand in the top-level command list.
+    if first == "help" {
+        let mut out = vec![args[0].clone()];
+        out.extend(args[2..].iter().cloned());
+        out.push("--help".to_string());
+        return out;
     }
     // If first arg is --info, treat it as info subcommand
     if first == "--info" {
@@ -90,6 +99,7 @@ pub fn preprocess_args_for_legacy(args: Vec<String>) -> Vec<String> {
 /// Main CLI parser
 #[derive(Parser, Clone)]
 #[command(name = "rustfs", version = SHORT_VERSION, long_version = LONG_VERSION)]
+#[command(disable_help_subcommand = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -102,6 +112,8 @@ pub enum Commands {
     Server(Box<ServerOpts>),
     /// Display system information
     Info(InfoOpts),
+    /// Inspect TLS certificate directory layout and parsing status
+    Tls(TlsOpts),
 }
 
 /// Information type to display
@@ -135,6 +147,28 @@ pub struct InfoOpts {
     pub info_type: Option<InfoType>,
 }
 
+/// TLS diagnostic subcommand options
+#[derive(Args, Clone)]
+pub struct TlsOpts {
+    #[command(subcommand)]
+    pub command: TlsCommands,
+}
+
+/// TLS diagnostic subcommands
+#[derive(Subcommand, Clone)]
+pub enum TlsCommands {
+    /// Inspect a TLS certificate directory
+    Inspect(TlsInspectOpts),
+}
+
+/// TLS inspect options
+#[derive(Args, Clone)]
+pub struct TlsInspectOpts {
+    /// TLS directory to inspect
+    #[arg(long = "path", alias = "tls-path", value_parser = NonEmptyStringValueParser::new())]
+    pub path: String,
+}
+
 /// Server subcommand options
 #[derive(Args, Clone)]
 pub struct ServerOpts {
@@ -155,7 +189,13 @@ pub struct ServerOpts {
     )]
     pub address: String,
 
-    /// Domain name used for virtual-hosted-style requests.
+    /// Domain name(s) for virtual-hosted-style S3 requests (comma-separated).
+    ///
+    /// Required for clients that default to virtual-hosted-style addressing
+    /// (AWS SDK, Terraform/Pulumi, etc.), e.g. `RUSTFS_SERVER_DOMAINS=s3.example.com`
+    /// so that `bucket.s3.example.com` is routed to bucket `bucket`. When unset, only
+    /// path-style addressing is supported (configure clients with
+    /// `s3_use_path_style = true` / `force_path_style=true`).
     #[arg(
         long,
         env = "RUSTFS_SERVER_DOMAINS",
@@ -196,7 +236,10 @@ pub struct ServerOpts {
     )]
     pub console_address: String,
 
-    /// Observability endpoint for trace, metrics and logs,only support grpc mode.
+    /// Root OTLP endpoint for traces, metrics, and logs.
+    /// For the current observability pipeline this should be an OTLP/HTTP base
+    /// URL such as `http://otel-collector:4318` or
+    /// `http://host.docker.internal:4318`.
     #[arg(
         long,
         default_value_t = rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(),
@@ -218,13 +261,17 @@ pub struct ServerOpts {
     #[arg(long, default_value_t = false, env = "RUSTFS_KMS_ENABLE")]
     pub kms_enable: bool,
 
-    /// KMS backend type (local or vault)
+    /// KMS backend type: local, vault or vault-kv2 (Vault KV2+Transit), vault-transit
     #[arg(long, default_value_t = rustfs_config::DEFAULT_KMS_BACKEND.to_string(), env = "RUSTFS_KMS_BACKEND")]
     pub kms_backend: String,
 
     /// KMS key directory for local backend
     #[arg(long, env = "RUSTFS_KMS_KEY_DIR")]
     pub kms_key_dir: Option<String>,
+
+    /// Master key for local KMS key-file encryption
+    #[arg(long, env = "RUSTFS_KMS_LOCAL_MASTER_KEY")]
+    pub kms_local_master_key: Option<String>,
 
     /// Vault address for vault backend
     #[arg(long, env = "RUSTFS_KMS_VAULT_ADDRESS")]
@@ -234,9 +281,17 @@ pub struct ServerOpts {
     #[arg(long, env = "RUSTFS_KMS_VAULT_TOKEN")]
     pub kms_vault_token: Option<String>,
 
+    /// Vault mount path for vault or vault-transit backend
+    #[arg(long, env = "RUSTFS_KMS_VAULT_MOUNT_PATH")]
+    pub kms_vault_mount_path: Option<String>,
+
     /// Default KMS key ID for encryption
     #[arg(long, env = "RUSTFS_KMS_DEFAULT_KEY_ID")]
     pub kms_default_key_id: Option<String>,
+
+    /// Allow development-only insecure KMS defaults
+    #[arg(long, default_value_t = false, env = "RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS")]
+    pub kms_allow_insecure_dev_defaults: bool,
 
     /// Disable adaptive buffer sizing with workload profiles
     /// Set this flag to use legacy fixed-size buffer behavior from PR #869
@@ -256,6 +311,8 @@ pub enum CommandResult {
     Server(Box<super::Config>),
     /// Info command with options
     Info(InfoOpts),
+    /// TLS command with options
+    Tls(TlsOpts),
 }
 
 /// Create default ServerOpts from environment variables
@@ -282,10 +339,33 @@ pub fn default_server_opts() -> ServerOpts {
         kms_enable: false,
         kms_backend: "local".to_string(),
         kms_key_dir: None,
+        kms_local_master_key: None,
         kms_vault_address: None,
         kms_vault_token: None,
+        kms_vault_mount_path: None,
         kms_default_key_id: None,
+        kms_allow_insecure_dev_defaults: false,
         buffer_profile_disable: false,
         buffer_profile: "GeneralPurpose".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, preprocess_args_for_legacy};
+    use clap::Parser;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn preprocess_help_command_displays_top_level_help() {
+        let args = preprocess_args_for_legacy(vec!["rustfs".to_string(), "help".to_string()]);
+
+        assert_eq!(args, vec!["rustfs".to_string(), "--help".to_string()]);
+
+        let err = match Cli::try_parse_from(args) {
+            Ok(_) => panic!("rustfs help should display help"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
     }
 }

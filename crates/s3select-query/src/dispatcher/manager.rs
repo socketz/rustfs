@@ -26,11 +26,12 @@ use datafusion::{
         record_batch::RecordBatch,
     },
     datasource::{
-        file_format::{csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat},
+        file_format::{csv::CsvFormat, json::JsonFormat},
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
     },
     error::Result as DFResult,
     execution::{RecordBatchStream, SendableRecordBatchStream},
+    sql::sqlparser::parser::ParserError,
 };
 use futures::{Stream, StreamExt};
 use rustfs_s3select_api::{
@@ -50,6 +51,7 @@ use s3s::dto::{FileHeaderInfo, SelectObjectContentInput};
 use std::sync::LazyLock;
 
 use crate::{
+    dispatcher::parquet_table::ParquetSelectTable,
     execution::factory::QueryExecutionFactoryRef,
     metadata::{ContextProviderExtension, MetadataProvider, TableHandleProviderRef, base_table::BaseTableProvider},
     sql::logical::planner::DefaultLogicalPlanner,
@@ -106,7 +108,11 @@ impl QueryDispatcher for SimpleQueryDispatcher {
 
         let stmt = match statements.front() {
             Some(stmt) => stmt.clone(),
-            None => return Ok(None),
+            None => {
+                return Err(QueryError::Parser {
+                    source: ParserError::ParserError("empty SQL expression".to_string()),
+                });
+            }
         };
 
         let logical_plan = self
@@ -158,6 +164,15 @@ impl SimpleQueryDispatcher {
     }
 
     async fn build_scheme_provider(&self, session: &SessionCtx) -> QueryResult<MetadataProvider> {
+        if self.input.request.input_serialization.parquet.is_some() {
+            let provider = ParquetSelectTable::try_new(session.inner(), self.input.as_ref()).await?;
+            let current_session_table_provider = self.build_table_handle_provider()?;
+            let metadata_provider =
+                MetadataProvider::new(provider, current_session_table_provider, self.func_manager.clone(), session.clone());
+
+            return Ok(metadata_provider);
+        }
+
         let path = format!("s3://{}/{}", self.input.bucket, self.input.key);
         let table_path = ListingTableUrl::parse(path)?;
         let (listing_options, need_rename_volume_name, need_ignore_volume_name) =
@@ -213,9 +228,6 @@ impl SimpleQueryDispatcher {
                     need_rename_volume_name,
                     need_ignore_volume_name,
                 )
-            } else if self.input.request.input_serialization.parquet.is_some() {
-                let file_format = ParquetFormat::new();
-                (ListingOptions::new(Arc::new(file_format)).with_file_extension(".parquet"), false, false)
             } else if self.input.request.input_serialization.json.is_some() {
                 let file_format = JsonFormat::default();
                 // Use the actual file extension from the object key so that files stored

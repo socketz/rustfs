@@ -73,7 +73,7 @@ jobs:
   # Check if we should build Docker images
   build-check:
     name: Docker Build Check
-    runs-on: ubicloud-standard-2
+    runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       should_push: ${{ steps.check.outputs.should_push }}
@@ -163,11 +163,10 @@ jobs:
                 if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]] || [[ "$version" == *"rc"* ]]; then
                   build_type="prerelease"
                   is_prerelease=true
-                  # TODO: Temporary change - currently allows alpha versions to also create latest tags
-                  # After the version is stable, you need to remove the following line and restore the original logic (latest is created only for stable versions)
-                  if [[ "$version" == *"alpha"* ]]; then
+                  # Current policy: create latest tags for stable releases and selected prereleases (alpha/beta).
+                  if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]]; then
                     create_latest=true
-                     echo "🧪 Building Docker image for prerelease: $version (temporarily allowing creation of latest tag)"
+                    echo "🧪 Building Docker image for prerelease: $version (creating latest tag)"
                   else
                     echo "🧪 Building Docker image for prerelease: $version"
                   fi
@@ -216,11 +215,10 @@ jobs:
               v*alpha*|v*beta*|v*rc*|*alpha*|*beta*|*rc*)
                 build_type="prerelease"
                 is_prerelease=true
-                # TODO: Temporary change - currently allows alpha versions to also create latest tags
-                # After the version is stable, you need to remove the if block below and restore the original logic.
-                if [[ "$input_version" == *"alpha"* ]]; then
+                # Current policy: create latest tags for stable releases and selected prereleases (alpha/beta).
+                if [[ "$version" == *"alpha"* ]] || [[ "$version" == *"beta"* ]]; then
                   create_latest=true
-                   echo "🧪 Building with prerelease version: $input_version (temporarily allowing creation of latest tag)"
+                  echo "🧪 Building with prerelease version: $input_version (creating latest tag)"
                 else
                   echo "🧪 Building with prerelease version: $input_version"
                 fi
@@ -351,9 +349,7 @@ jobs:
 
           # Add channel tags for prereleases and latest for stable
           if [[ "$CREATE_LATEST" == "true" ]]; then
-            # TODO: Temporary change - the current alpha version will also create the latest tag
-            # After the version is stabilized, the logic here remains unchanged, but the upstream CREATE_LATEST setting needs to be restored.
-            # Stable release (and temporary alpha versions)
+            # Create latest tags for stable releases and selected prereleases when CREATE_LATEST=true.
             TAGS="$TAGS,${{ env.REGISTRY_DOCKERHUB }}:latest${VARIANT_SUFFIX},${{ env.REGISTRY_GHCR }}:latest${VARIANT_SUFFIX},${{ env.REGISTRY_QUAY }}:latest${VARIANT_SUFFIX}"
           elif [[ "$BUILD_TYPE" == "prerelease" ]]; then
             # Prerelease channel tags (alpha, beta, rc)
@@ -420,12 +416,56 @@ jobs:
   # Note: Manifest creation is no longer needed as we only build one variant
   # Multi-arch manifests are automatically created by docker/build-push-action
 
+  # Report-only container image vulnerability scan
+  scan-docker-image:
+    name: Scan Docker Images
+    needs: [ build-check, build-docker ]
+    if: needs.build-check.outputs.should_build == 'true' && needs.build-check.outputs.should_push == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: musl
+            suffix: ""
+          - variant: glibc
+            suffix: "-glibc"
+    steps:
+      - name: Login to GitHub Container Registry
+        # docker/login-action v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_PASSWORD }}
+
+      - name: Scan image with Trivy
+        # aquasecurity/trivy-action v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: ${{ env.REGISTRY_GHCR }}:${{ needs.build-check.outputs.version }}${{ matrix.suffix }}
+          format: sarif
+          output: trivy-${{ matrix.variant }}.sarif
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+
+      - name: Upload container scan report
+        # actions/upload-artifact v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: container-image-scan-${{ matrix.variant }}
+          path: trivy-${{ matrix.variant }}.sarif
+          if-no-files-found: error
+          retention-days: 30
+
   # Docker build summary
   docker-summary:
     name: Docker Build Summary
     needs: [ build-check, build-docker ]
     if: always() && needs.build-check.outputs.should_build == 'true'
-    runs-on: ubicloud-standard-2
+    runs-on: ubuntu-latest
     steps:
       - name: Docker build completion summary
         run: |
@@ -450,10 +490,9 @@ jobs:
             "prerelease")
               echo "🧪 Prerelease Docker image has been built with ${VERSION} tags"
               echo "⚠️  This is a prerelease image - use with caution"
-              # TODO: Temporary change - alpha versions currently create the latest tag
-              # After the version is stable, you need to restore the following prompt information
-              if [[ "$VERSION" == *"alpha"* ]] && [[ "$CREATE_LATEST" == "true" ]]; then
-                echo "🏷️  Latest tag has been created for alpha version (temporary measures)"
+              # Create latest tags for stable releases and selected prereleases when CREATE_LATEST=true.
+              if [[ "$CREATE_LATEST" == "true" ]]; then
+                echo "🏷️  Latest tag has been created for prerelease: $VERSION"
               else
                 echo "🚫 Latest tag NOT created for prerelease"
               fi

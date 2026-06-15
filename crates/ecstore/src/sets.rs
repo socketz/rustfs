@@ -30,8 +30,8 @@ use crate::{
     store_api::{
         BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
         HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
-        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations,
-        ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, NamespaceLocking, ObjectIO, ObjectInfo,
+        ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
     },
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
@@ -287,6 +287,46 @@ impl Sets {
         self.get_disks(self.get_hashed_set_index(key))
     }
 
+    pub(crate) async fn storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+        let mut futures = Vec::with_capacity(self.disk_set.len());
+
+        for set in self.disk_set.iter() {
+            futures.push(set.storage_info_snapshot())
+        }
+
+        let results = join_all(futures).await;
+        let mut disks = Vec::new();
+
+        for res in results.into_iter() {
+            disks.extend_from_slice(&res.disks);
+        }
+
+        rustfs_madmin::StorageInfo {
+            disks,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) async fn local_storage_info_snapshot(&self) -> rustfs_madmin::StorageInfo {
+        let mut futures = Vec::with_capacity(self.disk_set.len());
+
+        for set in self.disk_set.iter() {
+            futures.push(set.local_storage_info_snapshot())
+        }
+
+        let results = join_all(futures).await;
+        let mut disks = Vec::new();
+
+        for res in results.into_iter() {
+            disks.extend_from_slice(&res.disks);
+        }
+
+        rustfs_madmin::StorageInfo {
+            disks,
+            ..Default::default()
+        }
+    }
+
     fn get_hashed_set_index(&self, input: &str) -> usize {
         match self.distribution_algo {
             DistributionAlgoVersion::V1 => crc_hash(input, self.disk_set.len()),
@@ -306,12 +346,10 @@ impl Sets {
     //     unimplemented!()
     // }
 
-    async fn delete_prefix(&self, bucket: &str, object: &str) -> Result<()> {
+    async fn delete_prefix(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         let mut futures = Vec::new();
-        let opt = ObjectOptions {
-            delete_prefix: true,
-            ..Default::default()
-        };
+        let mut opt = opts.clone();
+        opt.delete_prefix = true;
 
         for set in self.disk_set.iter() {
             futures.push(set.delete_object(bucket, object, opt.clone()));
@@ -463,6 +501,7 @@ impl ObjectOperations for Sets {
             versioned: dst_opts.versioned,
             version_id: dst_opts.version_id.clone(),
             mod_time: dst_opts.mod_time,
+            http_preconditions: dst_opts.http_preconditions.clone(),
             ..Default::default()
         };
 
@@ -485,7 +524,7 @@ impl ObjectOperations for Sets {
     #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         if opts.delete_prefix && !opts.delete_prefix_object {
-            self.delete_prefix(bucket, object).await?;
+            self.delete_prefix(bucket, object, &opts).await?;
             return Ok(ObjectInfo::default());
         }
 
@@ -858,64 +897,12 @@ impl HealOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl StorageAPI for Sets {
+impl StorageAPI for Sets {}
+
+#[async_trait::async_trait]
+impl NamespaceLocking for Sets {
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.disk_set[0].new_ns_lock(bucket, object).await
-    }
-    #[tracing::instrument(skip(self))]
-    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
-        unimplemented!()
-    }
-    #[tracing::instrument(skip(self))]
-    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let mut futures = Vec::with_capacity(self.disk_set.len());
-
-        for set in self.disk_set.iter() {
-            futures.push(set.storage_info())
-        }
-
-        let results = join_all(futures).await;
-
-        let mut disks = Vec::new();
-
-        for res in results.into_iter() {
-            disks.extend_from_slice(&res.disks);
-        }
-
-        rustfs_madmin::StorageInfo {
-            disks,
-            ..Default::default()
-        }
-    }
-    #[tracing::instrument(skip(self))]
-    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let mut futures = Vec::with_capacity(self.disk_set.len());
-
-        for set in self.disk_set.iter() {
-            futures.push(set.local_storage_info())
-        }
-
-        let results = join_all(futures).await;
-
-        let mut disks = Vec::new();
-
-        for res in results.into_iter() {
-            disks.extend_from_slice(&res.disks);
-        }
-        rustfs_madmin::StorageInfo {
-            disks,
-            ..Default::default()
-        }
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn get_disks(&self, _pool_idx: usize, _set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        unimplemented!()
-    }
-
-    #[tracing::instrument(skip(self))]
-    fn set_drive_counts(&self) -> Vec<usize> {
-        unimplemented!()
     }
 }
 

@@ -27,7 +27,7 @@ categories = ["network-programming", "filesystem"]
 
 [features]
 default = []
-ftps = ["dep:libunftp", "dep:unftp-core", "dep:rustls"]
+ftps = ["dep:libunftp", "dep:unftp-core", "dep:rustls", "dep:rustfs-tls-runtime"]
 swift = [
     "dep:rustfs-keystone",
     "dep:rustfs-ecstore",
@@ -53,7 +53,8 @@ swift = [
     "dep:base64",
     "dep:async-compression",
 ]
-webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:base64", "dep:rustls"]
+webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:base64", "dep:rustls", "dep:percent-encoding", "dep:rustfs-tls-runtime"]
+sftp = ["dep:russh", "dep:russh-sftp", "dep:uuid", "dep:subtle", "dep:tokio-util", "dep:socket2"]
 
 [dependencies]
 # Core RustFS dependencies
@@ -61,6 +62,9 @@ rustfs-iam = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-utils = { workspace = true }
+rustfs-config = { workspace = true }
+rustfs-storage-api = { workspace = true }
+rustfs-tls-runtime = { workspace = true, optional = true }
 
 # Async dependencies
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
@@ -99,7 +103,7 @@ sha2 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true, features = ["rt"] }
 serde = { workspace = true, optional = true }
 urlencoding = { workspace = true, optional = true }
 md5 = { workspace = true, optional = true }
@@ -117,6 +121,22 @@ hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 
+# SFTP specific dependencies (optional)
+russh = { workspace = true, optional = true }
+russh-sftp = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
+socket2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = "1"
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+# io-uring is Linux-only. Scope the feature to Linux targets.
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { workspace = true, features = ["io-uring"] }

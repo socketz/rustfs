@@ -46,9 +46,49 @@ use rustfs_config::{
     DEFAULT_COMPRESS_ENABLE, DEFAULT_COMPRESS_EXTENSIONS, DEFAULT_COMPRESS_MIME_TYPES, DEFAULT_COMPRESS_MIN_SIZE,
     ENV_COMPRESS_ENABLE, ENV_COMPRESS_EXTENSIONS, ENV_COMPRESS_MIME_TYPES, ENV_COMPRESS_MIN_SIZE, EnableState,
 };
+use rustfs_utils::string::{has_pattern, has_string_suffix_in_slice};
 use std::str::FromStr;
 use tower_http::compression::predicate::Predicate;
 use tracing::debug;
+
+#[rustfmt::skip]
+const HTTP_COMPRESSION_EXCLUDED_EXTENSIONS: &[&str] = &[
+    // Encoded archives
+    ".gz", ".bz2", ".rar", ".zip", ".7z", ".xz", ".zst", ".lz4", ".br", ".lzo", ".sz", ".tgz",
+    // Media
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".heic", ".heif", ".jxl",
+    ".mp4", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".webm", ".m4v", ".mpeg", ".mpg",
+    ".mp3", ".aac", ".ogg", ".flac", ".wma", ".m4a", ".opus",
+    // Internally compressed documents and packages
+    ".pdf", ".docx", ".xlsx", ".pptx", ".deb", ".rpm", ".jar", ".war", ".apk", ".woff", ".woff2",
+];
+
+const HTTP_COMPRESSION_EXCLUDED_CONTENT_TYPES: &[&str] = &[
+    "video/*",
+    "audio/*",
+    "image/*",
+    "application/zip",
+    "application/gzip",
+    "application/x-gzip",
+    "application/x-zip-compressed",
+    "application/x-compress",
+    "application/x-spoon",
+    "application/x-rar-compressed",
+    "application/x-7z-compressed",
+    "application/x-bzip",
+    "application/x-bzip2",
+    "application/x-xz",
+    "application/x-lzip",
+    "application/x-lzma",
+    "application/x-lzop",
+    "application/zstd",
+    "application/x-zstd",
+    "application/x-tar",
+    "application/tar",
+    "application/pdf",
+    "application/wasm",
+    "font/*",
+];
 
 /// Response extension key for storing the request path category.
 /// Set by `PathCategoryInjectionLayer` before the compression predicate evaluates.
@@ -65,7 +105,7 @@ pub(crate) struct RequestPathCategory(pub(crate) PathCategory);
 /// When compression is enabled, only responses matching these criteria will be compressed.
 /// This approach aligns with MinIO's behavior where compression is opt-in rather than default.
 #[derive(Clone, Debug)]
-pub struct CompressionConfig {
+pub struct HttpCompressionConfig {
     /// Whether compression is enabled
     pub enabled: bool,
     /// File extensions to compress (normalized to lowercase with leading dot)
@@ -76,7 +116,7 @@ pub struct CompressionConfig {
     pub min_size: u64,
 }
 
-impl CompressionConfig {
+impl HttpCompressionConfig {
     /// Create a new compression configuration from environment variables
     ///
     /// Reads the following environment variables:
@@ -196,9 +236,23 @@ impl CompressionConfig {
 
         None
     }
+
+    pub(crate) fn is_excluded_filename(filename: &str) -> bool {
+        has_string_suffix_in_slice(&filename.to_ascii_lowercase(), HTTP_COMPRESSION_EXCLUDED_EXTENSIONS)
+    }
+
+    pub(crate) fn is_excluded_mime_type(content_type: &str) -> bool {
+        let main_type = content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim()
+            .to_ascii_lowercase();
+        !main_type.is_empty() && has_pattern(HTTP_COMPRESSION_EXCLUDED_CONTENT_TYPES, &main_type)
+    }
 }
 
-impl Default for CompressionConfig {
+impl Default for HttpCompressionConfig {
     fn default() -> Self {
         Self {
             enabled: rustfs_config::DEFAULT_COMPRESS_ENABLE,
@@ -253,18 +307,18 @@ impl Default for CompressionConfig {
 /// This predicate is evaluated per-response and has O(n) complexity where n is
 /// the number of configured extensions/MIME patterns.
 #[derive(Clone, Debug)]
-pub struct CompressionPredicate {
-    config: CompressionConfig,
+pub struct HttpCompressionPredicate {
+    config: HttpCompressionConfig,
 }
 
-impl CompressionPredicate {
+impl HttpCompressionPredicate {
     /// Create a new compression predicate with the given configuration
-    pub fn new(config: CompressionConfig) -> Self {
+    pub fn new(config: HttpCompressionConfig) -> Self {
         Self { config }
     }
 }
 
-impl Predicate for CompressionPredicate {
+impl Predicate for HttpCompressionPredicate {
     fn should_compress<B>(&self, response: &Response<B>) -> bool
     where
         B: http_body::Body,
@@ -299,23 +353,37 @@ impl Predicate for CompressionPredicate {
             return false;
         }
 
-        // Check if the response matches configured extension via Content-Disposition
-        if let Some(content_disposition) = response.headers().get(http::header::CONTENT_DISPOSITION)
-            && let Ok(cd) = content_disposition.to_str()
-            && let Some(filename) = CompressionConfig::extract_filename_from_content_disposition(cd)
-            && self.config.matches_extension(&filename)
-        {
-            debug!("Compressing response: filename '{}' matches configured extension", filename);
-            return true;
-        }
-
-        // Check if the response matches configured MIME type
+        // Hard-stop archive/media/package MIME types even if the whitelist matches.
+        // This includes tar, gzip, bzip2, xz, zstd, zip, rar, 7z, lzip, lzma, lzop variants,
+        // plus video/*, audio/*, image/*, font/*, application/pdf, and application/wasm.
         if let Some(content_type) = response.headers().get(http::header::CONTENT_TYPE)
             && let Ok(ct) = content_type.to_str()
-            && self.config.matches_mime_type(ct)
         {
-            debug!("Compressing response: Content-Type '{}' matches configured MIME pattern", ct);
-            return true;
+            if HttpCompressionConfig::is_excluded_mime_type(ct) {
+                debug!("Skipping compression for excluded Content-Type '{}'", ct);
+                return false;
+            }
+
+            if self.config.matches_mime_type(ct) {
+                debug!("Compressing response: Content-Type '{}' matches configured MIME pattern", ct);
+                return true;
+            }
+        }
+
+        // Hard-stop archive-like attachment downloads even if the whitelist matches.
+        if let Some(content_disposition) = response.headers().get(http::header::CONTENT_DISPOSITION)
+            && let Ok(cd) = content_disposition.to_str()
+            && let Some(filename) = HttpCompressionConfig::extract_filename_from_content_disposition(cd)
+        {
+            if HttpCompressionConfig::is_excluded_filename(&filename) {
+                debug!("Skipping compression for excluded filename '{}'", filename);
+                return false;
+            }
+
+            if self.config.matches_extension(&filename) {
+                debug!("Compressing response: filename '{}' matches configured extension", filename);
+                return true;
+            }
         }
 
         // Default: don't compress (whitelist approach)
@@ -350,7 +418,7 @@ impl PathCategory {
             PathCategory::AdminApi
         } else if path.starts_with("/rustfs/console") {
             PathCategory::Console
-        } else if path.starts_with("/minio/health/") {
+        } else if path == "/health" || path.starts_with("/health/") {
             PathCategory::Probe
         } else {
             PathCategory::S3DataPlane
@@ -371,19 +439,19 @@ impl PathCategory {
 /// This avoids running MIME type / extension matching for admin, RPC, console,
 /// and health probe paths where compression is never beneficial.
 #[derive(Clone, Debug)]
-pub(crate) struct PathAwareCompressionPredicate {
-    inner: CompressionPredicate,
+pub(crate) struct PathAwareHttpCompressionPredicate {
+    inner: HttpCompressionPredicate,
 }
 
-impl PathAwareCompressionPredicate {
-    pub(crate) fn new(config: CompressionConfig) -> Self {
+impl PathAwareHttpCompressionPredicate {
+    pub(crate) fn new(config: HttpCompressionConfig) -> Self {
         Self {
-            inner: CompressionPredicate::new(config),
+            inner: HttpCompressionPredicate::new(config),
         }
     }
 }
 
-impl Predicate for PathAwareCompressionPredicate {
+impl Predicate for PathAwareHttpCompressionPredicate {
     fn should_compress<B>(&self, response: &Response<B>) -> bool
     where
         B: http_body::Body,
@@ -405,7 +473,11 @@ use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
 /// Tower layer that injects `RequestPathCategory` into each response's extensions
-/// based on the incoming request URI path. Must be placed before `CompressionLayer`.
+/// based on the incoming request URI path.
+///
+/// It must be placed inside `CompressionLayer` so the category is available when
+/// the outer compression middleware evaluates its response predicate. With
+/// `tower::ServiceBuilder`, that means adding this layer after `CompressionLayer`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PathCategoryInjectionLayer;
 
@@ -480,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_compression_config_default() {
-        let config = CompressionConfig::default();
+        let config = HttpCompressionConfig::default();
         assert!(!config.enabled);
         assert!(config.extensions.is_empty());
         assert!(!config.mime_patterns.is_empty());
@@ -489,7 +561,7 @@ mod tests {
 
     #[test]
     fn test_compression_config_mime_matching() {
-        let config = CompressionConfig {
+        let config = HttpCompressionConfig {
             enabled: true,
             extensions: vec![],
             mime_patterns: vec!["text/*".to_string(), "application/json".to_string()],
@@ -514,7 +586,7 @@ mod tests {
 
     #[test]
     fn test_compression_config_extension_matching() {
-        let config = CompressionConfig {
+        let config = HttpCompressionConfig {
             enabled: true,
             extensions: vec![".txt".to_string(), ".log".to_string(), ".csv".to_string()],
             mime_patterns: vec![],
@@ -537,36 +609,36 @@ mod tests {
     fn test_extract_filename_from_content_disposition() {
         // Quoted filename
         assert_eq!(
-            CompressionConfig::extract_filename_from_content_disposition(r#"attachment; filename="example.txt""#),
+            HttpCompressionConfig::extract_filename_from_content_disposition(r#"attachment; filename="example.txt""#),
             Some("example.txt".to_string())
         );
 
         // Unquoted filename
         assert_eq!(
-            CompressionConfig::extract_filename_from_content_disposition("attachment; filename=example.log"),
+            HttpCompressionConfig::extract_filename_from_content_disposition("attachment; filename=example.log"),
             Some("example.log".to_string())
         );
 
         // Filename with path
         assert_eq!(
-            CompressionConfig::extract_filename_from_content_disposition(r#"attachment; filename="path/to/file.csv""#),
+            HttpCompressionConfig::extract_filename_from_content_disposition(r#"attachment; filename="path/to/file.csv""#),
             Some("path/to/file.csv".to_string())
         );
 
         // Mixed case
         assert_eq!(
-            CompressionConfig::extract_filename_from_content_disposition(r#"Attachment; FILENAME="test.json""#),
+            HttpCompressionConfig::extract_filename_from_content_disposition(r#"Attachment; FILENAME="test.json""#),
             Some("test.json".to_string())
         );
 
         // No filename
-        assert_eq!(CompressionConfig::extract_filename_from_content_disposition("inline"), None);
+        assert_eq!(HttpCompressionConfig::extract_filename_from_content_disposition("inline"), None);
     }
 
     #[test]
     fn test_compression_config_from_empty_strings() {
         // Simulate config with empty extension and mime strings
-        let config = CompressionConfig {
+        let config = HttpCompressionConfig {
             enabled: true,
             extensions: ""
                 .split(',')
@@ -604,27 +676,63 @@ mod tests {
 
     #[test]
     fn test_compression_predicate_creation() {
-        // Test that CompressionPredicate can be created with various configs
-        let config_disabled = CompressionConfig {
+        // Test that HttpCompressionPredicate can be created with various configs
+        let config_disabled = HttpCompressionConfig {
             enabled: false,
             extensions: vec![".txt".to_string()],
             mime_patterns: vec!["text/*".to_string()],
             min_size: 0,
         };
-        let predicate = CompressionPredicate::new(config_disabled.clone());
+        let predicate = HttpCompressionPredicate::new(config_disabled);
         assert!(!predicate.config.enabled);
 
-        let config_enabled = CompressionConfig {
+        let config_enabled = HttpCompressionConfig {
             enabled: true,
             extensions: vec![".txt".to_string(), ".log".to_string()],
             mime_patterns: vec!["text/*".to_string(), "application/json".to_string()],
             min_size: 1000,
         };
-        let predicate = CompressionPredicate::new(config_enabled.clone());
+        let predicate = HttpCompressionPredicate::new(config_enabled);
         assert!(predicate.config.enabled);
         assert_eq!(predicate.config.extensions.len(), 2);
         assert_eq!(predicate.config.mime_patterns.len(), 2);
         assert_eq!(predicate.config.min_size, 1000);
+    }
+
+    #[test]
+    fn test_compression_predicate_skips_archive_mime_type_even_when_whitelisted() {
+        let predicate = HttpCompressionPredicate::new(HttpCompressionConfig {
+            enabled: true,
+            extensions: vec![],
+            mime_patterns: vec!["application/zip".to_string()],
+            min_size: 0,
+        });
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_TYPE, "application/zip")
+            .header(http::header::CONTENT_LENGTH, "4096")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .expect("response");
+
+        assert!(!predicate.should_compress(&response));
+    }
+
+    #[test]
+    fn test_compression_predicate_skips_archive_filename_even_when_whitelisted() {
+        let predicate = HttpCompressionPredicate::new(HttpCompressionConfig {
+            enabled: true,
+            extensions: vec![".zip".to_string()],
+            mime_patterns: vec![],
+            min_size: 0,
+        });
+
+        let response = Response::builder()
+            .header(http::header::CONTENT_DISPOSITION, r#"attachment; filename="bundle.zip""#)
+            .header(http::header::CONTENT_LENGTH, "4096")
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .expect("response");
+
+        assert!(!predicate.should_compress(&response));
     }
 
     #[test]
@@ -655,8 +763,9 @@ mod tests {
 
     #[test]
     fn test_path_category_classify_probe() {
-        assert_eq!(PathCategory::classify("/minio/health/live"), PathCategory::Probe);
-        assert_eq!(PathCategory::classify("/minio/health/ready"), PathCategory::Probe);
+        assert_eq!(PathCategory::classify("/health"), PathCategory::Probe);
+        assert_eq!(PathCategory::classify("/health/live"), PathCategory::Probe);
+        assert_eq!(PathCategory::classify("/health/ready"), PathCategory::Probe);
     }
 
     #[test]

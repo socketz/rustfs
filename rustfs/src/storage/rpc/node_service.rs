@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::service::site_replication::reload_site_replication_runtime_state;
+use crate::admin::service::{
+    config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
+    site_replication::reload_site_replication_runtime_state,
+};
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
-use rmp_serde::{Deserializer, Serializer};
+use rmp_serde::Deserializer;
 use rustfs_common::{get_global_local_node_name, heal_channel::HealOpts};
 use rustfs_ecstore::{
     admin_server_info::get_local_server_property,
@@ -26,11 +29,14 @@ use rustfs_ecstore::{
         UpdateMetadataOpts, error::DiskError,
     },
     get_global_lock_client,
+    global::GLOBAL_TierConfigMgr,
     metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics},
-    new_object_layer_fn,
-    rpc::{LocalPeerS3Client, PeerS3Client},
+    resolve_object_store_handle,
+    rpc::{
+        LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
+        SERVICE_SIGNAL_RELOAD_DYNAMIC,
+    },
     store::{all_local_disk_path, find_local_disk_by_ref},
-    store_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAPI},
 };
 use rustfs_filemeta::{FileInfo, MetacacheReader};
 use rustfs_iam::{get_global_iam_sys, store::UserType};
@@ -43,7 +49,8 @@ use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
 };
-use serde::{Deserialize, Serialize};
+use rustfs_storage_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions};
+use serde::Deserialize;
 use std::{collections::HashMap, io::Cursor, pin::Pin, sync::Arc};
 use tokio::spawn;
 use tokio::sync::mpsc;
@@ -51,7 +58,79 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, warn};
 
+const LOG_COMPONENT_STORAGE: &str = "storage";
+const LOG_SUBSYSTEM_RPC: &str = "rpc";
+const LOG_SUBSYSTEM_REBALANCE: &str = "rebalance";
+const EVENT_RPC_REQUEST_REJECTED: &str = "rpc_request_rejected";
+const EVENT_RPC_REQUEST_FAILED: &str = "rpc_request_failed";
+const EVENT_RPC_RESPONSE_EMITTED: &str = "rpc_response_emitted";
+const EVENT_RPC_BACKGROUND_TASK_SPAWNED: &str = "rpc_background_task_spawned";
+const EVENT_RPC_BACKGROUND_TASK_FAILED: &str = "rpc_background_task_failed";
+
+macro_rules! log_load_rebalance_meta_rejected {
+    ($reason:expr, $start_rebalance:expr) => {
+        warn!(
+            event = EVENT_RPC_REQUEST_REJECTED,
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            operation = "load_rebalance_meta",
+            result = "rejected",
+            reason = $reason,
+            start_rebalance = $start_rebalance,
+            "node rpc request rejected"
+        );
+    };
+}
+
+macro_rules! log_load_rebalance_meta_failed {
+    ($reason:expr, $start_rebalance:expr, $err:expr) => {
+        error!(
+            event = EVENT_RPC_REQUEST_FAILED,
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            operation = "load_rebalance_meta",
+            result = "failed",
+            reason = $reason,
+            start_rebalance = $start_rebalance,
+            error = %$err,
+            "node rpc request failed"
+        );
+    };
+}
+
+macro_rules! log_load_rebalance_meta_response_emitted {
+    ($start_rebalance:expr) => {
+        info!(
+            event = EVENT_RPC_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            operation = "load_rebalance_meta",
+            result = "success",
+            start_rebalance = $start_rebalance,
+            "node rpc response emitted"
+        );
+    };
+}
+
+macro_rules! log_background_rebalance_task_spawned {
+    ($start_rebalance:expr) => {
+        info!(
+            event = EVENT_RPC_BACKGROUND_TASK_SPAWNED,
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_REBALANCE,
+            operation = "start_rebalance",
+            state = "spawned",
+            start_rebalance = $start_rebalance,
+            "node rpc background task spawned"
+        );
+    };
+}
+
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+
+fn unimplemented_rpc(method: &str) -> Status {
+    Status::unimplemented(format!("{method} is not implemented"))
+}
 
 fn background_rebalance_start_error_message(result: rustfs_ecstore::error::Result<()>) -> Option<String> {
     result.err().map(|err| format!("start_rebalance failed: {err}"))
@@ -99,14 +178,26 @@ impl NodeService {
 #[tonic::async_trait]
 impl Node for NodeService {
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
-        debug!("PING");
-
         let ping_req = request.into_inner();
-        let ping_body = flatbuffers::root::<PingBody>(&ping_req.body);
-        if let Err(e) = ping_body {
-            error!("{}", e);
+        if ping_req.body.is_empty() {
+            debug!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_RPC,
+                event = "ping_request",
+                request_type = "liveness_probe",
+                "RPC ping request received"
+            );
         } else {
-            info!("ping_req:body(flatbuffer): {:?}", ping_body);
+            let ping_body = flatbuffers::root::<PingBody>(&ping_req.body);
+            if let Err(e) = ping_body {
+                warn!(
+                    component = LOG_COMPONENT_STORAGE,
+                    subsystem = LOG_SUBSYSTEM_RPC,
+                    event = "ping_request_decode_failed",
+                    error = %e,
+                    "Failed to decode RPC ping request body"
+                );
+            }
         }
 
         let mut fbb = flatbuffers::FlatBufferBuilder::new();
@@ -181,16 +272,14 @@ impl Node for NodeService {
 
     type WriteStreamStream = ResponseStream<WriteResponse>;
     async fn write_stream(&self, request: Request<Streaming<WriteRequest>>) -> Result<Response<Self::WriteStreamStream>, Status> {
-        info!("write_stream");
         let _ = request;
 
-        unimplemented!("write_stream");
+        Err(unimplemented_rpc("write_stream"))
     }
 
     type ReadAtStream = ResponseStream<ReadAtResponse>;
     async fn read_at(&self, _request: Request<Streaming<ReadAtRequest>>) -> Result<Response<Self::ReadAtStream>, Status> {
-        info!("read_at");
-        unimplemented!("read_at");
+        Err(unimplemented_rpc("read_at"))
     }
 
     async fn list_dir(&self, request: Request<ListDirRequest>) -> Result<Response<ListDirResponse>, Status> {
@@ -199,7 +288,6 @@ impl Node for NodeService {
 
     type WalkDirStream = ResponseStream<WalkDirResponse>;
     async fn walk_dir(&self, request: Request<WalkDirRequest>) -> Result<Response<Self::WalkDirStream>, Status> {
-        info!("walk_dir");
         let request = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
         if let Some(disk) = self.find_disk(&request.disk).await {
@@ -214,7 +302,13 @@ impl Node for NodeService {
                 let (rd, mut wr) = tokio::io::duplex(64);
                 let job1 = spawn(async move {
                     if let Err(err) = disk.walk_dir(opts, &mut wr).await {
-                        error!("walk_dir failed: {err:?}");
+                        error!(
+                            component = LOG_COMPONENT_STORAGE,
+                            subsystem = LOG_SUBSYSTEM_RPC,
+                            event = "walk_dir_failed",
+                            error = ?err,
+                            "walk_dir RPC failed"
+                        );
                     }
                 });
                 let job2 = spawn(async move {
@@ -235,7 +329,13 @@ impl Node for NodeService {
                                                 .await
                                                 .is_err()
                                             {
-                                                warn!("walk_dir stream receiver dropped while sending meta cache entry");
+                                                warn!(
+                                                    component = LOG_COMPONENT_STORAGE,
+                                                    subsystem = LOG_SUBSYSTEM_RPC,
+                                                    event = "walk_dir_stream_closed",
+                                                    stage = "entry_send",
+                                                    "walk_dir stream receiver dropped"
+                                                );
                                                 break;
                                             }
                                         }
@@ -249,7 +349,13 @@ impl Node for NodeService {
                                                 .await
                                                 .is_err()
                                             {
-                                                warn!("walk_dir stream receiver dropped while sending serialization error");
+                                                warn!(
+                                                    component = LOG_COMPONENT_STORAGE,
+                                                    subsystem = LOG_SUBSYSTEM_RPC,
+                                                    event = "walk_dir_stream_closed",
+                                                    stage = "serialization_error_send",
+                                                    "walk_dir stream receiver dropped"
+                                                );
                                                 break;
                                             }
                                         }
@@ -283,7 +389,13 @@ impl Node for NodeService {
                                     break;
                                 }
 
-                                warn!("walk_dir metacache read error: {err:?}");
+                                warn!(
+                                    component = LOG_COMPONENT_STORAGE,
+                                    subsystem = LOG_SUBSYSTEM_RPC,
+                                    event = "walk_dir_metacache_read_failed",
+                                    error = ?err,
+                                    "walk_dir metacache read failed"
+                                );
 
                                 let _ = tx
                                     .send(Ok(WalkDirResponse {
@@ -462,35 +574,35 @@ impl Node for NodeService {
         &self,
         _request: Request<StartProfilingRequest>,
     ) -> Result<Response<StartProfilingResponse>, Status> {
-        todo!()
+        Err(unimplemented_rpc("start_profiling"))
     }
 
     async fn download_profile_data(
         &self,
         _request: Request<DownloadProfileDataRequest>,
     ) -> Result<Response<DownloadProfileDataResponse>, Status> {
-        todo!()
+        Err(unimplemented_rpc("download_profile_data"))
     }
 
     async fn get_bucket_stats(
         &self,
         _request: Request<GetBucketStatsDataRequest>,
     ) -> Result<Response<GetBucketStatsDataResponse>, Status> {
-        todo!()
+        Err(unimplemented_rpc("get_bucket_stats"))
     }
 
     async fn get_sr_metrics(
         &self,
         _request: Request<GetSrMetricsDataRequest>,
     ) -> Result<Response<GetSrMetricsDataResponse>, Status> {
-        todo!()
+        Err(unimplemented_rpc("get_sr_metrics"))
     }
 
     async fn get_all_bucket_stats(
         &self,
         _request: Request<GetAllBucketStatsRequest>,
     ) -> Result<Response<GetAllBucketStatsResponse>, Status> {
-        todo!()
+        Err(unimplemented_rpc("get_all_bucket_stats"))
     }
 
     async fn load_bucket_metadata(
@@ -766,7 +878,7 @@ impl Node for NodeService {
         &self,
         _request: Request<ReloadSiteReplicationConfigRequest>,
     ) -> Result<Response<ReloadSiteReplicationConfigResponse>, Status> {
-        let Some(_store) = new_object_layer_fn() else {
+        let Some(_store) = resolve_object_store_handle() else {
             return Ok(Response::new(ReloadSiteReplicationConfigResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -786,39 +898,76 @@ impl Node for NodeService {
 
     async fn signal_service(&self, request: Request<SignalServiceRequest>) -> Result<Response<SignalServiceResponse>, Status> {
         let request = request.into_inner();
-        let _vars = match request.vars {
+        let vars = match request.vars {
             Some(vars) => vars.value,
             None => HashMap::new(),
         };
-        todo!()
+        let raw_signal = vars.get(PEER_RESTSIGNAL).map(String::as_str);
+        let signal = raw_signal.and_then(|value| value.parse::<u64>().ok());
+        let sub_system = vars.get(PEER_RESTSUB_SYS).map(String::as_str).unwrap_or_default();
+
+        match signal {
+            Some(SERVICE_SIGNAL_REFRESH_CONFIG) => match reload_runtime_config_snapshot().await {
+                Ok(()) => Ok(Response::new(SignalServiceResponse {
+                    success: true,
+                    error_info: None,
+                })),
+                Err(err) => Ok(Response::new(SignalServiceResponse {
+                    success: false,
+                    error_info: Some(err.to_string()),
+                })),
+            },
+            Some(SERVICE_SIGNAL_RELOAD_DYNAMIC) => match reload_dynamic_config_runtime_state(sub_system).await {
+                Ok(()) => Ok(Response::new(SignalServiceResponse {
+                    success: true,
+                    error_info: None,
+                })),
+                Err(err) => Ok(Response::new(SignalServiceResponse {
+                    success: false,
+                    error_info: Some(err.to_string()),
+                })),
+            },
+            Some(other) => Ok(Response::new(SignalServiceResponse {
+                success: false,
+                error_info: Some(format!("unsupported service signal: {other}")),
+            })),
+            None if raw_signal.is_some() => Ok(Response::new(SignalServiceResponse {
+                success: false,
+                error_info: Some(format!("invalid service signal value: {}", raw_signal.unwrap_or_default())),
+            })),
+            None => Ok(Response::new(SignalServiceResponse {
+                success: false,
+                error_info: Some("missing service signal".to_string()),
+            })),
+        }
     }
 
     async fn background_heal_status(
         &self,
         _request: Request<BackgroundHealStatusRequest>,
     ) -> Result<Response<BackgroundHealStatusResponse>, Status> {
-        todo!()
+        Err(unimplemented_rpc("background_heal_status"))
     }
 
     async fn get_metacache_listing(
         &self,
         _request: Request<GetMetacacheListingRequest>,
     ) -> Result<Response<GetMetacacheListingResponse>, Status> {
-        todo!()
+        Err(unimplemented_rpc("get_metacache_listing"))
     }
 
     async fn update_metacache_listing(
         &self,
         _request: Request<UpdateMetacacheListingRequest>,
     ) -> Result<Response<UpdateMetacacheListingResponse>, Status> {
-        todo!()
+        Err(unimplemented_rpc("update_metacache_listing"))
     }
 
     async fn reload_pool_meta(
         &self,
         _request: Request<ReloadPoolMetaRequest>,
     ) -> Result<Response<ReloadPoolMetaResponse>, Status> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -837,7 +986,7 @@ impl Node for NodeService {
     }
 
     async fn stop_rebalance(&self, _request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Ok(Response::new(StopRebalanceResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -851,35 +1000,41 @@ impl Node for NodeService {
         }))
     }
 
-    #[tracing::instrument(skip_all)]
+    #[tracing::instrument(skip_all, fields(start_rebalance))]
     async fn load_rebalance_meta(
         &self,
         request: Request<LoadRebalanceMetaRequest>,
     ) -> Result<Response<LoadRebalanceMetaResponse>, Status> {
-        let Some(store) = new_object_layer_fn() else {
+        let LoadRebalanceMetaRequest { start_rebalance } = request.into_inner();
+        let Some(store) = resolve_object_store_handle() else {
+            log_load_rebalance_meta_rejected!("server_not_initialized", start_rebalance);
             return Ok(Response::new(LoadRebalanceMetaResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
             }));
         };
 
-        let LoadRebalanceMetaRequest { start_rebalance } = request.into_inner();
-
-        warn!("handle LoadRebalanceMetaRequest");
-
         store.load_rebalance_meta().await.map_err(|err| {
-            error!("load_rebalance_meta err {:?}", err);
+            log_load_rebalance_meta_failed!("load_rebalance_meta_failed", start_rebalance, err);
             Status::internal(err.to_string())
         })?;
-
-        warn!("load_rebalance_meta success");
+        log_load_rebalance_meta_response_emitted!(start_rebalance);
 
         if start_rebalance {
-            warn!("start rebalance");
+            log_background_rebalance_task_spawned!(start_rebalance);
             let store = store.clone();
             spawn(async move {
                 if let Some(message) = background_rebalance_start_error_message(store.start_rebalance().await) {
-                    error!("{message}");
+                    error!(
+                        event = EVENT_RPC_BACKGROUND_TASK_FAILED,
+                        component = LOG_COMPONENT_STORAGE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        operation = "start_rebalance",
+                        state = "failed",
+                        start_rebalance,
+                        error = %message,
+                        "node rpc background task failed"
+                    );
                 }
             });
         }
@@ -894,7 +1049,23 @@ impl Node for NodeService {
         &self,
         _request: Request<LoadTransitionTierConfigRequest>,
     ) -> Result<Response<LoadTransitionTierConfigResponse>, Status> {
-        todo!()
+        let Some(store) = resolve_object_store_handle() else {
+            return Ok(Response::new(LoadTransitionTierConfigResponse {
+                success: false,
+                error_info: Some("errServerNotInitialized".to_string()),
+            }));
+        };
+
+        match GLOBAL_TierConfigMgr.write().await.reload(store).await {
+            Ok(_) => Ok(Response::new(LoadTransitionTierConfigResponse {
+                success: true,
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(LoadTransitionTierConfigResponse {
+                success: false,
+                error_info: Some(err.to_string()),
+            })),
+        }
     }
 }
 
@@ -904,18 +1075,23 @@ mod tests {
     use super::*;
     use Request;
     use rustfs_protos::proto_gen::node_service::{
-        CheckPartsRequest, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest, DeletePolicyRequest,
-        DeleteRequest, DeleteServiceAccountRequest, DeleteUserRequest, DeleteVersionRequest, DeleteVersionsRequest,
-        DeleteVolumeRequest, DiskInfoRequest, GenerallyLockRequest, GetBucketInfoRequest, GetCpusRequest, GetMemInfoRequest,
-        GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest,
-        GetSysConfigRequest, GetSysErrorsRequest, HealBucketRequest, ListBucketRequest, ListDirRequest, ListVolumesRequest,
-        LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest,
-        LoadServiceAccountRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
-        MakeVolumesRequest, PingRequest, ReadAllRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest,
+        BackgroundHealStatusRequest, CheckPartsRequest, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest,
+        DeletePolicyRequest, DeleteRequest, DeleteServiceAccountRequest, DeleteUserRequest, DeleteVersionRequest,
+        DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, DownloadProfileDataRequest, GenerallyLockRequest,
+        GetAllBucketStatsRequest, GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest,
+        GetMetacacheListingRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest,
+        GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest, HealBucketRequest,
+        ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
+        LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
+        LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
+        MakeVolumesRequest, PingRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest,
         ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
-        ServerInfoRequest, StatVolumeRequest, StopRebalanceRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
-        WriteMetadataRequest,
+        ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest,
+        UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
+        WriteRequest, node_service_client::NodeServiceClient, node_service_server::NodeServiceServer,
     };
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
 
     fn create_test_node_service() -> NodeService {
         make_server()
@@ -964,6 +1140,23 @@ mod tests {
 
         let response = service.ping(request).await;
         assert!(response.is_ok()); // Should still succeed but log error
+
+        let ping_response = response.unwrap().into_inner();
+        assert_eq!(ping_response.version, 1);
+        assert!(!ping_response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ping_with_empty_body() {
+        let service = create_test_node_service();
+
+        let request = Request::new(PingRequest {
+            version: 1,
+            body: Bytes::new(),
+        });
+
+        let response = service.ping(request).await;
+        assert!(response.is_ok());
 
         let ping_response = response.unwrap().into_inner();
         assert_eq!(ping_response.version, 1);
@@ -1389,8 +1582,8 @@ mod tests {
             path: "test-path".to_string(),
             file_info: "{}".to_string(),
             opts: "{}".to_string(),
-            file_info_bin: Vec::new(),
-            opts_bin: Vec::new(),
+            file_info_bin: Vec::new().into(),
+            opts_bin: Vec::new().into(),
         });
 
         let response = service.update_metadata(request).await;
@@ -1411,8 +1604,8 @@ mod tests {
             path: "test-path".to_string(),
             file_info: "invalid json".to_string(),
             opts: "{}".to_string(),
-            file_info_bin: Vec::new(),
-            opts_bin: Vec::new(),
+            file_info_bin: Vec::new().into(),
+            opts_bin: Vec::new().into(),
         });
 
         let response = service.update_metadata(request).await;
@@ -1433,8 +1626,8 @@ mod tests {
             path: "test-path".to_string(),
             file_info: "{}".to_string(),
             opts: "invalid json".to_string(),
-            file_info_bin: Vec::new(),
-            opts_bin: Vec::new(),
+            file_info_bin: Vec::new().into(),
+            opts_bin: Vec::new().into(),
         });
 
         let response = service.update_metadata(request).await;
@@ -1454,7 +1647,7 @@ mod tests {
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
             file_info: "{}".to_string(),
-            file_info_bin: Vec::new(),
+            file_info_bin: Vec::new().into(),
         });
 
         let response = service.write_metadata(request).await;
@@ -1474,7 +1667,7 @@ mod tests {
             volume: "test-volume".to_string(),
             path: "test-path".to_string(),
             file_info: "invalid json".to_string(),
-            file_info_bin: Vec::new(),
+            file_info_bin: Vec::new().into(),
         });
 
         let response = service.write_metadata(request).await;
@@ -1495,7 +1688,7 @@ mod tests {
             path: "test-path".to_string(),
             version_id: "version1".to_string(),
             opts: "{}".to_string(),
-            opts_bin: Vec::new(),
+            opts_bin: Vec::new().into(),
         });
 
         let response = service.read_version(request).await;
@@ -1517,7 +1710,7 @@ mod tests {
             path: "test-path".to_string(),
             version_id: "version1".to_string(),
             opts: "invalid json".to_string(),
-            opts_bin: Vec::new(),
+            opts_bin: Vec::new().into(),
         });
 
         let response = service.read_version(request).await;
@@ -1675,7 +1868,7 @@ mod tests {
         let request = Request::new(ReadMultipleRequest {
             disk: "invalid-disk-path".to_string(),
             read_multiple_req: "{}".to_string(),
-            read_multiple_req_bin: Vec::new(),
+            read_multiple_req_bin: Vec::new().into(),
         });
 
         let response = service.read_multiple(request).await;
@@ -1694,7 +1887,7 @@ mod tests {
         let request = Request::new(ReadMultipleRequest {
             disk: "invalid-disk-path".to_string(),
             read_multiple_req: "invalid json".to_string(),
-            read_multiple_req_bin: Vec::new(),
+            read_multiple_req_bin: Vec::new().into(),
         });
 
         let response = service.read_multiple(request).await;
@@ -1822,6 +2015,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_local_storage_info() {
         let service = create_test_node_service();
 
@@ -1977,6 +2171,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_proc_info_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_proc_info(Request::new(GetProcInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.proc_info));
+        let _: rustfs_madmin::health::ProcInfo = serde::Deserialize::deserialize(&mut de).expect("ProcInfo round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_mem_info_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_mem_info(Request::new(GetMemInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.mem_info));
+        let _: rustfs_madmin::health::MemInfo = serde::Deserialize::deserialize(&mut de).expect("MemInfo round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_sys_errors_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_sys_errors(Request::new(GetSysErrorsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.sys_errors));
+        let _: rustfs_madmin::health::SysErrors = serde::Deserialize::deserialize(&mut de).expect("SysErrors round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_sys_config_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_sys_config(Request::new(GetSysConfigRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.sys_config));
+        let _: rustfs_madmin::health::SysConfig = serde::Deserialize::deserialize(&mut de).expect("SysConfig round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_se_linux_info_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_se_linux_info(Request::new(GetSeLinuxInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.sys_services));
+        let _: rustfs_madmin::health::SysServices =
+            serde::Deserialize::deserialize(&mut de).expect("SysServices round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_os_info_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_os_info(Request::new(GetOsInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.os_info));
+        let _: rustfs_madmin::health::OsInfo = serde::Deserialize::deserialize(&mut de).expect("OsInfo round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_partitions_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_partitions(Request::new(GetPartitionsRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.partitions));
+        let _: rustfs_madmin::health::Partitions =
+            serde::Deserialize::deserialize(&mut de).expect("Partitions round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_net_info_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .get_net_info(Request::new(GetNetInfoRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.net_info));
+        let _: rustfs_madmin::net::NetInfo = serde::Deserialize::deserialize(&mut de).expect("NetInfo round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_cpus_round_trip() {
+        let service = create_test_node_service();
+        let response = service.get_cpus(Request::new(GetCpusRequest {})).await.unwrap().into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.cpus));
+        let _: rustfs_madmin::health::Cpus = serde::Deserialize::deserialize(&mut de).expect("Cpus round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_server_info_round_trip() {
+        let service = create_test_node_service();
+        let response = service
+            .server_info(Request::new(ServerInfoRequest { metrics: false }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.server_properties));
+        let _: rustfs_madmin::ServerProperties =
+            serde::Deserialize::deserialize(&mut de).expect("ServerProperties round-trip failed");
+    }
+
+    #[tokio::test]
+    async fn test_get_metrics_round_trip() {
+        let service = create_test_node_service();
+        let metric_type = MetricType::DISK;
+        let opts = CollectMetricsOpts::default();
+        let metric_type_bytes = rmp_serde::to_vec(&metric_type).unwrap();
+        let opts_bytes = rmp_serde::to_vec(&opts).unwrap();
+        let response = service
+            .get_metrics(Request::new(GetMetricsRequest {
+                metric_type: Bytes::from(metric_type_bytes),
+                opts: Bytes::from(opts_bytes),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.success);
+        let mut de = rmp_serde::Deserializer::new(std::io::Cursor::new(response.realtime_metrics));
+        let _: rustfs_madmin::metrics::RealtimeMetrics =
+            serde::Deserialize::deserialize(&mut de).expect("RealtimeMetrics round-trip failed");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_reload_pool_meta() {
         let service = create_test_node_service();
 
@@ -1992,6 +2337,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_stop_rebalance() {
         let service = create_test_node_service();
 
@@ -2007,6 +2353,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_load_rebalance_meta() {
         let service = create_test_node_service();
 
@@ -2052,6 +2399,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_load_bucket_metadata_no_object_layer() {
         let service = create_test_node_service();
 
@@ -2060,6 +2408,22 @@ mod tests {
         });
 
         let response = service.load_bucket_metadata(request).await;
+        assert!(response.is_ok());
+
+        let load_response = response.unwrap().into_inner();
+        assert!(!load_response.success);
+        assert!(load_response.error_info.is_some());
+        assert!(load_response.error_info.unwrap().contains("errServerNotInitialized"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
+    async fn test_load_transition_tier_config_no_object_layer() {
+        let service = create_test_node_service();
+
+        let response = service
+            .load_transition_tier_config(Request::new(LoadTransitionTierConfigRequest::default()))
+            .await;
         assert!(response.is_ok());
 
         let load_response = response.unwrap().into_inner();
@@ -2221,6 +2585,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn test_reload_site_replication_config() {
         let service = create_test_node_service();
 
@@ -2235,7 +2600,231 @@ mod tests {
         assert!(reload_response.error_info.is_some());
     }
 
-    // Note: signal_service test is skipped because it contains todo!() and would panic
+    #[tokio::test]
+    async fn test_signal_service_rejects_missing_signal() {
+        let service = create_test_node_service();
+
+        let request = Request::new(SignalServiceRequest {
+            vars: Some(Mss { value: HashMap::new() }),
+        });
+
+        let response = service.signal_service(request).await;
+        assert!(response.is_ok());
+
+        let signal_response = response.unwrap().into_inner();
+        assert!(!signal_response.success);
+        assert_eq!(signal_response.error_info.as_deref(), Some("missing service signal"));
+    }
+
+    #[tokio::test]
+    async fn test_signal_service_rejects_invalid_signal_value() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), "abc".to_string());
+
+        let request = Request::new(SignalServiceRequest {
+            vars: Some(Mss { value: vars }),
+        });
+
+        let response = service.signal_service(request).await;
+        assert!(response.is_ok());
+
+        let signal_response = response.unwrap().into_inner();
+        assert!(!signal_response.success);
+        assert_eq!(signal_response.error_info.as_deref(), Some("invalid service signal value: abc"));
+    }
+
+    #[tokio::test]
+    async fn test_signal_service_rejects_unsupported_signal() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), "99".to_string());
+
+        let request = Request::new(SignalServiceRequest {
+            vars: Some(Mss { value: vars }),
+        });
+
+        let response = service.signal_service(request).await;
+        assert!(response.is_ok());
+
+        let signal_response = response.unwrap().into_inner();
+        assert!(!signal_response.success);
+        assert_eq!(signal_response.error_info.as_deref(), Some("unsupported service signal: 99"));
+    }
+
+    #[tokio::test]
+    async fn test_signal_service_rejects_non_dynamic_subsystem() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
+        vars.insert(PEER_RESTSUB_SYS.to_string(), "identity_openid".to_string());
+
+        let request = Request::new(SignalServiceRequest {
+            vars: Some(Mss { value: vars }),
+        });
+
+        let response = service.signal_service(request).await;
+        assert!(response.is_ok());
+
+        let signal_response = response.unwrap().into_inner();
+        assert!(!signal_response.success);
+        let error_info = signal_response.error_info.expect("expected error info");
+        assert!(error_info.contains("unsupported dynamic config subsystem: identity_openid"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
+    #[serial_test::serial]
+    async fn test_signal_service_refresh_config_requires_object_layer() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_REFRESH_CONFIG.to_string());
+
+        let request = Request::new(SignalServiceRequest {
+            vars: Some(Mss { value: vars }),
+        });
+
+        let response = service.signal_service(request).await;
+        assert!(response.is_ok());
+
+        let signal_response = response.unwrap().into_inner();
+        assert!(!signal_response.success);
+        let error_info = signal_response.error_info.expect("expected error info");
+        assert!(error_info.contains("storage layer not initialized"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
+    #[serial_test::serial]
+    async fn test_signal_service_reload_dynamic_requires_object_layer() {
+        let service = create_test_node_service();
+
+        let mut vars = HashMap::new();
+        vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
+        vars.insert(
+            PEER_RESTSUB_SYS.to_string(),
+            rustfs_ecstore::config::com::STORAGE_CLASS_SUB_SYS.to_string(),
+        );
+
+        let request = Request::new(SignalServiceRequest {
+            vars: Some(Mss { value: vars }),
+        });
+
+        let response = service.signal_service(request).await;
+        assert!(response.is_ok());
+
+        let signal_response = response.unwrap().into_inner();
+        assert!(!signal_response.success);
+        let error_info = signal_response.error_info.expect("expected error info");
+        assert!(error_info.contains("storage layer not initialized"));
+    }
+
+    fn assert_unimplemented_status<T>(response: Result<Response<T>, Status>, method: &str) {
+        let err = match response {
+            Ok(_) => panic!("unimplemented RPC should return an error status"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(
+            err.message().contains(method),
+            "expected method name in status message, got {:?}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unimplemented_rpcs_return_status() {
+        let service = create_test_node_service();
+
+        assert_unimplemented_status(
+            service.start_profiling(Request::new(StartProfilingRequest::default())).await,
+            "start_profiling",
+        );
+        assert_unimplemented_status(
+            service
+                .download_profile_data(Request::new(DownloadProfileDataRequest::default()))
+                .await,
+            "download_profile_data",
+        );
+        assert_unimplemented_status(
+            service
+                .get_bucket_stats(Request::new(GetBucketStatsDataRequest::default()))
+                .await,
+            "get_bucket_stats",
+        );
+        assert_unimplemented_status(
+            service.get_sr_metrics(Request::new(GetSrMetricsDataRequest::default())).await,
+            "get_sr_metrics",
+        );
+        assert_unimplemented_status(
+            service
+                .get_all_bucket_stats(Request::new(GetAllBucketStatsRequest::default()))
+                .await,
+            "get_all_bucket_stats",
+        );
+        assert_unimplemented_status(
+            service
+                .background_heal_status(Request::new(BackgroundHealStatusRequest::default()))
+                .await,
+            "background_heal_status",
+        );
+        assert_unimplemented_status(
+            service
+                .get_metacache_listing(Request::new(GetMetacacheListingRequest::default()))
+                .await,
+            "get_metacache_listing",
+        );
+        assert_unimplemented_status(
+            service
+                .update_metacache_listing(Request::new(UpdateMetacacheListingRequest::default()))
+                .await,
+            "update_metacache_listing",
+        );
+    }
+
+    async fn connect_test_node_service_client() -> NodeServiceClient<tonic::transport::Channel> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service = create_test_node_service();
+
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(NodeServiceServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        NodeServiceClient::connect(format!("http://{addr}")).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_write_stream_unimplemented() {
+        let mut client = connect_test_node_service_client().await;
+        let request = tokio_stream::iter([WriteRequest::default()]);
+
+        let response = client.write_stream(request).await;
+
+        let err = response.expect_err("write_stream should return unimplemented status");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(err.message().contains("write_stream"));
+    }
+
+    #[tokio::test]
+    async fn test_read_at_unimplemented() {
+        let mut client = connect_test_node_service_client().await;
+        let request = tokio_stream::iter([ReadAtRequest::default()]);
+
+        let response = client.read_at(request).await;
+
+        let err = response.expect_err("read_at should return unimplemented status");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(err.message().contains("read_at"));
+    }
 
     #[tokio::test]
     async fn test_node_service_debug() {

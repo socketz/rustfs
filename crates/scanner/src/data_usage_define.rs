@@ -12,29 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use path_clean::PathClean;
 use s3s::dto::BucketLifecycleConfiguration;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    hash::{DefaultHasher, Hash, Hasher},
-    path::Path,
-    sync::{Arc, LazyLock},
+    future::Future,
+    sync::{Arc, LazyLock, Once},
     time::SystemTime,
 };
 
 use http::HeaderMap;
+use metrics::{counter, describe_counter, describe_histogram, histogram};
+#[cfg(test)]
+use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
+pub use rustfs_data_usage::{
+    BucketTargetUsageInfo, BucketUsageInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, hash_path,
+};
 use rustfs_ecstore::{
-    StorageAPI,
     bucket::{lifecycle::lifecycle::TRANSITION_COMPLETE, replication::ReplicationConfig},
     config::{com::save_config, storageclass},
     disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET},
     error::{Error, Result as StorageResult, StorageError},
-    store_api::{ObjectInfo, ObjectOptions},
+    store_api::{ObjectIO, ObjectInfo, ObjectOptions},
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
-use tokio::time::{Duration, sleep, timeout};
-use tracing::{error, warn};
+use tokio::time::{Duration, Instant, sleep, timeout};
+use tracing::warn;
 
 // Data usage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
@@ -44,6 +47,20 @@ const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
+const DATA_USAGE_CACHE_SAVE_RETRIES: u32 = 2;
+const DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_MAX: u64 = 5;
+const DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES: u32 = 0;
+const METRIC_CACHE_SAVE_ATTEMPT_TOTAL: &str = "rustfs_scanner_cache_save_attempt_total";
+const METRIC_CACHE_SAVE_TIMEOUT_TOTAL: &str = "rustfs_scanner_cache_save_timeout_total";
+const METRIC_CACHE_SAVE_RETRY_TOTAL: &str = "rustfs_scanner_cache_save_retry_total";
+const METRIC_CACHE_SAVE_DURATION_SECONDS: &str = "rustfs_scanner_cache_save_duration_seconds";
+const LOG_COMPONENT_SCANNER: &str = "scanner";
+const LOG_SUBSYSTEM_CACHE: &str = "cache";
+const EVENT_SCANNER_CACHE_LOAD_STATE: &str = "scanner_cache_load_state";
+const EVENT_SCANNER_CACHE_SAVE_STATE: &str = "scanner_cache_save_state";
+static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
+
+pub const DATA_USAGE_SCAN_CHECKPOINT_VERSION: u16 = 1;
 
 // Data usage paths (computed at runtime)
 pub static DATA_USAGE_BUCKET: LazyLock<String> =
@@ -96,14 +113,14 @@ impl AllTierStats {
     pub fn add_sizes(&mut self, tiers: HashMap<String, TierStats>) {
         for (tier, st) in tiers {
             self.tiers
-                .insert(tier.clone(), self.tiers.get(&tier).unwrap_or(&TierStats::default()).add(&st));
+                .insert(tier.clone(), self.tiers.get(&tier).copied().unwrap_or_default().add(&st));
         }
     }
 
     pub fn merge(&mut self, other: AllTierStats) {
         for (tier, st) in other.tiers {
             self.tiers
-                .insert(tier.clone(), self.tiers.get(&tier).unwrap_or(&TierStats::default()).add(&st));
+                .insert(tier.clone(), self.tiers.get(&tier).copied().unwrap_or_default().add(&st));
         }
     }
 
@@ -119,90 +136,6 @@ impl AllTierStats {
             );
         }
     }
-}
-
-/// Bucket target usage info provides replication statistics
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct BucketTargetUsageInfo {
-    pub replication_pending_size: u64,
-    pub replication_failed_size: u64,
-    pub replicated_size: u64,
-    pub replica_size: u64,
-    pub replication_pending_count: u64,
-    pub replication_failed_count: u64,
-    pub replicated_count: u64,
-}
-
-/// Bucket usage info provides bucket-level statistics
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct BucketUsageInfo {
-    pub size: u64,
-    // Following five fields suffixed with V1 are here for backward compatibility
-    // Total Size for objects that have not yet been replicated
-    pub replication_pending_size_v1: u64,
-    // Total size for objects that have witness one or more failures and will be retried
-    pub replication_failed_size_v1: u64,
-    // Total size for objects that have been replicated to destination
-    pub replicated_size_v1: u64,
-    // Total number of objects pending replication
-    pub replication_pending_count_v1: u64,
-    // Total number of objects that failed replication
-    pub replication_failed_count_v1: u64,
-
-    pub objects_count: u64,
-    pub object_size_histogram: HashMap<String, u64>,
-    pub object_versions_histogram: HashMap<String, u64>,
-    pub versions_count: u64,
-    pub delete_markers_count: u64,
-    pub replica_size: u64,
-    pub replica_count: u64,
-    pub replication_info: HashMap<String, BucketTargetUsageInfo>,
-}
-
-/// DataUsageInfo represents data usage stats of the underlying storage
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct DataUsageInfo {
-    /// Total capacity
-    pub total_capacity: u64,
-    /// Total used capacity
-    pub total_used_capacity: u64,
-    /// Total free capacity
-    pub total_free_capacity: u64,
-
-    /// LastUpdate is the timestamp of when the data usage info was last updated
-    pub last_update: Option<SystemTime>,
-
-    /// Objects total count across all buckets
-    pub objects_total_count: u64,
-    /// Versions total count across all buckets
-    pub versions_total_count: u64,
-    /// Delete markers total count across all buckets
-    pub delete_markers_total_count: u64,
-    /// Objects total size across all buckets
-    pub objects_total_size: u64,
-    /// Replication info across all buckets
-    pub replication_info: HashMap<String, BucketTargetUsageInfo>,
-
-    /// Total number of buckets in this cluster
-    pub buckets_count: u64,
-    /// Buckets usage info provides following information across all buckets
-    pub buckets_usage: HashMap<String, BucketUsageInfo>,
-    /// Deprecated kept here for backward compatibility reasons
-    pub bucket_sizes: HashMap<String, u64>,
-    /// Per-disk snapshot information when available
-    #[serde(default)]
-    pub disk_usage_status: Vec<DiskUsageStatus>,
-}
-
-/// Metadata describing the status of a disk-level data usage snapshot.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct DiskUsageStatus {
-    pub disk_id: String,
-    pub pool_index: Option<usize>,
-    pub set_index: Option<usize>,
-    pub disk_index: Option<usize>,
-    pub last_update: Option<SystemTime>,
-    pub snapshot_exists: bool,
 }
 
 /// Size summary for a single object or group of objects
@@ -251,7 +184,7 @@ impl SizeSummary {
             return;
         }
 
-        let mut tier = oi.storage_class.clone().unwrap_or(storageclass::STANDARD.to_string());
+        let mut tier = oi.storage_class.clone().unwrap_or_else(|| storageclass::STANDARD.to_string());
         if oi.transitioned_object.status == TRANSITION_COMPLETE {
             tier = oi.transitioned_object.tier.clone();
         }
@@ -281,288 +214,39 @@ pub struct ReplTargetSizeSummary {
 
 // ===== Cache-related data structures =====
 
-/// Data usage hash for path-based caching
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct DataUsageHash(pub String);
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataUsageScanCheckpointReason {
+    Runtime,
+    Objects,
+    Directories,
+    Unknown,
+}
 
-impl DataUsageHash {
-    pub fn string(&self) -> String {
-        self.0.clone()
-    }
-
-    pub fn key(&self) -> String {
-        self.0.clone()
-    }
-
-    pub fn mod_(&self, cycle: u32, cycles: u32) -> bool {
-        if cycles <= 1 {
-            return cycles == 1;
+impl DataUsageScanCheckpointReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime",
+            Self::Objects => "objects",
+            Self::Directories => "directories",
+            Self::Unknown => "unknown",
         }
-
-        let hash = self.calculate_hash();
-        hash as u32 % cycles == cycle % cycles
-    }
-
-    pub fn mod_alt(&self, cycle: u32, cycles: u32) -> bool {
-        if cycles <= 1 {
-            return cycles == 1;
-        }
-
-        let hash = self.calculate_hash();
-
-        (hash >> 32) as u32 % cycles == cycle % cycles
-    }
-
-    fn calculate_hash(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        self.0.hash(&mut hasher);
-        hasher.finish()
     }
 }
 
-/// Data usage hash map type
-pub type DataUsageHashMap = HashSet<String>;
-
-/// Size histogram for object size distribution
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SizeHistogram(Vec<u64>);
-
-impl Default for SizeHistogram {
-    fn default() -> Self {
-        Self(vec![0; 11]) // DATA_USAGE_BUCKET_LEN = 11
-    }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataUsageScanCheckpoint {
+    pub version: u16,
+    pub resume_after: String,
+    pub reason: DataUsageScanCheckpointReason,
 }
 
-impl SizeHistogram {
-    pub fn add(&mut self, size: u64) {
-        let intervals = [
-            (0, 1024),                                  // LESS_THAN_1024_B
-            (1024, 64 * 1024 - 1),                      // BETWEEN_1024_B_AND_64_KB
-            (64 * 1024, 256 * 1024 - 1),                // BETWEEN_64_KB_AND_256_KB
-            (256 * 1024, 512 * 1024 - 1),               // BETWEEN_256_KB_AND_512_KB
-            (512 * 1024, 1024 * 1024 - 1),              // BETWEEN_512_KB_AND_1_MB
-            (1024, 1024 * 1024 - 1),                    // BETWEEN_1024B_AND_1_MB
-            (1024 * 1024, 10 * 1024 * 1024 - 1),        // BETWEEN_1_MB_AND_10_MB
-            (10 * 1024 * 1024, 64 * 1024 * 1024 - 1),   // BETWEEN_10_MB_AND_64_MB
-            (64 * 1024 * 1024, 128 * 1024 * 1024 - 1),  // BETWEEN_64_MB_AND_128_MB
-            (128 * 1024 * 1024, 512 * 1024 * 1024 - 1), // BETWEEN_128_MB_AND_512_MB
-            (512 * 1024 * 1024, u64::MAX),              // GREATER_THAN_512_MB
-        ];
-
-        for (idx, (start, end)) in intervals.iter().enumerate() {
-            if size >= *start && size <= *end {
-                self.0[idx] += 1;
-                break;
-            }
-        }
-    }
-
-    pub fn to_map(&self) -> HashMap<String, u64> {
-        let names = [
-            "LESS_THAN_1024_B",
-            "BETWEEN_1024_B_AND_64_KB",
-            "BETWEEN_64_KB_AND_256_KB",
-            "BETWEEN_256_KB_AND_512_KB",
-            "BETWEEN_512_KB_AND_1_MB",
-            "BETWEEN_1024B_AND_1_MB",
-            "BETWEEN_1_MB_AND_10_MB",
-            "BETWEEN_10_MB_AND_64_MB",
-            "BETWEEN_64_MB_AND_128_MB",
-            "BETWEEN_128_MB_AND_512_MB",
-            "GREATER_THAN_512_MB",
-        ];
-
-        let mut res = HashMap::new();
-        let mut spl_count = 0;
-        for (count, name) in self.0.iter().zip(names.iter()) {
-            if name == &"BETWEEN_1024B_AND_1_MB" {
-                res.insert(name.to_string(), spl_count);
-            } else if name.starts_with("BETWEEN_") && name.contains("_KB_") && name.contains("_MB") {
-                spl_count += count;
-                res.insert(name.to_string(), *count);
-            } else {
-                res.insert(name.to_string(), *count);
-            }
-        }
-        res
-    }
-}
-
-/// Versions histogram for version count distribution
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct VersionsHistogram(Vec<u64>);
-
-impl Default for VersionsHistogram {
-    fn default() -> Self {
-        Self(vec![0; 7]) // DATA_USAGE_VERSION_LEN = 7
-    }
-}
-
-impl VersionsHistogram {
-    pub fn add(&mut self, count: u64) {
-        let intervals = [
-            (0, 0),            // UNVERSIONED
-            (1, 1),            // SINGLE_VERSION
-            (2, 9),            // BETWEEN_2_AND_10
-            (10, 99),          // BETWEEN_10_AND_100
-            (100, 999),        // BETWEEN_100_AND_1000
-            (1000, 9999),      // BETWEEN_1000_AND_10000
-            (10000, u64::MAX), // GREATER_THAN_10000
-        ];
-
-        for (idx, (start, end)) in intervals.iter().enumerate() {
-            if count >= *start && count <= *end {
-                self.0[idx] += 1;
-                break;
-            }
-        }
-    }
-
-    pub fn to_map(&self) -> HashMap<String, u64> {
-        let names = [
-            "UNVERSIONED",
-            "SINGLE_VERSION",
-            "BETWEEN_2_AND_10",
-            "BETWEEN_10_AND_100",
-            "BETWEEN_100_AND_1000",
-            "BETWEEN_1000_AND_10000",
-            "GREATER_THAN_10000",
-        ];
-
-        let mut res = HashMap::new();
-        for (count, name) in self.0.iter().zip(names.iter()) {
-            res.insert(name.to_string(), *count);
-        }
-        res
-    }
-}
-
-/// Replication statistics for a single target
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct ReplicationStats {
-    pub pending_size: u64,
-    pub replicated_size: u64,
-    pub failed_size: u64,
-    pub failed_count: u64,
-    pub pending_count: u64,
-    pub missed_threshold_size: u64,
-    pub after_threshold_size: u64,
-    pub missed_threshold_count: u64,
-    pub after_threshold_count: u64,
-    pub replicated_count: u64,
-}
-
-impl ReplicationStats {
-    pub fn empty(&self) -> bool {
-        self.replicated_size == 0 && self.failed_size == 0 && self.failed_count == 0
-    }
-}
-
-/// Replication statistics for all targets
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct ReplicationAllStats {
-    pub targets: HashMap<String, ReplicationStats>,
-    pub replica_size: u64,
-    pub replica_count: u64,
-}
-
-impl ReplicationAllStats {
-    pub fn empty(&self) -> bool {
-        if self.replica_size != 0 && self.replica_count != 0 {
-            return false;
-        }
-        for (_, v) in self.targets.iter() {
-            if !v.empty() {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-/// Data usage cache entry
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct DataUsageEntry {
-    pub children: DataUsageHashMap,
-    // These fields do not include any children.
-    pub size: usize,
-    pub objects: usize,
-    pub versions: usize,
-    pub delete_markers: usize,
-    pub obj_sizes: SizeHistogram,
-    pub obj_versions: VersionsHistogram,
-    pub replication_stats: Option<ReplicationAllStats>,
-    pub compacted: bool,
-    /// Number of objects that failed to scan (e.g., IO errors)
-    #[serde(default)]
-    pub failed_objects: usize,
-}
-
-impl DataUsageEntry {
-    pub fn add_child(&mut self, hash: &DataUsageHash) {
-        if self.children.contains(&hash.key()) {
-            return;
-        }
-        self.children.insert(hash.key());
-    }
-
-    pub fn add_sizes(&mut self, summary: &SizeSummary) {
-        self.size += summary.total_size;
-        self.versions += summary.versions;
-        self.delete_markers += summary.delete_markers;
-        self.obj_sizes.add(summary.total_size as u64);
-        self.obj_versions.add(summary.versions as u64);
-
-        let replication_stats = self.replication_stats.get_or_insert_with(ReplicationAllStats::default);
-        replication_stats.replica_size += summary.replica_size as u64;
-        replication_stats.replica_count += summary.replica_count as u64;
-
-        for (arn, st) in &summary.repl_target_stats {
-            let tgt_stat = replication_stats.targets.entry(arn.to_string()).or_default();
-            tgt_stat.pending_size += st.pending_size as u64;
-            tgt_stat.failed_size += st.failed_size as u64;
-            tgt_stat.replicated_size += st.replicated_size as u64;
-            tgt_stat.replicated_count += st.replicated_count as u64;
-            tgt_stat.failed_count += st.failed_count as u64;
-            tgt_stat.pending_count += st.pending_count as u64;
-        }
-    }
-
-    pub fn merge(&mut self, other: &DataUsageEntry) {
-        self.objects += other.objects;
-        self.versions += other.versions;
-        self.delete_markers += other.delete_markers;
-        self.size += other.size;
-        self.failed_objects += other.failed_objects;
-
-        if let Some(o_rep) = &other.replication_stats {
-            if self.replication_stats.is_none() {
-                self.replication_stats = Some(ReplicationAllStats::default());
-            }
-            let s_rep = self.replication_stats.as_mut().unwrap();
-            s_rep.targets.clear();
-            s_rep.replica_size += o_rep.replica_size;
-            s_rep.replica_count += o_rep.replica_count;
-            for (arn, stat) in o_rep.targets.iter() {
-                let st = s_rep.targets.entry(arn.clone()).or_default();
-                *st = ReplicationStats {
-                    pending_size: stat.pending_size + st.pending_size,
-                    failed_size: stat.failed_size + st.failed_size,
-                    replicated_size: stat.replicated_size + st.replicated_size,
-                    pending_count: stat.pending_count + st.pending_count,
-                    failed_count: stat.failed_count + st.failed_count,
-                    replicated_count: stat.replicated_count + st.replicated_count,
-                    ..Default::default()
-                };
-            }
-        }
-
-        for (i, v) in other.obj_sizes.0.iter().enumerate() {
-            self.obj_sizes.0[i] += v;
-        }
-
-        for (i, v) in other.obj_versions.0.iter().enumerate() {
-            self.obj_versions.0[i] += v;
+impl DataUsageScanCheckpoint {
+    pub fn new(resume_after: String, reason: DataUsageScanCheckpointReason) -> Self {
+        Self {
+            version: DATA_USAGE_SCAN_CHECKPOINT_VERSION,
+            resume_after,
+            reason,
         }
     }
 }
@@ -585,6 +269,10 @@ pub struct DataUsageCacheInfo {
     pub replication: Option<Arc<ReplicationConfig>>,
     #[serde(default)]
     pub failed_objects: HashMap<String, u64>,
+    #[serde(default)]
+    pub scan_resume_after: Option<String>,
+    #[serde(default)]
+    pub scan_checkpoint: Option<DataUsageScanCheckpoint>,
 }
 
 /// Data usage cache
@@ -595,17 +283,37 @@ pub struct DataUsageCache {
 }
 
 impl DataUsageCache {
+    fn ensure_cache_save_metrics_registered() {
+        CACHE_SAVE_METRICS_ONCE.call_once(|| {
+            describe_counter!(
+                METRIC_CACHE_SAVE_ATTEMPT_TOTAL,
+                "Total scanner data usage cache save attempts by result and cache type."
+            );
+            describe_counter!(
+                METRIC_CACHE_SAVE_TIMEOUT_TOTAL,
+                "Total scanner data usage cache save timeouts by cache type."
+            );
+            describe_counter!(
+                METRIC_CACHE_SAVE_RETRY_TOTAL,
+                "Total scanner data usage cache save retries by cache type."
+            );
+            describe_histogram!(
+                METRIC_CACHE_SAVE_DURATION_SECONDS,
+                "Duration of scanner data usage cache save attempts in seconds."
+            );
+        });
+    }
+
+    fn cache_path_type(path: &str) -> &'static str {
+        if path.ends_with(".bkp") { "backup" } else { "main" }
+    }
+
     pub fn replace(&mut self, path: &str, parent: &str, e: DataUsageEntry) {
         let hash = hash_path(path);
         self.cache.insert(hash.key(), e);
         if !parent.is_empty() {
-            let phash = hash_path(parent);
-            let p = {
-                let p = self.cache.entry(phash.key()).or_default();
-                p.add_child(&hash);
-                p.clone()
-            };
-            self.cache.insert(phash.key(), p);
+            let parent_hash = hash_path(parent);
+            self.cache.entry(parent_hash.key()).or_default().add_child(&hash);
         }
     }
 
@@ -649,8 +357,7 @@ impl DataUsageCache {
                 self.copy_with_children(src, &DataUsageHash(ch.to_string()), &Some(hash.clone()));
             }
             if let Some(parent) = parent {
-                let p = self.cache.entry(parent.key()).or_default();
-                p.add_child(hash);
+                self.cache.entry(parent.key()).or_default().add_child(hash);
             }
         }
     }
@@ -663,9 +370,9 @@ impl DataUsageCache {
             }
         }
         self.cache.remove(&hash.string());
-        need_remove.iter().for_each(|child| {
-            self.delete_recursive(&DataUsageHash(child.to_string()));
-        });
+        for child in need_remove {
+            self.delete_recursive(&DataUsageHash(child));
+        }
     }
 
     pub fn size_recursive(&self, path: &str) -> Option<DataUsageEntry> {
@@ -675,7 +382,7 @@ impl DataUsageCache {
                     return Some(root.clone());
                 }
                 let mut flat = self.flatten(root);
-                if flat.replication_stats.as_ref().is_some_and(|rs| rs.empty()) {
+                if flat.replication_stats.as_ref().is_some_and(|stats| stats.empty()) {
                     flat.replication_stats = None;
                 }
                 Some(flat)
@@ -690,24 +397,19 @@ impl DataUsageCache {
             && let Some(v) = self.find(&want[0..last_index])
             && v.children.contains(&want)
         {
-            let found = hash_path(&want[0..last_index]);
-            return Some(found);
+            return Some(hash_path(&want[0..last_index]));
         }
 
         for (k, v) in self.cache.iter() {
             if v.children.contains(&want) {
-                let found = DataUsageHash(k.clone());
-                return Some(found);
+                return Some(DataUsageHash(k.clone()));
             }
         }
         None
     }
 
     pub fn is_compacted(&self, hash: &DataUsageHash) -> bool {
-        match self.cache.get(&hash.key()) {
-            Some(due) => due.compacted,
-            None => false,
-        }
+        self.cache.get(&hash.key()).is_some_and(|due| due.compacted)
     }
 
     pub fn force_compact(&mut self, limit: usize) {
@@ -715,14 +417,11 @@ impl DataUsageCache {
             return;
         }
         let top = hash_path(&self.info.name).key();
-        let top_e = match self.find(&top) {
-            Some(e) => e.clone(),
-            None => return,
+        let Some(top_e) = self.find(&top).cloned() else {
+            return;
         };
-        // Note: DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS constant would need to be passed as parameter
-        // or defined in common crate if needed
+
         if top_e.children.len() > 250_000 {
-            // DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS
             self.reduce_children_of(&hash_path(&self.info.name), limit, true);
         }
         if self.cache.len() <= limit {
@@ -732,18 +431,12 @@ impl DataUsageCache {
         let mut found = HashSet::new();
         found.insert(top);
         mark(self, &top_e, &mut found);
-        self.cache.retain(|k, _| {
-            if !found.contains(k) {
-                return false;
-            }
-            true
-        });
+        self.cache.retain(|k, _| found.contains(k));
     }
 
     pub fn reduce_children_of(&mut self, path: &DataUsageHash, limit: usize, compact_self: bool) {
-        let e = match self.cache.get(&path.key()) {
-            Some(e) => e,
-            None => return,
+        let Some(e) = self.cache.get(&path.key()).cloned() else {
+            return;
         };
 
         if e.compacted {
@@ -757,18 +450,20 @@ impl DataUsageCache {
             self.replace_hashed(path, &None, &flat);
             return;
         }
+
         let total = self.total_children_rec(&path.key());
         if total < limit {
             return;
         }
 
-        let mut leaves = Vec::new();
+        let mut candidates = Vec::new();
         let mut remove = total - limit;
-        add(self, path, &mut leaves);
-        leaves.sort_by(|a, b| a.objects.cmp(&b.objects));
+        add(self, path, &mut candidates);
+        candidates.sort_by_key(|a| a.objects);
 
-        while remove > 0 && !leaves.is_empty() {
-            let e = leaves.first().unwrap();
+        let mut candidate_index = 0;
+        while remove > 0 && candidate_index < candidates.len() {
+            let e = &candidates[candidate_index];
             let candidate = e.path.clone();
             if candidate == *path && !compact_self {
                 break;
@@ -777,7 +472,7 @@ impl DataUsageCache {
             let mut flat = match self.size_recursive(&candidate.key()) {
                 Some(flat) => flat,
                 None => {
-                    leaves.remove(0);
+                    candidate_index += 1;
                     continue;
                 }
             };
@@ -786,8 +481,8 @@ impl DataUsageCache {
             self.delete_recursive(&candidate);
             self.replace_hashed(&candidate, &None, &flat);
 
-            remove -= removing;
-            leaves.remove(0);
+            remove = remove.saturating_sub(removing);
+            candidate_index += 1;
         }
     }
 
@@ -807,31 +502,36 @@ impl DataUsageCache {
     }
 
     pub fn merge(&mut self, o: &DataUsageCache) {
-        let mut existing_root = self.root();
-        let other_root = o.root();
-        if existing_root.is_none() && other_root.is_none() {
-            return;
-        }
-        if other_root.is_none() {
-            return;
-        }
-        if existing_root.is_none() {
+        let Some(mut existing_root) = self.root() else {
+            if o.root().is_none() {
+                return;
+            }
             *self = o.clone();
             return;
-        }
-        if o.info.last_update.gt(&self.info.last_update) {
+        };
+
+        let Some(other_root) = o.root() else {
+            return;
+        };
+
+        if o.info.last_update > self.info.last_update {
             self.info.last_update = o.info.last_update;
         }
 
-        existing_root.as_mut().unwrap().merge(other_root.as_ref().unwrap());
-        self.cache.insert(hash_path(&self.info.name).key(), existing_root.unwrap());
-        let e_hash = self.root_hash();
-        for key in other_root.as_ref().unwrap().children.iter() {
-            let entry = &o.cache[key];
+        existing_root.merge(&other_root);
+        self.cache.insert(hash_path(&self.info.name).key(), existing_root);
+
+        let root_hash = self.root_hash();
+        for key in other_root.children.iter() {
+            let Some(entry) = o.cache.get(key) else {
+                continue;
+            };
             let flat = o.flatten(entry);
-            let mut existing = self.cache[key].clone();
-            existing.merge(&flat);
-            self.replace_hashed(&DataUsageHash(key.clone()), &Some(e_hash.clone()), &existing);
+            if let Some(existing) = self.cache.get_mut(key) {
+                existing.merge(&flat);
+            } else {
+                self.replace_hashed(&DataUsageHash(key.clone()), &Some(root_hash.clone()), &flat);
+            }
         }
     }
 
@@ -916,7 +616,7 @@ impl DataUsageCache {
     /// Only backend errors are returned as errors.
     /// The loader is optimistic and has no locking, but tries 5 times before giving up.
     /// If the object is not found, a nil error with empty data usage cache is returned.
-    pub async fn load<S: StorageAPI>(&mut self, store: Arc<S>, name: &str) -> StorageResult<()> {
+    pub async fn load<S: ObjectIO>(&mut self, store: Arc<S>, name: &str) -> StorageResult<()> {
         // By default, empty data usage cache
         *self = DataUsageCache::default();
 
@@ -955,14 +655,23 @@ impl DataUsageCache {
         }
 
         if retries == 5 {
-            warn!("maximum retry reached to load the data usage cache `{}`", name);
+            warn!(
+                target: "rustfs::scanner::data_usage",
+                event = EVENT_SCANNER_CACHE_LOAD_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_CACHE,
+                cache_name = %name,
+                retries,
+                state = "max_retries_reached",
+                "Scanner cache load reached retry limit"
+            );
         }
 
         Ok(())
     }
     // Inner load function that attempts to load from a specific path
     // Returns (should_retry, cache_option, error_option)
-    async fn try_load_inner<S: StorageAPI>(
+    async fn try_load_inner<S: ObjectIO>(
         store: Arc<S>,
         load_name: &str,
         timeout_duration: Duration,
@@ -1094,41 +803,156 @@ impl DataUsageCache {
         }
     }
 
-    pub async fn save<S: StorageAPI>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
+    fn cache_save_timeout() -> Duration {
+        crate::runtime_config::scanner_cache_save_timeout()
+    }
+
+    fn backup_cache_save_timeout(timeout_duration: Duration) -> Duration {
+        timeout_duration.min(Duration::from_secs(DATA_USAGE_CACHE_BACKUP_SAVE_TIMEOUT_SECS_MAX))
+    }
+
+    fn record_save_attempt(path_type: &'static str, result: &'static str, duration: Duration) {
+        histogram!(METRIC_CACHE_SAVE_DURATION_SECONDS, "cache" => path_type).record(duration.as_secs_f64());
+        counter!(
+            METRIC_CACHE_SAVE_ATTEMPT_TOTAL,
+            "cache" => path_type,
+            "result" => result
+        )
+        .increment(1);
+        if result == "timeout" {
+            counter!(METRIC_CACHE_SAVE_TIMEOUT_TOTAL, "cache" => path_type).increment(1);
+        }
+    }
+
+    async fn retry_save_op<F, Fut>(
+        path_type: &'static str,
+        timeout_duration: Duration,
+        max_retries: u32,
+        mut save_op: F,
+    ) -> StorageResult<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = StorageResult<()>>,
+    {
+        let mut last_err: Option<StorageError> = None;
+
+        for attempt in 0..=max_retries {
+            let attempt_start = Instant::now();
+            let timeout_res = timeout(timeout_duration, save_op()).await;
+            let duration = attempt_start.elapsed();
+
+            match timeout_res {
+                Ok(Ok(())) => {
+                    Self::record_save_attempt(path_type, "success", duration);
+                    return Ok(());
+                }
+                Err(e) => {
+                    Self::record_save_attempt(path_type, "timeout", duration);
+                    last_err = Some(StorageError::other(format!("{e} after {timeout_duration:?}")));
+                }
+                Ok(Err(e)) => {
+                    Self::record_save_attempt(path_type, "error", duration);
+                    last_err = Some(e);
+                }
+            }
+
+            if last_err.is_some() && attempt < max_retries {
+                counter!(METRIC_CACHE_SAVE_RETRY_TOTAL, "cache" => path_type).increment(1);
+                let backoff_ms = 50_u64 * (1_u64 << attempt) + (rand::random::<u64>() % 100);
+                sleep(Duration::from_millis(backoff_ms)).await;
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| StorageError::other("Failed to save data usage cache".to_string())))
+    }
+
+    async fn save_path_with_retry<S: ObjectIO>(
+        store: Arc<S>,
+        path: &str,
+        buf: &[u8],
+        timeout_duration: Duration,
+        max_retries: u32,
+    ) -> StorageResult<()> {
+        Self::ensure_cache_save_metrics_registered();
+        let path_type = Self::cache_path_type(path);
+        let path = path.to_string();
+
+        Self::retry_save_op(path_type, timeout_duration, max_retries, move || {
+            let store_clone = store.clone();
+            let path_clone = path.clone();
+            let buf_clone = buf.to_vec();
+            async move {
+                save_config(store_clone, &path_clone, buf_clone).await?;
+                Ok::<(), StorageError>(())
+            }
+        })
+        .await
+    }
+
+    pub async fn save<S: ObjectIO>(&self, store: Arc<S>, name: &str) -> StorageResult<()> {
         let mut buf = Vec::new();
         self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
+        let timeout_duration = Self::cache_save_timeout();
 
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
+        Self::save_path_with_retry(store.clone(), &path, &buf, timeout_duration, DATA_USAGE_CACHE_SAVE_RETRIES).await?;
 
-        let store_clone = store.clone();
-        let buf_clone = buf.clone();
-        let path_clone = path.clone();
-        let res = timeout(Duration::from_secs(5), async move {
-            save_config(store_clone, &path_clone, buf_clone).await?;
-            Ok::<(), StorageError>(())
-        })
-        .await
-        .map_err(|e| StorageError::other(format!("Failed to save data usage cache: {e}")))?;
-
-        if let Err(e) = res {
-            error!("Failed to save data usage cache: {e}");
-            return Err(e);
-        }
-
-        let store_clone = store.clone();
         let backup_name = format!("{name}.bkp");
         let backup_path = path_join_buf(&[BUCKET_META_PREFIX, &backup_name]);
-        let res = timeout(Duration::from_secs(5), async move {
-            save_config(store_clone, &backup_path, buf).await?;
-            Ok::<(), StorageError>(())
-        })
-        .await
-        .map_err(|e| StorageError::other(format!("Failed to save data usage cache: {e}")))?;
-        if let Err(e) = res {
-            error!("Failed to save data usage cache backup: {e}");
-            return Err(e);
+        let backup_timeout_duration = Self::backup_cache_save_timeout(timeout_duration);
+        if let Err(e) =
+            Self::save_path_with_retry(store, &backup_path, &buf, backup_timeout_duration, DATA_USAGE_CACHE_BACKUP_SAVE_RETRIES)
+                .await
+        {
+            warn!(
+                target: "rustfs::scanner::data_usage",
+                event = EVENT_SCANNER_CACHE_SAVE_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_CACHE,
+                cache_name = %name,
+                backup_path = %backup_path,
+                state = "backup_save_failed",
+                error = %e,
+                "Scanner cache backup save failed"
+            );
         }
         Ok(())
+    }
+}
+
+#[derive(Default, Clone)]
+struct Inner {
+    objects: usize,
+    path: DataUsageHash,
+}
+
+fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, candidates: &mut Vec<Inner>) -> usize {
+    let e = match data_usage_cache.cache.get(&path.key()) {
+        Some(e) => e,
+        None => return 0,
+    };
+    let mut objects = e.objects;
+    for ch in e.children.iter() {
+        objects += add(data_usage_cache, &DataUsageHash(ch.clone()), candidates);
+    }
+    // Collect internal nodes (with children) as compaction candidates.
+    // Leaf nodes have no children to remove, so compacting them is a no-op —
+    // total_children_rec returns 0 for leaves, so `remove` would never decrement.
+    if !e.children.is_empty() {
+        candidates.push(Inner {
+            objects,
+            path: path.clone(),
+        });
+    }
+    objects
+}
+
+fn mark(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut HashSet<String>) {
+    for k in entry.children.iter() {
+        found.insert(k.to_string());
+        if let Some(ch) = duc.cache.get(k) {
+            mark(duc, ch, found);
+        }
     }
 }
 
@@ -1142,366 +966,6 @@ pub trait DataUsageCacheStorage {
 
     /// Save data usage cache to backend storage
     async fn save(&self, name: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-}
-
-// Helper structs and functions for cache operations
-#[derive(Default, Clone)]
-struct Inner {
-    objects: usize,
-    path: DataUsageHash,
-}
-
-fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, leaves: &mut Vec<Inner>) {
-    let e = match data_usage_cache.cache.get(&path.key()) {
-        Some(e) => e,
-        None => return,
-    };
-    if !e.children.is_empty() {
-        return;
-    }
-
-    let sz = data_usage_cache.size_recursive(&path.key()).unwrap_or_default();
-    leaves.push(Inner {
-        objects: sz.objects,
-        path: path.clone(),
-    });
-    for ch in e.children.iter() {
-        add(data_usage_cache, &DataUsageHash(ch.clone()), leaves);
-    }
-}
-
-fn mark(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut HashSet<String>) {
-    for k in entry.children.iter() {
-        found.insert(k.to_string());
-        if let Some(ch) = duc.cache.get(k) {
-            mark(duc, ch, found);
-        }
-    }
-}
-
-/// Hash a path for data usage caching
-pub fn hash_path(data: &str) -> DataUsageHash {
-    DataUsageHash(Path::new(&data).clean().to_string_lossy().to_string())
-}
-
-impl DataUsageInfo {
-    /// Create a new DataUsageInfo
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add object metadata to data usage statistics
-    pub fn add_object(&mut self, object_path: &str, meta_object: &rustfs_filemeta::MetaObject) {
-        // This method is kept for backward compatibility
-        // For accurate version counting, use add_object_from_file_meta instead
-        let bucket_name = match self.extract_bucket_from_path(object_path) {
-            Ok(name) => name,
-            Err(_) => return,
-        };
-
-        // Update bucket statistics
-        if let Some(bucket_usage) = self.buckets_usage.get_mut(&bucket_name) {
-            bucket_usage.size += meta_object.size as u64;
-            bucket_usage.objects_count += 1;
-            bucket_usage.versions_count += 1; // Simplified: assume 1 version per object
-
-            // Update size histogram
-            let total_size = meta_object.size as u64;
-            let size_ranges = [
-                ("0-1KB", 0, 1024),
-                ("1KB-1MB", 1024, 1024 * 1024),
-                ("1MB-10MB", 1024 * 1024, 10 * 1024 * 1024),
-                ("10MB-100MB", 10 * 1024 * 1024, 100 * 1024 * 1024),
-                ("100MB-1GB", 100 * 1024 * 1024, 1024 * 1024 * 1024),
-                ("1GB+", 1024 * 1024 * 1024, u64::MAX),
-            ];
-
-            for (range_name, min_size, max_size) in size_ranges {
-                if total_size >= min_size && total_size < max_size {
-                    *bucket_usage.object_size_histogram.entry(range_name.to_string()).or_insert(0) += 1;
-                    break;
-                }
-            }
-
-            // Update version histogram (simplified - count as single version)
-            *bucket_usage
-                .object_versions_histogram
-                .entry("SINGLE_VERSION".to_string())
-                .or_insert(0) += 1;
-        } else {
-            // Create new bucket usage
-            let mut bucket_usage = BucketUsageInfo {
-                size: meta_object.size as u64,
-                objects_count: 1,
-                versions_count: 1,
-                ..Default::default()
-            };
-            bucket_usage.object_size_histogram.insert("0-1KB".to_string(), 1);
-            bucket_usage.object_versions_histogram.insert("SINGLE_VERSION".to_string(), 1);
-            self.buckets_usage.insert(bucket_name, bucket_usage);
-        }
-
-        // Update global statistics
-        self.objects_total_size += meta_object.size as u64;
-        self.objects_total_count += 1;
-        self.versions_total_count += 1;
-    }
-
-    /// Add object from FileMeta for accurate version counting
-    pub fn add_object_from_file_meta(&mut self, object_path: &str, file_meta: &rustfs_filemeta::FileMeta) {
-        let bucket_name = match self.extract_bucket_from_path(object_path) {
-            Ok(name) => name,
-            Err(_) => return,
-        };
-
-        // Calculate accurate statistics from all versions
-        let mut total_size = 0u64;
-        let mut versions_count = 0u64;
-        let mut delete_markers_count = 0u64;
-        let mut latest_object_size = 0u64;
-
-        // Process all versions to get accurate counts
-        for version in &file_meta.versions {
-            match rustfs_filemeta::FileMetaVersion::try_from(version.clone()) {
-                Ok(ver) => {
-                    if let Some(obj) = ver.object {
-                        total_size += obj.size as u64;
-                        versions_count += 1;
-                        latest_object_size = obj.size as u64; // Keep track of latest object size
-                    } else if ver.delete_marker.is_some() {
-                        delete_markers_count += 1;
-                    }
-                }
-                Err(_) => {
-                    // Skip invalid versions
-                    continue;
-                }
-            }
-        }
-
-        // Update bucket statistics
-        if let Some(bucket_usage) = self.buckets_usage.get_mut(&bucket_name) {
-            bucket_usage.size += total_size;
-            bucket_usage.objects_count += 1;
-            bucket_usage.versions_count += versions_count;
-            bucket_usage.delete_markers_count += delete_markers_count;
-
-            // Update size histogram based on latest object size
-            let size_ranges = [
-                ("0-1KB", 0, 1024),
-                ("1KB-1MB", 1024, 1024 * 1024),
-                ("1MB-10MB", 1024 * 1024, 10 * 1024 * 1024),
-                ("10MB-100MB", 10 * 1024 * 1024, 100 * 1024 * 1024),
-                ("100MB-1GB", 100 * 1024 * 1024, 1024 * 1024 * 1024),
-                ("1GB+", 1024 * 1024 * 1024, u64::MAX),
-            ];
-
-            for (range_name, min_size, max_size) in size_ranges {
-                if latest_object_size >= min_size && latest_object_size < max_size {
-                    *bucket_usage.object_size_histogram.entry(range_name.to_string()).or_insert(0) += 1;
-                    break;
-                }
-            }
-
-            // Update version histogram based on actual version count
-            let version_ranges = [
-                ("1", 1, 1),
-                ("2-5", 2, 5),
-                ("6-10", 6, 10),
-                ("11-50", 11, 50),
-                ("51-100", 51, 100),
-                ("100+", 101, usize::MAX),
-            ];
-
-            for (range_name, min_versions, max_versions) in version_ranges {
-                if versions_count as usize >= min_versions && versions_count as usize <= max_versions {
-                    *bucket_usage
-                        .object_versions_histogram
-                        .entry(range_name.to_string())
-                        .or_insert(0) += 1;
-                    break;
-                }
-            }
-        } else {
-            // Create new bucket usage
-            let mut bucket_usage = BucketUsageInfo {
-                size: total_size,
-                objects_count: 1,
-                versions_count,
-                delete_markers_count,
-                ..Default::default()
-            };
-
-            // Set size histogram
-            let size_ranges = [
-                ("0-1KB", 0, 1024),
-                ("1KB-1MB", 1024, 1024 * 1024),
-                ("1MB-10MB", 1024 * 1024, 10 * 1024 * 1024),
-                ("10MB-100MB", 10 * 1024 * 1024, 100 * 1024 * 1024),
-                ("100MB-1GB", 100 * 1024 * 1024, 1024 * 1024 * 1024),
-                ("1GB+", 1024 * 1024 * 1024, u64::MAX),
-            ];
-
-            for (range_name, min_size, max_size) in size_ranges {
-                if latest_object_size >= min_size && latest_object_size < max_size {
-                    bucket_usage.object_size_histogram.insert(range_name.to_string(), 1);
-                    break;
-                }
-            }
-
-            // Set version histogram
-            let version_ranges = [
-                ("1", 1, 1),
-                ("2-5", 2, 5),
-                ("6-10", 6, 10),
-                ("11-50", 11, 50),
-                ("51-100", 51, 100),
-                ("100+", 101, usize::MAX),
-            ];
-
-            for (range_name, min_versions, max_versions) in version_ranges {
-                if versions_count as usize >= min_versions && versions_count as usize <= max_versions {
-                    bucket_usage.object_versions_histogram.insert(range_name.to_string(), 1);
-                    break;
-                }
-            }
-
-            self.buckets_usage.insert(bucket_name, bucket_usage);
-            // Update buckets count when adding new bucket
-            self.buckets_count = self.buckets_usage.len() as u64;
-        }
-
-        // Update global statistics
-        self.objects_total_size += total_size;
-        self.objects_total_count += 1;
-        self.versions_total_count += versions_count;
-        self.delete_markers_total_count += delete_markers_count;
-    }
-
-    /// Extract bucket name from object path
-    pub fn extract_bucket_from_path(&self, object_path: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let parts: Vec<&str> = object_path.split('/').collect();
-        if parts.is_empty() {
-            return Err("Invalid object path: empty".into());
-        }
-        Ok(parts[0].to_string())
-    }
-
-    /// Update capacity information
-    pub fn update_capacity(&mut self, total: u64, used: u64, free: u64) {
-        self.total_capacity = total;
-        self.total_used_capacity = used;
-        self.total_free_capacity = free;
-        self.last_update = Some(SystemTime::now());
-    }
-
-    /// Add bucket usage info
-    pub fn add_bucket_usage(&mut self, bucket: String, usage: BucketUsageInfo) {
-        self.buckets_usage.insert(bucket.clone(), usage);
-        self.buckets_count = self.buckets_usage.len() as u64;
-        self.last_update = Some(SystemTime::now());
-    }
-
-    /// Get bucket usage info
-    pub fn get_bucket_usage(&self, bucket: &str) -> Option<&BucketUsageInfo> {
-        self.buckets_usage.get(bucket)
-    }
-
-    /// Calculate total statistics from all buckets
-    pub fn calculate_totals(&mut self) {
-        self.objects_total_count = 0;
-        self.versions_total_count = 0;
-        self.delete_markers_total_count = 0;
-        self.objects_total_size = 0;
-
-        for usage in self.buckets_usage.values() {
-            self.objects_total_count += usage.objects_count;
-            self.versions_total_count += usage.versions_count;
-            self.delete_markers_total_count += usage.delete_markers_count;
-            self.objects_total_size += usage.size;
-        }
-    }
-
-    /// Merge another DataUsageInfo into this one
-    pub fn merge(&mut self, other: &DataUsageInfo) {
-        // Merge bucket usage
-        for (bucket, usage) in &other.buckets_usage {
-            if let Some(existing) = self.buckets_usage.get_mut(bucket) {
-                existing.merge(usage);
-            } else {
-                self.buckets_usage.insert(bucket.clone(), usage.clone());
-            }
-        }
-
-        self.disk_usage_status.extend(other.disk_usage_status.iter().cloned());
-
-        // Recalculate totals
-        self.calculate_totals();
-
-        // Ensure buckets_count stays consistent with buckets_usage
-        self.buckets_count = self.buckets_usage.len() as u64;
-
-        // Update last update time
-        if let Some(other_update) = other.last_update
-            && (self.last_update.is_none() || other_update > self.last_update.unwrap())
-        {
-            self.last_update = Some(other_update);
-        }
-    }
-}
-
-impl BucketUsageInfo {
-    /// Create a new BucketUsageInfo
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add size summary to this bucket usage
-    pub fn add_size_summary(&mut self, summary: &SizeSummary) {
-        self.size += summary.total_size as u64;
-        self.versions_count += summary.versions as u64;
-        self.delete_markers_count += summary.delete_markers as u64;
-        self.replica_size += summary.replica_size as u64;
-        self.replica_count += summary.replica_count as u64;
-    }
-
-    /// Merge another BucketUsageInfo into this one
-    pub fn merge(&mut self, other: &BucketUsageInfo) {
-        self.size += other.size;
-        self.objects_count += other.objects_count;
-        self.versions_count += other.versions_count;
-        self.delete_markers_count += other.delete_markers_count;
-        self.replica_size += other.replica_size;
-        self.replica_count += other.replica_count;
-
-        // Merge histograms
-        for (key, value) in &other.object_size_histogram {
-            *self.object_size_histogram.entry(key.clone()).or_insert(0) += value;
-        }
-
-        for (key, value) in &other.object_versions_histogram {
-            *self.object_versions_histogram.entry(key.clone()).or_insert(0) += value;
-        }
-
-        // Merge replication info
-        for (target, info) in &other.replication_info {
-            let entry = self.replication_info.entry(target.clone()).or_default();
-            entry.replicated_size += info.replicated_size;
-            entry.replica_size += info.replica_size;
-            entry.replication_pending_size += info.replication_pending_size;
-            entry.replication_failed_size += info.replication_failed_size;
-            entry.replication_pending_count += info.replication_pending_count;
-            entry.replication_failed_count += info.replication_failed_count;
-            entry.replicated_count += info.replicated_count;
-        }
-
-        // Merge backward compatibility fields
-        self.replication_pending_size_v1 += other.replication_pending_size_v1;
-        self.replication_failed_size_v1 += other.replication_failed_size_v1;
-        self.replicated_size_v1 += other.replicated_size_v1;
-        self.replication_pending_count_v1 += other.replication_pending_count_v1;
-        self.replication_failed_count_v1 += other.replication_failed_count_v1;
-    }
 }
 
 impl SizeSummary {
@@ -1541,6 +1005,9 @@ impl SizeSummary {
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temp_env::{with_var, with_var_unset};
 
     #[test]
     fn test_data_usage_info_creation() {
@@ -1618,5 +1085,429 @@ mod tests {
 
         let decoded: DataUsageEntry = serde_json::from_value(value).expect("Failed to deserialize entry");
         assert_eq!(decoded.failed_objects, 0);
+    }
+
+    #[test]
+    fn test_data_usage_cache_info_deserialize_defaults_scan_resume_after() {
+        let value = serde_json::json!({
+            "name": "bucket",
+            "next_cycle": 7,
+            "last_update": null,
+            "skip_healing": false,
+            "lifecycle": null,
+            "replication": null,
+            "failed_objects": {}
+        });
+
+        let decoded: DataUsageCacheInfo = serde_json::from_value(value).expect("Failed to deserialize cache info");
+
+        assert_eq!(decoded.name, "bucket");
+        assert_eq!(decoded.next_cycle, 7);
+        assert!(decoded.scan_resume_after.is_none());
+        assert!(decoded.scan_checkpoint.is_none());
+    }
+
+    #[test]
+    fn test_data_usage_cache_info_unmarshal_old_msgpack_defaults_scan_resume_after() {
+        #[derive(Serialize)]
+        struct OldDataUsageCacheInfo {
+            name: String,
+            next_cycle: u64,
+            last_update: Option<SystemTime>,
+            skip_healing: bool,
+            lifecycle: Option<Arc<BucketLifecycleConfiguration>>,
+            replication: Option<Arc<ReplicationConfig>>,
+            failed_objects: HashMap<String, u64>,
+        }
+
+        let old_info = OldDataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            last_update: None,
+            skip_healing: true,
+            lifecycle: None,
+            replication: None,
+            failed_objects: HashMap::from([("bad-object".to_string(), 11)]),
+        };
+        let mut buf = Vec::new();
+        old_info
+            .serialize(&mut rmp_serde::Serializer::new(&mut buf))
+            .expect("Failed to serialize old cache info");
+
+        let decoded: DataUsageCacheInfo = rmp_serde::from_slice(&buf).expect("Failed to deserialize old cache info");
+
+        assert_eq!(decoded.name, "bucket");
+        assert_eq!(decoded.next_cycle, 7);
+        assert!(decoded.skip_healing);
+        assert_eq!(decoded.failed_objects.get("bad-object"), Some(&11));
+        assert!(decoded.scan_resume_after.is_none());
+        assert!(decoded.scan_checkpoint.is_none());
+    }
+
+    #[test]
+    fn test_data_usage_cache_mutations_update_in_place() {
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                failed_objects: HashMap::from([("bad-object".to_string(), 7)]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let root_hash = hash_path("bucket");
+        let child_hash = hash_path("bucket/a");
+        let grandchild_hash = hash_path("bucket/a/b");
+
+        cache.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+        cache.replace_hashed(
+            &child_hash,
+            &Some(root_hash.clone()),
+            &DataUsageEntry {
+                objects: 2,
+                size: 20,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(
+            &grandchild_hash,
+            &Some(child_hash.clone()),
+            &DataUsageEntry {
+                objects: 3,
+                size: 30,
+                ..Default::default()
+            },
+        );
+
+        assert!(cache.find("bucket").unwrap().children.contains(&child_hash.key()));
+        assert!(cache.find("bucket/a").unwrap().children.contains(&grandchild_hash.key()));
+        assert_eq!(cache.search_parent(&grandchild_hash), Some(child_hash.clone()));
+        assert_eq!(cache.info.failed_objects.get("bad-object"), Some(&7));
+
+        let flat = cache.size_recursive("bucket").unwrap();
+        assert_eq!(flat.objects, 5);
+        assert_eq!(flat.size, 50);
+        assert!(flat.children.is_empty());
+    }
+
+    #[test]
+    fn test_data_usage_cache_copy_and_delete_recursive() {
+        let root_hash = hash_path("bucket");
+        let child_hash = hash_path("bucket/a");
+        let grandchild_hash = hash_path("bucket/a/b");
+
+        let mut src = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        src.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+        src.replace_hashed(
+            &child_hash,
+            &Some(root_hash.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        src.replace_hashed(
+            &grandchild_hash,
+            &Some(child_hash.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+
+        let mut dst = DataUsageCache {
+            info: src.info.clone(),
+            ..Default::default()
+        };
+        dst.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+        dst.copy_with_children(&src, &child_hash, &Some(root_hash.clone()));
+
+        assert!(dst.cache.contains_key(&child_hash.key()));
+        assert!(dst.cache.contains_key(&grandchild_hash.key()));
+        assert!(dst.find("bucket").unwrap().children.contains(&child_hash.key()));
+        assert!(dst.find("bucket/a").unwrap().children.contains(&grandchild_hash.key()));
+
+        dst.delete_recursive(&child_hash);
+
+        assert!(!dst.cache.contains_key(&child_hash.key()));
+        assert!(!dst.cache.contains_key(&grandchild_hash.key()));
+        assert!(dst.cache.contains_key(&root_hash.key()));
+    }
+
+    #[test]
+    fn test_find_children_copy_preserves_missing_entry_behavior() {
+        let mut cache = DataUsageCache::default();
+        let missing_hash = hash_path("missing");
+
+        assert!(cache.find_children_copy(missing_hash.clone()).is_empty());
+        assert!(cache.cache.contains_key(&missing_hash.key()));
+    }
+
+    #[test]
+    fn test_cache_path_type_distinguishes_main_and_backup() {
+        assert_eq!(DataUsageCache::cache_path_type("buckets/.usage-cache.bin"), "main");
+        assert_eq!(DataUsageCache::cache_path_type("buckets/.usage-cache.bin.bkp"), "backup");
+    }
+
+    #[test]
+    fn test_cache_save_timeout_uses_default_when_env_missing() {
+        with_var_unset(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+            assert_eq!(
+                DataUsageCache::cache_save_timeout(),
+                Duration::from_secs(rustfs_config::DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS)
+            );
+        });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+    }
+
+    #[test]
+    fn test_cache_save_timeout_respects_env_and_minimum_bound() {
+        with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("7"), || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+            assert_eq!(DataUsageCache::cache_save_timeout(), Duration::from_secs(7));
+        });
+
+        with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("0"), || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+            assert_eq!(DataUsageCache::cache_save_timeout(), Duration::from_secs(1));
+        });
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+    }
+
+    #[tokio::test]
+    async fn test_retry_save_op_retries_on_error_then_succeeds() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        let result =
+            DataUsageCache::retry_save_op("main", Duration::from_millis(200), DATA_USAGE_CACHE_SAVE_RETRIES, move || {
+                let attempts = attempts_clone.clone();
+                async move {
+                    let current = attempts.fetch_add(1, Ordering::SeqCst);
+                    if current < 2 {
+                        return Err(StorageError::other("transient".to_string()));
+                    }
+                    Ok(())
+                }
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    // --- Tests for `add` function (bug #1: logic inversion) ---
+
+    /// Build a small tree: root -> child1 (leaf), child2 -> grandchild (leaf).
+    /// Returns (cache, root_hash).
+    fn build_test_tree() -> (DataUsageCache, DataUsageHash) {
+        let root = hash_path("bucket");
+        let c1 = hash_path("bucket/a");
+        let c2 = hash_path("bucket/b");
+        let gc = hash_path("bucket/b/c");
+
+        let mut cache = DataUsageCache::default();
+        cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+        cache.replace_hashed(
+            &c1,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                size: 10,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(
+            &c2,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 2,
+                size: 20,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(
+            &gc,
+            &Some(c2.clone()),
+            &DataUsageEntry {
+                objects: 3,
+                size: 30,
+                ..Default::default()
+            },
+        );
+        (cache, root)
+    }
+
+    fn build_underflow_test_tree() -> (DataUsageCache, DataUsageHash) {
+        let root = hash_path("bucket");
+        let small = hash_path("bucket/small");
+        let small_a = hash_path("bucket/small/a");
+        let small_b = hash_path("bucket/small/b");
+        let large = hash_path("bucket/large");
+        let large_a = hash_path("bucket/large/a");
+        let large_b = hash_path("bucket/large/b");
+
+        let mut cache = DataUsageCache::default();
+        cache.replace_hashed(
+            &root,
+            &None,
+            &DataUsageEntry {
+                objects: 100,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(&small, &Some(root.clone()), &DataUsageEntry::default());
+        cache.replace_hashed(
+            &small_a,
+            &Some(small.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(
+            &small_b,
+            &Some(small.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(&large, &Some(root.clone()), &DataUsageEntry::default());
+        cache.replace_hashed(
+            &large_a,
+            &Some(large.clone()),
+            &DataUsageEntry {
+                objects: 10,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(
+            &large_b,
+            &Some(large.clone()),
+            &DataUsageEntry {
+                objects: 10,
+                ..Default::default()
+            },
+        );
+        (cache, root)
+    }
+
+    #[test]
+    fn test_add_collects_internal_nodes_as_compaction_candidates() {
+        // `add()` should collect internal nodes (with children) as compaction candidates.
+        // Leaf nodes have no children to remove, so compacting them is a no-op.
+        let (cache, root) = build_test_tree();
+        let mut candidates = Vec::new();
+        add(&cache, &root, &mut candidates);
+
+        let mut paths: Vec<String> = candidates.iter().map(|l| l.path.key()).collect();
+        paths.sort();
+        // Internal nodes: "bucket" (children: [a, b]) and "bucket/b" (children: [c]).
+        // Leaf nodes "bucket/a" and "bucket/b/c" are NOT collected.
+        assert_eq!(paths.len(), 2, "add() should find internal nodes with children");
+        assert!(paths.contains(&hash_path("bucket").key()));
+        assert!(paths.contains(&hash_path("bucket/b").key()));
+    }
+
+    #[test]
+    fn test_add_returns_empty_for_missing_path() {
+        let cache = DataUsageCache::default();
+        let mut candidates = Vec::new();
+        add(&cache, &hash_path("nonexistent"), &mut candidates);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_add_skips_leaf_node() {
+        // A leaf node (no children) is not a valid compaction candidate —
+        // total_children_rec returns 0 for leaves, so compacting them has no effect.
+        let mut cache = DataUsageCache::default();
+        let h = hash_path("single-leaf");
+        cache.replace_hashed(
+            &h,
+            &None,
+            &DataUsageEntry {
+                objects: 5,
+                size: 50,
+                ..Default::default()
+            },
+        );
+
+        let mut candidates = Vec::new();
+        add(&cache, &h, &mut candidates);
+        assert!(candidates.is_empty(), "leaf node should not be a compaction candidate");
+    }
+
+    // --- Tests for `reduce_children_of` (bug #2: usize underflow) ---
+
+    #[test]
+    fn test_reduce_children_of_compacts_internal_node() {
+        // Build tree: root -> c1(leaf), c2 -> gc(leaf). total=3, limit=2, remove=1.
+        // Internal nodes (compaction candidates): root, c2.
+        // compact_self=false skips root; c2 (objects=2, 1 child) is the only candidate.
+        // Compacting c2 removes gc (removing=1), satisfying remove=1.
+        let (mut cache, root) = build_test_tree();
+        cache.reduce_children_of(&root, 2, false);
+
+        // "bucket/b" should be compacted (its child gc removed).
+        let entry_c2 = cache.find("bucket/b").unwrap();
+        assert!(entry_c2.compacted, "internal node 'bucket/b' should be compacted");
+        // "bucket/a" (leaf, not a candidate) should remain unchanged.
+        let entry_c1 = cache.find("bucket/a").unwrap();
+        assert!(!entry_c1.compacted, "leaf 'bucket/a' should not be compacted");
+        // "bucket/b/c" was deleted when its parent was compacted.
+        assert!(cache.find("bucket/b/c").is_none(), "grandchild should be removed after parent compaction");
+    }
+
+    #[test]
+    fn test_reduce_children_of_no_op_when_under_limit() {
+        let (mut cache, root) = build_test_tree();
+        let before = cache.cache.len();
+        // limit=10 > total children => no compaction
+        cache.reduce_children_of(&root, 10, false);
+        assert_eq!(cache.cache.len(), before);
+    }
+
+    #[test]
+    fn test_reduce_children_of_usize_underflow_saturates() {
+        let (mut cache, root) = build_underflow_test_tree();
+
+        // total children=6, limit=5, remove=1. The smallest candidate removes
+        // two descendants, so plain subtraction would underflow and compact the
+        // next candidate too.
+        cache.reduce_children_of(&root, 5, false);
+
+        assert!(cache.find("bucket/small").is_some_and(|entry| entry.compacted));
+        assert!(cache.find("bucket/small/a").is_none());
+        assert!(cache.find("bucket/small/b").is_none());
+        assert!(cache.find("bucket/large").is_some_and(|entry| !entry.compacted));
+        assert!(cache.find("bucket/large/a").is_some());
+        assert!(cache.find("bucket/large/b").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_retry_save_op_times_out_and_returns_error_after_retries() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        let result = DataUsageCache::retry_save_op("main", Duration::from_millis(10), DATA_USAGE_CACHE_SAVE_RETRIES, move || {
+            let attempts = attempts_clone.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<StorageResult<()>>().await
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), (DATA_USAGE_CACHE_SAVE_RETRIES + 1) as usize);
     }
 }

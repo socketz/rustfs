@@ -1,4 +1,4 @@
-[![RustFS](https://github.com/user-attachments/assets/1b5afcd6-a2c3-47ff-8bc3-ce882b0ddca7)](https://rustfs.com.cn)
+[![RustFS](https://repository-images.githubusercontent.com/722597620/0fa936a2-8164-4f53-867f-def4beb64b21)](https://rustfs.com.cn)
 
 <p align="center">RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。</p>
 
@@ -100,20 +100,27 @@ curl -O https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
 
 ### 2\. Docker 快速启动 (选项 2)
 
-RustFS 容器以非 root 用户 `rustfs` (UID `10001`) 运行。如果您使用 Docker 的 `-v` 参数挂载宿主机目录，请务必确保宿主机目录的所有者已更改为 `10001`，否则会遇到权限拒绝错误。
+RustFS 容器以非 root 用户 `rustfs` (UID/GID `10001:10001`) 运行。如果您通过 Docker 或 Compose 绑定挂载宿主机目录，请务必确保所有挂载路径都对该用户可写，否则启动时可能出现权限拒绝错误。这不仅适用于数据目录和日志目录，也适用于启用 `RUSTFS_TLS_PATH` 时挂载的 TLS 证书目录。
 
 ```bash
- # 创建数据和日志目录
- mkdir -p data logs
+# 创建数据和日志目录
+mkdir -p data logs
 
- # 更改这两个目录的所有者
- chown -R 10001:10001 data logs
+# 更改这两个目录的所有者
+chown -R 10001:10001 data logs
 
- # 使用最新版本运行
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
+# 使用最新版本运行
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
- # 使用指定版本运行
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0.alpha.68
+# 使用指定版本运行
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.8
+```
+
+如果您通过绑定挂载启用 TLS 证书目录，也请用同样方式准备该目录：
+
+```bash
+mkdir -p certs
+chown -R 10001:10001 certs
 ```
 
 您也可以使用 Docker Compose。使用根目录下的 `docker-compose.yml` 文件：
@@ -122,7 +129,14 @@ RustFS 容器以非 root 用户 `rustfs` (UID `10001`) 运行。如果您使用 
 docker compose --profile observability up -d
 ```
 
-**注意**: 我们建议您在运行前查看 `docker-compose.yaml` 文件。该文件定义了包括 Grafana、Prometheus 和 Jaeger 在内的多个服务，有助于 RustFS 的可观测性监控。如果您还想启动 Redis 或 Nginx 容器，可以指定相应的 profile。
+在使用 Compose 且包含宿主机绑定挂载时，请先确认：
+
+- 所有挂载到容器内的宿主机路径都对 `10001:10001` 可写。
+- 如果启用了 TLS，挂载到 `/opt/tls` 的证书目录也需要对 `10001:10001` 可读。
+- 如果不方便调整宿主机目录归属，可以为 `rustfs` 服务显式设置 `user: "<host-uid>:<host-gid>"`。
+- `docker-compose-simple.yml` 为命名 volume 提供了 `volume-permission-helper` 服务；`docker-compose.yml` 使用宿主机绑定挂载，因此需要您在启动前自行准备目录权限。
+
+**注意**: 我们建议您在运行前查看 `docker-compose.yml` 文件。该文件定义了包括 Grafana、Prometheus 和 Jaeger 在内的多个服务，有助于 RustFS 的可观测性监控。如果您还想启动 Redis 或 Nginx 容器，可以指定相应的 profile。
 
 ### 3\. 源码编译 (选项 3) - 进阶用户
 
@@ -197,7 +211,7 @@ rustfs --help
 
 ### 访问 RustFS
 
-1. **访问控制台**: 打开浏览器并访问 `http://localhost:9000` 进入 RustFS 控制台。
+1. **访问控制台**: 打开浏览器并访问 `http://localhost:9001` 进入 RustFS 控制台。
    - 默认账号/密码: `rustfsadmin` / `rustfsadmin`
 2. **创建存储桶**: 使用控制台为您​​的对象创建一个新的存储桶 (Bucket)。
 3. **上传对象**: 您可以直接通过控制台上传文件，或使用 S3 兼容的 API/客户端与您的 RustFS 实例进行交互。
@@ -228,7 +242,7 @@ rustfs --help
 - **商务合作**: [hello@rustfs.com](mailto:hello@rustfs.com)
 - **工作机会**: [jobs@rustfs.com](mailto:jobs@rustfs.com)
 - **一般讨论**: [GitHub Discussions](https://github.com/rustfs/rustfs/discussions)
-- **贡献指南**: [CONTRIBUTING.md](https://www.google.com/search?q=CONTRIBUTING.md)
+- **贡献指南**: [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## 贡献者
 

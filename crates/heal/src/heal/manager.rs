@@ -18,20 +18,35 @@ use crate::heal::{
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType},
 };
 use crate::{Error, Result};
+use metrics::{counter, gauge};
+use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 use rustfs_ecstore::disk::DiskAPI;
 use rustfs_ecstore::disk::error::DiskError;
 use rustfs_ecstore::global::GLOBAL_LOCAL_DISK_MAP;
+use rustfs_madmin::heal_commands::HealResultItem;
 use std::{
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashMap},
     sync::Arc,
     time::{Duration, SystemTime},
 };
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{Mutex, Notify, RwLock},
     time::interval,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);
+const LOG_COMPONENT_HEAL: &str = "heal";
+const LOG_SUBSYSTEM_DISK_SCANNER: &str = "disk_scanner";
+const LOG_SUBSYSTEM_MANAGER: &str = "manager";
+const EVENT_HEAL_AUTO_SCAN_STATE: &str = "heal_auto_scan_state";
+const EVENT_HEAL_AUTO_SCAN_DISK: &str = "heal_auto_scan_disk";
+const EVENT_HEAL_AUTO_SCAN_ENQUEUE: &str = "heal_auto_scan_enqueue";
+const EVENT_HEAL_MANAGER_STATE: &str = "heal_manager_state";
+const EVENT_HEAL_QUEUE_ADMISSION: &str = "heal_queue_admission";
+const EVENT_HEAL_SCHEDULER_STATE: &str = "heal_scheduler_state";
+const EVENT_HEAL_QUEUE_STATE: &str = "heal_queue_state";
 
 /// Priority queue wrapper for heal requests
 /// Uses BinaryHeap for priority-based ordering while maintaining FIFO for same-priority items
@@ -41,8 +56,8 @@ struct PriorityHealQueue {
     heap: BinaryHeap<PriorityQueueItem>,
     /// Sequence counter for FIFO ordering within same priority
     sequence: u64,
-    /// Set of request keys to prevent duplicates
-    dedup_keys: HashSet<String>,
+    /// Deduplication key reference counts for queued requests
+    dedup_keys: HashMap<String, usize>,
 }
 
 /// Wrapper for heap items to implement proper ordering
@@ -80,12 +95,32 @@ impl PartialOrd for PriorityQueueItem {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuePushOutcome {
+    Accepted,
+    Merged,
+}
+
+#[derive(Debug, Clone)]
+struct CompletedHealStatus {
+    heal_type: HealType,
+    status: HealTaskStatus,
+    result_items: Vec<HealResultItem>,
+    completed_at: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct HealTaskReport {
+    pub status: HealTaskStatus,
+    pub result_items: Vec<HealResultItem>,
+}
+
 impl PriorityHealQueue {
     fn new() -> Self {
         Self {
             heap: BinaryHeap::new(),
             sequence: 0,
-            dedup_keys: HashSet::new(),
+            dedup_keys: HashMap::new(),
         }
     }
 
@@ -93,26 +128,79 @@ impl PriorityHealQueue {
         self.heap.len()
     }
 
+    fn pop_next(&mut self) -> Option<HealRequest> {
+        self.heap.pop().map(|item| {
+            let key = Self::make_dedup_key(&item.request);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+            item.request
+        })
+    }
+
     fn is_empty(&self) -> bool {
         self.heap.is_empty()
     }
 
-    fn push(&mut self, request: HealRequest) -> bool {
+    fn push(&mut self, request: HealRequest) -> QueuePushOutcome {
         let key = Self::make_dedup_key(&request);
 
-        // Check for duplicates
-        if self.dedup_keys.contains(&key) {
-            return false; // Duplicate request, don't add
+        // Check for duplicates unless the caller explicitly forces admission.
+        if self.dedup_keys.contains_key(&key) && !request.force_start {
+            return QueuePushOutcome::Merged;
         }
-
-        self.dedup_keys.insert(key);
+        // Track dedup keys for both normal and forced requests so queued forced work
+        // also reserves the dedup key for later non-forced duplicates.
+        *self.dedup_keys.entry(key).or_insert(0) += 1;
         self.sequence += 1;
         self.heap.push(PriorityQueueItem {
             priority: request.priority,
             sequence: self.sequence,
             request,
         });
-        true
+        QueuePushOutcome::Accepted
+    }
+
+    fn can_displace_lower_priority(&self, priority: HealPriority) -> bool {
+        self.heap.iter().any(|item| item.priority < priority)
+    }
+
+    fn push_displacing_lower_priority(&mut self, request: HealRequest) -> Option<HealRequest> {
+        let mut retained = BinaryHeap::new();
+        let mut displaced: Option<PriorityQueueItem> = None;
+
+        while let Some(item) = self.heap.pop() {
+            if item.priority < request.priority {
+                let should_displace = displaced
+                    .as_ref()
+                    .map(|current| {
+                        item.priority < current.priority
+                            || (item.priority == current.priority && item.sequence > current.sequence)
+                    })
+                    .unwrap_or(true);
+                if should_displace {
+                    if let Some(current) = displaced.replace(item) {
+                        retained.push(current);
+                    }
+                } else {
+                    retained.push(item);
+                }
+            } else {
+                retained.push(item);
+            }
+        }
+
+        self.heap = retained;
+
+        let displaced = displaced.map(|item| {
+            let key = Self::make_dedup_key(&item.request);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+            item.request
+        });
+
+        if displaced.is_some() {
+            debug_assert_eq!(self.push(request), QueuePushOutcome::Accepted);
+        }
+
+        displaced
     }
 
     /// Get statistics about queue contents by priority
@@ -124,12 +212,55 @@ impl PriorityHealQueue {
         stats
     }
 
+    #[cfg(test)]
     fn pop(&mut self) -> Option<HealRequest> {
         self.heap.pop().map(|item| {
             let key = Self::make_dedup_key(&item.request);
-            self.dedup_keys.remove(&key);
+            Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
             item.request
         })
+    }
+
+    #[cfg(test)]
+    fn pop_runnable<F>(&mut self, can_run: F) -> Option<HealRequest>
+    where
+        F: Fn(&HealRequest) -> bool,
+    {
+        self.pop_runnable_with_skips(can_run, |_| None).0
+    }
+
+    fn pop_runnable_with_skips<F, G>(&mut self, can_run: F, skip_label: G) -> (Option<HealRequest>, Vec<String>)
+    where
+        F: Fn(&HealRequest) -> bool,
+        G: Fn(&HealRequest) -> Option<String>,
+    {
+        let mut deferred = Vec::new();
+        let mut selected = None;
+        let mut skipped = Vec::new();
+
+        while let Some(item) = self.heap.pop() {
+            if can_run(&item.request) {
+                selected = Some(item);
+                break;
+            }
+            if let Some(label) = skip_label(&item.request) {
+                skipped.push(label);
+            }
+            deferred.push(item);
+        }
+
+        for item in deferred {
+            self.heap.push(item);
+        }
+
+        (
+            selected.map(|item| {
+                let key = Self::make_dedup_key(&item.request);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+                item.request
+            }),
+            skipped,
+        )
     }
 
     /// Create a deduplication key from a heal request
@@ -164,18 +295,108 @@ impl PriorityHealQueue {
         }
     }
 
+    fn decrement_or_remove_dedup_key(dedup_keys: &mut HashMap<String, usize>, key: &str) {
+        if let Some(count) = dedup_keys.get_mut(key) {
+            if *count <= 1 {
+                dedup_keys.remove(key);
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+
     /// Check if a request with the same key already exists in the queue
     #[allow(dead_code)]
     fn contains_key(&self, request: &HealRequest) -> bool {
         let key = Self::make_dedup_key(request);
-        self.dedup_keys.contains(&key)
+        self.dedup_keys.contains_key(&key)
     }
 
     /// Check if an erasure set heal request for a specific set_disk_id exists
     fn contains_erasure_set(&self, set_disk_id: &str) -> bool {
         let key = format!("erasure_set:{set_disk_id}");
-        self.dedup_keys.contains(&key)
+        self.dedup_keys.contains_key(&key)
     }
+
+    fn contains_request_id(&self, request_id: &str) -> bool {
+        self.heap.iter().any(|item| item.request.id == request_id)
+    }
+
+    fn contains_request_id_matching_path(&self, request_id: &str, heal_path: &str) -> bool {
+        self.heap
+            .iter()
+            .any(|item| item.request.id == request_id && heal_type_matches_path(&item.request.heal_type, heal_path))
+    }
+
+    fn contains_matching<F>(&self, mut matches: F) -> bool
+    where
+        F: FnMut(&HealRequest) -> bool,
+    {
+        self.heap.iter().any(|item| matches(&item.request))
+    }
+
+    fn remove_request_id(&mut self, request_id: &str) -> Option<HealRequest> {
+        let mut retained = BinaryHeap::new();
+        let mut removed = None;
+
+        while let Some(item) = self.heap.pop() {
+            if removed.is_none() && item.request.id == request_id {
+                let key = Self::make_dedup_key(&item.request);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+                removed = Some(item.request);
+            } else {
+                retained.push(item);
+            }
+        }
+
+        self.heap = retained;
+        removed
+    }
+
+    fn remove_matching<F>(&mut self, mut should_remove: F) -> usize
+    where
+        F: FnMut(&HealRequest) -> bool,
+    {
+        let mut retained = BinaryHeap::new();
+        let mut removed_count = 0;
+
+        while let Some(item) = self.heap.pop() {
+            if should_remove(&item.request) {
+                let key = Self::make_dedup_key(&item.request);
+                Self::decrement_or_remove_dedup_key(&mut self.dedup_keys, &key);
+                removed_count += 1;
+            } else {
+                retained.push(item);
+            }
+        }
+
+        self.heap = retained;
+        removed_count
+    }
+}
+
+fn heal_type_matches_path(heal_type: &HealType, heal_path: &str) -> bool {
+    let heal_path = heal_path.trim_matches('/');
+    if heal_path.is_empty() {
+        return false;
+    }
+
+    match heal_type {
+        HealType::Object { bucket, object, .. }
+        | HealType::Metadata { bucket, object }
+        | HealType::ECDecode { bucket, object, .. } => heal_path == bucket || heal_path == format!("{bucket}/{object}"),
+        HealType::Bucket { bucket } => heal_path == bucket,
+        HealType::ErasureSet { set_disk_id, .. } => heal_path == set_disk_id,
+        HealType::MRF { meta_path } => heal_path == meta_path.trim_matches('/'),
+    }
+}
+
+fn publish_active_heal_count(active_heals: &HashMap<String, Arc<HealTask>>) {
+    crate::set_heal_active_tasks(active_heals.len());
+}
+
+fn publish_heal_queue_length(queue: &PriorityHealQueue) {
+    crate::set_heal_queue_length(queue.len());
 }
 
 /// Heal config
@@ -187,10 +408,22 @@ pub struct HealConfig {
     pub heal_interval: Duration,
     /// Maximum concurrent heal tasks
     pub max_concurrent_heals: usize,
+    /// Maximum concurrent heal tasks allowed for a single erasure set
+    pub max_concurrent_per_set: usize,
     /// Task timeout
     pub task_timeout: Duration,
     /// Queue size
     pub queue_size: usize,
+    /// Whether duplicate low-priority requests should merge into an existing queued request.
+    pub low_priority_merge_enable: bool,
+    /// Whether low-priority requests may be dropped when the queue is full.
+    pub low_priority_drop_when_full: bool,
+    /// Whether notify-driven scheduler wakeups are enabled.
+    pub event_driven_scheduler_enable: bool,
+    /// Whether per-set bulkhead scheduling is enabled.
+    pub set_bulkhead_enable: bool,
+    /// Whether erasure-set page parallelism is enabled.
+    pub page_parallel_enable: bool,
 }
 
 impl Default for HealConfig {
@@ -211,12 +444,42 @@ impl Default for HealConfig {
             rustfs_config::ENV_HEAL_MAX_CONCURRENT_HEALS,
             rustfs_config::DEFAULT_HEAL_MAX_CONCURRENT_HEALS,
         );
+        let max_concurrent_per_set = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_HEAL_MAX_CONCURRENT_PER_SET,
+            rustfs_config::DEFAULT_HEAL_MAX_CONCURRENT_PER_SET,
+        );
+        let low_priority_merge_enable = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_HEAL_LOW_PRIORITY_MERGE_ENABLE,
+            rustfs_config::DEFAULT_HEAL_LOW_PRIORITY_MERGE_ENABLE,
+        );
+        let low_priority_drop_when_full = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_HEAL_LOW_PRIORITY_DROP_WHEN_FULL,
+            rustfs_config::DEFAULT_HEAL_LOW_PRIORITY_DROP_WHEN_FULL,
+        );
+        let event_driven_scheduler_enable = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE,
+            rustfs_config::DEFAULT_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE,
+        );
+        let set_bulkhead_enable = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_HEAL_SET_BULKHEAD_ENABLE,
+            rustfs_config::DEFAULT_HEAL_SET_BULKHEAD_ENABLE,
+        );
+        let page_parallel_enable = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE,
+            rustfs_config::DEFAULT_HEAL_PAGE_PARALLEL_ENABLE,
+        );
         Self {
             enable_auto_heal,
             heal_interval,        // 10 seconds
             max_concurrent_heals, // max 4,
-            task_timeout,         // 5 minutes
+            max_concurrent_per_set: std::cmp::min(max_concurrent_heals.max(1), max_concurrent_per_set.max(1)),
+            task_timeout, // 5 minutes
             queue_size,
+            low_priority_merge_enable,
+            low_priority_drop_when_full,
+            event_driven_scheduler_enable,
+            set_bulkhead_enable,
+            page_parallel_enable,
         }
     }
 }
@@ -248,15 +511,27 @@ pub struct HealManager {
     active_heals: Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
     /// Heal queue (priority-based)
     heal_queue: Arc<Mutex<PriorityHealQueue>>,
+    /// Recently completed heal statuses retained for status queries.
+    completed_heals: Arc<Mutex<HashMap<String, CompletedHealStatus>>>,
     /// Storage layer interface
     storage: Arc<dyn HealStorageAPI>,
     /// Cancel token
     cancel_token: CancellationToken,
     /// Statistics
     statistics: Arc<RwLock<HealStatistics>>,
+    /// Scheduler wake-up notifier for event-driven dispatch
+    notify: Arc<Notify>,
 }
 
 impl HealManager {
+    fn classify_full_admission(request: &HealRequest, config: &HealConfig) -> HealAdmissionResult {
+        if request.priority == HealPriority::Low && config.low_priority_drop_when_full {
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)
+        } else {
+            HealAdmissionResult::Full
+        }
+    }
+
     /// Create new HealManager
     pub fn new(storage: Arc<dyn HealStorageAPI>, config: Option<HealConfig>) -> Self {
         let config = config.unwrap_or_default();
@@ -265,9 +540,11 @@ impl HealManager {
             state: Arc::new(RwLock::new(HealState::default())),
             active_heals: Arc::new(Mutex::new(HashMap::new())),
             heal_queue: Arc::new(Mutex::new(PriorityHealQueue::new())),
+            completed_heals: Arc::new(Mutex::new(HashMap::new())),
             storage,
             cancel_token: CancellationToken::new(),
             statistics: Arc::new(RwLock::new(HealStatistics::new())),
+            notify: Arc::new(Notify::new()),
         }
     }
 
@@ -275,13 +552,27 @@ impl HealManager {
     pub async fn start(&self) -> Result<()> {
         let mut state = self.state.write().await;
         if state.is_running {
-            warn!("HealManager is already running");
+            warn!(
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_MANAGER_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                state = "already_running",
+                "Heal manager already running"
+            );
             return Ok(());
         }
         state.is_running = true;
         drop(state);
 
-        info!("Starting HealManager");
+        info!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_MANAGER_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            state = "starting",
+            "Heal manager starting"
+        );
 
         // start scheduler
         self.start_scheduler().await?;
@@ -289,13 +580,27 @@ impl HealManager {
         // start auto disk scanner to heal unformatted disks
         self.start_auto_disk_scanner().await?;
 
-        info!("HealManager started successfully");
+        info!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_MANAGER_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            state = "running",
+            "Heal manager started"
+        );
         Ok(())
     }
 
     /// Stop HealManager
     pub async fn stop(&self) -> Result<()> {
-        info!("Stopping HealManager");
+        info!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_MANAGER_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            state = "stopping",
+            "Heal manager stopping"
+        );
 
         // cancel all tasks
         self.cancel_token.cancel();
@@ -304,90 +609,369 @@ impl HealManager {
         let mut active_heals = self.active_heals.lock().await;
         for task in active_heals.values() {
             if let Err(e) = task.cancel().await {
-                warn!("Failed to cancel task {}: {}", task.id, e);
+                warn!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_MANAGER_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    state = "task_cancel_failed",
+                    task_id = %task.id,
+                    error = %e,
+                    "Heal active task cancellation failed"
+                );
             }
         }
         active_heals.clear();
+        publish_active_heal_count(&active_heals);
+        self.completed_heals.lock().await.clear();
+        crate::set_heal_queue_length(0);
 
         // update state
         let mut state = self.state.write().await;
         state.is_running = false;
 
-        info!("HealManager stopped successfully");
+        info!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_MANAGER_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            state = "stopped",
+            "Heal manager stopped"
+        );
         Ok(())
     }
 
     /// Submit heal request
-    pub async fn submit_heal_request(&self, request: HealRequest) -> Result<String> {
+    pub async fn submit_heal_request(&self, request: HealRequest) -> Result<HealAdmissionResult> {
         let config = self.config.read().await;
         let mut queue = self.heal_queue.lock().await;
 
         let queue_len = queue.len();
+        publish_heal_queue_length(&queue);
         let queue_capacity = config.queue_size;
 
-        if queue_len >= queue_capacity {
-            return Err(Error::ConfigurationError {
-                message: format!("Heal queue is full ({queue_len}/{queue_capacity})"),
-            });
+        if !request.force_start && queue.contains_key(&request) {
+            let admission = if request.priority == HealPriority::Low && !config.low_priority_merge_enable {
+                HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped)
+            } else {
+                HealAdmissionResult::Merged
+            };
+
+            match admission {
+                HealAdmissionResult::Merged => {
+                    debug!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        priority = ?request.priority,
+                        result = "merged_duplicate",
+                        "Heal queue request merged"
+                    );
+                }
+                HealAdmissionResult::Dropped(reason) => {
+                    warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        priority = ?request.priority,
+                        reason = reason.as_str(),
+                        result = "dropped_duplicate",
+                        "Heal queue request dropped"
+                    );
+                }
+                HealAdmissionResult::Accepted | HealAdmissionResult::Full => {}
+            }
+
+            return Ok(admission);
+        }
+
+        if queue_len >= queue_capacity && !request.force_start {
+            if queue.can_displace_lower_priority(request.priority) {
+                let request_id = request.id.clone();
+                let priority = request.priority;
+                if let Some(displaced) = queue.push_displacing_lower_priority(request) {
+                    publish_heal_queue_length(&queue);
+                    warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request_id,
+                        priority = ?priority,
+                        displaced_request_id = %displaced.id,
+                        displaced_priority = ?displaced.priority,
+                        queue_len,
+                        queue_capacity,
+                        result = "accepted_by_displacement",
+                        "Heal queue request accepted by displacement"
+                    );
+                    drop(queue);
+                    if config.event_driven_scheduler_enable {
+                        self.notify.notify_one();
+                    }
+                    return Ok(HealAdmissionResult::Accepted);
+                }
+
+                warn!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_QUEUE_ADMISSION,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    request_id = %request_id,
+                    priority = ?priority,
+                    queue_len,
+                    queue_capacity,
+                    result = "full_no_displacement_candidate",
+                    "Heal queue request rejected without displacement"
+                );
+                return Ok(HealAdmissionResult::Full);
+            }
+
+            let admission = Self::classify_full_admission(&request, &config);
+            match admission {
+                HealAdmissionResult::Dropped(reason) => {
+                    warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        priority = ?request.priority,
+                        queue_len,
+                        queue_capacity,
+                        reason = reason.as_str(),
+                        result = "dropped_full",
+                        "Heal queue request dropped"
+                    );
+                }
+                HealAdmissionResult::Full => {
+                    warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        priority = ?request.priority,
+                        queue_len,
+                        queue_capacity,
+                        result = "rejected_full",
+                        "Heal queue request rejected"
+                    );
+                }
+                HealAdmissionResult::Accepted | HealAdmissionResult::Merged => {}
+            }
+            return Ok(admission);
         }
 
         // Warn when queue is getting full (>80% capacity)
         let capacity_threshold = (queue_capacity as f64 * 0.8) as usize;
         if queue_len >= capacity_threshold {
             warn!(
-                "Heal queue is {}% full ({}/{}). Consider increasing queue size or processing capacity.",
-                (queue_len * 100) / queue_capacity,
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_QUEUE_ADMISSION,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
                 queue_len,
-                queue_capacity
+                queue_capacity,
+                queue_usage_pct = (queue_len * 100) / queue_capacity,
+                result = "queue_pressure_high",
+                "Heal queue pressure high"
             );
         }
 
         let request_id = request.id.clone();
         let priority = request.priority;
 
-        // Try to push the request; if it's a duplicate, still return the request_id
-        let is_new = queue.push(request);
+        let push_outcome = queue.push(request);
+        debug_assert_eq!(push_outcome, QueuePushOutcome::Accepted);
+        publish_heal_queue_length(&queue);
 
         // Log queue statistics periodically (when adding high/urgent priority items)
         if matches!(priority, HealPriority::High | HealPriority::Urgent) {
             let stats = queue.get_priority_stats();
-            info!(
-                "Heal queue stats after adding {:?} priority request: total={}, urgent={}, high={}, normal={}, low={}",
-                priority,
-                queue_len + 1,
-                stats.get(&HealPriority::Urgent).unwrap_or(&0),
-                stats.get(&HealPriority::High).unwrap_or(&0),
-                stats.get(&HealPriority::Normal).unwrap_or(&0),
-                stats.get(&HealPriority::Low).unwrap_or(&0)
+            debug!(
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_QUEUE_ADMISSION,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                request_id = %request_id,
+                priority = ?priority,
+                queue_len = queue_len + 1,
+                urgent = *stats.get(&HealPriority::Urgent).unwrap_or(&0),
+                high = *stats.get(&HealPriority::High).unwrap_or(&0),
+                normal = *stats.get(&HealPriority::Normal).unwrap_or(&0),
+                low = *stats.get(&HealPriority::Low).unwrap_or(&0),
+                result = "accepted",
+                "Heal queue snapshot recorded"
             );
         }
 
         drop(queue);
 
-        if is_new {
-            info!("Submitted heal request: {} with priority: {:?}", request_id, priority);
-        } else {
-            info!("Heal request already queued (duplicate): {}", request_id);
+        debug!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_QUEUE_ADMISSION,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            request_id = %request_id,
+            priority = ?priority,
+            queue_len = queue_len + 1,
+            result = "accepted",
+            "Heal queue request accepted"
+        );
+        if config.event_driven_scheduler_enable {
+            self.notify.notify_one();
         }
 
-        Ok(request_id)
+        Ok(HealAdmissionResult::Accepted)
     }
 
     /// Get task status
     pub async fn get_task_status(&self, task_id: &str) -> Result<HealTaskStatus> {
-        let active_heals = self.active_heals.lock().await;
-        if let Some(task) = active_heals.get(task_id) {
-            Ok(task.get_status().await)
-        } else {
-            Err(Error::TaskNotFound {
-                task_id: task_id.to_string(),
-            })
+        {
+            let active_heals = self.active_heals.lock().await;
+            if let Some(task) = active_heals.get(task_id) {
+                return Ok(task.get_status().await);
+            }
         }
+
+        let queue = self.heal_queue.lock().await;
+        if queue.contains_request_id(task_id) {
+            return Ok(HealTaskStatus::Pending);
+        }
+        drop(queue);
+
+        let mut completed_heals = self.completed_heals.lock().await;
+        prune_completed_heal_statuses(&mut completed_heals);
+        if let Some(completed) = completed_heals.get(task_id) {
+            return Ok(completed.status.clone());
+        }
+
+        Err(Error::TaskNotFound {
+            task_id: task_id.to_string(),
+        })
+    }
+
+    pub async fn get_task_report_for_path(&self, heal_path: &str, task_id: &str) -> Result<HealTaskReport> {
+        {
+            let active_heals = self.active_heals.lock().await;
+            if let Some(task) = active_heals.get(task_id)
+                && heal_type_matches_path(&task.heal_type, heal_path)
+            {
+                return Ok(HealTaskReport {
+                    status: task.get_status().await,
+                    result_items: task.get_result_items().await,
+                });
+            }
+        }
+
+        {
+            let queue = self.heal_queue.lock().await;
+            if queue.contains_request_id_matching_path(task_id, heal_path) {
+                return Ok(HealTaskReport {
+                    status: HealTaskStatus::Pending,
+                    result_items: Vec::new(),
+                });
+            }
+        }
+
+        {
+            let mut completed_heals = self.completed_heals.lock().await;
+            prune_completed_heal_statuses(&mut completed_heals);
+            if let Some(completed) = completed_heals.get(task_id)
+                && heal_type_matches_path(&completed.heal_type, heal_path)
+            {
+                return Ok(HealTaskReport {
+                    status: completed.status.clone(),
+                    result_items: completed.result_items.clone(),
+                });
+            }
+        }
+
+        if self.path_has_task(heal_path).await {
+            return Err(Error::InvalidClientToken);
+        }
+
+        Err(Error::TaskNotFound {
+            task_id: task_id.to_string(),
+        })
+    }
+
+    /// Get task status for a path-bound client token.
+    ///
+    /// If the token is unknown but no task remains for the path, the caller can
+    /// treat it as an already-finished sequence. If the path still has a live or
+    /// recently completed task, a different token is invalid for that path.
+    pub async fn get_task_status_for_path(&self, heal_path: &str, task_id: &str) -> Result<HealTaskStatus> {
+        {
+            let active_heals = self.active_heals.lock().await;
+            if let Some(task) = active_heals.get(task_id)
+                && heal_type_matches_path(&task.heal_type, heal_path)
+            {
+                return Ok(task.get_status().await);
+            }
+        }
+
+        {
+            let queue = self.heal_queue.lock().await;
+            if queue.contains_request_id_matching_path(task_id, heal_path) {
+                return Ok(HealTaskStatus::Pending);
+            }
+        }
+
+        {
+            let mut completed_heals = self.completed_heals.lock().await;
+            prune_completed_heal_statuses(&mut completed_heals);
+            if let Some(completed) = completed_heals.get(task_id)
+                && heal_type_matches_path(&completed.heal_type, heal_path)
+            {
+                return Ok(completed.status.clone());
+            }
+        }
+
+        if self.path_has_task(heal_path).await {
+            return Err(Error::InvalidClientToken);
+        }
+
+        Err(Error::TaskNotFound {
+            task_id: task_id.to_string(),
+        })
+    }
+
+    async fn path_has_task(&self, heal_path: &str) -> bool {
+        {
+            let active_heals = self.active_heals.lock().await;
+            if active_heals
+                .values()
+                .any(|task| heal_type_matches_path(&task.heal_type, heal_path))
+            {
+                return true;
+            }
+        }
+
+        {
+            let queue = self.heal_queue.lock().await;
+            if queue.contains_matching(|request| heal_type_matches_path(&request.heal_type, heal_path)) {
+                return true;
+            }
+        }
+
+        let mut completed_heals = self.completed_heals.lock().await;
+        prune_completed_heal_statuses(&mut completed_heals);
+        completed_heals
+            .values()
+            .any(|completed| heal_type_matches_path(&completed.heal_type, heal_path))
     }
 
     /// Get task progress
     pub async fn get_active_tasks_count(&self) -> usize {
-        self.active_heals.lock().await.len()
+        let active_heals = self.active_heals.lock().await;
+        publish_active_heal_count(&active_heals);
+        active_heals.len()
     }
 
     pub async fn get_task_progress(&self, task_id: &str) -> Result<HealProgress> {
@@ -403,17 +987,93 @@ impl HealManager {
 
     /// Cancel task
     pub async fn cancel_task(&self, task_id: &str) -> Result<()> {
-        let mut active_heals = self.active_heals.lock().await;
-        if let Some(task) = active_heals.get(task_id) {
-            task.cancel().await?;
-            active_heals.remove(task_id);
-            info!("Cancelled heal task: {}", task_id);
-            Ok(())
-        } else {
-            Err(Error::TaskNotFound {
-                task_id: task_id.to_string(),
-            })
+        {
+            let mut active_heals = self.active_heals.lock().await;
+            if let Some(task) = active_heals.get(task_id) {
+                task.cancel().await?;
+                active_heals.remove(task_id);
+                publish_active_heal_count(&active_heals);
+                info!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_MANAGER_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    task_id,
+                    state = "cancelled_active_task",
+                    "Heal manager cancelled active task"
+                );
+                return Ok(());
+            }
         }
+
+        let mut queue = self.heal_queue.lock().await;
+        if queue.remove_request_id(task_id).is_some() {
+            publish_heal_queue_length(&queue);
+            info!(
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_MANAGER_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_MANAGER,
+                task_id,
+                state = "cancelled_queued_task",
+                "Heal manager cancelled queued task"
+            );
+            return Ok(());
+        }
+
+        Err(Error::TaskNotFound {
+            task_id: task_id.to_string(),
+        })
+    }
+
+    /// Cancel all queued or active tasks matching a heal path.
+    pub async fn cancel_tasks_for_path(&self, heal_path: &str) -> Result<usize> {
+        let mut cancelled = 0usize;
+
+        {
+            let mut active_heals = self.active_heals.lock().await;
+            let task_ids = active_heals
+                .iter()
+                .filter_map(|(task_id, task)| heal_type_matches_path(&task.heal_type, heal_path).then_some(task_id.clone()))
+                .collect::<Vec<_>>();
+
+            for task_id in task_ids {
+                if let Some(task) = active_heals.get(&task_id) {
+                    task.cancel().await?;
+                }
+                active_heals.remove(&task_id);
+                cancelled += 1;
+            }
+
+            if cancelled > 0 {
+                publish_active_heal_count(&active_heals);
+            }
+        }
+
+        let mut queue = self.heal_queue.lock().await;
+        let queued_cancelled = queue.remove_matching(|request| heal_type_matches_path(&request.heal_type, heal_path));
+        if queued_cancelled > 0 {
+            publish_heal_queue_length(&queue);
+            cancelled += queued_cancelled;
+        }
+
+        if cancelled == 0 {
+            return Err(Error::TaskNotFound {
+                task_id: heal_path.to_string(),
+            });
+        }
+
+        info!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_MANAGER_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            heal_path,
+            cancelled,
+            state = "cancelled_path_tasks",
+            "Heal manager cancelled tasks for path"
+        );
+        Ok(cancelled)
     }
 
     /// Get statistics
@@ -424,12 +1084,14 @@ impl HealManager {
     /// Get active task count
     pub async fn get_active_task_count(&self) -> usize {
         let active_heals = self.active_heals.lock().await;
+        publish_active_heal_count(&active_heals);
         active_heals.len()
     }
 
     /// Get queue length
     pub async fn get_queue_length(&self) -> usize {
         let queue = self.heal_queue.lock().await;
+        publish_heal_queue_length(&queue);
         queue.len()
     }
 
@@ -438,21 +1100,34 @@ impl HealManager {
         let config = self.config.clone();
         let heal_queue = self.heal_queue.clone();
         let active_heals = self.active_heals.clone();
+        let completed_heals = self.completed_heals.clone();
         let cancel_token = self.cancel_token.clone();
         let statistics = self.statistics.clone();
         let storage = self.storage.clone();
+        let notify = self.notify.clone();
 
         tokio::spawn(async move {
             let mut interval = interval(config.read().await.heal_interval);
 
             loop {
+                let event_driven_scheduler_enable = config.read().await.event_driven_scheduler_enable;
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
-                        info!("Heal scheduler received shutdown signal");
+                        info!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_SCHEDULER_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                            state = "shutdown",
+                            "Heal scheduler stopped"
+                        );
                         break;
                     }
+                    _ = notify.notified(), if event_driven_scheduler_enable => {
+                        Self::process_heal_queue(&heal_queue, &active_heals, &completed_heals, &config, &statistics, &storage, &notify).await;
+                    }
                     _ = interval.tick() => {
-                        Self::process_heal_queue(&heal_queue, &active_heals, &config, &statistics, &storage).await;
+                        Self::process_heal_queue(&heal_queue, &active_heals, &completed_heals, &config, &statistics, &storage, &notify).await;
                     }
                 }
             }
@@ -468,6 +1143,7 @@ impl HealManager {
         let active_heals = self.active_heals.clone();
         let cancel_token = self.cancel_token.clone();
         let storage = self.storage.clone();
+        let notify = self.notify.clone();
         let mut duration = {
             let config = config.read().await;
             config.heal_interval
@@ -475,15 +1151,34 @@ impl HealManager {
         if duration < Duration::from_secs(10) {
             duration = Duration::from_secs(10);
         }
-        info!("start_auto_disk_scanner: Starting auto disk scanner with interval: {:?}", duration);
+        info!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_AUTO_SCAN_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+            state = "started",
+            interval = ?duration,
+            "Heal auto disk scanner started"
+        );
 
         tokio::spawn(async move {
             let mut interval = interval(duration);
 
             loop {
+                let mut candidate_count = 0usize;
+                let mut skipped_duplicate_count = 0usize;
+                let mut skipped_invalid_count = 0usize;
+                let mut enqueued_count = 0usize;
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
-                        info!("start_auto_disk_scanner: Auto disk scanner received shutdown signal");
+                        info!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_AUTO_SCAN_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                            state = "shutdown",
+                            "Heal auto disk scanner stopped"
+                        );
                         break;
                     }
                     _ = interval.tick() => {
@@ -494,12 +1189,29 @@ impl HealManager {
                                 // detect unformatted disk via get_disk_id()
                                 match disk.get_disk_id().await {
                                     Err(DiskError::UnformattedDisk) => {
-                                        info!("start_auto_disk_scanner: Detected unformatted disk: {}", disk.endpoint());
+                                        candidate_count += 1;
+                                        debug!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_AUTO_SCAN_DISK,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                            endpoint = %disk.endpoint(),
+                                            disk_state = "unformatted",
+                                            "Heal auto-scan candidate detected"
+                                        );
                                         endpoints.push(disk.endpoint());
                                     }
                                     Err(e) => {
-                                        // Log other errors for debugging
-                                        tracing::warn!("start_auto_disk_scanner: Disk {} check failed: {:?}", disk.endpoint(), e);
+                                        warn!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_AUTO_SCAN_DISK,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                            endpoint = %disk.endpoint(),
+                                            disk_state = "check_failed",
+                                            error = ?e,
+                                            "Heal auto-scan disk inspection failed"
+                                        );
                                     }
                                     Ok(_) => {
                                         // Disk is formatted, no action needed
@@ -509,7 +1221,14 @@ impl HealManager {
                         }
 
                         if endpoints.is_empty() {
-                            debug!("start_auto_disk_scanner: No endpoints need healing");
+                            debug!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_AUTO_SCAN_STATE,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                state = "idle",
+                                "Heal auto disk scanner idle"
+                            );
                             continue;
                         }
 
@@ -517,7 +1236,15 @@ impl HealManager {
                         let buckets = match storage.list_buckets().await {
                             Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
                             Err(e) => {
-                                error!("start_auto_disk_scanner: Failed to get bucket list for auto healing: {}", e);
+                                error!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_AUTO_SCAN_STATE,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                    state = "bucket_list_failed",
+                                    error = %e,
+                                    "Heal auto-scan bucket listing failed"
+                                );
                                 continue;
                             }
                         };
@@ -527,7 +1254,16 @@ impl HealManager {
                             let Some(set_disk_id) =
                                 crate::heal::utils::format_set_disk_id_from_i32(ep.pool_idx, ep.set_idx)
                             else {
-                                warn!("start_auto_disk_scanner: Skipping endpoint {} without valid pool/set index", ep);
+                                warn!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                    endpoint = %ep,
+                                    result = "skipped_invalid_set_disk_id",
+                                    "Heal auto-scan enqueue skipped"
+                                );
+                                skipped_invalid_count += 1;
                                 continue;
                             };
                             // skip if already queued or healing
@@ -553,7 +1289,17 @@ impl HealManager {
                             }
 
                             if skip {
-                                info!("start_auto_disk_scanner: Skipping auto erasure set heal for endpoint: {} (set_disk_id: {}) because it is already queued or healing", ep, set_disk_id);
+                                skipped_duplicate_count += 1;
+                                debug!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                    endpoint = %ep,
+                                    set_disk_id,
+                                    result = "skipped_duplicate",
+                                    "Heal auto-scan duplicate skipped"
+                                );
                                 continue;
                             }
 
@@ -567,9 +1313,38 @@ impl HealManager {
                                 HealPriority::Normal,
                             );
                             let mut queue = heal_queue.lock().await;
-                            queue.push(req);
-                            info!("start_auto_disk_scanner: Enqueued auto erasure set heal for endpoint: {} (set_disk_id: {})", ep, set_disk_id);
+                            if matches!(queue.push(req), QueuePushOutcome::Accepted) {
+                                publish_heal_queue_length(&queue);
+                                let config = config.read().await;
+                                if config.event_driven_scheduler_enable {
+                                    notify.notify_one();
+                                }
+                                enqueued_count += 1;
+                                debug!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                    endpoint = %ep,
+                                    set_disk_id,
+                                    bucket_count = buckets.len(),
+                                    result = "enqueued",
+                                    "Heal auto-scan task enqueued"
+                                );
+                            }
                         }
+                        info!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_AUTO_SCAN_STATE,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                            state = "cycle_completed",
+                            candidate_count,
+                            enqueued_count,
+                            skipped_duplicate_count,
+                            skipped_invalid_count,
+                            "Heal auto-scan cycle completed"
+                        );
                     }
                 }
             }
@@ -582,12 +1357,15 @@ impl HealManager {
     async fn process_heal_queue(
         heal_queue: &Arc<Mutex<PriorityHealQueue>>,
         active_heals: &Arc<Mutex<HashMap<String, Arc<HealTask>>>>,
+        completed_heals: &Arc<Mutex<HashMap<String, CompletedHealStatus>>>,
         config: &Arc<RwLock<HealConfig>>,
         statistics: &Arc<RwLock<HealStatistics>>,
         storage: &Arc<dyn HealStorageAPI>,
+        notify: &Arc<Notify>,
     ) {
         let config = config.read().await;
         let mut active_heals_guard = active_heals.lock().await;
+        publish_active_heal_count(&active_heals_guard);
 
         // Check if new heal tasks can be started
         let active_count = active_heals_guard.len();
@@ -600,47 +1378,112 @@ impl HealManager {
 
         let mut queue = heal_queue.lock().await;
         let queue_len = queue.len();
+        publish_heal_queue_length(&queue);
 
         if queue_len == 0 {
             return;
         }
 
-        // Process multiple tasks if:
-        // 1. We have available slots
-        // 2. Queue is not empty
-        // Prioritize urgent/high priority tasks by processing up to 2 tasks per cycle if available
-        let tasks_to_process = if queue_len > 0 {
-            std::cmp::min(available_slots, std::cmp::min(2, queue_len))
-        } else {
-            0
-        };
+        let mut running_per_set = running_erasure_set_counts(&active_heals_guard);
+        let mut tasks_started = 0usize;
 
-        for _ in 0..tasks_to_process {
-            if let Some(request) = queue.pop() {
+        for _ in 0..available_slots {
+            let selected_request = if config.set_bulkhead_enable {
+                let max_concurrent_per_set = config.max_concurrent_per_set;
+                let (selected_request, skipped_sets) = queue.pop_runnable_with_skips(
+                    |request| can_schedule_request(request, &running_per_set, max_concurrent_per_set),
+                    |request| heal_request_set_key(request).map(|_| heal_request_set_metric_label(request)),
+                );
+                for skipped_set in skipped_sets {
+                    record_scheduler_skip(&skipped_set);
+                }
+                selected_request
+            } else {
+                queue.pop_next()
+            };
+
+            if let Some(request) = selected_request {
                 let task_priority = request.priority;
+                let task_type_label = heal_request_type_label(&request).to_string();
+                let task_set_label = heal_request_set_metric_label(&request);
+                if config.set_bulkhead_enable
+                    && let Some(set_key) = heal_request_set_key(&request)
+                {
+                    *running_per_set.entry(set_key).or_insert(0) += 1;
+                }
                 let task = Arc::new(HealTask::from_request(request, storage.clone()));
                 let task_id = task.id.clone();
                 active_heals_guard.insert(task_id.clone(), task.clone());
+                publish_active_heal_count(&active_heals_guard);
+                update_task_running_metric_for_task(&active_heals_guard, task.as_ref());
                 let active_heals_clone = active_heals.clone();
+                let completed_heals_clone = completed_heals.clone();
                 let statistics_clone = statistics.clone();
+                let notify_clone = notify.clone();
+                let task_type_label_for_spawn = task_type_label.clone();
+                let task_set_label_for_spawn = task_set_label.clone();
 
                 // start heal task
                 tokio::spawn(async move {
-                    info!("Starting heal task: {} with priority: {:?}", task_id, task_priority);
+                    debug!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_SCHEDULER_STATE,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        task_id,
+                        priority = ?task_priority,
+                        heal_type = %task_type_label_for_spawn,
+                        set = %task_set_label_for_spawn,
+                        state = "task_started",
+                        "Heal scheduler task started"
+                    );
                     let result = task.execute().await;
                     match result {
                         Ok(_) => {
-                            info!("Heal task completed successfully: {}", task_id);
+                            debug!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_SCHEDULER_STATE,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_MANAGER,
+                                task_id,
+                                heal_type = %task_type_label_for_spawn,
+                                set = %task_set_label_for_spawn,
+                                state = "task_completed",
+                                "Heal scheduler task completed"
+                            );
                         }
                         Err(e) => {
-                            error!("Heal task failed: {} - {}", task_id, e);
+                            error!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_SCHEDULER_STATE,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_MANAGER,
+                                task_id,
+                                heal_type = %task_type_label_for_spawn,
+                                set = %task_set_label_for_spawn,
+                                state = "task_failed",
+                                error = %e,
+                                "Heal scheduler task failed"
+                            );
                         }
                     }
                     let mut active_heals_guard = active_heals_clone.lock().await;
                     if let Some(completed_task) = active_heals_guard.remove(&task_id) {
+                        publish_active_heal_count(&active_heals_guard);
+                        update_task_running_metric_for_task(&active_heals_guard, completed_task.as_ref());
+                        let completed_status = completed_task.get_status().await;
+                        let completed_status_entry = CompletedHealStatus {
+                            heal_type: completed_task.heal_type.clone(),
+                            status: completed_status.clone(),
+                            result_items: completed_task.get_result_items().await,
+                            completed_at: SystemTime::now(),
+                        };
+                        let mut completed_heals_guard = completed_heals_clone.lock().await;
+                        prune_completed_heal_statuses(&mut completed_heals_guard);
+                        completed_heals_guard.insert(task_id.clone(), completed_status_entry);
                         // update statistics
                         let mut stats = statistics_clone.write().await;
-                        match completed_task.get_status().await {
+                        match completed_status {
                             HealTaskStatus::Completed => {
                                 stats.update_task_completion(true);
                             }
@@ -650,7 +1493,9 @@ impl HealManager {
                         }
                         stats.update_running_tasks(active_heals_guard.len() as u64);
                     }
+                    notify_clone.notify_one();
                 });
+                tasks_started += 1;
             } else {
                 break;
             }
@@ -658,13 +1503,25 @@ impl HealManager {
 
         // Update statistics for all started tasks
         let mut stats = statistics.write().await;
-        stats.total_tasks += tasks_to_process as u64;
+        stats.total_tasks += tasks_started as u64;
+        stats.update_running_tasks(active_heals_guard.len() as u64);
+        publish_active_heal_count(&active_heals_guard);
+        publish_heal_queue_length(&queue);
 
         // Log queue status if items remain
         if !queue.is_empty() {
             let remaining = queue.len();
             if remaining > 10 {
-                info!("Heal queue has {} pending requests, {} tasks active", remaining, active_heals_guard.len());
+                info!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_QUEUE_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    queue_len = remaining,
+                    active_tasks = active_heals_guard.len(),
+                    state = "backlog_high",
+                    "Heal queue backlog high"
+                );
             }
         }
     }
@@ -681,10 +1538,192 @@ impl std::fmt::Debug for HealManager {
     }
 }
 
+fn heal_request_set_key(request: &HealRequest) -> Option<String> {
+    match &request.heal_type {
+        HealType::ErasureSet { set_disk_id, .. } => Some(set_disk_id.clone()),
+        _ => None,
+    }
+}
+
+fn heal_request_type_label(request: &HealRequest) -> &'static str {
+    match &request.heal_type {
+        HealType::Object { .. } => "object",
+        HealType::Bucket { .. } => "bucket",
+        HealType::ErasureSet { .. } => "erasure_set",
+        HealType::Metadata { .. } => "metadata",
+        HealType::MRF { .. } => "mrf",
+        HealType::ECDecode { .. } => "ec_decode",
+    }
+}
+
+fn heal_request_set_metric_label(request: &HealRequest) -> String {
+    heal_request_set_key(request).unwrap_or_else(|| match (request.options.pool_index, request.options.set_index) {
+        (Some(pool), Some(set)) => format!("pool_{pool}_set_{set}"),
+        _ => "global".to_string(),
+    })
+}
+
+fn record_scheduler_skip(set_label: &str) {
+    counter!(
+        "rustfs_heal_scheduler_skip_total",
+        "reason" => "set_limit".to_string(),
+        "set" => set_label.to_string()
+    )
+    .increment(1);
+}
+
+fn update_task_running_metric_for_task(active_heals: &HashMap<String, Arc<HealTask>>, task: &HealTask) {
+    let type_label = task.metric_type_label();
+    let set_label = task.metric_set_label();
+    let count = active_heals
+        .values()
+        .filter(|active_task| active_task.metric_type_label() == type_label && active_task.metric_set_label() == set_label)
+        .count();
+
+    gauge!(
+        "rustfs_heal_task_running",
+        "type" => type_label.to_string(),
+        "set" => set_label.clone()
+    )
+    .set(count as f64);
+}
+
+fn running_erasure_set_counts(active_heals: &HashMap<String, Arc<HealTask>>) -> HashMap<String, usize> {
+    let mut running = HashMap::new();
+    for task in active_heals.values() {
+        if let HealType::ErasureSet { set_disk_id, .. } = &task.heal_type {
+            *running.entry(set_disk_id.clone()).or_insert(0) += 1;
+        }
+    }
+    running
+}
+
+fn prune_completed_heal_statuses(completed_heals: &mut HashMap<String, CompletedHealStatus>) {
+    let Ok(now) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
+        return;
+    };
+
+    completed_heals.retain(|_, completed| {
+        completed
+            .completed_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|completed_at| now.saturating_sub(completed_at) <= KEEP_HEAL_TASK_STATUS_DURATION)
+            .unwrap_or(false)
+    });
+}
+
+fn can_schedule_request(request: &HealRequest, running_per_set: &HashMap<String, usize>, max_concurrent_per_set: usize) -> bool {
+    match heal_request_set_key(request) {
+        Some(set_key) => running_per_set.get(&set_key).copied().unwrap_or(0) < max_concurrent_per_set,
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heal::storage::HealStorageAPI;
     use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealType};
+    use rustfs_common::heal_channel::HealOpts;
+    use rustfs_ecstore::disk::{DiskStore, endpoint::Endpoint};
+    use rustfs_madmin::heal_commands::HealResultItem;
+    use rustfs_storage_api::BucketInfo;
+
+    struct MockStorage;
+
+    #[async_trait::async_trait]
+    impl HealStorageAPI for MockStorage {
+        async fn get_object_meta(&self, _bucket: &str, _object: &str) -> Result<Option<rustfs_ecstore::store_api::ObjectInfo>> {
+            Ok(None)
+        }
+
+        async fn get_object_data(&self, _bucket: &str, _object: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        async fn put_object_data(&self, _bucket: &str, _object: &str, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_object(&self, _bucket: &str, _object: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn verify_object_integrity(&self, _bucket: &str, _object: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_disk_status(&self, _endpoint: &Endpoint) -> Result<crate::heal::storage::DiskStatus> {
+            Ok(crate::heal::storage::DiskStatus::Ok)
+        }
+
+        async fn format_disk(&self, _endpoint: &Endpoint) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_bucket_info(&self, _bucket: &str) -> Result<Option<BucketInfo>> {
+            Ok(None)
+        }
+
+        async fn heal_bucket_metadata(&self, _bucket: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn object_exists(&self, _bucket: &str, _object: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn get_object_size(&self, _bucket: &str, _object: &str) -> Result<Option<u64>> {
+            Ok(None)
+        }
+
+        async fn get_object_checksum(&self, _bucket: &str, _object: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn heal_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _version_id: Option<&str>,
+            _opts: &HealOpts,
+        ) -> Result<(HealResultItem, Option<Error>)> {
+            Ok((HealResultItem::default(), None))
+        }
+
+        async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
+            Ok(HealResultItem::default())
+        }
+
+        async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
+            Ok((HealResultItem::default(), None))
+        }
+
+        async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_objects_for_heal_page(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _continuation_token: Option<&str>,
+        ) -> Result<(Vec<String>, Option<String>, bool)> {
+            Ok((Vec::new(), None, false))
+        }
+
+        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> Result<DiskStore> {
+            Err(Error::other("not implemented in tests"))
+        }
+    }
 
     #[test]
     fn test_priority_queue_ordering() {
@@ -724,10 +1763,10 @@ mod tests {
         );
 
         // Add in random order: low, high, normal, urgent
-        assert!(queue.push(low_req));
-        assert!(queue.push(high_req));
-        assert!(queue.push(normal_req));
-        assert!(queue.push(urgent_req));
+        assert_eq!(queue.push(low_req), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(high_req), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(normal_req), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(urgent_req), QueuePushOutcome::Accepted);
 
         assert_eq!(queue.len(), 4);
 
@@ -780,9 +1819,9 @@ mod tests {
         let id2 = req2.id.clone();
         let id3 = req3.id.clone();
 
-        assert!(queue.push(req1));
-        assert!(queue.push(req2));
-        assert!(queue.push(req3));
+        assert_eq!(queue.push(req1), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(req2), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(req3), QueuePushOutcome::Accepted);
 
         // Should maintain FIFO order for same priority
         let popped1 = queue.pop().unwrap();
@@ -820,11 +1859,11 @@ mod tests {
         );
 
         // First request should be added
-        assert!(queue.push(req1));
+        assert_eq!(queue.push(req1), QueuePushOutcome::Accepted);
         assert_eq!(queue.len(), 1);
 
         // Second request with same object should be rejected (duplicate)
-        assert!(!queue.push(req2));
+        assert_eq!(queue.push(req2), QueuePushOutcome::Merged);
         assert_eq!(queue.len(), 1);
     }
 
@@ -841,7 +1880,7 @@ mod tests {
             HealPriority::Normal,
         );
 
-        assert!(queue.push(req));
+        assert_eq!(queue.push(req), QueuePushOutcome::Accepted);
         assert!(queue.contains_erasure_set("pool_0_set_1"));
         assert!(!queue.contains_erasure_set("pool_0_set_2"));
     }
@@ -929,7 +1968,8 @@ mod tests {
 
         for (heal_type, priority) in requests {
             let req = HealRequest::new(heal_type, HealOptions::default(), priority);
-            queue.push(req);
+            let outcome = queue.push(req);
+            assert_eq!(outcome, QueuePushOutcome::Accepted);
         }
 
         assert_eq!(queue.len(), 4);
@@ -954,32 +1994,41 @@ mod tests {
 
         // Add requests with different priorities
         for _ in 0..3 {
-            queue.push(HealRequest::new(
-                HealType::Bucket {
-                    bucket: format!("bucket-low-{}", queue.len()),
-                },
-                HealOptions::default(),
-                HealPriority::Low,
-            ));
+            assert_eq!(
+                queue.push(HealRequest::new(
+                    HealType::Bucket {
+                        bucket: format!("bucket-low-{}", queue.len()),
+                    },
+                    HealOptions::default(),
+                    HealPriority::Low,
+                )),
+                QueuePushOutcome::Accepted
+            );
         }
 
         for _ in 0..2 {
-            queue.push(HealRequest::new(
-                HealType::Bucket {
-                    bucket: format!("bucket-normal-{}", queue.len()),
-                },
-                HealOptions::default(),
-                HealPriority::Normal,
-            ));
+            assert_eq!(
+                queue.push(HealRequest::new(
+                    HealType::Bucket {
+                        bucket: format!("bucket-normal-{}", queue.len()),
+                    },
+                    HealOptions::default(),
+                    HealPriority::Normal,
+                )),
+                QueuePushOutcome::Accepted
+            );
         }
 
-        queue.push(HealRequest::new(
-            HealType::Bucket {
-                bucket: "bucket-high".to_string(),
-            },
-            HealOptions::default(),
-            HealPriority::High,
-        ));
+        assert_eq!(
+            queue.push(HealRequest::new(
+                HealType::Bucket {
+                    bucket: "bucket-high".to_string(),
+                },
+                HealOptions::default(),
+                HealPriority::High,
+            )),
+            QueuePushOutcome::Accepted
+        );
 
         let stats = queue.get_priority_stats();
 
@@ -995,18 +2044,661 @@ mod tests {
 
         assert!(queue.is_empty());
 
-        queue.push(HealRequest::new(
-            HealType::Bucket {
-                bucket: "test".to_string(),
-            },
-            HealOptions::default(),
-            HealPriority::Normal,
-        ));
+        assert_eq!(
+            queue.push(HealRequest::new(
+                HealType::Bucket {
+                    bucket: "test".to_string(),
+                },
+                HealOptions::default(),
+                HealPriority::Normal,
+            )),
+            QueuePushOutcome::Accepted
+        );
 
         assert!(!queue.is_empty());
 
         queue.pop();
 
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_priority_queue_pop_runnable_skips_blocked_erasure_set() {
+        let mut queue = PriorityHealQueue::new();
+
+        let blocked = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-a".to_string()],
+                set_disk_id: "pool_0_set_1".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Urgent,
+        );
+        let runnable = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket-b".to_string()],
+                set_disk_id: "pool_0_set_2".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        assert_eq!(queue.push(blocked), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(runnable.clone()), QueuePushOutcome::Accepted);
+
+        let mut running = HashMap::new();
+        running.insert("pool_0_set_1".to_string(), 1);
+
+        let popped = queue
+            .pop_runnable(|request| can_schedule_request(request, &running, 1))
+            .expect("should find runnable request");
+
+        match popped.heal_type {
+            HealType::ErasureSet { set_disk_id, .. } => assert_eq!(set_disk_id, "pool_0_set_2"),
+            other => panic!("expected erasure set request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_can_schedule_request_respects_per_set_limit() {
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: vec!["bucket".to_string()],
+                set_disk_id: "pool_0_set_1".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        let mut running = HashMap::new();
+        running.insert("pool_0_set_1".to_string(), 1);
+
+        assert!(!can_schedule_request(&request, &running, 1));
+        assert!(can_schedule_request(&request, &running, 2));
+    }
+
+    #[tokio::test]
+    async fn test_submit_heal_request_returns_merged_for_duplicate() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket".to_string(),
+                object: "object".to_string(),
+                version_id: None,
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+
+        assert_eq!(
+            manager
+                .submit_heal_request(request.clone())
+                .await
+                .expect("first request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(request)
+                .await
+                .expect("duplicate request should produce admission result"),
+            HealAdmissionResult::Merged
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_reports_pending_for_queued_request() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let request = HealRequest::bucket("bucket".to_string());
+        let request_id = request.id.clone();
+
+        assert_eq!(
+            manager
+                .submit_heal_request(request)
+                .await
+                .expect("request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .get_task_status(&request_id)
+                .await
+                .expect("queued request should have status"),
+            HealTaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_for_path_rejects_wrong_token_when_path_is_active() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        manager
+            .submit_heal_request(HealRequest::bucket("bucket".to_string()))
+            .await
+            .expect("request should be accepted");
+
+        assert!(matches!(
+            manager.get_task_status_for_path("bucket", "wrong-token").await,
+            Err(Error::InvalidClientToken)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_for_path_rejects_token_from_other_active_path() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let bucket_request = HealRequest::bucket("bucket".to_string());
+        let other_request = HealRequest::bucket("other".to_string());
+        let other_request_id = other_request.id.clone();
+
+        manager
+            .submit_heal_request(bucket_request)
+            .await
+            .expect("bucket request should be accepted");
+        manager
+            .submit_heal_request(other_request)
+            .await
+            .expect("other request should be accepted");
+
+        assert!(matches!(
+            manager.get_task_status_for_path("bucket", &other_request_id).await,
+            Err(Error::InvalidClientToken)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_for_path_does_not_accept_token_from_inactive_path() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let request = HealRequest::bucket("bucket".to_string());
+        let request_id = request.id.clone();
+
+        manager
+            .submit_heal_request(request)
+            .await
+            .expect("request should be accepted");
+
+        assert!(matches!(
+            manager.get_task_status_for_path("other", &request_id).await,
+            Err(Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_for_path_returns_not_found_when_path_is_inactive() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        assert!(matches!(
+            manager.get_task_status_for_path("bucket", "old-token").await,
+            Err(Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_for_empty_path_does_not_match_unrelated_tasks() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let request = HealRequest::bucket("bucket".to_string());
+        let request_id = request.id.clone();
+
+        manager
+            .submit_heal_request(request)
+            .await
+            .expect("request should be accepted");
+
+        assert!(matches!(
+            manager.get_task_status_for_path("", &request_id).await,
+            Err(Error::TaskNotFound { .. })
+        ));
+        assert!(matches!(
+            manager.get_task_status_for_path("", "wrong-token").await,
+            Err(Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_task_status_reads_recent_completed_status() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        manager.completed_heals.lock().await.insert(
+            "completed-token".to_string(),
+            CompletedHealStatus {
+                heal_type: HealType::Bucket {
+                    bucket: "bucket".to_string(),
+                },
+                status: HealTaskStatus::Completed,
+                result_items: Vec::new(),
+                completed_at: SystemTime::now(),
+            },
+        );
+
+        assert_eq!(
+            manager
+                .get_task_status_for_path("bucket", "completed-token")
+                .await
+                .expect("recent completed task should be queryable"),
+            HealTaskStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_task_report_for_path_reads_completed_items() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        manager.completed_heals.lock().await.insert(
+            "completed-token".to_string(),
+            CompletedHealStatus {
+                heal_type: HealType::Object {
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    version_id: None,
+                },
+                status: HealTaskStatus::Completed,
+                result_items: vec![HealResultItem {
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    object_size: 1024,
+                    ..Default::default()
+                }],
+                completed_at: SystemTime::now(),
+            },
+        );
+
+        let report = manager
+            .get_task_report_for_path("bucket/object", "completed-token")
+            .await
+            .expect("recent completed task report should be queryable");
+
+        assert_eq!(report.status, HealTaskStatus::Completed);
+        assert_eq!(report.result_items.len(), 1);
+        assert_eq!(report.result_items[0].object_size, 1024);
+    }
+
+    #[tokio::test]
+    async fn test_get_task_report_for_empty_path_does_not_match_unrelated_tasks() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        manager
+            .submit_heal_request(HealRequest::bucket("bucket".to_string()))
+            .await
+            .expect("request should be accepted");
+
+        assert!(matches!(
+            manager.get_task_report_for_path("", "wrong-token").await,
+            Err(Error::TaskNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_task_removes_queued_request() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let request = HealRequest::bucket("bucket".to_string());
+        let request_id = request.id.clone();
+
+        manager
+            .submit_heal_request(request)
+            .await
+            .expect("request should be accepted");
+        manager
+            .cancel_task(&request_id)
+            .await
+            .expect("queued request should be cancelled");
+
+        assert!(matches!(manager.get_task_status(&request_id).await, Err(Error::TaskNotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_tasks_for_path_removes_matching_queued_requests() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let bucket_request = HealRequest::bucket("bucket".to_string());
+        let bucket_request_id = bucket_request.id.clone();
+        let other_request = HealRequest::bucket("other".to_string());
+        let other_request_id = other_request.id.clone();
+
+        manager
+            .submit_heal_request(bucket_request)
+            .await
+            .expect("bucket request should be accepted");
+        manager
+            .submit_heal_request(other_request)
+            .await
+            .expect("other request should be accepted");
+
+        assert_eq!(
+            manager
+                .cancel_tasks_for_path("bucket")
+                .await
+                .expect("matching request should be cancelled"),
+            1
+        );
+        assert!(matches!(
+            manager.get_task_status(&bucket_request_id).await,
+            Err(Error::TaskNotFound { .. })
+        ));
+        assert_eq!(
+            manager
+                .get_task_status(&other_request_id)
+                .await
+                .expect("unmatched request should remain queued"),
+            HealTaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_heal_request_returns_merged_before_full_for_duplicate() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                ..HealConfig::default()
+            }),
+        );
+
+        let request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket".to_string(),
+                object: "object".to_string(),
+                version_id: None,
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+
+        assert_eq!(
+            manager
+                .submit_heal_request(request.clone())
+                .await
+                .expect("first request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(request)
+                .await
+                .expect("duplicate request should merge even when queue is full"),
+            HealAdmissionResult::Merged
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_heal_request_returns_dropped_for_low_priority_when_full() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                low_priority_drop_when_full: true,
+                ..HealConfig::default()
+            }),
+        );
+
+        let accepted = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+        let dropped = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-b".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+
+        assert_eq!(
+            manager
+                .submit_heal_request(accepted)
+                .await
+                .expect("first request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(dropped)
+                .await
+                .expect("low priority request should be dropped with explicit admission result"),
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_high_priority_request_displaces_lower_priority_when_queue_full() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                ..HealConfig::default()
+            }),
+        );
+
+        let low = HealRequest::new(
+            HealType::Bucket {
+                bucket: "background-bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        let low_id = low.id.clone();
+        let high = HealRequest::new(
+            HealType::Bucket {
+                bucket: "manual-bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::High,
+        );
+        let high_id = high.id.clone();
+
+        assert_eq!(
+            manager
+                .submit_heal_request(low)
+                .await
+                .expect("low priority request should be accepted first"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(high)
+                .await
+                .expect("high priority request should be admitted by displacing lower priority work"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(manager.get_queue_length().await, 1);
+        assert!(matches!(manager.get_task_status(&low_id).await, Err(Error::TaskNotFound { .. })));
+        assert_eq!(
+            manager
+                .get_task_status(&high_id)
+                .await
+                .expect("high priority request should remain queued"),
+            HealTaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_start_bypasses_duplicate_and_full_admission() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                low_priority_drop_when_full: true,
+                ..HealConfig::default()
+            }),
+        );
+
+        let normal = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        let mut forced_duplicate = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        forced_duplicate.force_start = true;
+
+        let subsequent_duplicate = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+
+        assert_eq!(
+            manager
+                .submit_heal_request(normal)
+                .await
+                .expect("first request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(forced_duplicate)
+                .await
+                .expect("force start should bypass duplicate/full policy"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(subsequent_duplicate)
+                .await
+                .expect("subsequent non-force duplicate should be merged"),
+            HealAdmissionResult::Merged
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_start_marks_dedup_key_for_future_duplicates() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                ..HealConfig::default()
+            }),
+        );
+
+        let normal = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        let mut forced = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+        forced.force_start = true;
+        let duplicate = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Low,
+        );
+
+        assert_eq!(
+            manager
+                .submit_heal_request(normal)
+                .await
+                .expect("first request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(forced)
+                .await
+                .expect("forced request should bypass duplicate/full admission"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(duplicate)
+                .await
+                .expect("non-forced duplicate should merge while forced request is queued"),
+            HealAdmissionResult::Merged
+        );
+    }
+
+    #[test]
+    fn test_running_erasure_set_counts_groups_only_erasure_tasks() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let erasure_task = Arc::new(HealTask::from_request(
+            HealRequest::new(
+                HealType::ErasureSet {
+                    buckets: vec!["bucket".to_string()],
+                    set_disk_id: "pool_0_set_1".to_string(),
+                },
+                HealOptions::default(),
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        ));
+        let object_task = Arc::new(HealTask::from_request(
+            HealRequest::new(
+                HealType::Object {
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    version_id: None,
+                },
+                HealOptions::default(),
+                HealPriority::Normal,
+            ),
+            storage,
+        ));
+
+        let mut active = HashMap::new();
+        active.insert(erasure_task.id.clone(), erasure_task);
+        active.insert(object_task.id.clone(), object_task);
+
+        let counts = running_erasure_set_counts(&active);
+        assert_eq!(counts.get("pool_0_set_1"), Some(&1));
+        assert_eq!(counts.len(), 1);
+    }
+
+    #[test]
+    fn test_heal_config_respects_feature_flags() {
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE, Some("false")),
+                (rustfs_config::ENV_HEAL_SET_BULKHEAD_ENABLE, Some("false")),
+                (rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE, Some("false")),
+            ],
+            || {
+                let config = HealConfig::default();
+                assert!(!config.event_driven_scheduler_enable);
+                assert!(!config.set_bulkhead_enable);
+                assert!(!config.page_parallel_enable);
+            },
+        );
     }
 }

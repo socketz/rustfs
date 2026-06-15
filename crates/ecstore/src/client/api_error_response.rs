@@ -36,6 +36,8 @@ pub struct ErrorResponse {
     pub bucket_name: String,
     pub key: String,
     pub resource: String,
+    // External S3-style error response contract: keep `RequestId`.
+    #[serde(rename = "RequestId")]
     pub request_id: String,
     pub host_id: String,
     pub region: String,
@@ -100,7 +102,7 @@ pub fn http_resp_to_error_response(
     bucket_name: &str,
     object_name: &str,
 ) -> ErrorResponse {
-    let err_body = String::from_utf8(b).unwrap();
+    let err_body = String::from_utf8_lossy(&b).to_string();
     if h.is_empty() || resp_status.is_client_error() || resp_status.is_server_error() {
         return ErrorResponse {
             status_code: resp_status,
@@ -178,36 +180,46 @@ pub fn http_resp_to_error_response(
                 };
             }
         }
-    } else {
-        err_resp = err_resp_.unwrap();
+    } else if let Ok(parsed_resp) = err_resp_ {
+        err_resp = parsed_resp;
     }
     err_resp.status_code = resp_status;
     if let Some(server_name) = h.get("Server") {
-        err_resp.server = server_name.to_str().expect("err").to_string();
+        if let Ok(server_str) = server_name.to_str() {
+            err_resp.server = server_str.to_string();
+        }
     }
 
-    let code = h.get("x-minio-error-code");
-    if code.is_some() {
-        err_resp.code = S3ErrorCode::Custom(code.expect("err").to_str().expect("err").into());
+    if let Some(code) = h.get("x-minio-error-code") {
+        if let Ok(code_str) = code.to_str() {
+            err_resp.code = S3ErrorCode::Custom(code_str.into());
+        }
     }
-    let desc = h.get("x-minio-error-desc");
-    if desc.is_some() {
-        err_resp.message = desc.expect("err").to_str().expect("err").trim_matches('"').to_string();
+    if let Some(desc) = h.get("x-minio-error-desc") {
+        if let Ok(desc_str) = desc.to_str() {
+            err_resp.message = desc_str.trim_matches('"').to_string();
+        }
     }
 
     if err_resp.request_id == "" {
         if let Some(x_amz_request_id) = h.get("x-amz-request-id") {
-            err_resp.request_id = x_amz_request_id.to_str().expect("err").to_string();
+            if let Ok(request_id_str) = x_amz_request_id.to_str() {
+                err_resp.request_id = request_id_str.to_string();
+            }
         }
     }
     if err_resp.host_id == "" {
         if let Some(x_amz_id_2) = h.get("x-amz-id-2") {
-            err_resp.host_id = x_amz_id_2.to_str().expect("err").to_string();
+            if let Ok(host_id_str) = x_amz_id_2.to_str() {
+                err_resp.host_id = host_id_str.to_string();
+            }
         }
     }
     if err_resp.region == "" {
         if let Some(x_amz_bucket_region) = h.get("x-amz-bucket-region") {
-            err_resp.region = x_amz_bucket_region.to_str().expect("err").to_string();
+            if let Ok(region_str) = x_amz_bucket_region.to_str() {
+                err_resp.region = region_str.to_string();
+            }
         }
     }
     if err_resp.code == S3ErrorCode::InvalidLocationConstraint/*InvalidRegion*/ && err_resp.region != "" {
@@ -290,5 +302,31 @@ pub fn err_api_not_supported(message: &str) -> ErrorResponse {
         message: message.to_string(),
         request_id: "rustfs".to_string(),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn error_response_serializes_request_id_as_pascal_case_contract() {
+        let response = ErrorResponse {
+            code: S3ErrorCode::InvalidArgument,
+            message: "bad request".to_string(),
+            bucket_name: "bucket".to_string(),
+            key: "key".to_string(),
+            resource: "/bucket/key".to_string(),
+            request_id: "req-xml-123".to_string(),
+            host_id: "host-1".to_string(),
+            region: "us-east-1".to_string(),
+            server: "rustfs".to_string(),
+            status_code: StatusCode::BAD_REQUEST,
+        };
+
+        let value = serde_json::to_value(response).expect("error response should serialize");
+        assert_eq!(value["RequestId"], Value::String("req-xml-123".to_string()));
+        assert!(value.get("request_id").is_none(), "external error contract must not expose request_id");
     }
 }

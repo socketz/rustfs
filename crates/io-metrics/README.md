@@ -4,9 +4,6 @@
   <a href="https://github.com/rustfs/rustfs/actions/workflows/ci.yml">
     <img src="https://github.com/rustfs/rustfs/actions/workflows/ci.yml/badge.svg" alt="CI Status" />
   </a>
-  <a href="https://docs.rs/rustfs-io-metrics">
-    <img src="https://docs.rs/rustfs-io-metrics/badge.svg" alt="Documentation" />
-  </a>
   <a href="https://crates.io/crates/rustfs-io-metrics">
     <img src="https://img.shields.io/crates/v/rustfs-io-metrics.svg" alt="Crates.io" />
   </a>
@@ -14,7 +11,7 @@
 
 <p align="center">
   · <a href="https://github.com/rustfs/rustfs">Home</a>
-  · <a href="https://docs.rs/rustfs-io-metrics">Docs</a>
+  · <a href="#documentation">Docs</a>
   · <a href="https://github.com/rustfs/rustfs/issues">Issues</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">Discussions</a>
 </p>
@@ -31,6 +28,7 @@
 - **Bandwidth Monitoring**: Real-time bandwidth observation and analysis
 - **Performance Metrics**: I/O performance metrics collection
 - **Unified Configuration**: Centralized configuration management
+- **Exporter Boundary**: Emit via `metrics`, export via `rustfs-obs`, no Prometheus HTTP endpoint
 
 ## Features
 
@@ -145,6 +143,66 @@ record_backpressure_event("warning", 0.85);
 record_timeout_event("GetObject", Duration::from_secs(30));
 ```
 
+### Internode Transport Metrics
+
+Internode metrics are recorded by `src/internode_metrics.rs`. Aggregate metrics
+remain unlabeled for compatibility with existing dashboards:
+
+| Metric | Meaning |
+| --- | --- |
+| `rustfs_system_network_internode_sent_bytes_total` | Total internode bytes sent by this node. |
+| `rustfs_system_network_internode_recv_bytes_total` | Total internode bytes received by this node. |
+| `rustfs_system_network_internode_requests_outgoing_total` | Total outgoing internode requests. |
+| `rustfs_system_network_internode_requests_incoming_total` | Total incoming internode requests. |
+| `rustfs_system_network_internode_errors_total` | Total internode errors. |
+| `rustfs_system_network_internode_dial_errors_total` | Failed internode connection attempts. |
+| `rustfs_system_network_internode_dial_avg_time_nanos` | Average internode dial duration. |
+
+Operation-level metrics use the same low-cardinality label set:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `rustfs_system_network_internode_operation_sent_bytes_total` | `operation`, `backend` | Bytes sent for an internode operation. |
+| `rustfs_system_network_internode_operation_recv_bytes_total` | `operation`, `backend` | Bytes received for an internode operation. |
+| `rustfs_system_network_internode_operation_requests_outgoing_total` | `operation`, `backend` | Outgoing request attempts for an internode operation. |
+| `rustfs_system_network_internode_operation_requests_incoming_total` | `operation`, `backend` | Incoming request attempts for an internode operation. |
+| `rustfs_system_network_internode_operation_errors_total` | `operation`, `backend` | Failed internode operation attempts. |
+| `rustfs_system_network_internode_operation_classified_errors_total` | `operation`, `backend`, `classification` | Classified internode transport failures. |
+| `rustfs_system_network_internode_operation_retries_total` | `operation`, `backend`, `classification` | Retry attempts for retryable internode transport failures. |
+| `rustfs_system_network_internode_operation_retry_successes_total` | `operation`, `backend`, `classification` | Successful recoveries after retryable internode transport failures. |
+| `rustfs_system_storage_erasure_write_quorum_failures_total` | `stage`, `dominant_error` | Erasure write quorum failures grouped by failure stage and dominant error class. |
+
+Current `operation` values are `read_file_stream`, `put_file_stream`,
+`walk_dir`, `grpc_read_all`, and `grpc_write_all`. Current `backend` values are
+`tcp-http` for the `InternodeDataTransport` TCP/HTTP path and `grpc` for the
+remaining gRPC byte paths. The compatibility wrapper uses `unknown` only for
+callers that have not been classified yet.
+
+Success/failure is intentionally not a high-cardinality label today. Failures
+are represented by `rustfs_system_network_internode_operation_errors_total`;
+successful completions are not emitted as a dedicated result-labeled metric.
+Adding completion/result labels is a follow-up once stream completion semantics
+are defined consistently for request setup, body transfer, and shutdown.
+
+Current low-cardinality `classification` values come from the TCP/HTTP internode
+path and include:
+
+- `connect_timeout`
+- `connection_refused`
+- `dns_resolution_failed`
+- `connection_reset`
+- `body_stream_aborted`
+- `http_429`
+- `http_502`
+- `http_503`
+- `http_504`
+- `http_status_other`
+- `unknown`
+
+`scripts/run_internode_transport_baseline.sh --metrics-url ...` records metric
+deltas with `operation` and `backend` columns, so the TCP baseline can attribute
+bytes and request/error counts to `tcp-http` transport operations.
+
 ### Unified Configuration
 
 Centralized configuration management:
@@ -183,6 +241,7 @@ rustfs-io-metrics/
 │   ├── deadlock_metrics.rs  # Deadlock metrics
 │   ├── lock_metrics.rs      # Lock metrics
 │   ├── timeout_metrics.rs   # Timeout metrics
+│   ├── internode_metrics.rs # Internode transport metrics
 │   ├── bandwidth.rs         # Bandwidth monitoring
 │   ├── global_metrics.rs    # Global metrics
 │   └── performance.rs       # Performance metrics
@@ -199,15 +258,28 @@ cargo test --package rustfs-io-metrics
 cargo test --package rustfs-io-metrics --lib adaptive_ttl
 
 # Run benchmarks
-cargo bench --package rustfs-io-metrics
+cargo bench --package rustfs-io-metrics --bench metrics_pipeline
 ```
 
 ## Documentation
 
-- [API Documentation](https://docs.rs/rustfs-io-metrics)
-- [Adaptive TTL Design](./docs/adaptive-ttl-design.md)
-- [Metrics Guide](./docs/metrics-guide.md)
-- [Configuration Reference](./docs/config-reference.md)
+This crate records metrics through the Rust `metrics` crate and leaves
+exporting to `rustfs-obs` or the application-level observability pipeline. It
+does not expose Prometheus-compatible HTTP endpoints such as
+`/rustfs/v2/metrics/cluster` or `/rustfs/v2/metrics/node`.
+
+API documentation can be generated locally:
+
+```bash
+cargo doc --package rustfs-io-metrics --no-deps --open
+```
+
+Useful source references:
+
+- [Crate API overview](./src/lib.rs)
+- [Metrics example](./examples/metrics_example.rs)
+- [Configuration module](./src/config.rs)
+- [Adaptive TTL module](./src/adaptive_ttl.rs)
 
 ## Related Modules
 

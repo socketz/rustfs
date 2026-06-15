@@ -14,18 +14,27 @@
 
 pub mod account_info;
 pub mod audit;
+mod audit_runtime_config;
 pub mod bucket_meta;
+pub mod config_admin;
 pub mod event;
+pub mod extensions;
 pub mod group;
 pub mod heal;
 pub mod health;
+pub(crate) mod iam_error;
 pub mod is_admin;
 pub mod kms;
 pub mod kms_dynamic;
 pub mod kms_keys;
 pub mod kms_management;
 pub mod metrics;
+pub mod module_switch;
+mod notify_runtime_access;
+pub mod object_zip_download;
 pub mod oidc;
+pub mod plugins_catalog;
+pub mod plugins_instances;
 pub mod policies;
 pub mod pools;
 pub mod profile;
@@ -33,11 +42,15 @@ pub mod profile_admin;
 pub mod quota;
 pub mod rebalance;
 pub mod replication;
+pub mod scanner;
 pub mod service_account;
 pub mod site_replication;
 pub mod sts;
 pub mod system;
+pub mod table_catalog;
+mod target_descriptor;
 pub mod tier;
+pub mod tls_debug;
 pub mod trace;
 pub mod user;
 pub mod user_iam;
@@ -52,7 +65,23 @@ mod tests {
     fn test_handler_struct_creation() {
         // Test that handler structs can be created
         let _account_handler = account_info::AccountInfoHandler {};
+        let _get_config_kv_handler = config_admin::GetConfigKVHandler {};
+        let _set_config_kv_handler = config_admin::SetConfigKVHandler {};
+        let _del_config_kv_handler = config_admin::DelConfigKVHandler {};
+        let _help_config_kv_handler = config_admin::HelpConfigKVHandler {};
+        let _get_config_handler = config_admin::GetConfigHandler {};
+        let _set_config_handler = config_admin::SetConfigHandler {};
         let _list_audit_targets = audit::ListAuditTargets {};
+        let _get_module_switches = module_switch::GetModuleSwitchesHandler {};
+        let _get_extension_catalog = extensions::GetExtensionCatalogHandler {};
+        let _list_extension_instances = extensions::ListExtensionInstancesHandler {};
+        let _get_plugin_catalog = plugins_catalog::GetPluginCatalogHandler {};
+        let _create_object_zip_download = object_zip_download::CreateObjectZipDownloadHandler {};
+        let _list_plugin_instances = plugins_instances::ListPluginInstancesHandler {};
+        let _get_plugin_instance = plugins_instances::GetPluginInstanceHandler {};
+        let _put_plugin_instance = plugins_instances::PutPluginInstanceHandler {};
+        let _delete_plugin_instance = plugins_instances::DeletePluginInstanceHandler {};
+        let _update_module_switches = module_switch::UpdateModuleSwitchesHandler {};
         let _service_handler = system::ServiceHandle {};
         let _server_info_handler = system::ServerInfoHandler {};
         let _inspect_data_handler = system::InspectDataHandler {};
@@ -61,15 +90,18 @@ mod tests {
         let _metrics_handler = metrics::MetricsHandler {};
         let _profile_handler = profile_admin::ProfileHandler {};
         let _profile_status_handler = profile_admin::ProfileStatusHandler {};
+        let _tls_status_handler = tls_debug::TlsStatusHandler {};
         let _heal_handler = heal::HealHandler {};
         let _bg_heal_handler = heal::BackgroundHealStatusHandler {};
         let _replication_metrics_handler = replication::GetReplicationMetricsHandler {};
         let _set_remote_target_handler = replication::SetRemoteTargetHandler {};
         let _list_remote_target_handler = replication::ListRemoteTargetHandler {};
         let _remove_remote_target_handler = replication::RemoveRemoteTargetHandler {};
+        let _scanner_status_handler = scanner::ScannerStatusHandler {};
         let _site_replication_add_handler = site_replication::SiteReplicationAddHandler {};
         let _site_replication_info_handler = site_replication::SiteReplicationInfoHandler {};
         let _site_replication_status_handler = site_replication::SiteReplicationStatusHandler {};
+        let _table_catalog_config_handler = table_catalog::GetCatalogConfigHandler {};
 
         // Just verify they can be created without panicking
         // Test passes if we reach this point without panicking

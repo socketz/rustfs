@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{DEFAULT_SECRET_KEY, ENV_RPC_SECRET, IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
+use crate::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ENV_RPC_SECRET, IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
+use base64_simd::URL_SAFE_NO_PAD;
+use hmac::{Hmac, KeyInit, Mac};
 use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::io::Error;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use time::OffsetDateTime;
 
 /// Global active credentials
@@ -28,6 +31,17 @@ static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
 
 /// Global RPC authentication token
 pub static GLOBAL_RUSTFS_RPC_SECRET: OnceLock<String> = OnceLock::new();
+
+/// Public error returned when RPC authentication is not safely configured.
+pub const RPC_SECRET_REQUIRED_MESSAGE: &str = "RPC authentication secret is not configured";
+
+/// Operator-facing guidance for configuring RPC authentication safely.
+pub const RPC_SECRET_REQUIRED_OPERATOR_MESSAGE: &str =
+    "RUSTFS_RPC_SECRET can be set explicitly; otherwise the RPC secret is derived from the active access/secret key pair";
+
+type HmacSha256 = Hmac<Sha256>;
+
+const RPC_SECRET_DERIVATION_CONTEXT: &[u8] = b"rustfs-rpc-secret:v1";
 
 /// Error type for credentials operations
 #[derive(Debug)]
@@ -204,24 +218,73 @@ pub fn gen_secret_key(length: usize) -> std::io::Result<String> {
     let mut key = vec![0u8; URL_SAFE_NO_PAD.estimated_decoded_length(length)];
     rng.fill_bytes(&mut key);
 
+    // URL_SAFE_NO_PAD uses "-" and "_" instead of "+" and "/", so "/" never
+    // appears in the output. The .replace("/", "+") was a dead no-op.
     let encoded = URL_SAFE_NO_PAD.encode_to_string(&key);
-    let key_str = encoded.replace("/", "+");
 
-    Ok(key_str)
+    Ok(encoded)
 }
 
-/// Get the RPC authentication token from environment variable
+/// Get the RPC authentication token from the environment or derive it from the active credentials.
 ///
 /// # Returns
 /// * `String` - The RPC authentication token
 ///
+fn normalize_rpc_secret(secret: &str) -> Option<String> {
+    let secret = secret.trim();
+    (!secret.is_empty() && secret != DEFAULT_SECRET_KEY && secret != DEFAULT_ACCESS_KEY).then(|| secret.to_string())
+}
+
+fn derive_rpc_secret(access_key: &str, secret_key: &str) -> Option<String> {
+    let access_key = access_key.trim();
+    let secret_key = secret_key.trim();
+
+    if access_key.is_empty() || secret_key.is_empty() {
+        return None;
+    }
+
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
+    mac.update(RPC_SECRET_DERIVATION_CONTEXT);
+    mac.update(&[0]);
+    mac.update(access_key.as_bytes());
+
+    Some(URL_SAFE_NO_PAD.encode_to_string(mac.finalize().into_bytes()))
+}
+
+fn resolve_rpc_secret(env_secret: Option<&str>, global_access: Option<&str>, global_secret: Option<&str>) -> Option<String> {
+    if let Some(secret) = env_secret.map(str::trim).filter(|secret| !secret.is_empty()) {
+        return normalize_rpc_secret(secret);
+    }
+
+    match (global_access, global_secret) {
+        (Some(access_key), Some(secret_key)) => derive_rpc_secret(access_key, secret_key),
+        _ => None,
+    }
+}
+
+pub fn try_get_rpc_token() -> std::io::Result<String> {
+    if let Some(secret) = GLOBAL_RUSTFS_RPC_SECRET.get() {
+        return normalize_rpc_secret(secret).ok_or_else(|| Error::other(RPC_SECRET_REQUIRED_MESSAGE));
+    }
+
+    let env_secret = env::var(ENV_RPC_SECRET).ok();
+    let global_access = get_global_access_key_opt();
+    let global_secret = get_global_secret_key_opt();
+    let secret = resolve_rpc_secret(env_secret.as_deref(), global_access.as_deref(), global_secret.as_deref())
+        .ok_or_else(|| Error::other(RPC_SECRET_REQUIRED_MESSAGE))?;
+
+    match GLOBAL_RUSTFS_RPC_SECRET.set(secret.clone()) {
+        Ok(()) => Ok(secret),
+        Err(_) => GLOBAL_RUSTFS_RPC_SECRET
+            .get()
+            .and_then(|stored| normalize_rpc_secret(stored))
+            .ok_or_else(|| Error::other(RPC_SECRET_REQUIRED_MESSAGE)),
+    }
+}
+
+#[deprecated(note = "use try_get_rpc_token to handle missing RPC secrets explicitly")]
 pub fn get_rpc_token() -> String {
-    GLOBAL_RUSTFS_RPC_SECRET
-        .get_or_init(|| {
-            env::var(ENV_RPC_SECRET)
-                .unwrap_or_else(|_| get_global_secret_key_opt().unwrap_or_else(|| DEFAULT_SECRET_KEY.to_string()))
-        })
-        .clone()
+    try_get_rpc_token().expect(RPC_SECRET_REQUIRED_MESSAGE)
 }
 
 /// A wrapper struct for masking sensitive strings in Debug implementations.
@@ -300,7 +363,7 @@ impl fmt::Debug for Credentials {
         f.debug_struct("Credentials")
             .field("access_key", &self.access_key)
             .field("secret_key", &Masked(Some(&self.secret_key)))
-            .field("session_token", &self.session_token)
+            .field("session_token", &Masked(Some(&self.session_token)))
             .field("expiration", &self.expiration)
             .field("status", &self.status)
             .field("parent_user", &self.parent_user)
@@ -313,6 +376,17 @@ impl fmt::Debug for Credentials {
 }
 
 impl Credentials {
+    /// Returns a reference to this credential's claims, or a shared empty map
+    /// when the credential has no claims attached. Avoids per-call allocation
+    /// at call sites that need an `&HashMap<String, Value>`.
+    pub fn claims_or_empty(&self) -> &HashMap<String, Value> {
+        static EMPTY: LazyLock<HashMap<String, Value>> = LazyLock::new(HashMap::new);
+        match &self.claims {
+            Some(c) => c,
+            None => &EMPTY,
+        }
+    }
+
     pub fn is_expired(&self) -> bool {
         if self.expiration.is_none() {
             return false;
@@ -363,7 +437,7 @@ impl Credentials {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
+    use crate::{DEFAULT_ACCESS_KEY, IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
     use time::Duration;
 
     #[test]
@@ -447,7 +521,7 @@ mod tests {
             // Initialize
             let test_ak = "test_access_key".to_string();
             let test_sk = "test_secret_key_123456".to_string();
-            init_global_action_credentials(Some(test_ak.clone()), Some(test_sk.clone())).ok();
+            init_global_action_credentials(Some(test_ak), Some(test_sk)).ok();
         }
 
         // Verify the state after initialization
@@ -466,11 +540,122 @@ mod tests {
         // If it hasn't already been initialized, the test automatically generates logic
         if get_global_action_cred().is_none() {
             init_global_action_credentials(None, None).ok();
-            let ak = get_global_access_key();
-            let sk = get_global_secret_key();
-            assert_eq!(ak.len(), 20);
-            assert_eq!(sk.len(), 32);
         }
+
+        let ak = get_global_access_key();
+        let sk = get_global_secret_key();
+        assert!(ak.len() >= 3);
+        assert!(sk.len() >= 8);
+    }
+
+    #[test]
+    fn test_gen_secret_key_uses_url_safe_base64_without_padding() {
+        let key = gen_secret_key(32).expect("secret key should generate");
+
+        assert_eq!(key.len(), 32);
+        assert!(!key.contains('/'));
+        assert!(!key.contains('+'));
+        assert!(!key.contains('='));
+    }
+
+    #[test]
+    fn test_gen_access_key_length_and_charset() {
+        let err = gen_access_key(2).expect_err("length below 3 should fail");
+        assert_eq!(err.to_string(), "access key length is too short");
+
+        let key = gen_access_key(20).expect("access key should generate");
+        assert_eq!(key.len(), 20);
+        assert!(key.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit()));
+    }
+
+    #[test]
+    fn test_resolve_rpc_secret_allows_default_credentials_for_derivation() {
+        assert!(resolve_rpc_secret(None, None, None).is_none());
+
+        let expected = derive_rpc_secret(DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY).expect("secret should derive");
+        assert_eq!(
+            resolve_rpc_secret(None, Some(DEFAULT_ACCESS_KEY), Some(DEFAULT_SECRET_KEY)).as_deref(),
+            Some(expected.as_str())
+        );
+
+        assert!(resolve_rpc_secret(Some(DEFAULT_SECRET_KEY), Some("custom-access"), Some("custom-global-secret")).is_none());
+    }
+
+    #[test]
+    fn test_rpc_secret_public_error_omits_configuration_details() {
+        assert!(!RPC_SECRET_REQUIRED_MESSAGE.contains("RUSTFS_"));
+        assert!(!RPC_SECRET_REQUIRED_MESSAGE.contains(DEFAULT_SECRET_KEY));
+        assert!(RPC_SECRET_REQUIRED_OPERATOR_MESSAGE.contains("RUSTFS_RPC_SECRET"));
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn test_get_rpc_token_preserves_string_return_type() {
+        fn assert_string_return(_: fn() -> String) {}
+
+        assert_string_return(get_rpc_token);
+    }
+
+    #[test]
+    fn test_resolve_rpc_secret_accepts_non_default_secret() {
+        assert_eq!(
+            resolve_rpc_secret(Some("custom-rpc-secret"), None, None).as_deref(),
+            Some("custom-rpc-secret")
+        );
+        let expected = derive_rpc_secret("custom-access", "custom-global-secret").expect("secret should derive");
+        assert_eq!(
+            resolve_rpc_secret(None, Some("custom-access"), Some("custom-global-secret")).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn test_resolve_rpc_secret_trims_and_falls_back_from_blank_env() {
+        let expected = derive_rpc_secret("custom-access", "custom-global-secret").expect("secret should derive");
+        assert_eq!(
+            resolve_rpc_secret(Some("  custom-rpc-secret  "), None, None).as_deref(),
+            Some("custom-rpc-secret")
+        );
+        assert_eq!(
+            resolve_rpc_secret(Some(""), Some("custom-access"), Some("custom-global-secret")).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            resolve_rpc_secret(Some("  "), Some("  custom-access  "), Some("  custom-global-secret  ")).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            resolve_rpc_secret(Some("  "), Some("custom-access"), Some("custom-global-secret")).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn test_resolve_rpc_secret_returns_none_for_trimmed_default_secret() {
+        let padded_default_secret = format!("  {}  ", DEFAULT_SECRET_KEY);
+        assert!(
+            resolve_rpc_secret(Some(padded_default_secret.as_str()), Some("custom-access"), Some("custom-global-secret"))
+                .is_none()
+        );
+
+        let padded_default_access = format!("  {}  ", DEFAULT_ACCESS_KEY);
+        assert!(
+            resolve_rpc_secret(Some(padded_default_access.as_str()), Some("custom-access"), Some("custom-global-secret"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_derive_rpc_secret_is_stable_and_not_plaintext() {
+        let first = derive_rpc_secret("custom-access", "custom-secret").expect("secret should derive");
+        let second = derive_rpc_secret("custom-access", "custom-secret").expect("secret should derive");
+
+        assert_eq!(first, second);
+        assert_ne!(first, "custom-access");
+        assert_ne!(first, "custom-secret");
+        assert_ne!(first, format!("{}{}", "custom-access", "custom-secret"));
+        assert!(!first.contains("custom-access"));
+        assert!(!first.contains("custom-secret"));
     }
 
     #[test]
@@ -500,6 +685,24 @@ mod tests {
         assert_eq!(format!("{:?}", Masked(Some("中"))), "***");
         assert_eq!(format!("{:?}", Masked(Some("中文"))), "中***|2");
         assert_eq!(format!("{:?}", Masked(Some("中文测试"))), "中***试|4");
+    }
+
+    #[test]
+    fn test_credentials_debug_masks_sensitive_fields() {
+        let cred = Credentials {
+            access_key: "debug-access-key".to_string(),
+            secret_key: "debug-secret-key".to_string(),
+            session_token: "debug-session-token".to_string(),
+            parent_user: "parent-user".to_string(),
+            ..Default::default()
+        };
+
+        let output = format!("{cred:?}");
+
+        assert!(output.contains("debug-access-key"));
+        assert!(output.contains("parent-user"));
+        assert!(!output.contains("debug-secret-key"));
+        assert!(!output.contains("debug-session-token"));
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::bucket::utils::deserialize;
 use crate::config::com::{read_config, save_config};
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::{Error, Result};
-use crate::new_object_layer_fn;
+use crate::resolve_object_store_handle;
 use crate::store::ECStore;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use rustfs_policy::policy::BucketPolicy;
@@ -30,6 +30,7 @@ use s3s::dto::{
     ServerSideEncryptionConfiguration, Tagging, VersioningConfiguration, WebsiteConfiguration,
 };
 use serde::Serializer;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -244,6 +245,30 @@ pub const BUCKET_ACCELERATE_CONFIG: &str = "accelerate.xml";
 pub const BUCKET_REQUEST_PAYMENT_CONFIG: &str = "request-payment.xml";
 pub const BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG: &str = "public-access-block.xml";
 pub const BUCKET_ACL_CONFIG: &str = "bucket-acl.json";
+pub const BUCKET_TABLE_CONFIG: &str = "table-bucket.json";
+pub const BUCKET_TABLE_RESERVED_PREFIX: &str = ".rustfs-table";
+pub const BUCKET_TABLE_CATALOG_META_PREFIX: &str = "s3tables/catalog";
+pub const BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX: &str = "table-buckets";
+
+pub fn table_catalog_path_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut output = String::with_capacity(digest.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+pub fn table_bucket_catalog_metadata_prefix(bucket: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        BUCKET_TABLE_CATALOG_META_PREFIX,
+        BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX,
+        table_catalog_path_hash(bucket)
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct BucketMetadata {
@@ -268,6 +293,7 @@ pub struct BucketMetadata {
     pub request_payment_config_xml: Vec<u8>,
     pub public_access_block_config_xml: Vec<u8>,
     pub bucket_acl_config_json: Vec<u8>,
+    pub table_bucket_config_json: Vec<u8>,
 
     pub policy_config_updated_at: OffsetDateTime,
     pub object_lock_config_updated_at: OffsetDateTime,
@@ -287,6 +313,7 @@ pub struct BucketMetadata {
     pub request_payment_config_updated_at: OffsetDateTime,
     pub public_access_block_config_updated_at: OffsetDateTime,
     pub bucket_acl_config_updated_at: OffsetDateTime,
+    pub table_bucket_config_updated_at: OffsetDateTime,
 
     pub new_field_updated_at: OffsetDateTime,
 
@@ -334,6 +361,7 @@ impl Default for BucketMetadata {
             request_payment_config_xml: Default::default(),
             public_access_block_config_xml: Default::default(),
             bucket_acl_config_json: Default::default(),
+            table_bucket_config_json: Default::default(),
             policy_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             object_lock_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             encryption_config_updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -352,6 +380,7 @@ impl Default for BucketMetadata {
             request_payment_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             public_access_block_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             bucket_acl_config_updated_at: OffsetDateTime::UNIX_EPOCH,
+            table_bucket_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             new_field_updated_at: OffsetDateTime::UNIX_EPOCH,
             policy_config: Default::default(),
             notification_config: Default::default(),
@@ -395,6 +424,10 @@ impl BucketMetadata {
 
     pub fn object_locking(&self) -> bool {
         self.lock_enabled || (self.versioning_config.as_ref().is_some_and(|v| v.enabled()))
+    }
+
+    pub fn table_bucket_enabled(&self) -> bool {
+        !self.table_bucket_config_json.is_empty()
     }
 
     /// Decode from msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
@@ -447,6 +480,7 @@ impl BucketMetadata {
                     self.public_access_block_config_xml = read_msgp_bin(rd)?
                 }
                 "BucketAclConfigJSON" | "BucketAclConfigJson" => self.bucket_acl_config_json = read_msgp_bin(rd)?,
+                "TableBucketConfigJSON" | "TableBucketConfigJson" => self.table_bucket_config_json = read_msgp_bin(rd)?,
                 "CorsConfigUpdatedAt" => self.cors_config_updated_at = read_msgp_time_value(rd)?,
                 "LoggingConfigUpdatedAt" => self.logging_config_updated_at = read_msgp_time_value(rd)?,
                 "WebsiteConfigUpdatedAt" => self.website_config_updated_at = read_msgp_time_value(rd)?,
@@ -454,6 +488,7 @@ impl BucketMetadata {
                 "RequestPaymentConfigUpdatedAt" => self.request_payment_config_updated_at = read_msgp_time_value(rd)?,
                 "PublicAccessBlockConfigUpdatedAt" => self.public_access_block_config_updated_at = read_msgp_time_value(rd)?,
                 "BucketAclConfigUpdatedAt" => self.bucket_acl_config_updated_at = read_msgp_time_value(rd)?,
+                "TableBucketConfigUpdatedAt" => self.table_bucket_config_updated_at = read_msgp_time_value(rd)?,
                 other => {
                     tracing::debug!(field = %other, "BucketMetadata decode_from: skipping unknown field");
                     skip_msgp_value(rd)?;
@@ -466,8 +501,8 @@ impl BucketMetadata {
 
     /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
-        // Map size: MinIO fields (25) + RustFS extensions (14)
-        let map_len: u32 = 39;
+        // Map size: MinIO fields (25) + RustFS extensions (16)
+        let map_len: u32 = 41;
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -523,6 +558,7 @@ impl BucketMetadata {
         write_bin_field(wr, "RequestPaymentConfigXML", &self.request_payment_config_xml)?;
         write_bin_field(wr, "PublicAccessBlockConfigXML", &self.public_access_block_config_xml)?;
         write_bin_field(wr, "BucketAclConfigJSON", &self.bucket_acl_config_json)?;
+        write_bin_field(wr, "TableBucketConfigJSON", &self.table_bucket_config_json)?;
         rmp::encode::write_str(wr, "CorsConfigUpdatedAt")?;
         write_msgp_time(wr, self.cors_config_updated_at)?;
         rmp::encode::write_str(wr, "LoggingConfigUpdatedAt")?;
@@ -537,6 +573,8 @@ impl BucketMetadata {
         write_msgp_time(wr, self.public_access_block_config_updated_at)?;
         rmp::encode::write_str(wr, "BucketAclConfigUpdatedAt")?;
         write_msgp_time(wr, self.bucket_acl_config_updated_at)?;
+        rmp::encode::write_str(wr, "TableBucketConfigUpdatedAt")?;
+        write_msgp_time(wr, self.table_bucket_config_updated_at)?;
 
         Ok(())
     }
@@ -632,6 +670,9 @@ impl BucketMetadata {
         if self.bucket_acl_config_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.bucket_acl_config_updated_at = self.created
         }
+        if self.table_bucket_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.table_bucket_config_updated_at = self.created
+        }
     }
 
     pub fn update_config(&mut self, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
@@ -678,7 +719,7 @@ impl BucketMetadata {
                 // let x = data.clone();
                 // let str = std::str::from_utf8(&x).expect("Invalid UTF-8");
                 // println!("update config:{}", str);
-                self.bucket_targets_config_json = data.clone();
+                self.bucket_targets_config_json = data;
                 self.bucket_targets_config_updated_at = updated;
             }
             BUCKET_CORS_CONFIG => {
@@ -709,6 +750,10 @@ impl BucketMetadata {
                 self.bucket_acl_config_json = data;
                 self.bucket_acl_config_updated_at = updated;
             }
+            BUCKET_TABLE_CONFIG => {
+                self.table_bucket_config_json = data;
+                self.table_bucket_config_updated_at = updated;
+            }
             _ => return Err(Error::other(format!("config file not found : {config_file}"))),
         }
 
@@ -720,11 +765,11 @@ impl BucketMetadata {
     }
 
     pub async fn save(&mut self) -> Result<()> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(Error::other("errServerNotInitialized"));
         };
 
-        self.parse_all_configs(store.clone())?;
+        self.parse_all_configs()?;
 
         let mut buf: Vec<u8> = vec![0; 4];
 
@@ -752,61 +797,141 @@ impl BucketMetadata {
         Ok(())
     }
 
-    fn parse_all_configs(&mut self, _api: Arc<ECStore>) -> Result<()> {
+    fn parse_all_configs(&mut self) -> Result<()> {
         if let Err(e) = self.parse_policy_config() {
-            tracing::warn!(bucket = %self.name, config = "policy", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "policy",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.notification_config_xml.is_empty()
             && let Err(e) = deserialize::<NotificationConfiguration>(&self.notification_config_xml)
                 .map(|c| self.notification_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "notification", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "notification",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.lifecycle_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<BucketLifecycleConfiguration>(&self.lifecycle_config_xml).map(|c| self.lifecycle_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "lifecycle", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "lifecycle",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.object_lock_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<ObjectLockConfiguration>(&self.object_lock_config_xml).map(|c| self.object_lock_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "object_lock", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "object_lock",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.versioning_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<VersioningConfiguration>(&self.versioning_config_xml).map(|c| self.versioning_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "versioning", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "versioning",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.encryption_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<ServerSideEncryptionConfiguration>(&self.encryption_config_xml).map(|c| self.sse_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "encryption", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "encryption",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.tagging_config_xml.is_empty()
             && let Err(e) = deserialize::<Tagging>(&self.tagging_config_xml).map(|c| self.tagging_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "tagging", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "tagging",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.quota_config_json.is_empty()
             && let Err(e) = serde_json::from_slice(&self.quota_config_json).map(|c| self.quota_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "quota", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "quota",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.replication_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<ReplicationConfiguration>(&self.replication_config_xml).map(|c| self.replication_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "replication", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "replication",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.bucket_targets_config_json.is_empty() {
             if let Err(e) = serde_json::from_slice::<BucketTargets>(&self.bucket_targets_config_json)
                 .map(|t| self.bucket_target_config = Some(t))
             {
-                tracing::warn!(bucket = %self.name, config = "bucket_targets", error = %e, "parse_all_configs: failed to parse");
+                tracing::warn!(
+                    event = "bucket_metadata_parse_failed",
+                    component = "ecstore",
+                    subsystem = "bucket_metadata",
+                    bucket = %self.name,
+                    config = "bucket_targets",
+                    error = %e,
+                    "Failed to parse bucket metadata config"
+                );
                 self.bucket_target_config = Some(BucketTargets::default());
             }
         } else {
@@ -815,45 +940,96 @@ impl BucketMetadata {
         if !self.cors_config_xml.is_empty()
             && let Err(e) = deserialize::<CORSConfiguration>(&self.cors_config_xml).map(|c| self.cors_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "cors", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "cors",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.logging_config_xml.is_empty()
             && let Err(e) = deserialize::<BucketLoggingStatus>(&self.logging_config_xml).map(|c| self.logging_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "logging", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "logging",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.website_config_xml.is_empty()
             && let Err(e) = deserialize::<WebsiteConfiguration>(&self.website_config_xml).map(|c| self.website_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "website", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "website",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.accelerate_config_xml.is_empty()
             && let Err(e) =
                 deserialize::<AccelerateConfiguration>(&self.accelerate_config_xml).map(|c| self.accelerate_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "accelerate", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "accelerate",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.request_payment_config_xml.is_empty()
             && let Err(e) = deserialize::<RequestPaymentConfiguration>(&self.request_payment_config_xml)
                 .map(|c| self.request_payment_config = Some(c))
         {
             tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
                 bucket = %self.name,
                 config = "request_payment",
                 error = %e,
-                "parse_all_configs: failed to parse"
+                "Failed to parse bucket metadata config"
             );
         }
         if !self.public_access_block_config_xml.is_empty()
             && let Err(e) = deserialize::<PublicAccessBlockConfiguration>(&self.public_access_block_config_xml)
                 .map(|c| self.public_access_block_config = Some(c))
         {
-            tracing::warn!(bucket = %self.name, config = "public_access_block", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "public_access_block",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
         if !self.bucket_acl_config_json.is_empty()
             && let Err(e) = String::from_utf8(self.bucket_acl_config_json.clone()).map(|acl| self.bucket_acl_config = Some(acl))
         {
-            tracing::warn!(bucket = %self.name, config = "bucket_acl", error = %e, "parse_all_configs: failed to parse");
+            tracing::warn!(
+                event = "bucket_metadata_parse_failed",
+                component = "ecstore",
+                subsystem = "bucket_metadata",
+                bucket = %self.name,
+                config = "bucket_acl",
+                error = %e,
+                "Failed to parse bucket metadata config"
+            );
         }
 
         Ok(())
@@ -881,10 +1057,8 @@ pub async fn load_bucket_metadata_parse(api: Arc<ECStore>, bucket: &str, parse: 
     bm.default_timestamps();
 
     if parse {
-        bm.parse_all_configs(api)?;
+        bm.parse_all_configs()?;
     }
-
-    // TODO: parse_all_configs
 
     Ok(bm)
 }
@@ -937,6 +1111,23 @@ mod test {
         let new = BucketMetadata::unmarshal(&buf).unwrap();
 
         assert_eq!(bm.name, new.name);
+    }
+
+    #[test]
+    fn parse_all_configs_parses_stored_configs_without_store_dependency() {
+        let mut bm = BucketMetadata::new("test-bucket");
+        bm.policy_config_json = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+        bm.bucket_targets_config_json =
+            br#"{"targets":[{"endpoint":"s3.amazonaws.com","targetbucket":"target-bucket","arn":"arn:aws:s3:::target-bucket"}]}"#
+                .to_vec();
+
+        bm.parse_all_configs().unwrap();
+
+        assert!(bm.policy_config.is_some());
+        let bucket_targets = bm.bucket_target_config.unwrap();
+        assert_eq!(bucket_targets.targets.len(), 1);
+        assert_eq!(bucket_targets.targets[0].endpoint, "s3.amazonaws.com");
+        assert_eq!(bucket_targets.targets[0].target_bucket, "target-bucket");
     }
 
     #[tokio::test]
@@ -1013,6 +1204,10 @@ mod test {
         bm.bucket_acl_config_json = bucket_acl.as_bytes().to_vec();
         bm.bucket_acl_config_updated_at = OffsetDateTime::now_utc();
 
+        let table_bucket_marker = r#"{"enabled":true}"#;
+        bm.table_bucket_config_json = table_bucket_marker.as_bytes().to_vec();
+        bm.table_bucket_config_updated_at = OffsetDateTime::now_utc();
+
         // Test serialization
         let buf = bm.marshal_msg().unwrap();
         assert!(!buf.is_empty(), "Serialized buffer should not be empty");
@@ -1034,6 +1229,7 @@ mod test {
         assert_eq!(bm.quota_config_json, deserialized_bm.quota_config_json);
         assert_eq!(bm.public_access_block_config_xml, deserialized_bm.public_access_block_config_xml);
         assert_eq!(bm.bucket_acl_config_json, deserialized_bm.bucket_acl_config_json);
+        assert_eq!(bm.table_bucket_config_json, deserialized_bm.table_bucket_config_json);
         assert_eq!(bm.object_lock_config_xml, deserialized_bm.object_lock_config_xml);
         assert_eq!(bm.notification_config_xml, deserialized_bm.notification_config_xml);
         assert_eq!(bm.replication_config_xml, deserialized_bm.replication_config_xml);
@@ -1085,6 +1281,11 @@ mod test {
             bm.bucket_targets_config_meta_updated_at.unix_timestamp(),
             deserialized_bm.bucket_targets_config_meta_updated_at.unix_timestamp()
         );
+        assert_eq!(
+            bm.table_bucket_config_updated_at.unix_timestamp(),
+            deserialized_bm.table_bucket_config_updated_at.unix_timestamp()
+        );
+        assert!(deserialized_bm.table_bucket_enabled());
 
         // Test that the serialized data contains expected content
         let buf_str = String::from_utf8_lossy(&buf);
@@ -1099,6 +1300,20 @@ mod test {
         println!("   - Policy config size: {} bytes", deserialized_bm.policy_config_json.len());
         println!("   - Lifecycle config size: {} bytes", deserialized_bm.lifecycle_config_xml.len());
         println!("   - Serialized buffer size: {} bytes", buf.len());
+    }
+
+    #[test]
+    fn table_bucket_marker_tracks_config_presence() {
+        let mut bm = BucketMetadata::new("table-bucket");
+        assert!(!bm.table_bucket_enabled());
+
+        bm.update_config(BUCKET_TABLE_CONFIG, br#"{"enabled":true}"#.to_vec())
+            .unwrap();
+        assert!(bm.table_bucket_enabled());
+        assert!(!bm.table_bucket_config_json.is_empty());
+
+        bm.update_config(BUCKET_TABLE_CONFIG, Vec::new()).unwrap();
+        assert!(!bm.table_bucket_enabled());
     }
 
     /// After policy deletion (policy_config_json cleared), parse_policy_config sets policy_config to None.

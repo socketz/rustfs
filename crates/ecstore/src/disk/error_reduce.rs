@@ -14,6 +14,19 @@
 
 use crate::disk::error::Error;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteQuorumFailureSummary {
+    pub required: usize,
+    pub achieved: usize,
+    pub failed: usize,
+    pub total: usize,
+    pub offline_disks: usize,
+    pub ignored_failures: usize,
+    pub retryable_failures: usize,
+    pub dominant_error: Option<Error>,
+    pub dominant_error_label: &'static str,
+}
+
 pub static OBJECT_OP_IGNORED_ERRS: &[Error] = &[
     Error::DiskNotFound,
     Error::FaultyDisk,
@@ -67,7 +80,7 @@ pub fn reduce_errs(errors: &[Option<Error>], ignored_errs: &[Error]) -> (usize, 
     let (best_err, best_count) = err_counts
         .into_iter()
         .max_by(|(_, c1), (_, c2)| c1.cmp(c2))
-        .unwrap_or((nil_error.clone(), 0));
+        .unwrap_or((nil_error, 0));
 
     // Compare nil errors with the top non-nil error and prefer the nil error
     if nil_count > best_count || (nil_count == best_count && nil_count > 0) {
@@ -77,12 +90,72 @@ pub fn reduce_errs(errors: &[Option<Error>], ignored_errs: &[Error]) -> (usize, 
     }
 }
 
+pub fn build_write_quorum_failure_summary(
+    errors: &[Option<Error>],
+    ignored_errs: &[Error],
+    quorum: usize,
+) -> WriteQuorumFailureSummary {
+    let total = errors.len();
+    let achieved = errors.iter().filter(|err| err.is_none()).count();
+    let failed = total.saturating_sub(achieved);
+    let offline_disks = count_errs(errors, &Error::DiskNotFound);
+    let ignored_failures = errors
+        .iter()
+        .filter_map(|err| err.as_ref())
+        .filter(|err| is_ignored_err(ignored_errs, err))
+        .count();
+    let retryable_failures = count_retryable_failures(errors);
+    let (_, dominant_error) = reduce_errs(errors, ignored_errs);
+    let dominant_error_label = dominant_error_label(errors, ignored_errs, dominant_error.as_ref());
+
+    WriteQuorumFailureSummary {
+        required: quorum,
+        achieved,
+        failed,
+        total,
+        offline_disks,
+        ignored_failures,
+        retryable_failures,
+        dominant_error,
+        dominant_error_label,
+    }
+}
+
+fn dominant_error_label(errors: &[Option<Error>], ignored_errs: &[Error], dominant_error: Option<&Error>) -> &'static str {
+    let Some(dominant_error) = dominant_error else {
+        return "nil_dominated";
+    };
+
+    if dominant_error == &Error::DiskNotFound {
+        return "disk_not_found";
+    }
+    if dominant_error == &Error::ShortWrite {
+        return "short_write";
+    }
+
+    errors
+        .iter()
+        .filter_map(|err| err.as_ref())
+        .find(|err| !is_ignored_err(ignored_errs, err) && *err == dominant_error)
+        .and_then(Error::internode_http_error_kind)
+        .map(|kind| kind.metric_label())
+        .unwrap_or("other_error")
+}
+
 pub fn is_ignored_err(ignored_errs: &[Error], err: &Error) -> bool {
     ignored_errs.iter().any(|e| e == err)
 }
 
 pub fn count_errs(errors: &[Option<Error>], err: &Error) -> usize {
     errors.iter().filter(|&e| e.as_ref() == Some(err)).count()
+}
+
+pub fn count_retryable_failures(errors: &[Option<Error>]) -> usize {
+    errors
+        .iter()
+        .filter_map(|err| err.as_ref())
+        .filter(|err| err.is_retryable_internode_write_failure())
+        .count()
 }
 
 pub fn is_all_buckets_not_found(errs: &[Option<Error>]) -> bool {
@@ -112,7 +185,7 @@ mod tests {
     fn test_reduce_errs_basic() {
         let e1 = err_io("a");
         let e2 = err_io("b");
-        let errors = vec![Some(e1.clone()), Some(e1.clone()), Some(e2.clone()), None];
+        let errors = vec![Some(e1.clone()), Some(e1.clone()), Some(e2), None];
         let ignored = vec![];
         let (count, err) = reduce_errs(&errors, &ignored);
         assert_eq!(count, 2);
@@ -124,7 +197,7 @@ mod tests {
         let e1 = err_io("a");
         let e2 = err_io("b");
         let errors = vec![Some(e1.clone()), Some(e2.clone()), Some(e1.clone()), Some(e2.clone()), None];
-        let ignored = vec![e2.clone()];
+        let ignored = vec![e2];
         let (count, err) = reduce_errs(&errors, &ignored);
         assert_eq!(count, 2);
         assert_eq!(err, Some(e1));
@@ -134,7 +207,7 @@ mod tests {
     fn test_reduce_quorum_errs() {
         let e1 = err_io("a");
         let e2 = err_io("b");
-        let errors = vec![Some(e1.clone()), Some(e1.clone()), Some(e2.clone()), None];
+        let errors = vec![Some(e1.clone()), Some(e1.clone()), Some(e2), None];
         let ignored = vec![];
         let quorum_err = Error::FaultyDisk;
         // quorum = 2, should return e1
@@ -164,10 +237,55 @@ mod tests {
     }
 
     #[test]
+    fn test_build_write_quorum_failure_summary() {
+        let retryable = Error::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::ConnectionReset,
+        ));
+        let non_retryable = err_io("other");
+        let errors = vec![
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(retryable),
+            Some(non_retryable),
+            Some(Error::DiskNotFound),
+        ];
+
+        let summary = build_write_quorum_failure_summary(&errors, OBJECT_OP_IGNORED_ERRS, 6);
+        assert_eq!(summary.required, 6);
+        assert_eq!(summary.achieved, 5);
+        assert_eq!(summary.failed, 3);
+        assert_eq!(summary.total, 8);
+        assert_eq!(summary.offline_disks, 1);
+        assert_eq!(summary.ignored_failures, 1);
+        assert_eq!(summary.retryable_failures, 1);
+        assert_eq!(summary.dominant_error, None);
+        assert_eq!(summary.dominant_error_label, "nil_dominated");
+    }
+
+    #[test]
+    fn test_build_write_quorum_failure_summary_preserves_internode_label() {
+        let retryable_a = Error::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::ConnectionReset,
+        ));
+        let retryable_b = Error::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::ConnectionReset,
+        ));
+        let errors = vec![Some(retryable_a), Some(retryable_b)];
+
+        let summary = build_write_quorum_failure_summary(&errors, OBJECT_OP_IGNORED_ERRS, 2);
+
+        assert_eq!(summary.retryable_failures, 2);
+        assert_eq!(summary.dominant_error_label, "connection_reset");
+    }
+
+    #[test]
     fn test_reduce_errs_nil_tiebreak() {
         // Error::Nil and another error have the same count, should prefer Nil
         let e1 = err_io("a");
-        let errors = vec![Some(e1.clone()), None, Some(e1.clone()), None]; // e1:2, Nil:2
+        let errors = vec![Some(e1.clone()), None, Some(e1), None]; // e1:2, Nil:2
         let ignored = vec![];
         let (count, err) = reduce_errs(&errors, &ignored);
         assert_eq!(count, 2);

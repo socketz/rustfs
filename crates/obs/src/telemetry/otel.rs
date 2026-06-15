@@ -40,8 +40,8 @@ use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
 use crate::telemetry::filter::build_env_filter;
-use crate::telemetry::guard::OtelGuard;
-use crate::telemetry::local::spawn_cleanup_task;
+use crate::telemetry::guard::{MemoryProfilingAgent, OtelGuard, ProfilingAgent};
+use crate::telemetry::local::{build_json_log_layer, spawn_cleanup_task};
 use crate::telemetry::recorder::Recorder;
 use crate::telemetry::resource::build_resource;
 use crate::telemetry::rolling::{RollingAppender, Rotation};
@@ -57,21 +57,18 @@ use opentelemetry_sdk::{
     metrics::{PeriodicReader, SdkMeterProvider},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
+use percent_encoding::percent_decode_str;
 use rustfs_config::observability::{DEFAULT_OBS_LOG_MATCH_MODE, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES};
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
     DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
 };
+use std::collections::HashMap;
 use std::{fs, io::IsTerminal, time::Duration};
 use tracing::info;
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
-use tracing_subscriber::{
-    Layer,
-    fmt::{format::FmtSpan, time::LocalTime},
-    layer::SubscriberExt,
-    util::SubscriberInitExt,
-};
+use tracing_subscriber::{Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Initialize the full OpenTelemetry HTTP pipeline (traces + metrics + logs).
 ///
@@ -94,7 +91,7 @@ use tracing_subscriber::{
 ///
 /// # Note
 /// This function is intentionally kept unchanged from the pre-refactor
-/// implementation to preserve existing OTLP behaviour.
+/// implementation to preserve existing OTLP behavior.
 pub(super) fn init_observability_http(
     config: &OtelConfig,
     logger_level: &str,
@@ -162,8 +159,8 @@ pub(super) fn init_observability_http(
     // ── Meter provider (HTTP) ─────────────────────────────────────────────────
     let meter_provider = build_meter_provider(&metric_ep, config, res.clone(), &service_name, use_stdout)?;
 
-    #[cfg(unix)]
     let profiling_agent = init_profiler(config);
+    let memory_profiling_agent = init_memory_profiler(config);
 
     // ── Logger Logic ──────────────────────────────────────────────────────────
     // Logging is the only signal that may intentionally route to either OTLP
@@ -229,20 +226,7 @@ pub(super) fn init_observability_http(
                 RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
 
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            let file_layer = tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime::rfc_3339())
-                .with_target(true)
-                .with_ansi(false)
-                .with_thread_names(true)
-                .with_thread_ids(true)
-                .with_file(true)
-                .with_line_number(true)
-                .with_writer(non_blocking)
-                .json()
-                .with_current_span(true)
-                .with_span_list(true)
-                .with_span_events(span_events.clone())
-                .with_filter(build_env_filter(logger_level, None));
+            let file_layer = build_json_log_layer(non_blocking, false, span_events.clone());
             let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
             Ok((file_layer, guard, cleanup_handle, rotation_str))
         })();
@@ -254,8 +238,17 @@ pub(super) fn init_observability_http(
                 cleanup_handle = Some(new_cleanup_handle);
 
                 info!(
-                    "Init file logging at '{}', rotation: {}, keep {} files",
-                    log_directory, rotation_str, keep_files
+                    backend = "local",
+                    sink = "file",
+                    output_format = "json",
+                    log_directory,
+                    rotation = %rotation_str,
+                    keep_files,
+                    stdout_mirror_enabled = config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED)
+                        || !is_production,
+                    logger_level,
+                    is_production,
+                    "Initialized local logging fallback for observability"
                 );
             }
             Err(error) if crate::telemetry::local::should_fallback_to_stdout(&error) => {
@@ -277,43 +270,41 @@ pub(super) fn init_observability_http(
     if force_stdout_logging || config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) || !is_production {
         let (stdout_nb, stdout_g) = tracing_appender::non_blocking(std::io::stdout());
         stdout_guard = Some(stdout_g);
-        stdout_layer_opt = Some(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime::rfc_3339())
-                .with_target(true)
-                .with_ansi(std::io::stdout().is_terminal())
-                .with_thread_names(true)
-                .with_thread_ids(true)
-                .with_file(true)
-                .with_line_number(true)
-                .with_writer(stdout_nb)
-                .with_span_events(span_events)
-                .with_filter(build_env_filter(logger_level, None)),
-        );
+        stdout_layer_opt = Some(build_json_log_layer(stdout_nb, std::io::stdout().is_terminal(), span_events));
     }
+    let local_file_fallback_enabled = file_layer_opt.is_some();
+    let stdout_mirror_enabled = stdout_guard.is_some();
     let filter = build_env_filter(logger_level, None);
     tracing_subscriber::registry()
         .with(filter)
         .with(ErrorLayer::default())
-        .with(file_layer_opt) // File
-        .with(stdout_layer_opt) // Stdout (only if file logging enabled it)
+        .with(file_layer_opt)
+        .with(stdout_layer_opt)
         .with(tracer_layer)
         .with(otel_bridge)
         .with(metrics_layer)
         .init();
 
-    counter!("rustfs.start.total").increment(1);
+    counter!("rustfs_start_total").increment(1);
     info!(
-        "Init observability (HTTP): trace='{}', metric='{}', log='{}'",
-        trace_ep, metric_ep, log_ep
+        backend = "otlp_http",
+        trace_endpoint = %trace_ep,
+        metric_endpoint = %metric_ep,
+        log_endpoint = %log_ep,
+        local_file_fallback_enabled,
+        stdout_mirror_enabled,
+        output_format = "json",
+        logger_level,
+        is_production,
+        "Initialized observability"
     );
 
     Ok(OtelGuard {
         tracer_provider,
         meter_provider,
         logger_provider,
-        #[cfg(unix)]
         profiling_agent,
+        memory_profiling_agent,
         tracing_guard,
         stdout_guard,
         cleanup_handle,
@@ -339,11 +330,19 @@ fn build_tracer_provider(
         return Ok(None);
     }
 
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
+    let mut exporter_builder = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_endpoint(trace_ep)
         .with_protocol(Protocol::HttpBinary)
-        .with_compression(Compression::Gzip)
+        .with_compression(Compression::Gzip);
+    let trace_headers = resolve_signal_headers(config.endpoint_headers.as_deref(), config.trace_headers.as_deref());
+    if !trace_headers.is_empty() {
+        exporter_builder = exporter_builder.with_headers(trace_headers);
+    }
+    if let Some(timeout) = resolve_signal_timeout(config.endpoint_timeout_millis, config.trace_timeout_millis) {
+        exporter_builder = exporter_builder.with_timeout(timeout);
+    }
+    let exporter = exporter_builder
         .build()
         .map_err(|e| TelemetryError::BuildSpanExporter(e.to_string()))?;
 
@@ -398,12 +397,20 @@ fn build_meter_provider(
         return Ok(None);
     }
 
-    let exporter = opentelemetry_otlp::MetricExporter::builder()
+    let mut exporter_builder = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
         .with_endpoint(metric_ep)
         .with_temporality(opentelemetry_sdk::metrics::Temporality::default())
         .with_protocol(Protocol::HttpBinary)
-        .with_compression(Compression::Gzip)
+        .with_compression(Compression::Gzip);
+    let metric_headers = resolve_signal_headers(config.endpoint_headers.as_deref(), config.metric_headers.as_deref());
+    if !metric_headers.is_empty() {
+        exporter_builder = exporter_builder.with_headers(metric_headers);
+    }
+    if let Some(timeout) = resolve_signal_timeout(config.endpoint_timeout_millis, config.metric_timeout_millis) {
+        exporter_builder = exporter_builder.with_timeout(timeout);
+    }
+    let exporter = exporter_builder
         .build()
         .map_err(|e| TelemetryError::BuildMetricExporter(e.to_string()))?;
 
@@ -444,11 +451,19 @@ fn build_logger_provider(
         return Ok(None);
     }
 
-    let exporter = opentelemetry_otlp::LogExporter::builder()
+    let mut exporter_builder = opentelemetry_otlp::LogExporter::builder()
         .with_http()
         .with_endpoint(log_ep)
         .with_protocol(Protocol::HttpBinary)
-        .with_compression(Compression::Gzip)
+        .with_compression(Compression::Gzip);
+    let log_headers = resolve_signal_headers(config.endpoint_headers.as_deref(), config.log_headers.as_deref());
+    if !log_headers.is_empty() {
+        exporter_builder = exporter_builder.with_headers(log_headers);
+    }
+    if let Some(timeout) = resolve_signal_timeout(config.endpoint_timeout_millis, config.log_timeout_millis) {
+        exporter_builder = exporter_builder.with_timeout(timeout);
+    }
+    let exporter = exporter_builder
         .build()
         .map_err(|e| TelemetryError::BuildLogExporter(e.to_string()))?;
 
@@ -462,10 +477,14 @@ fn build_logger_provider(
 
 /// Start the Pyroscope continuous profiling agent when profiling is enabled.
 ///
-/// Returns `None` on non-Unix platforms, when the feature is disabled, or when
-/// no usable profiling endpoint is configured.
-#[cfg(unix)]
-fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
+/// Returns `None` when profiling export is disabled, when no usable
+/// profiling endpoint is configured, or when building or starting the agent
+/// fails.
+#[cfg(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
     use pyroscope::pyroscope::PyroscopeAgentBuilder;
     use rustfs_config::VERSION;
@@ -489,7 +508,7 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
     let sample_rate = 100; // 100 Hz
 
     let agent = PyroscopeAgentBuilder::new(endpoint, service_name, sample_rate, "pyroscope-rs", "1.0.1", backend)
-        .tags(vec![("version", version)]) // TODO: add git commit tag
+        .tags(vec![("version", version), ("profile_type", "cpu")])
         .build()
         .ok()?;
 
@@ -502,6 +521,73 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
     }
 }
 
+#[cfg(not(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+)))]
+fn init_profiler(_config: &OtelConfig) -> Option<ProfilingAgent> {
+    None
+}
+
+/// Initialise a Pyroscope agent for continuous **memory** profiling via jemalloc.
+///
+/// This is only available on `linux + gnu + x86_64` where tikv-jemallocator
+/// is the global allocator and `jemalloc_pprof::PROF_CTL` is accessible.
+///
+/// Returns `None` when profiling export is disabled, the endpoint is missing,
+/// jemalloc profiling is not activated, or the agent fails to build/start.
+#[cfg(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+fn init_memory_profiler(config: &OtelConfig) -> Option<MemoryProfilingAgent> {
+    use pyroscope::backend::jemalloc_backend;
+    use pyroscope::pyroscope::PyroscopeAgentBuilder;
+    use rustfs_config::VERSION;
+
+    if !config
+        .profiling_export_enabled
+        .unwrap_or(rustfs_config::DEFAULT_OBS_PROFILING_EXPORT_ENABLED)
+    {
+        return None;
+    }
+
+    let endpoint = config.profiling_endpoint.as_ref()?.as_str();
+    if endpoint.is_empty() {
+        return None;
+    }
+
+    // Verify jemalloc profiling is available and activated
+    {
+        let prof_ctl = jemalloc_pprof::PROF_CTL.as_ref()?;
+        let ctl = prof_ctl.try_lock().ok()?;
+        if !ctl.activated() {
+            eprintln!("Memory profiling skipped: jemalloc profiling is not activated");
+            return None;
+        }
+    }
+
+    let backend = jemalloc_backend();
+    let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
+    let version = config.service_version.as_deref().unwrap_or(VERSION);
+    let sample_rate = 100;
+
+    let agent = PyroscopeAgentBuilder::new(endpoint, service_name, sample_rate, "pyroscope-rs", "1.0.1", backend)
+        .tags(vec![("version", version), ("profile_type", "memory")])
+        .build()
+        .ok()?;
+
+    match agent.start() {
+        Ok(agent) => Some(agent),
+        Err(err) => {
+            eprintln!("Memory profiling agent start error: {err:?}");
+            None
+        }
+    }
+}
+
+#[cfg(not(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
+fn init_memory_profiler(_config: &OtelConfig) -> Option<MemoryProfilingAgent> {
+    None
+}
+
 /// Create a stdout periodic metrics reader for the given interval.
 ///
 /// This helper is primarily used for local development and diagnostics when
@@ -510,6 +596,39 @@ fn create_periodic_reader(interval: u64) -> PeriodicReader<opentelemetry_stdout:
     PeriodicReader::builder(opentelemetry_stdout::MetricExporter::default())
         .with_interval(Duration::from_secs(interval))
         .build()
+}
+
+fn resolve_signal_headers(common_headers: Option<&str>, signal_headers: Option<&str>) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    if let Some(raw_headers) = common_headers {
+        headers.extend(parse_otlp_headers(raw_headers));
+    }
+    if let Some(raw_headers) = signal_headers {
+        headers.extend(parse_otlp_headers(raw_headers));
+    }
+    headers
+}
+
+fn parse_otlp_headers(raw_headers: &str) -> HashMap<String, String> {
+    raw_headers
+        .split(',')
+        .filter_map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let value = percent_decode_str(value.trim()).decode_utf8().ok()?;
+            Some((key.to_string(), value.into_owned()))
+        })
+        .collect()
+}
+
+fn resolve_signal_timeout(common_timeout_millis: Option<u64>, signal_timeout_millis: Option<u64>) -> Option<Duration> {
+    signal_timeout_millis
+        .or(common_timeout_millis)
+        .filter(|timeout_millis| *timeout_millis > 0)
+        .map(Duration::from_millis)
 }
 
 #[cfg(test)]
@@ -537,5 +656,35 @@ mod tests {
 
         let sampler = build_tracer_sampler(1.2);
         assert!(format!("{sampler:?}").contains("AlwaysOn"));
+    }
+
+    #[test]
+    fn test_parse_otlp_headers_ignores_invalid_entries() {
+        let headers = parse_otlp_headers("Authorization=Bearer%20abc,empty=,missing, =ignored,key=value,bad=%FF");
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers.get("Authorization"), Some(&"Bearer abc".to_string()));
+        assert_eq!(headers.get("empty"), Some(&"".to_string()));
+        assert_eq!(headers.get("key"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_signal_headers_signal_overrides_common() {
+        let headers = resolve_signal_headers(Some("k1=v1,k2=common"), Some("k2=signal,k3=v3"));
+        assert_eq!(headers.get("k1"), Some(&"v1".to_string()));
+        assert_eq!(headers.get("k2"), Some(&"signal".to_string()));
+        assert_eq!(headers.get("k3"), Some(&"v3".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_signal_timeout_prefers_signal_value() {
+        assert_eq!(resolve_signal_timeout(Some(2_000), Some(5_000)), Some(Duration::from_millis(5_000)));
+    }
+
+    #[test]
+    fn test_resolve_signal_timeout_falls_back_to_common() {
+        assert_eq!(resolve_signal_timeout(Some(3_000), None), Some(Duration::from_millis(3_000)));
+        assert_eq!(resolve_signal_timeout(None, None), None);
+        assert_eq!(resolve_signal_timeout(Some(0), None), None);
+        assert_eq!(resolve_signal_timeout(None, Some(0)), None);
     }
 }

@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use crate::admin::auth::validate_admin_request;
+use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::utils::read_compatible_admin_body;
+use crate::app::context::resolve_object_store_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -32,9 +34,9 @@ use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
 use rustfs_ecstore::bucket::target::BucketTarget;
 use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::global_rustfs_port;
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
+use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_storage_api::BucketOptions;
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
@@ -134,7 +136,7 @@ impl Operation for GetReplicationMetricsHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -192,7 +194,7 @@ impl Operation for SetRemoteTargetHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -231,11 +233,23 @@ impl Operation for SetRemoteTargetHandler {
         }
 
         remote_target.source_bucket = bucket.clone();
+        let site_endpoint = if remote_target.endpoint.starts_with("http://") || remote_target.endpoint.starts_with("https://") {
+            remote_target.endpoint.clone()
+        } else if remote_target.secure {
+            format!("https://{}", remote_target.endpoint)
+        } else {
+            format!("http://{}", remote_target.endpoint)
+        };
+        if let Some(deployment_id) = site_replication_peer_deployment_id_for_endpoint(&site_endpoint).await {
+            remote_target.deployment_id = deployment_id;
+        }
 
         let bucket_target_sys = BucketTargetSys::get();
 
         if !update {
-            let (arn, exist) = bucket_target_sys.get_remote_arn(bucket, Some(&remote_target), "").await;
+            let (arn, exist) = bucket_target_sys
+                .get_remote_arn(bucket, Some(&remote_target), remote_target.deployment_id.as_str())
+                .await;
             remote_target.arn = arn.clone();
             if exist && !arn.is_empty() {
                 let arn_str = serde_json::to_string(&arn).unwrap_or_default();
@@ -275,15 +289,10 @@ impl Operation for SetRemoteTargetHandler {
 
         let arn = remote_target.arn.clone();
 
-        bucket_target_sys
+        let targets = bucket_target_sys
             .set_target(bucket, &remote_target, update)
             .await
             .map_err(map_bucket_target_error)?;
-
-        let targets = bucket_target_sys.list_bucket_targets(bucket).await.map_err(|e| {
-            error!("Failed to list bucket targets: {}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, "Failed to list bucket targets".to_string())
-        })?;
         let json_targets = serde_json::to_vec(&targets).map_err(|e| {
             error!("Serialization error: {}", e);
             S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())
@@ -295,6 +304,7 @@ impl Operation for SetRemoteTargetHandler {
                 error!("Failed to update bucket targets: {}", e);
                 S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
             })?;
+        bucket_target_sys.update_all_targets(bucket, Some(&targets)).await;
 
         let arn_str = serde_json::to_string(&arn).unwrap_or_default();
 
@@ -309,11 +319,9 @@ pub struct ListRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for ListRemoteTargetHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        validate_replication_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
+
         let queries = extract_query_params(&req.uri);
-        let Some(_cred) = req.credentials else {
-            error!("credentials null");
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
 
         if let Some(bucket) = queries.get("bucket") {
             if bucket.is_empty() {
@@ -321,7 +329,7 @@ impl Operation for ListRemoteTargetHandler {
                 return Err(s3_error!(InvalidRequest, "bucket is required"));
             }
 
-            let Some(store) = new_object_layer_fn() else {
+            let Some(store) = resolve_object_store_handle() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
             };
 
@@ -381,7 +389,7 @@ impl Operation for RemoveRemoteTargetHandler {
             return Err(s3_error!(InvalidRequest, "arn is required"));
         };
 
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
         };
 
@@ -392,12 +400,7 @@ impl Operation for RemoveRemoteTargetHandler {
 
         let sys = BucketTargetSys::get();
 
-        sys.remove_target(bucket, arn_str).await.map_err(map_bucket_target_error)?;
-
-        let targets = sys.list_bucket_targets(bucket).await.map_err(|e| {
-            error!("Failed to list bucket targets: {}", e);
-            S3Error::with_message(S3ErrorCode::InternalError, "Failed to list bucket targets".to_string())
-        })?;
+        let targets = sys.remove_target(bucket, arn_str).await.map_err(map_bucket_target_error)?;
 
         let json_targets = serde_json::to_vec(&targets).map_err(|e| {
             error!("Serialization error: {}", e);
@@ -410,6 +413,7 @@ impl Operation for RemoveRemoteTargetHandler {
                 error!("Failed to update bucket targets: {}", e);
                 S3Error::with_message(S3ErrorCode::InternalError, format!("Failed to update bucket targets: {e}"))
             })?;
+        sys.update_all_targets(bucket, Some(&targets)).await;
 
         Ok(S3Response::new((StatusCode::NO_CONTENT, Body::from("".to_string()))))
     }

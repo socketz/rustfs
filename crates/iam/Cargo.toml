@@ -30,7 +30,7 @@ workspace = true
 
 [dependencies]
 rustfs-credentials = { workspace = true }
-rustfs-config = { workspace = true, features = ["constants"] }
+rustfs-config = { workspace = true, features = ["constants", "server-config-model"] }
 tokio.workspace = true
 time = { workspace = true, features = ["serde-human-readable"] }
 serde = { workspace = true, features = ["derive", "rc"] }
@@ -42,12 +42,12 @@ thiserror.workspace = true
 arc-swap = { workspace = true }
 rustfs-crypto = { workspace = true }
 futures.workspace = true
-rand.workspace = true
 base64-simd = { workspace = true }
 jsonwebtoken = { workspace = true }
 tracing.workspace = true
 rustfs-madmin.workspace = true
 rustfs-utils = { workspace = true, features = ["path"] }
+rustfs-io-metrics.workspace = true
 tokio-util.workspace = true
 pollster.workspace = true
 reqwest = { workspace = true }
@@ -58,6 +58,8 @@ url = { workspace = true }
 
 [dev-dependencies]
 pollster.workspace = true
+serial_test = { workspace = true }
+temp-env = { workspace = true }
 
 [lib]
 doctest = false

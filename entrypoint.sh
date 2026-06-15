@@ -113,7 +113,7 @@ process_data_volumes
 process_log_directory
 
 # 4) Default credentials warning
-if [ "${RUSTFS_ACCESS_KEY}" = "rustfsadmin" ] || [ "${RUSTFS_SECRET_KEY}" = "rustfsadmin" ]; then
+if [ "${RUSTFS_ACCESS_KEY:-}" = "rustfsadmin" ] || [ "${RUSTFS_SECRET_KEY:-}" = "rustfsadmin" ]; then
   echo "!!!WARNING: Using default RUSTFS_ACCESS_KEY or RUSTFS_SECRET_KEY. Override them in production!"
 fi
 

@@ -38,39 +38,68 @@ concurrency:
   cancel-in-progress: true
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   nix-validation:
     name: Nix Build & Check
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NIX_CURL_FLAGS: -A cargo/stable
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        uses: DeterminateSystems/determinate-nix-action@v3.21.0
         with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
-          extra_nix_config: |
-            experimental-features = nix-command flakes
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          extra-conf: |
+            experimental-features = nix-command flakes configurable-impure-env
+            impure-env = NIX_CURL_FLAGS
+            max-jobs = 1
 
-      - name: Setup Magic Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@v13
+      - name: Cache Nix
+        uses: DeterminateSystems/flakehub-cache-action@v3.21.0
 
-      - name: Setup Flake Checker
+      - name: Check Nix Flake Inputs
         uses: DeterminateSystems/flake-checker-action@v12
+        with:
+          fail-mode: true
+          ignore-missing-flake-lock: false
 
       - name: Verify Flake
         run: |
           echo "Checking flake structure and evaluation..."
           nix flake show
-          nix flake check --print-build-logs
+          for attempt in 1 2 3; do
+            if nix flake check --print-build-logs --fallback --option fallback true; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "nix flake check failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
 
       - name: Build RustFS
         run: |
           echo "Building the default package..."
-          nix build .#default --print-build-logs
+          for attempt in 1 2 3; do
+            if nix build .#default --print-build-logs --fallback --option fallback true; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "nix build failed after 3 attempts."
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
 
       - name: Test Binary
         run: |

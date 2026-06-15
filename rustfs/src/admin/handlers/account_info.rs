@@ -14,6 +14,7 @@
 
 use crate::admin::auth::authenticate_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::app::context::resolve_object_store_handle;
 use crate::auth::get_condition_values;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue};
@@ -21,12 +22,11 @@ use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_credentials::get_global_action_cred;
 use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, StorageAPI};
-use rustfs_iam::store::MappedPolicy;
+use rustfs_ecstore::store_api::BucketOperations;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
+use rustfs_storage_api::{BucketOptions, StorageAdminApi};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -61,7 +61,7 @@ fn resolve_bucket_access(can_list_bucket: bool, can_get_bucket_location: bool, c
 #[async_trait::async_trait]
 impl Operation for AccountInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = resolve_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -146,22 +146,6 @@ impl Operation for AccountInfoHandler {
             cred.access_key.clone()
         };
 
-        let claims_args = Args {
-            account: "",
-            groups: &None,
-            action: Action::None,
-            bucket: "",
-            conditions: &HashMap::new(),
-            is_owner: false,
-            object: "",
-            claims,
-            deny_only: false,
-        };
-
-        let role_arn = claims_args.get_role_arn();
-
-        // TODO: get_policies_from_claims(claims);
-
         let Some(admin_cred) = get_global_action_cred() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
@@ -178,35 +162,25 @@ impl Operation for AccountInfoHandler {
                     break;
                 }
             }
-        } else if let Some(arn) = role_arn {
-            let (_, policy_name) = iam_store
-                .get_role_policy(arn)
-                .await
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-
-            let policies = MappedPolicy::new(&policy_name).to_slice();
-            effective_policy = iam_store.get_combined_policy(&policies).await;
-        } else if let Some(claim_policies) = claims.get("policy").and_then(|v| v.as_str()) {
-            // STS/OIDC users: resolve policy names from JWT claims against built-in policies
-            let mut resolved = Vec::new();
-            for policy_name in claim_policies.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                for (name, p) in DEFAULT_POLICIES.iter() {
-                    if *name == policy_name {
-                        resolved.push(p.clone());
-                        break;
-                    }
-                }
-            }
-            if !resolved.is_empty() {
-                effective_policy = rustfs_policy::policy::Policy::merge_policies(resolved);
-            }
         } else {
-            let policies = iam_store
-                .policy_db_get(&account_name, &cred.groups)
-                .await
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("get policy failed: {e}")))?;
-
-            effective_policy = iam_store.get_combined_policy(&policies).await;
+            // Reuse the canonical IAM preparation path so accountinfo policy view
+            // stays in sync with real authorization semantics (STS/group fallback included).
+            let empty_conditions = HashMap::new();
+            let auth_args = Args {
+                account: &cred.access_key,
+                groups: &cred.groups,
+                action: Action::None,
+                bucket: "",
+                conditions: &empty_conditions,
+                is_owner: owner,
+                object: "",
+                claims,
+                deny_only: false,
+            };
+            let prepared = iam_store.prepare_auth(&auth_args).await;
+            if let Some(policy) = prepared.combined_policy_for_view() {
+                effective_policy = policy.clone();
+            }
         };
 
         let policy_str = serde_json::to_string(&effective_policy)
@@ -214,7 +188,7 @@ impl Operation for AccountInfoHandler {
 
         let mut account_info = rustfs_madmin::AccountInfo {
             account_name,
-            server: store.backend_info().await,
+            server: StorageAdminApi::backend_info(store.as_ref()).await,
             policy: serde_json::Value::String(policy_str),
             ..Default::default()
         };

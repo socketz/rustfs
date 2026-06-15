@@ -6,24 +6,43 @@ Use the nearest subdirectory `AGENTS.md` for path-specific guidance.
 ## Rule Precedence
 
 1. System/developer instructions.
-2. This file (global defaults).
-3. The nearest `AGENTS.md` in the current path (more specific scope wins).
+2. Current user/task instructions.
+3. The nearest `AGENTS.md` in the current path.
+4. This file (global defaults).
 
 If repo-level instructions conflict, follow the nearest file and keep behavior aligned with CI.
+
+## Execution Discipline
+
+- Read the relevant existing code, tests, and local guidance before changing behavior.
+- State assumptions when they affect the implementation or verification path.
+- If a task has multiple plausible interpretations, list the options briefly and choose the narrowest reasonable path; ask when the ambiguity would make the change risky.
+- For multi-step work, keep the plan minimal and tied to verifiable outcomes.
+- Avoid redundant file reads, repeated commands, and unnecessary exploratory work once enough context is available.
+- A good result is a minimal diff with clear assumptions, no over-engineering, and independent verification.
 
 ## Communication and Language
 
 - Respond in the same language used by the requester.
 - Keep source code, comments, commit messages, and PR title/body in English.
+- Be concise. Avoid sycophantic openers, closing fluff, and verbose status reporting.
+
+## Skill Usage
+
+- Do not use the `rust-refactor-helper` skill in any scenario.
 
 ## Change Style for Existing Logic
 
 - Prefer direct, local code over extracting one-off helpers.
 - Extract a helper only when logic is reused or the extraction materially clarifies a non-trivial flow.
+- Solve only the requested problem; do not add speculative features, configurability, or adjacent improvements.
+- Prefer editing existing code over rewriting files or reshaping unrelated logic.
+- Modify only what is required and remove only artifacts introduced by your own changes.
 - Preserve the existing control-flow and logic shape when fixing bugs or addressing review comments, especially in init, distributed coordination, locking, metadata, and concurrency paths.
 - Do not refactor existing code only to make it easier to unit test.
 - Keep fixes narrowly aligned with the requested behavior; avoid semantic-adjacent rewrites while touching sensitive paths.
 - Keep code elegant, concise, and direct. Prefer minimal, readable implementations over over-engineering and excessive abstraction. Use comments to clarify non-obvious intent and invariants, not to compensate for unclear code.
+- Mention unrelated issues when useful, but do not fix them as part of a narrow task.
 
 ## Constant and String Usage
 
@@ -44,11 +63,18 @@ Reference the source files above instead.
 
 ## Verification Before PR
 
+Convert changes into independently verifiable outcomes. Prefer focused tests for behavior changes and run the relevant checks before declaring completion.
+
 For code changes, run and pass the following before opening a PR:
 
 ```bash
 make pre-commit
 ```
+
+Before pushing code changes, make sure formatting is clean:
+
+- Run `cargo fmt --all`.
+- Run `cargo fmt --all --check` and ensure no files are modified unexpectedly.
 
 If `make` is unavailable, run the equivalent checks defined under `.config/make/`.
 Documentation-only or instruction-only changes are exempt from the verification commands above (including the `.config/make/` equivalents), though any installed git pre-commit hooks (for example, from `make setup-hooks`) may still run on commit unless explicitly skipped.
@@ -64,12 +90,38 @@ Do not open a PR with code changes when the required checks fail.
 - Use `N/A` for non-applicable template sections.
 - Include verification commands in the PR description.
 - When using `gh pr create`/`gh pr edit`, use `--body-file` instead of inline `--body` for multiline markdown.
+- Do not include the literal sequence `\n` in any GitHub issue, pull request, or discussion comment.
+- After fixing code review comments or CI findings, always mark corresponding review
+  comments/threads as resolved before returning to the user.
+- In handling review comments, confirm the underlying issue before changing code.
+  If a suggested change is not appropriate for behavior or risk, reply with a
+  concise rationale instead of blindly applying it.
 
 ## Security Baseline
 
 - Never commit secrets, credentials, or key material.
 - Use environment variables or vault tooling for sensitive configuration.
 - For localhost-sensitive tests, verify proxy settings to avoid traffic leakage.
+
+## Tools
+
+### xl.meta decode tool Quick Use
+
+```
+cargo run -p rustfs-filemeta --example dump_fileinfo -- "/path/to/file/xl.meta"
+```
+
+## Serde Safety
+
+- Add `#[serde(deny_unknown_fields)]` to structs deserialized from untrusted input (S3 API XML/JSON, lifecycle rules, bucket policies, replication configs).
+- When `deny_unknown_fields` is impractical (backward compatibility), at minimum log unknown fields at `warn` level.
+- Never use `#[serde(default)]` on security-critical fields without explicit validation of the resulting value.
+
+## Naming Conventions
+
+- Follow Rust API Guidelines for naming: `SCREAMING_SNAKE_CASE` for statics and constants, `snake_case` for functions and variables, `PascalCase` for types.
+- Do not use camelCase or Hungarian notation (e.g., `globalDeploymentIDPtr` → `GLOBAL_DEPLOYMENT_ID`).
+- If existing code violates naming conventions, do not widen the violation in new code. Fix opportunistically when touching the surrounding area.
 
 ## Scoped Guidance in This Repository
 
@@ -81,5 +133,6 @@ Do not open a PR with code changes when the required checks fail.
 - `crates/iam/AGENTS.md`
 - `crates/kms/AGENTS.md`
 - `crates/policy/AGENTS.md`
+- `crates/targets/AGENTS.md`
 - `rustfs/src/admin/AGENTS.md`
 - `rustfs/src/storage/AGENTS.md`

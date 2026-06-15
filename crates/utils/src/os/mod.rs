@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(any(target_os = "linux", test))]
+mod fs_type;
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -21,13 +24,15 @@ mod unix;
 mod windows;
 
 #[cfg(target_os = "linux")]
-pub use linux::{get_drive_stats, get_info, same_disk};
+pub use linux::{check_cross_device_mounts, get_drive_stats, get_info, get_physical_device_ids, same_disk};
 
 #[cfg(all(unix, not(target_os = "linux")))]
-pub use unix::{get_drive_stats, get_info, same_disk};
+pub use unix::{check_cross_device_mounts, get_drive_stats, get_info, get_physical_device_ids, same_disk};
 
 #[cfg(target_os = "windows")]
-pub use windows::{get_drive_stats, get_info, same_disk};
+pub use windows::{
+    check_cross_device_mounts, get_drive_stats, get_info, get_physical_device_ids, get_volume_serial_number, same_disk,
+};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct IOStats {

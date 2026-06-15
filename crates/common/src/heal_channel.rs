@@ -18,7 +18,7 @@ use std::{
     fmt::{self, Display},
     sync::OnceLock,
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 pub const HEAL_DELETE_DANGLING: bool = true;
@@ -110,6 +110,25 @@ pub enum HealScanMode {
     Deep = 2,
 }
 
+impl HealScanMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Normal => "normal",
+            Self::Deep => "deep",
+        }
+    }
+
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::Normal),
+            2 => Some(Self::Deep),
+            _ => None,
+        }
+    }
+}
+
 impl Serialize for HealScanMode {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -137,12 +156,7 @@ impl<'de> Deserialize<'de> for HealScanMode {
             where
                 E: serde::de::Error,
             {
-                match value {
-                    0 => Ok(HealScanMode::Unknown),
-                    1 => Ok(HealScanMode::Normal),
-                    2 => Ok(HealScanMode::Deep),
-                    _ => Err(E::custom(format!("invalid HealScanMode value: {value}"))),
-                }
+                HealScanMode::from_u8(value).ok_or_else(|| E::custom(format!("invalid HealScanMode value: {value}")))
             }
 
             fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
@@ -206,15 +220,71 @@ pub struct HealOpts {
     pub set: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealAdmissionDropReason {
+    QueueFull,
+    PolicyDropped,
+}
+
+impl HealAdmissionDropReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QueueFull => "queue_full",
+            Self::PolicyDropped => "policy_dropped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealAdmissionResult {
+    Accepted,
+    Merged,
+    Full,
+    Dropped(HealAdmissionDropReason),
+}
+
+impl HealAdmissionResult {
+    pub fn result_label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Merged => "merged",
+            Self::Full => "full",
+            Self::Dropped(_) => "dropped",
+        }
+    }
+
+    pub fn reason_label(self) -> &'static str {
+        match self {
+            Self::Dropped(reason) => reason.as_str(),
+            _ => "none",
+        }
+    }
+
+    pub fn is_admitted(self) -> bool {
+        matches!(self, Self::Accepted | Self::Merged)
+    }
+}
+
 /// Heal channel command type
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum HealChannelCommand {
     /// Start a new heal task
-    Start(HealChannelRequest),
+    Start {
+        request: HealChannelRequest,
+        response_tx: oneshot::Sender<Result<HealAdmissionResult, String>>,
+    },
     /// Query heal task status
-    Query { heal_path: String, client_token: String },
+    Query {
+        heal_path: String,
+        client_token: String,
+        response_tx: oneshot::Sender<Result<HealChannelResponse, String>>,
+    },
     /// Cancel heal task
-    Cancel { heal_path: String },
+    Cancel {
+        heal_path: String,
+        client_token: String,
+        response_tx: oneshot::Sender<Result<HealChannelResponse, String>>,
+    },
 }
 
 /// Heal request from admin to ahm
@@ -331,7 +401,9 @@ fn heal_response_sender() -> &'static HealResponseSender {
 
 /// Publish a heal response to subscribers.
 pub fn publish_heal_response(response: HealChannelResponse) -> Result<(), broadcast::error::SendError<HealChannelResponse>> {
-    heal_response_sender().send(response).map(|_| ())
+    let sender = heal_response_sender();
+    let _ = sender.send(response);
+    Ok(())
 }
 
 /// Subscribe to heal responses.
@@ -339,19 +411,54 @@ pub fn subscribe_heal_responses() -> broadcast::Receiver<HealChannelResponse> {
     heal_response_sender().subscribe()
 }
 
+/// Send heal start request and wait for structured admission feedback.
+pub async fn send_heal_request_with_admission(request: HealChannelRequest) -> Result<HealAdmissionResult, String> {
+    let (response_tx, response_rx) = oneshot::channel();
+    send_heal_command(HealChannelCommand::Start { request, response_tx }).await?;
+    response_rx
+        .await
+        .map_err(|e| format!("Failed to receive heal admission response: {e}"))?
+}
+
 /// Send heal start request
 pub async fn send_heal_request(request: HealChannelRequest) -> Result<(), String> {
-    send_heal_command(HealChannelCommand::Start(request)).await
+    match send_heal_request_with_admission(request).await? {
+        HealAdmissionResult::Accepted | HealAdmissionResult::Merged => Ok(()),
+        HealAdmissionResult::Full => Err("Heal request queue is full".to_string()),
+        HealAdmissionResult::Dropped(reason) => Err(format!("Heal request dropped: {}", reason.as_str())),
+    }
+}
+
+async fn receive_heal_channel_response(
+    response_rx: oneshot::Receiver<Result<HealChannelResponse, String>>,
+) -> Result<HealChannelResponse, String> {
+    response_rx
+        .await
+        .map_err(|e| format!("Failed to receive heal channel response: {e}"))?
 }
 
 /// Send heal query request
-pub async fn query_heal_status(heal_path: String, client_token: String) -> Result<(), String> {
-    send_heal_command(HealChannelCommand::Query { heal_path, client_token }).await
+pub async fn query_heal_status(heal_path: String, client_token: String) -> Result<HealChannelResponse, String> {
+    let (response_tx, response_rx) = oneshot::channel();
+    send_heal_command(HealChannelCommand::Query {
+        heal_path,
+        client_token,
+        response_tx,
+    })
+    .await?;
+    receive_heal_channel_response(response_rx).await
 }
 
 /// Send heal cancel request
-pub async fn cancel_heal_task(heal_path: String) -> Result<(), String> {
-    send_heal_command(HealChannelCommand::Cancel { heal_path }).await
+pub async fn cancel_heal_task(heal_path: String, client_token: String) -> Result<HealChannelResponse, String> {
+    let (response_tx, response_rx) = oneshot::channel();
+    send_heal_command(HealChannelCommand::Cancel {
+        heal_path,
+        client_token,
+        response_tx,
+    })
+    .await?;
+    receive_heal_channel_response(response_rx).await
 }
 
 /// Create a new heal request
@@ -450,7 +557,7 @@ pub fn lc_has_active_rules(config: &BucketLifecycleConfiguration, prefix: &str) 
         }
 
         if let Some(e) = &rule.noncurrent_version_expiration {
-            if let Some(true) = e.noncurrent_days.map(|d| d > 0) {
+            if e.noncurrent_days.is_some() {
                 return true;
             }
             if let Some(true) = e.newer_noncurrent_versions.map(|d| d > 0) {
@@ -542,6 +649,19 @@ pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPri
 mod tests {
     use super::*;
 
+    #[test]
+    fn heal_admission_result_labels_are_stable() {
+        assert_eq!(HealAdmissionResult::Accepted.result_label(), "accepted");
+        assert_eq!(HealAdmissionResult::Merged.result_label(), "merged");
+        assert_eq!(HealAdmissionResult::Full.result_label(), "full");
+        assert_eq!(
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull).reason_label(),
+            "queue_full"
+        );
+        assert!(HealAdmissionResult::Merged.is_admitted());
+        assert!(!HealAdmissionResult::Full.is_admitted());
+    }
+
     #[tokio::test]
     async fn heal_response_broadcast_reaches_subscriber() {
         let mut receiver = subscribe_heal_responses();
@@ -552,5 +672,10 @@ mod tests {
         let received = receiver.recv().await.expect("should receive heal response");
         assert_eq!(received.request_id, response.request_id);
         assert!(received.success);
+
+        drop(receiver);
+        let response = create_heal_response("req-no-subscriber".to_string(), true, None, None);
+
+        publish_heal_response(response).expect("publish without subscribers should be ignored");
     }
 }

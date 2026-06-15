@@ -23,10 +23,9 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.console_address | string | `":9001"` |  |
 | config.rustfs.console_enable | string | `"true"` |  |
 | config.rustfs.domains | string | `""` | Enable virtual host mode. |
-| config.rustfs.ec.storage_class_standard | string | `EC:4` | Standard storage class environment variable. |
 | config.rustfs.log_level | string | `"info"` |  |
 | config.rustfs.obs_environment | string | `"development"` |  |
-| config.rustfs.obs_log_directory | string | `"/logs"` |  |
+| config.rustfs.obs_log_directory | string | `"/logs"` | Log directory inside the RustFS container. Set to `""` to disable log PVCs and mounts. |
 | config.rustfs.region | string | `"us-east-1"` |  |
 | config.rustfs.volumes | string | `""` |  |
 | config.rustfs.log_rotation.size | int | `"100"` | Default log rotation size mb for rustfs. |
@@ -35,8 +34,22 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.metrics.enabled | bool | `false` | Toggle metrics export. |
 | config.rustfs.metrics.endpoint | string | `""` | Dedicated metrics endpoint. |
 | config.rustfs.scanner.speed | string | `""` | Scanner speed preset: `fastest`, `fast`, `default`, `slow`, `slowest`. |
+| config.rustfs.scanner.delay | string | `""` | Override scanner sleep multiplier with `RUSTFS_SCANNER_DELAY` (`0` through `10000`). |
+| config.rustfs.scanner.max_wait_secs | string | `""` | Override maximum scanner sleep in seconds with `RUSTFS_SCANNER_MAX_WAIT_SECS`. |
+| config.rustfs.scanner.cycle_secs | string | `""` | Override scanner cycle interval in seconds with `RUSTFS_SCANNER_CYCLE`. |
 | config.rustfs.scanner.start_delay_secs | string | `""` | Override scanner cycle interval in seconds with `RUSTFS_SCANNER_START_DELAY_SECS`. |
+| config.rustfs.scanner.cycle_max_duration_secs | string | `""` | Cap one scanner cycle's runtime in seconds with `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` (`0` disables). |
+| config.rustfs.scanner.cycle_max_objects | string | `""` | Cap objects processed by one scanner cycle with `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` (`0` disables). |
+| config.rustfs.scanner.cycle_max_directories | string | `""` | Cap directories entered by one scanner cycle with `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` (`0` disables). |
+| config.rustfs.scanner.bitrot_cycle_secs | string | `""` | Override periodic deep bitrot cycle with `RUSTFS_SCANNER_BITROT_CYCLE_SECS`; `false`, `off`, `no`, or `disabled` disables it. |
 | config.rustfs.scanner.idle_mode | string | `""` | Override scanner idle throttling flag (`RUSTFS_SCANNER_IDLE_MODE`). |
+| config.rustfs.scanner.cache_save_timeout_secs | string | `""` | Override scanner cache save timeout in seconds with `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` (minimum `1`). |
+| config.rustfs.scanner.max_concurrent_set_scans | string | `""` | Cap concurrent scanner set tasks with `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` (`0` keeps topology-derived concurrency). |
+| config.rustfs.scanner.max_concurrent_disk_scans | string | `""` | Cap concurrent scanner disk bucket walks per set with `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` (`0` keeps disk-count-derived concurrency). |
+| config.rustfs.scanner.yield_every_n_objects | string | `""` | Yield to the async runtime every N scanned objects with `RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS` (`0` disables extra yield). |
+| config.rustfs.scanner.alert_excess_versions | string | `""` | Set version count threshold for scanner alerts with `RUSTFS_SCANNER_ALERT_EXCESS_VERSIONS`. |
+| config.rustfs.scanner.alert_excess_version_size | string | `""` | Set retained version byte threshold for scanner alerts with `RUSTFS_SCANNER_ALERT_EXCESS_VERSION_SIZE`. |
+| config.rustfs.scanner.alert_excess_folders | string | `""` | Set direct subfolder threshold for scanner alerts with `RUSTFS_SCANNER_ALERT_EXCESS_FOLDERS`. |
 | config.rustfs.obs_endpoint.enabled | bool | `false` | Whether to send metrics/logs/traces/profilings to remote endpoint, eg, OLTP. |
 | config.rustfs.obs_endpoint.base_endpoint | string | `""` | Root OTLP/HTTP endpoint, e.g. http://otel-collector:4318. |
 | config.rustfs.obs_endpoint.use_stdout | bool | `false` | Whether to output logs to stdout in addition the OLTP. |
@@ -48,10 +61,20 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | config.rustfs.obs_endpoint.logs.endpoint | string | `""` | Remote endpoint url for logs. |
 | config.rustfs.obs_endpoint.profiling.enabled | bool | `false` | Whether to send profiling to remote endpoint. |
 | config.rustfs.obs_endpoint.profiling.endpoint | string | `""` | Remote endpoint url for profiling. |
-| extraEnv | list | `[]` |  Extra environment variables for RustFS container. |
+| config.rustfs.kms.enabled | bool | `false`| Whether to enable kms. |
+| config.rustfs.kms.type | string | `vault`| The kms type that RustFS supported. |
+| config.rustfs.kms.vault.vault_backend | string | `""`| The vault backend, `vault-kv2` or `vault-transit`. |
+| config.rustfs.kms.vault.vault_address | string | `""`| The vault address. |
+| config.rustfs.kms.vault.vault_token | string | `""`| The vault token. |
+| config.rustfs.kms.vault.vault_mount_path | string | `"transit"`| The vault mount path, only works if `vault_backend` equals `vault-transit` . |
+| config.rustfs.kms.vault.default_key | string | `"transit"`| The master key id for RustFS. |
+| extraEnv | map | `[]` |  Extra environment variables for RustFS container. |
+| extraVolumes | list | `[]` | Extra volumes to add to the pod spec. Supported in both standalone (Deployment) and distributed (StatefulSet) modes. |
+| extraVolumeMounts | list | `[]` | Extra volume mounts to add to the RustFS container. Supported in both standalone (Deployment) and distributed (StatefulSet) modes. |
 | containerSecurityContext.capabilities.drop[0] | string | `"ALL"` |  |
 | containerSecurityContext.readOnlyRootFilesystem | bool | `true` |  |
 | containerSecurityContext.runAsNonRoot | bool | `true` |  |
+| priorityClassName | string | `""` |  |
 | enableServiceLinks | bool | `false` |  |
 | extraManifests | list | `[]` | List of additional k8s manifests. |
 | fullnameOverride | string | `""` |  |
@@ -96,7 +119,13 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | mode.standalone.existingClaim.dataClaim |string |`""` |Whether to use existing pvc claim for data storage. |
 | mode.standalone.existingClaim.logsClaim |string |`""` |Whether to use existing pvc claim for logs storage. |
 | mtls.enabled | bool | `false` | Enable mtls betweens pods. |
-| mtls.serverOnly | bool | `false` | Only enable server https. |
+| mtls.clientCertPath | string | `/opt/tls/client_cert.pem` | The path for client cert. |
+| mtls.clientKeyPath | string | `/opt/tls/client_key.pem` | The path for client key. |
+| mtls.existingIssuerRef.enabled | bool | `false` | Enable to use external/existing certificate issuer.|
+| mtls.existingIssuerRef.name | string | `""` | The name of external/existing certificate issuer. |
+| mtls.existingIssuerRef.kind | string | `""` | The kind of external/existing certificate iss
+uer. `ClusterIssuer` or `Issuer`. |
+| mtls.existingIssuerRef.group | string | `""` | The group of external/existing certificate issuer. |
 | nameOverride | string | `""` |  |
 | nodeSelector | object | `{}` |  |
 | pdb.create | bool | `false` | Enable/disable a Pod Disruption Budget creation |
@@ -134,7 +163,11 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | storageclass.dataStorageSize | string | `"256Mi"` | The storage size for data PVC. |
 | storageclass.logStorageSize | string | `"256Mi"` | The storage size for logs PVC. |
 | storageclass.name | string | `"local-path"` | The name for StorageClass. |
+| storageclass.pvcAnnotations.data | map | `{}` | Data pvc customized annotations. |
+| storageclass.pvcAnnotations.logs | map | `{}` | Logs pvc customized annotations. |
 | tolerations | list | `[]` |  |
+| topologySpreadConstraints.enabled | bool | `false` | Enable custom topology spread constraints on distributed-mode StatefulSet pods. |
+| topologySpreadConstraints.constraints | list | `[]` | Raw `spec.template.spec.topologySpreadConstraints` entries applied to the distributed StatefulSet when enabled. |
 | gatewayApi.enabled | bool | `false` | To enable/disable gateway api support. |
 | gatewayApi.gatewayClass | string | `traefik` | Gateway class implementation. |
 | gatewayApi.listeners.http.name | string | `web` | Gateway API http listener name. |
@@ -145,6 +178,12 @@ RustFS helm chart supports **standalone and distributed mode**. For standalone m
 | gatewayApi.secretName | string | Secret tls to via RustFS using HTTPS. |
 | gatewayApi.existingGateway.name | string | `""` |  The existing gateway name, instead of creating a new one. |
 | gatewayApi.existingGateway.namespace | string | `""` |  The namespace of the existing gateway, if not the local namespace. |
+
+Scanner values map directly to scanner environment variables. For tuning
+workflow and `/v3/scanner/status` interpretation, see
+[Scanner Runtime Controls](../docs/operations/scanner-runtime-controls.md). For
+repeatable scanner-pressure validation, see
+[Scanner Benchmark Runbook](../docs/operations/scanner-benchmark-runbook.md).
 
 ---
 

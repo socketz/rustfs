@@ -53,18 +53,21 @@ runs:
           musl-tools \
           build-essential \
           pkg-config \
-          libssl-dev
+          libssl-dev \
+          ripgrep \
+          unzip \
+          protobuf-compiler
 
     - name: Install protoc
-      uses: arduino/setup-protoc@v3
+      uses: rustfs/setup-protoc@v3.0.1
       with:
-        version: "33.1"
-        repo-token: ${{ inputs.github-token }}
+        version: "34.1"
+        repo-token: ${{ github.token }}
 
     - name: Install flatc
       uses: Nugine/setup-flatc@v1
       with:
-        version: "25.9.23"
+        version: "25.12.19"
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -82,7 +85,7 @@ runs:
       uses: taiki-e/install-action@cargo-zigbuild
 
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@cargo-nextest
+      uses: taiki-e/install-action@nextest
 
     - name: Setup Rust cache
       uses: Swatinem/rust-cache@v2

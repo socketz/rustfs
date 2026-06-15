@@ -17,10 +17,9 @@ use crate::error::{Error, Result};
 use crate::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::{
     disk::endpoint::Endpoint,
-    global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints},
-    new_object_layer_fn,
+    global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints, get_global_deployment_id},
     notification_sys::get_global_notification_sys,
-    store_api::StorageAPI,
+    resolve_object_store_handle,
 };
 
 use crate::data_usage::load_data_usage_cache;
@@ -32,6 +31,7 @@ use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{PingRequest, PingResponse},
 };
+use rustfs_storage_api::StorageAdminApi;
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, SystemTime},
@@ -162,8 +162,9 @@ pub async fn get_local_server_property() -> ServerProperties {
 
     let mut props = ServerProperties {
         endpoint: addr,
-        uptime: SystemTime::now()
-            .duration_since(*GLOBAL_BOOT_TIME.get().unwrap())
+        uptime: GLOBAL_BOOT_TIME
+            .get()
+            .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
             .unwrap_or_default()
             .as_secs(),
         network,
@@ -182,13 +183,10 @@ pub async fn get_local_server_property() -> ServerProperties {
     };
 
     // let mut sensitive = HashSet::new();
-    // sensitive.insert(ENV_ACCESS_KEY.to_string());
-    // sensitive.insert(ENV_SECRET_KEY.to_string());
-    // sensitive.insert(ENV_ROOT_USER.to_string());
-    // sensitive.insert(ENV_ROOT_PASSWORD.to_string());
-
-    if let Some(store) = new_object_layer_fn() {
-        let storage_info = store.local_storage_info().await;
+    // sensitive.insert(rustfs_config::ENV_RUSTFS_ACCESS_KEY.to_string());
+    // sensitive.insert(rustfs_config::ENV_RUSTFS_SECRET_KEY.to_string());
+    if let Some(store) = resolve_object_store_handle() {
+        let storage_info = StorageAdminApi::local_storage_info(store.as_ref()).await;
         props.state = ITEM_ONLINE.to_string();
         props.disks = storage_info.disks;
     } else {
@@ -231,7 +229,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
     let mut backend = rustfs_madmin::ErasureBackend::default();
     let mut pools: HashMap<i32, HashMap<i32, ErasureSetInfo>> = HashMap::new();
 
-    if let Some(store) = new_object_layer_fn() {
+    if let Some(store) = resolve_object_store_handle() {
         mode = ITEM_ONLINE;
         match load_data_usage_from_backend(store.clone()).await {
             Ok(res) => {
@@ -254,7 +252,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
 
         warn!("load_data_usage_from_backend end {:?}", after3 - after2);
 
-        let backend_info = store.clone().backend_info().await;
+        let backend_info = StorageAdminApi::backend_info(store.as_ref()).await;
 
         let after4 = OffsetDateTime::now_utc();
 
@@ -293,7 +291,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         domain: None,
         region: None,
         sqs_arn: None,
-        deployment_id: None,
+        deployment_id: get_global_deployment_id(),
         buckets: Some(buckets),
         objects: Some(objects),
         versions: Some(versions),
@@ -349,7 +347,7 @@ fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, Backend
 }
 
 async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, ErasureSetInfo>>> {
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_object_store_handle() else {
         return Err(Error::other("ServerNotInitialized"));
     };
 
@@ -394,4 +392,22 @@ pub fn get_commit_id() -> String {
     };
 
     format!("{}@{}", build::COMMIT_DATE_3339, ver)
+}
+
+#[cfg(test)]
+mod tests {
+    use serial_test::serial;
+
+    use crate::global::get_global_deployment_id;
+
+    use super::get_server_info;
+
+    #[serial]
+    #[tokio::test]
+    async fn server_info_includes_global_deployment_id() {
+        let expected_deployment_id = get_global_deployment_id();
+        let info = get_server_info(false).await;
+
+        assert_eq!(info.deployment_id, expected_deployment_id);
+    }
 }

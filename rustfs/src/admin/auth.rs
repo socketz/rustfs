@@ -20,7 +20,6 @@ use rustfs_iam::store::object::ObjectStore;
 use rustfs_iam::sys::IamSys;
 use rustfs_policy::policy::{Args, action::Action};
 use s3s::{S3Result, s3_error};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -31,6 +30,22 @@ struct AuthContext<'a> {
     is_owner: bool,
     deny_only: bool,
     remote_addr: Option<std::net::SocketAddr>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AdminResourceScope<'a> {
+    bucket: &'a str,
+    object: &'a str,
+}
+
+impl<'a> AdminResourceScope<'a> {
+    pub fn bucket(bucket: &'a str) -> Self {
+        Self { bucket, object: "" }
+    }
+
+    pub fn bucket_object(bucket: &'a str, object: &'a str) -> Self {
+        Self { bucket, object }
+    }
 }
 
 pub async fn validate_admin_request(
@@ -79,7 +94,7 @@ async fn check_admin_request_auth(
             action,
             conditions: &conditions,
             is_owner: ctx.is_owner,
-            claims: ctx.cred.claims.as_ref().unwrap_or(&HashMap::new()),
+            claims: ctx.cred.claims_or_empty(),
             deny_only: ctx.deny_only,
             bucket,
             object,
@@ -110,6 +125,27 @@ pub async fn validate_admin_request_with_bucket(
     remote_addr: Option<std::net::SocketAddr>,
     bucket: &str,
 ) -> S3Result<()> {
+    validate_admin_request_with_bucket_object(
+        headers,
+        cred,
+        is_owner,
+        deny_only,
+        actions,
+        remote_addr,
+        AdminResourceScope::bucket(bucket),
+    )
+    .await
+}
+
+pub async fn validate_admin_request_with_bucket_object(
+    headers: &HeaderMap,
+    cred: &Credentials,
+    is_owner: bool,
+    deny_only: bool,
+    actions: Vec<Action>,
+    remote_addr: Option<std::net::SocketAddr>,
+    resource: AdminResourceScope<'_>,
+) -> S3Result<()> {
     let Ok(iam_store) = rustfs_iam::get() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
@@ -122,7 +158,7 @@ pub async fn validate_admin_request_with_bucket(
     };
 
     for action in &actions {
-        if check_admin_request_auth(iam_store.clone(), &ctx, *action, bucket, "")
+        if check_admin_request_auth(iam_store.clone(), &ctx, *action, resource.bucket, resource.object)
             .await
             .is_ok()
         {

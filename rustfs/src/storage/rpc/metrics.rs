@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::storage::rpc::encode_msgpack_map;
 
 impl NodeService {
     pub(super) async fn handle_get_metrics(
@@ -26,7 +27,7 @@ impl NodeService {
         let t: MetricType = match Deserialize::deserialize(&mut buf_t) {
             Ok(t) => t,
             Err(err) => {
-                error!("Failed to deserialize metric_type: {}", err);
+                error!(error = %err, "failed to deserialize metric_type");
                 return Ok(Response::new(GetMetricsResponse {
                     success: false,
                     realtime_metrics: Bytes::new(),
@@ -40,7 +41,7 @@ impl NodeService {
         let opts: CollectMetricsOpts = match Deserialize::deserialize(&mut buf_o) {
             Ok(opts) => opts,
             Err(err) => {
-                error!("Failed to deserialize opts: {}", err);
+                error!(error = %err, "failed to deserialize opts");
                 return Ok(Response::new(GetMetricsResponse {
                     success: false,
                     realtime_metrics: Bytes::new(),
@@ -50,19 +51,17 @@ impl NodeService {
         };
 
         let info = collect_local_metrics(t, &opts).await;
-
-        let mut buf = Vec::new();
-        if let Err(err) = info.serialize(&mut Serializer::new(&mut buf)) {
-            return Ok(Response::new(GetMetricsResponse {
+        match encode_msgpack_map(&info) {
+            Ok(buf) => Ok(Response::new(GetMetricsResponse {
+                success: true,
+                realtime_metrics: buf.into(),
+                error_info: None,
+            })),
+            Err(err) => Ok(Response::new(GetMetricsResponse {
                 success: false,
                 realtime_metrics: Bytes::new(),
                 error_info: Some(err.to_string()),
-            }));
+            })),
         }
-        Ok(Response::new(GetMetricsResponse {
-            success: true,
-            realtime_metrics: buf.into(),
-            error_info: None,
-        }))
     }
 }

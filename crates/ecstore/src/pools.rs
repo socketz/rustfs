@@ -35,12 +35,12 @@ use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_data_movement_overwrite, is_err_object_not_found,
     is_err_operation_canceled, is_err_version_not_found,
 };
-use crate::new_object_layer_fn;
 use crate::notification_sys::get_global_notification_sys;
+use crate::resolve_object_store_handle;
 use crate::set_disk::SetDisks;
 use crate::store_api::{
     BucketOperations, BucketOptions, GetObjectReader, HealOperations, MakeBucketOptions, ObjectIO, ObjectOperations,
-    ObjectOptions, StorageAPI,
+    ObjectOptions,
 };
 use crate::{global::GLOBAL_LifecycleSys, sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
@@ -51,9 +51,10 @@ use rmp_serde::Deserializer;
 use rmp_serde::Serializer;
 use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
+use rustfs_concurrency::workers::Workers;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_utils::path::{SLASH_SEPARATOR, encode_dir_object, path_join};
-use rustfs_workers::workers::Workers;
+use rustfs_storage_api::StorageAdminApi;
+use rustfs_utils::path::{encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
 use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -69,6 +70,12 @@ use std::sync::{
 use time::{Duration, OffsetDateTime};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_POOLS: &str = "pools";
+const EVENT_DECOMMISSION_STATE: &str = "decommission_state";
+const EVENT_DECOMMISSION_BUCKET: &str = "decommission_bucket";
+const EVENT_DECOMMISSION_ENTRY: &str = "decommission_entry";
 
 pub const POOL_META_NAME: &str = "pool.bin";
 pub const POOL_META_FORMAT: u16 = 1;
@@ -140,6 +147,13 @@ fn ensure_decommission_not_rebalancing(rebalance_running: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn decommission_meta_bucket_options() -> MakeBucketOptions {
+    MakeBucketOptions {
+        force_create: true,
+        ..Default::default()
+    }
 }
 
 fn is_decommission_active(complete: bool, failed: bool, canceled: bool) -> bool {
@@ -986,25 +1000,11 @@ impl PoolMeta {
 }
 
 pub fn path2_bucket_object(name: &str) -> (String, String) {
-    path2_bucket_object_with_base_path("", name)
+    path_to_bucket_object(name)
 }
 
 pub fn path2_bucket_object_with_base_path(base_path: &str, path: &str) -> (String, String) {
-    // Trim the base path and leading slash
-    let trimmed_path = path
-        .strip_prefix(base_path)
-        .unwrap_or(path)
-        .strip_prefix(SLASH_SEPARATOR)
-        .unwrap_or(path);
-    // Find the position of the first '/'
-    let Some(pos) = trimmed_path.find(SLASH_SEPARATOR) else {
-        return (trimmed_path.to_string(), "".to_string());
-    };
-    // Split into bucket and prefix
-    let bucket = &trimmed_path[0..pos];
-    let prefix = &trimmed_path[pos + 1..]; // +1 to skip the '/' character if it exists
-
-    (bucket.to_string(), prefix.to_string())
+    path_to_bucket_object_with_base_path(base_path, path)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1240,8 +1240,8 @@ impl ECStore {
 
     async fn get_decommission_pool_space_info(&self, idx: usize) -> Result<PoolSpaceInfo> {
         if let Some(sets) = self.pools.get(idx) {
-            let mut info = sets.storage_info().await;
-            info.backend = self.backend_info().await;
+            let mut info = sets.storage_info_snapshot().await;
+            info.backend = StorageAdminApi::backend_info(self).await;
 
             let total = get_total_usable_capacity(&info.disks, &info);
             let free = get_total_usable_capacity_free(&info.disks, &info);
@@ -1286,7 +1286,15 @@ impl ECStore {
             take_decommission_canceler(cancelers.as_mut_slice(), idx)
         };
         if !cancel_decommission_canceler(canceler) {
-            warn!("decommission_cancel: no active canceler found for pool {}", idx);
+            warn!(
+                event = EVENT_DECOMMISSION_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                state = "cancel_skipped",
+                reason = "no_active_canceler",
+                "Decommission cancel skipped"
+            );
         }
 
         if should_reload_pool_meta && let Some(notification_sys) = get_global_notification_sys() {
@@ -1344,7 +1352,15 @@ impl ECStore {
             let store = store.clone();
             tokio::spawn(async move {
                 if let Err(err) = store.do_decommission_in_routine(canceler, idx).await {
-                    error!("decommission: routine failed for idx {}: {err}", idx);
+                    error!(
+                        event = EVENT_DECOMMISSION_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        pool_index = idx,
+                        state = "routine_failed",
+                        error = %err,
+                        "Decommission routine failed"
+                    );
                 }
             });
         }
@@ -1356,12 +1372,19 @@ impl ECStore {
     pub async fn decommission(&self, rx: CancellationToken, indices: Vec<usize>) -> Result<()> {
         let indices = dedup_indices(&indices);
 
-        warn!("decommission: {:?}", indices);
+        info!(
+            event = EVENT_DECOMMISSION_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            pool_indices = ?indices,
+            state = "requested",
+            "Decommission requested"
+        );
         validate_start_decommission_request(&indices, self.single_pool())?;
 
         ensure_decommission_not_rebalancing(self.is_rebalance_conflicting_with_decommission().await)?;
 
-        let store = require_decommission_store(new_object_layer_fn(), "start decommission")?;
+        let store = require_decommission_store(resolve_object_store_handle(), "start decommission")?;
 
         self.start_decommission(indices.clone()).await?;
         if let Err(err) = self.spawn_decommission_routines(store, rx, indices.clone()).await {
@@ -1369,8 +1392,13 @@ impl ECStore {
             for idx in indices {
                 if let Err(cancel_err) = self.decommission_cancel(idx).await {
                     error!(
-                        "decommission: failed to rollback decommission state for idx {} after spawn error: {:?}",
-                        idx, cancel_err
+                        event = EVENT_DECOMMISSION_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        pool_index = idx,
+                        state = "rollback_failed",
+                        error = ?cancel_err,
+                        "Decommission rollback failed after spawn error"
                     );
                     if rollback_err.is_none() {
                         rollback_err = Some(Error::other(format!("decommission rollback failed for idx {idx}: {cancel_err}")));
@@ -1396,16 +1424,35 @@ impl ECStore {
         lock_retention: Option<DefaultRetention>,
         replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
     ) -> Result<()> {
-        warn!("decommission_entry: {} {}", &bucket, &entry.name);
+        debug!(
+            event = EVENT_DECOMMISSION_ENTRY,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            pool_index = idx,
+            bucket = %bucket,
+            object = %entry.name,
+            state = "started",
+            "Decommission entry started"
+        );
         wk.give().await;
         if entry.is_dir() {
-            warn!("decommission_entry: skip dir {}", &entry.name);
+            debug!(
+                event = EVENT_DECOMMISSION_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                bucket = %bucket,
+                object = %entry.name,
+                state = "skipped_directory",
+                "Decommission entry skipped directory"
+            );
             return Ok(());
         }
 
         let mut fivs = load_decommission_entry_versions(&entry, &bucket, "file_info_versions")?;
 
-        fivs.versions.sort_by(|a, b| b.mod_time.cmp(&a.mod_time));
+        fivs.versions
+            .sort_by_key(|v| (v.mod_time.is_none(), std::cmp::Reverse(v.mod_time)));
 
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;
@@ -1431,7 +1478,16 @@ impl ECStore {
             if should_skip_decommission_delete_marker(version, remaining_versions, replication_config.is_some()) {
                 //
                 decommissioned += 1;
-                info!("decommission_pool: DELETE marked object with no other non-current versions will be skipped");
+                debug!(
+                    event = EVENT_DECOMMISSION_ENTRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    bucket = %bucket,
+                    object = %version.name,
+                    state = "skipped_delete_marker",
+                    "Decommission delete marker skipped"
+                );
                 continue;
             }
 
@@ -1452,8 +1508,16 @@ impl ECStore {
                 {
                     if is_err_object_not_found(&err) || is_err_version_not_found(&err) || is_err_data_movement_overwrite(&err) {
                         warn!(
-                            "decommission_pool: ignore delete-marker copy for {}/{} version {:?}: {:?}",
-                            &bucket, &version.name, &version_id, &err
+                            event = EVENT_DECOMMISSION_ENTRY,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            pool_index = idx,
+                            bucket = %bucket,
+                            object = %version.name,
+                            version_id = ?version_id,
+                            state = "ignored_delete_marker_copy",
+                            error = ?err,
+                            "Decommission delete marker copy ignored"
                         );
                         ignore = true;
                         cleanup_ignored = true;
@@ -1468,7 +1532,16 @@ impl ECStore {
                     if should_count_decommission_version_complete(ignore, cleanup_ignored, failure) {
                         decommissioned += 1;
                     }
-                    info!("decommission_pool: ignore {}", &version.name);
+                    debug!(
+                        event = EVENT_DECOMMISSION_ENTRY,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        pool_index = idx,
+                        bucket = %bucket,
+                        object = %version.name,
+                        state = "ignored",
+                        "Decommission entry ignored"
+                    );
                     continue;
                 }
 
@@ -1488,9 +1561,17 @@ impl ECStore {
                     decommissioned += 1;
                 }
 
-                info!(
-                    "decommission_pool: DecomCopyDeleteMarker  {} {} {:?} {:?}",
-                    &bucket, &version.name, &version_id, error
+                debug!(
+                    event = EVENT_DECOMMISSION_ENTRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    bucket = %bucket,
+                    object = %version.name,
+                    version_id = ?version_id,
+                    result = ?error,
+                    state = "delete_marker_copied",
+                    "Decommission delete marker copied"
                 );
                 continue;
             }
@@ -1576,8 +1657,15 @@ impl ECStore {
                 }
 
                 warn!(
-                    "decommission_pool: decommission_object done {}/{} {}",
-                    &bucket_name, &object_name, &version.name
+                    event = EVENT_DECOMMISSION_ENTRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    bucket = %bucket_name,
+                    object = %object_name,
+                    version = %version.name,
+                    state = "object_migrated",
+                    "Decommission object migrated"
                 );
 
                 failure = false;
@@ -1588,7 +1676,16 @@ impl ECStore {
                 if should_count_decommission_version_complete(ignore, cleanup_ignored, failure) {
                     decommissioned += 1;
                 }
-                info!("decommission_pool: ignore {}", &version.name);
+                debug!(
+                    event = EVENT_DECOMMISSION_ENTRY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    bucket = %bucket,
+                    object = %version.name,
+                    state = "ignored",
+                    "Decommission entry ignored"
+                );
                 continue;
             }
 
@@ -1629,12 +1726,17 @@ impl ECStore {
             resolve_decommission_entry_cleanup_delete_result(cleanup_result, bucket.as_str(), entry.name.as_str())?
         } else if decommissioned != fivs.versions.len() || expired > 0 {
             warn!(
-                "decommission_pool: source object retained for {}/{} because only {}/{} versions were decommissioned and {} expired by lifecycle",
-                &bucket,
-                &entry.name,
+                event = EVENT_DECOMMISSION_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                bucket = %bucket,
+                object = %entry.name,
                 decommissioned,
-                fivs.versions.len(),
-                expired
+                total_versions = fivs.versions.len(),
+                expired,
+                state = "source_retained",
+                "Decommission source object retained"
             );
         }
 
@@ -1672,7 +1774,16 @@ impl ECStore {
             }
         }
 
-        warn!("decommission_pool: decommission_entry done {} {}", &bucket, &entry.name);
+        debug!(
+            event = EVENT_DECOMMISSION_ENTRY,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            pool_index = idx,
+            bucket = %bucket,
+            object = %entry.name,
+            state = "completed",
+            "Decommission entry completed"
+        );
         Ok(())
     }
 
@@ -1710,7 +1821,16 @@ impl ECStore {
         for (set_idx, set) in pool.disk_set.iter().enumerate() {
             wk.clone().take().await;
 
-            warn!("decommission_pool: decommission_pool {} {}", set_idx, &bi.name);
+            debug!(
+                event = EVENT_DECOMMISSION_BUCKET,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                set_index = set_idx,
+                bucket = %bi.name,
+                state = "listing_worker_started",
+                "Decommission listing worker started"
+            );
 
             let decommission_entry: ListCallback = Arc::new({
                 let this = Arc::clone(self);
@@ -1758,23 +1878,69 @@ impl ECStore {
             let worker = tokio::spawn(async move {
                 loop {
                     if rx_clone.is_cancelled() {
-                        warn!("decommission_pool: cancel {}", set_id);
+                        debug!(
+                            event = EVENT_DECOMMISSION_BUCKET,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            pool_index = idx,
+                            set_index = set_id,
+                            bucket = %bi.name,
+                            state = "listing_worker_cancelled",
+                            "Decommission listing worker cancelled"
+                        );
                         break;
                     }
-                    warn!("decommission_pool: list_objects_to_decommission {} {}", set_id, &bi.name);
+                    debug!(
+                        event = EVENT_DECOMMISSION_BUCKET,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_POOLS,
+                        pool_index = idx,
+                        set_index = set_id,
+                        bucket = %bi.name,
+                        state = "listing_started",
+                        "Decommission listing started"
+                    );
 
                     match set
                         .list_objects_to_decommission(rx_clone.clone(), bi.clone(), decommission_entry.clone())
                         .await
                     {
                         Ok(_) => {
-                            warn!("decommission_pool: list_objects_to_decommission {} done", set_id);
+                            debug!(
+                                event = EVENT_DECOMMISSION_BUCKET,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                pool_index = idx,
+                                set_index = set_id,
+                                bucket = %bi.name,
+                                state = "listing_completed",
+                                "Decommission listing completed"
+                            );
                             break;
                         }
                         Err(err) => {
-                            error!("decommission_pool: list_objects_to_decommission {} err {:?}", set_id, &err);
+                            error!(
+                                event = EVENT_DECOMMISSION_BUCKET,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_POOLS,
+                                pool_index = idx,
+                                set_index = set_id,
+                                bucket = %bi.name,
+                                state = "listing_failed",
+                                error = ?err,
+                                "Decommission listing failed"
+                            );
                             if is_err_bucket_not_found(&err) {
-                                warn!("decommission_pool: list_objects_to_decommission {} volume not found", set_id);
+                                warn!(
+                                    event = EVENT_DECOMMISSION_BUCKET,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_POOLS,
+                                    pool_index = idx,
+                                    set_index = set_id,
+                                    bucket = %bi.name,
+                                    state = "listing_bucket_missing",
+                                    "Decommission listing bucket missing"
+                                );
                                 break;
                             }
 
@@ -1788,7 +1954,15 @@ impl ECStore {
             listing_workers.push((set_id, worker));
         }
 
-        warn!("decommission_pool: decommission_pool wait {} {}", idx, &bi.name);
+        debug!(
+            event = EVENT_DECOMMISSION_BUCKET,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            pool_index = idx,
+            bucket = %bi.name,
+            state = "waiting_for_workers",
+            "Decommission waiting for workers"
+        );
 
         let mut listing_worker_error = None;
         for (set_id, worker) in listing_workers {
@@ -1812,11 +1986,28 @@ impl ECStore {
         }
 
         if let Err(err) = decommission_cancel_signal_result(rx.is_cancelled()) {
-            warn!("decommission_pool: canceled after wait {} {}", idx, &bi.name);
+            warn!(
+                event = EVENT_DECOMMISSION_BUCKET,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                bucket = %bi.name,
+                state = "cancelled_after_wait",
+                error = %err,
+                "Decommission bucket cancelled after wait"
+            );
             return Err(err);
         }
 
-        warn!("decommission_pool: decommission_pool done {} {}", idx, &bi.name);
+        debug!(
+            event = EVENT_DECOMMISSION_BUCKET,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            pool_index = idx,
+            bucket = %bi.name,
+            state = "completed",
+            "Decommission bucket completed"
+        );
 
         Ok(())
     }
@@ -1826,7 +2017,14 @@ impl ECStore {
         defer!(|| async {
             let mut cancelers = self.decommission_cancelers.write().await;
             if take_decommission_canceler(cancelers.as_mut_slice(), idx).is_none() {
-                warn!("decommission: canceler already cleared for pool {}", idx);
+                warn!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    state = "canceler_already_cleared",
+                    "Decommission canceler already cleared"
+                );
             }
         });
 
@@ -1835,7 +2033,14 @@ impl ECStore {
         let (final_state, canceled, cmd_line) = {
             let pool_meta = self.pool_meta.read().await;
             let Some(pool) = pool_meta.pools.get(idx) else {
-                error!("decommission: pool metadata missing for idx {}", idx);
+                error!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    state = "pool_metadata_missing",
+                    "Decommission pool metadata missing"
+                );
                 return Err(Error::other(format!(
                     "failed to resolve decommission final state: pool metadata missing for idx {idx}"
                 )));
@@ -1854,29 +2059,75 @@ impl ECStore {
         };
 
         if let Err(err) = result {
-            error!("decom err {:?}", &err);
+            error!(
+                event = EVENT_DECOMMISSION_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                state = "background_failed",
+                error = ?err,
+                "Decommission background routine failed"
+            );
 
             if is_err_operation_canceled(&err) || should_preserve_decommission_canceled_state(canceled, rx.is_cancelled()) {
-                warn!("decommission: canceled for pool {}, preserving canceled state", cmd_line);
+                warn!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    cmd_line = %cmd_line,
+                    state = "cancelled_preserved",
+                    "Decommission cancelled; preserving canceled state"
+                );
                 return Ok(());
             }
 
             resolve_decommission_terminal_mark_after_error_result(self.decommission_failed(idx).await, idx, &err)?;
-            warn!("decommission: decommission_failed {}", idx);
+            warn!(
+                event = EVENT_DECOMMISSION_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                state = "marked_failed",
+                "Decommission marked failed"
+            );
 
             return Ok(());
         }
 
-        warn!("decommission: decommission_in_background complete {}", idx);
+        debug!(
+            event = EVENT_DECOMMISSION_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            pool_index = idx,
+            state = "background_complete",
+            "Decommission background routine completed"
+        );
 
         if should_preserve_decommission_canceled_state(canceled, rx.is_cancelled()) {
-            warn!("decommission: canceled for pool {}, skipping terminal state overwrite", cmd_line);
+            warn!(
+                event = EVENT_DECOMMISSION_STATE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                pool_index = idx,
+                cmd_line = %cmd_line,
+                state = "terminal_state_preserved",
+                "Decommission terminal state preserved after cancellation"
+            );
             return Ok(());
         }
 
         match final_state {
             DecommissionFinalState::Complete => {
-                warn!("Decommissioning complete for pool {}, verifying for any pending objects", cmd_line);
+                debug!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    cmd_line = %cmd_line,
+                    state = "verifying_completion",
+                    "Decommission completion verification started"
+                );
                 if let Err(err) = self.check_after_decommission(idx).await {
                     resolve_decommission_terminal_mark_result(self.decommission_failed(idx).await, "failed", &cmd_line)?;
                     return Err(Error::other(format!(
@@ -1884,16 +2135,40 @@ impl ECStore {
                     )));
                 }
 
-                warn!("Decommissioning complete for pool {}, marking completed state", cmd_line);
+                info!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    cmd_line = %cmd_line,
+                    state = "marking_completed",
+                    "Decommission marking completed state"
+                );
                 resolve_decommission_terminal_mark_result(self.complete_decommission(idx).await, "completed", &cmd_line)?;
             }
             DecommissionFinalState::Failed => {
-                warn!("Decommissioning finished with failed items for pool {}, marking failed state", cmd_line);
+                warn!(
+                    event = EVENT_DECOMMISSION_STATE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_POOLS,
+                    pool_index = idx,
+                    cmd_line = %cmd_line,
+                    state = "marking_failed",
+                    "Decommission marking failed state"
+                );
                 resolve_decommission_terminal_mark_result(self.decommission_failed(idx).await, "failed", &cmd_line)?;
             }
         }
 
-        warn!("Decommissioning complete for pool {}", cmd_line);
+        info!(
+            event = EVENT_DECOMMISSION_STATE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_POOLS,
+            pool_index = idx,
+            cmd_line = %cmd_line,
+            state = "completed",
+            "Decommission completed"
+        );
         Ok(())
     }
 
@@ -2049,9 +2324,10 @@ impl ECStore {
             path_join(&[PathBuf::from(RUSTFS_META_BUCKET), PathBuf::from(BUCKET_META_PREFIX)]),
         ];
 
+        let meta_bucket_opts = decommission_meta_bucket_options();
         for bk in meta_buckets.iter() {
             if let Err(err) = self
-                .make_bucket(bk.to_string_lossy().to_string().as_str(), &MakeBucketOptions::default())
+                .make_bucket(bk.to_string_lossy().to_string().as_str(), &meta_bucket_opts)
                 .await
                 && !is_err_bucket_exists(&err)
             {
@@ -2750,12 +3026,13 @@ mod pools_tests {
     use super::{
         DecomBucketInfo, DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolStatus, bind_decommission_cancelers,
         cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
-        decommission_cancel_signal_result, decommission_item_size, decommission_start_guard_state, dedup_indices,
-        ensure_decommission_cancel_allowed, ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing,
-        ensure_decommission_start_allowed, ensure_decommission_terminal_operation_supported,
-        ensure_valid_decommission_pool_index, get_by_index, has_active_decommission_canceler, is_decommission_active,
-        is_decommission_cancel_terminal, load_decommission_entry_versions, mark_decommission_bucket_done,
-        require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
+        decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
+        decommission_start_guard_state, dedup_indices, ensure_decommission_cancel_allowed,
+        ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
+        ensure_decommission_terminal_operation_supported, ensure_valid_decommission_pool_index, get_by_index,
+        has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_terminal,
+        load_decommission_entry_versions, mark_decommission_bucket_done, require_decommission_store,
+        resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
         resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
         resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
         resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
@@ -3390,6 +3667,13 @@ mod pools_tests {
     }
 
     #[test]
+    fn test_decommission_meta_bucket_options_are_idempotent() {
+        let opts = decommission_meta_bucket_options();
+
+        assert!(opts.force_create);
+    }
+
+    #[test]
     fn test_is_decommission_active_true_only_when_not_terminal() {
         assert!(is_decommission_active(false, false, false));
         assert!(!is_decommission_active(true, false, false));
@@ -3684,7 +3968,7 @@ mod pools_tests {
     #[test]
     fn test_take_decommission_canceler_takes_and_clears_slot() {
         let token = CancellationToken::new();
-        let mut cancelers = vec![Some(token.clone())];
+        let mut cancelers = vec![Some(token)];
 
         let taken = take_decommission_canceler(cancelers.as_mut_slice(), 0);
         assert!(taken.is_some());
@@ -3744,5 +4028,14 @@ mod pools_tests {
             err.to_string()
                 .contains("failed to start decommission routines: scheduled 1 of 2 expected workers")
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_path2_bucket_object_with_base_path_supports_windows_separators() {
+        let (bucket, object) = super::path2_bucket_object_with_base_path("C:\\data", "C:\\data\\my-bucket\\nested\\object.txt");
+
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(object, "nested/object.txt");
     }
 }

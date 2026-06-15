@@ -17,9 +17,14 @@ pub mod heal;
 
 pub use error::{Error, Result};
 pub use heal::{HealManager, HealOptions, HealPriority, HealRequest, HealType, channel::HealChannelProcessor};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+
+const LOG_COMPONENT_HEAL: &str = "heal";
+const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
+const EVENT_HEAL_RUNTIME_STATE: &str = "heal_runtime_state";
 
 // Global cancellation token for heal and related services
 static GLOBAL_AHM_SERVICES_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
@@ -55,6 +60,8 @@ static GLOBAL_HEAL_MANAGER: OnceLock<Arc<HealManager>> = OnceLock::new();
 
 /// Global heal channel processor instance
 static GLOBAL_HEAL_CHANNEL_PROCESSOR: OnceLock<Arc<tokio::sync::Mutex<HealChannelProcessor>>> = OnceLock::new();
+static GLOBAL_HEAL_ACTIVE_TASKS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_HEAL_QUEUE_LENGTH: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize and start heal manager with channel processor
 pub async fn init_heal_manager(
@@ -89,12 +96,27 @@ pub async fn init_heal_manager(
         if let Some(processor_guard) = GLOBAL_HEAL_CHANNEL_PROCESSOR.get() {
             let mut processor = processor_guard.lock().await;
             if let Err(e) = processor.start(receiver).await {
-                error!("Heal channel processor failed: {}", e);
+                error!(
+                    target: "rustfs::heal",
+                    event = EVENT_HEAL_RUNTIME_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "channel_processor_failed",
+                    error = %e,
+                    "Heal runtime channel processor failed"
+                );
             }
         }
     });
 
-    info!("Heal manager with channel processor initialized successfully");
+    info!(
+        target: "rustfs::heal",
+        event = EVENT_HEAL_RUNTIME_STATE,
+        component = LOG_COMPONENT_HEAL,
+        subsystem = LOG_SUBSYSTEM_RUNTIME,
+        state = "initialized",
+        "Heal runtime initialized"
+    );
     Ok(heal_manager)
 }
 
@@ -106,4 +128,20 @@ pub fn get_heal_manager() -> Option<&'static Arc<HealManager>> {
 /// Get global heal channel processor instance
 pub fn get_heal_channel_processor() -> Option<&'static Arc<tokio::sync::Mutex<HealChannelProcessor>>> {
     GLOBAL_HEAL_CHANNEL_PROCESSOR.get()
+}
+
+pub fn current_heal_active_tasks() -> u64 {
+    GLOBAL_HEAL_ACTIVE_TASKS.load(Ordering::Relaxed)
+}
+
+pub fn current_heal_queue_length() -> u64 {
+    GLOBAL_HEAL_QUEUE_LENGTH.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_heal_active_tasks(count: usize) {
+    GLOBAL_HEAL_ACTIVE_TASKS.store(count as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn set_heal_queue_length(count: usize) {
+    GLOBAL_HEAL_QUEUE_LENGTH.store(count as u64, Ordering::Relaxed);
 }

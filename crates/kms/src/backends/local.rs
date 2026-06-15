@@ -34,7 +34,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 /// Local KMS client that stores keys in local files
 pub struct LocalKmsClient {
@@ -74,7 +74,7 @@ impl LocalKmsClient {
         // Create key directory if it doesn't exist
         if !config.key_dir.exists() {
             fs::create_dir_all(&config.key_dir).await?;
-            info!("Created KMS key directory: {:?}", config.key_dir);
+            debug!(path = ?config.key_dir, "KMS key directory created");
         }
 
         // Initialize master cipher if master key is provided
@@ -219,7 +219,7 @@ impl LocalKmsClient {
 
         fs::rename(&temp_path, &key_path).await?;
 
-        info!("Saved master key {} to {:?}", master_key.key_id, key_path);
+        debug!(key_id = %master_key.key_id, path = ?key_path, "Local KMS master key saved");
         Ok(())
     }
 
@@ -267,7 +267,7 @@ impl KmsClient for LocalKmsClient {
             key_id: uuid::Uuid::new_v4().to_string(),
             master_key_id: request.master_key_id.clone(),
             key_spec: request.key_spec.clone(),
-            encrypted_key: encrypted_key.clone(),
+            encrypted_key,
             nonce,
             encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),
@@ -278,7 +278,7 @@ impl KmsClient for LocalKmsClient {
 
         let data_key = DataKeyInfo::new(envelope.key_id, 1, Some(plaintext_key), ciphertext, request.key_spec.clone());
 
-        info!("Generated data key for master key: {}", request.master_key_id);
+        debug!(key_id = %request.master_key_id, "Local KMS data key generated");
         Ok(data_key)
     }
 
@@ -334,7 +334,7 @@ impl KmsClient for LocalKmsClient {
             .decrypt_with_master_key(&envelope.master_key_id, &envelope.encrypted_key, &envelope.nonce)
             .await?;
 
-        info!("Successfully decrypted data");
+        debug!("Local KMS data decrypted");
         Ok(plaintext)
     }
 
@@ -367,7 +367,7 @@ impl KmsClient for LocalKmsClient {
         let mut cache = self.key_cache.write().await;
         cache.insert(key_id.to_string(), master_key.clone());
 
-        info!("Created master key: {}", key_id);
+        debug!(key_id, "Local KMS master key created");
         Ok(master_key)
     }
 
@@ -453,7 +453,7 @@ impl KmsClient for LocalKmsClient {
         let mut cache = self.key_cache.write().await;
         cache.insert(key_id.to_string(), master_key);
 
-        info!("Enabled key: {}", key_id);
+        debug!(key_id, "Local KMS key enabled");
         Ok(())
     }
 
@@ -470,7 +470,7 @@ impl KmsClient for LocalKmsClient {
         let mut cache = self.key_cache.write().await;
         cache.insert(key_id.to_string(), master_key);
 
-        info!("Disabled key: {}", key_id);
+        debug!(key_id, "Local KMS key disabled");
         Ok(())
     }
 
@@ -492,7 +492,7 @@ impl KmsClient for LocalKmsClient {
         let mut cache = self.key_cache.write().await;
         cache.insert(key_id.to_string(), master_key);
 
-        warn!("Scheduled key deletion: {}", key_id);
+        debug!(key_id, "Local KMS key deletion scheduled");
         Ok(())
     }
 
@@ -509,7 +509,7 @@ impl KmsClient for LocalKmsClient {
         let mut cache = self.key_cache.write().await;
         cache.insert(key_id.to_string(), master_key);
 
-        info!("Canceled deletion for key: {}", key_id);
+        debug!(key_id, "Local KMS key deletion canceled");
         Ok(())
     }
 
@@ -528,7 +528,7 @@ impl KmsClient for LocalKmsClient {
         let mut cache = self.key_cache.write().await;
         cache.insert(key_id.to_string(), master_key.clone());
 
-        info!("Rotated key: {}", key_id);
+        debug!(key_id, "Local KMS key rotated");
         Ok(master_key)
     }
 
@@ -564,9 +564,13 @@ pub struct LocalKmsBackend {
 impl LocalKmsBackend {
     /// Create a new LocalKmsBackend
     pub async fn new(config: KmsConfig) -> Result<Self> {
+        config.validate()?;
+
         let local_config = match &config.backend_config {
             crate::config::BackendConfig::Local(local_config) => local_config.clone(),
-            _ => return Err(KmsError::configuration_error("Expected Local backend configuration")),
+            crate::config::BackendConfig::VaultKv2(_) | crate::config::BackendConfig::VaultTransit(_) => {
+                return Err(KmsError::configuration_error("Expected Local backend configuration"));
+            }
         };
 
         let client = LocalKmsClient::new(local_config).await?;
@@ -717,7 +721,7 @@ impl KmsBackend for LocalKmsBackend {
             let mut cache = self.client.key_cache.write().await;
             cache.remove(key_id);
 
-            info!("Immediately deleted key: {}", key_id);
+            debug!(key_id, "Local KMS key deleted immediately");
 
             // Return success response for immediate deletion
             let key_metadata = KeyMetadata {

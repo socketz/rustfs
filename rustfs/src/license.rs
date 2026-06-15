@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_appauth::token::Token;
-use rustfs_appauth::token::parse_license;
+use rustfs_crypto::{Token, parse_license_with_public_key};
 use std::fmt;
 use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{error, info, warn};
+use tracing::{error, warn};
+
+const LOG_COMPONENT_LICENSE: &str = "license";
+const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
+const EVENT_LICENSE_INITIALIZATION_FAILED: &str = "license_initialization_failed";
 
 pub type LicenseResult<T> = std::result::Result<T, LicenseError>;
 pub type SharedLicenseVerifier = Arc<dyn LicenseVerifier>;
@@ -108,7 +111,9 @@ struct AppAuthLicenseVerifier;
 
 impl LicenseVerifier for AppAuthLicenseVerifier {
     fn validate(&self, raw_license: &str, _now: u64) -> LicenseResult<Token> {
-        let token = parse_license(raw_license).map_err(|err| LicenseError::Invalid(err.to_string()))?;
+        let public_key = license_public_key()?;
+        let token =
+            parse_license_with_public_key(raw_license, &public_key).map_err(|err| LicenseError::Invalid(err.to_string()))?;
 
         #[cfg(feature = "license")]
         if token.expired <= _now {
@@ -146,6 +151,30 @@ fn now_epoch_secs() -> LicenseResult<u64> {
 
 fn normalized_license(raw_license: Option<String>) -> Option<String> {
     raw_license.map(|raw| raw.trim().to_string()).filter(|raw| !raw.is_empty())
+}
+
+fn license_public_key() -> LicenseResult<String> {
+    let public_key = std::env::var(rustfs_config::ENV_RUSTFS_LICENSE_PUBLIC_KEY)
+        .map(|raw| raw.trim().to_string())
+        .map_err(|_| {
+            LicenseError::Invalid(format!(
+                "{} must contain the RSA public key used to verify licenses",
+                rustfs_config::ENV_RUSTFS_LICENSE_PUBLIC_KEY
+            ))
+        })?;
+
+    if public_key.is_empty() {
+        return Err(LicenseError::Invalid(format!(
+            "{} must contain the RSA public key used to verify licenses",
+            rustfs_config::ENV_RUSTFS_LICENSE_PUBLIC_KEY
+        )));
+    }
+
+    Ok(public_key)
+}
+
+fn is_license_token_current(token: &Token, now: u64) -> bool {
+    token.expired > now
 }
 
 fn strict_build_missing_status() -> LicenseStatus {
@@ -192,7 +221,36 @@ pub fn set_license_verifier(verifier: SharedLicenseVerifier) -> bool {
 /// This keeps the default API signature stable and is safe to call multiple times.
 pub fn initialize_license(raw_license: Option<String>) {
     if let Err(err) = initialize_license_result(raw_license) {
-        error!("license initialization failed: {err}");
+        match err {
+            LicenseError::Missing | LicenseError::Invalid(_) => {
+                warn!(
+                    event = EVENT_LICENSE_INITIALIZATION_FAILED,
+                    component = LOG_COMPONENT_LICENSE,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    error = %err,
+                    "License initialization failed"
+                );
+            }
+            #[cfg(feature = "license")]
+            LicenseError::Expired { .. } => {
+                warn!(
+                    event = EVENT_LICENSE_INITIALIZATION_FAILED,
+                    component = LOG_COMPONENT_LICENSE,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    error = %err,
+                    "License initialization failed"
+                );
+            }
+            LicenseError::StatePoisoned | LicenseError::Clock(_) => {
+                error!(
+                    event = EVENT_LICENSE_INITIALIZATION_FAILED,
+                    component = LOG_COMPONENT_LICENSE,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    error = %err,
+                    "License initialization failed"
+                );
+            }
+        }
     }
 }
 
@@ -206,13 +264,11 @@ pub fn initialize_license_result(raw_license: Option<String>) -> LicenseResult<(
             let now = now_epoch_secs()?;
             match license_verifier().validate(&raw_license, now) {
                 Ok(token) => {
-                    apply_valid_status(&mut state, token.clone());
-                    info!("license loaded, subject: {}", token.name);
+                    apply_valid_status(&mut state, token);
                     Ok(())
                 }
                 Err(err) => {
                     apply_invalid_status(&mut state, err.clone());
-                    warn!("license verification failed: {err}");
                     Err(err)
                 }
             }
@@ -241,6 +297,18 @@ pub fn get_license() -> Option<Token> {
 /// New name for compatibility with external integrations.
 pub fn current_license() -> Option<Token> {
     get_license()
+}
+
+/// Return whether the loaded license token is present and not expired.
+pub fn has_valid_license() -> bool {
+    let Some(token) = get_license() else {
+        return false;
+    };
+    let Ok(now) = now_epoch_secs() else {
+        return false;
+    };
+
+    is_license_token_current(&token, now)
 }
 
 /// Observe the current license status for observability.
@@ -282,4 +350,79 @@ pub fn ensure_license() -> LicenseResult<()> {
 /// Compatibility API for call-sites that still use the legacy name.
 pub fn license_check() -> Result<()> {
     ensure_license().map_err(LicenseError::into_io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rsa::{
+        RsaPrivateKey, RsaPublicKey,
+        pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
+    };
+    use rustfs_crypto::sign_license_token;
+    use serial_test::serial;
+
+    #[test]
+    fn license_token_current_requires_future_expiration() {
+        let token = Token {
+            name: "test_app".to_string(),
+            expired: 100,
+        };
+
+        assert!(is_license_token_current(&token, 99));
+        assert!(!is_license_token_current(&token, 100));
+        assert!(!is_license_token_current(&token, 101));
+    }
+
+    #[test]
+    #[serial]
+    fn appauth_verifier_rejects_missing_public_key() {
+        temp_env::with_var(rustfs_config::ENV_RUSTFS_LICENSE_PUBLIC_KEY, None::<&str>, || {
+            assert_license_public_key_error(AppAuthLicenseVerifier.validate("signed-license", 0));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn appauth_verifier_rejects_blank_public_key() {
+        temp_env::with_var(rustfs_config::ENV_RUSTFS_LICENSE_PUBLIC_KEY, Some("  \t\n  "), || {
+            assert_license_public_key_error(AppAuthLicenseVerifier.validate("signed-license", 0));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn appauth_verifier_accepts_signed_license_with_trimmed_public_key() {
+        let mut rng = rand::rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("private key should be generated");
+        let public_key = RsaPublicKey::from(&private_key);
+        let private_key_pem = private_key.to_pkcs8_pem(LineEnding::LF).expect("private key should encode");
+        let public_key_pem = public_key
+            .to_public_key_pem(LineEnding::LF)
+            .expect("public key should encode");
+        let expected = Token {
+            name: "test_app".to_string(),
+            expired: 100,
+        };
+        let signed_license = sign_license_token(&expected, &private_key_pem).expect("license should sign");
+        let public_key_env = format!(" \n{public_key_pem}\t ");
+
+        let actual = temp_env::with_var(rustfs_config::ENV_RUSTFS_LICENSE_PUBLIC_KEY, Some(public_key_env), || {
+            AppAuthLicenseVerifier.validate(&signed_license, 0)
+        })
+        .expect("signed license should validate with env public key");
+
+        assert_eq!(expected.name, actual.name);
+        assert_eq!(expected.expired, actual.expired);
+    }
+
+    fn assert_license_public_key_error(result: LicenseResult<Token>) {
+        let err = result.expect_err("license verification should fail without a public key");
+        let LicenseError::Invalid(message) = err else {
+            panic!("expected invalid license error, got {err:?}");
+        };
+
+        assert!(message.contains(rustfs_config::ENV_RUSTFS_LICENSE_PUBLIC_KEY));
+        assert!(message.contains("RSA public key"));
+    }
 }

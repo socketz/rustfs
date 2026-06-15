@@ -19,26 +19,60 @@
 
 use super::Opt;
 use crate::apply_external_env_compat;
-use rustfs_config::{ENV_RUSTFS_ROOT_PASSWORD, ENV_RUSTFS_ROOT_USER, RUSTFS_REGION};
+use rustfs_config::{
+    DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, ENV_RUSTFS_ACCESS_KEY, ENV_RUSTFS_SECRET_KEY, RUSTFS_REGION,
+};
 use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, Masked};
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+
+pub(crate) const LEGACY_ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
+pub(crate) const LEGACY_ENV_RUSTFS_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
+static LEGACY_CREDENTIAL_WARNED_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn warn_legacy_credential_env_once(legacy_key: &str, canonical_key: &str) {
+    let warned = LEGACY_CREDENTIAL_WARNED_KEYS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut warned = match warned.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if warned.insert(legacy_key.to_string()) {
+        tracing::warn!(
+            "Environment variable {} is deprecated and will be removed at GA; use {} instead",
+            legacy_key,
+            canonical_key
+        );
+    }
+}
 
 /// Helper function to resolve credentials from multiple sources with precedence:
 /// 1. Inline value (if provided)
 /// 2. File value (if provided, read the content of the file)
-/// 3. Environment variable (if set)
-/// 4. Default value (if none of the above are provided)
+/// 3. Canonical environment variable (if set)
+/// 4. Legacy environment aliases (if set)
+/// 5. Default value (if none of the above are provided)
 pub(crate) fn resolve_credential<T: AsRef<std::path::Path>>(
     inline_value: Option<String>,
     file_value: Option<T>,
     env_key: &str,
+    legacy_env_keys: &[&str],
     default_value: &str,
 ) -> std::io::Result<String> {
-    let value = inline_value
-        .map(Ok)
-        .or_else(|| file_value.map(std::fs::read_to_string))
-        .or_else(|| rustfs_utils::get_env_opt_str(env_key).map(Ok))
-        .transpose()?
-        .unwrap_or_else(|| default_value.to_string());
+    let value = if let Some(value) = inline_value {
+        value
+    } else if let Some(path) = file_value {
+        std::fs::read_to_string(path)?
+    } else if let Some(value) = rustfs_utils::get_env_opt_str(env_key) {
+        value
+    } else if let Some((legacy_key, value)) = legacy_env_keys
+        .iter()
+        .find_map(|legacy_key| rustfs_utils::get_env_opt_str(legacy_key).map(|value| (*legacy_key, value)))
+    {
+        warn_legacy_credential_env_once(legacy_key, env_key);
+        value
+    } else {
+        default_value.to_string()
+    };
 
     Ok(value.trim().to_string())
 }
@@ -91,14 +125,23 @@ pub struct Config {
     /// KMS key directory for local backend
     pub kms_key_dir: Option<String>,
 
+    /// Master key for local KMS key-file encryption
+    pub kms_local_master_key: Option<String>,
+
     /// Vault address for vault backend
     pub kms_vault_address: Option<String>,
 
     /// Vault token for vault backend
     pub kms_vault_token: Option<String>,
 
+    /// Vault mount path for vault or vault-transit backend
+    pub kms_vault_mount_path: Option<String>,
+
     /// Default KMS key ID for encryption
     pub kms_default_key_id: Option<String>,
+
+    /// Allow development-only insecure KMS defaults
+    pub kms_allow_insecure_dev_defaults: bool,
 
     /// Disable adaptive buffer sizing with workload profiles
     pub buffer_profile_disable: bool,
@@ -108,6 +151,41 @@ pub struct Config {
 }
 
 impl Config {
+    /// Create a `Config` with sensible defaults for the given volumes and address.
+    ///
+    /// This is the programmatic alternative to [`Opt::parse_command`] which reads
+    /// from the CLI / environment. Useful for embedded / integration-test usage.
+    pub fn new(address: impl Into<String>, volumes: Vec<String>) -> Self {
+        Config {
+            volumes,
+            address: address.into(),
+            server_domains: Vec::new(),
+            access_key: DEFAULT_ACCESS_KEY.to_string(),
+            secret_key: DEFAULT_SECRET_KEY.to_string(),
+            console_enable: DEFAULT_CONSOLE_ENABLE,
+            console_address: DEFAULT_CONSOLE_ADDRESS.to_string(),
+            obs_endpoint: rustfs_config::DEFAULT_OBS_ENDPOINT.to_string(),
+            tls_path: None,
+            license: None,
+            region: Some(RUSTFS_REGION.to_string()),
+            kms_enable: false,
+            kms_backend: "local".to_string(),
+            kms_key_dir: None,
+            kms_local_master_key: None,
+            kms_vault_address: None,
+            kms_vault_token: None,
+            kms_vault_mount_path: None,
+            kms_default_key_id: None,
+            kms_allow_insecure_dev_defaults: false,
+            buffer_profile_disable: false,
+            buffer_profile: "GeneralPurpose".to_string(),
+        }
+    }
+
+    pub fn is_using_default_credentials(&self) -> bool {
+        DEFAULT_ACCESS_KEY.eq(&self.access_key) && DEFAULT_SECRET_KEY.eq(&self.secret_key)
+    }
+
     /// Create Config from Opt
     pub(super) fn from_opt(opt: Opt) -> std::io::Result<Self> {
         let Opt {
@@ -127,15 +205,30 @@ impl Config {
             kms_enable,
             kms_backend,
             kms_key_dir,
+            kms_local_master_key,
             kms_vault_address,
             kms_vault_token,
+            kms_vault_mount_path,
             kms_default_key_id,
+            kms_allow_insecure_dev_defaults,
             buffer_profile_disable,
             buffer_profile,
         } = opt;
 
-        let access_key = resolve_credential(access_key, access_key_file.as_ref(), ENV_RUSTFS_ROOT_USER, DEFAULT_ACCESS_KEY)?;
-        let secret_key = resolve_credential(secret_key, secret_key_file.as_ref(), ENV_RUSTFS_ROOT_PASSWORD, DEFAULT_SECRET_KEY)?;
+        let access_key = resolve_credential(
+            access_key,
+            access_key_file.as_ref(),
+            ENV_RUSTFS_ACCESS_KEY,
+            &[LEGACY_ENV_RUSTFS_ROOT_USER],
+            DEFAULT_ACCESS_KEY,
+        )?;
+        let secret_key = resolve_credential(
+            secret_key,
+            secret_key_file.as_ref(),
+            ENV_RUSTFS_SECRET_KEY,
+            &[LEGACY_ENV_RUSTFS_ROOT_PASSWORD],
+            DEFAULT_SECRET_KEY,
+        )?;
 
         // Region is optional, but if not set, we should default to "us-east-1" for signing compatibility with AWS S3 clients
         let region = region.or_else(|| Some(RUSTFS_REGION.to_string()));
@@ -155,9 +248,12 @@ impl Config {
             kms_enable,
             kms_backend,
             kms_key_dir,
+            kms_local_master_key,
             kms_vault_address,
             kms_vault_token,
+            kms_vault_mount_path,
             kms_default_key_id,
+            kms_allow_insecure_dev_defaults,
             buffer_profile_disable,
             buffer_profile,
         })
@@ -195,9 +291,12 @@ impl std::fmt::Debug for Config {
             .field("kms_enable", &self.kms_enable)
             .field("kms_backend", &self.kms_backend)
             .field("kms_key_dir", &self.kms_key_dir)
+            .field("kms_local_master_key", &Masked(self.kms_local_master_key.as_deref()))
             .field("kms_vault_address", &self.kms_vault_address)
             .field("kms_vault_token", &Masked(self.kms_vault_token.as_deref()))
+            .field("kms_vault_mount_path", &self.kms_vault_mount_path)
             .field("kms_default_key_id", &self.kms_default_key_id)
+            .field("kms_allow_insecure_dev_defaults", &self.kms_allow_insecure_dev_defaults)
             .field("buffer_profile_disable", &self.buffer_profile_disable)
             .field("buffer_profile", &self.buffer_profile)
             .finish()

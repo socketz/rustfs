@@ -27,6 +27,10 @@ categories.workspace = true
 documentation = "https://docs.rustfs.com/"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "rustfs"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rustfs"
 path = "src/main.rs"
@@ -39,17 +43,18 @@ bench = false
 required-features = ["manual-test-runners"]
 
 [features]
-default = ["direct-io"]
-metrics-gpu = ["rustfs-metrics/gpu"]
+default = ["ftps", "webdav"]
+metrics-gpu = ["rustfs-obs/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
 webdav = ["rustfs-protocols/webdav"]
+sftp = ["rustfs-protocols/sftp"]
 license = []
-direct-io = []  # Aligned direct I/O reader support (uses aligned pread, does not set O_DIRECT)
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
-full = ["metrics-gpu", "ftps", "swift", "webdav", "direct-io"]
+full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp"]
 manual-test-runners = []
+rio-v2 = ["rustfs-ecstore/rio-v2"]
 
 [lints]
 workspace = true
@@ -57,10 +62,9 @@ workspace = true
 [dependencies]
 # RustFS Internal Crates
 rustfs-heal = { workspace = true }
-rustfs-appauth = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
-rustfs-config = { workspace = true, features = ["constants", "notify"] }
+rustfs-config = { workspace = true, features = ["constants", "notify", "server-config-model"] }
 rustfs-crypto = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-ecstore = { workspace = true }
@@ -70,29 +74,37 @@ rustfs-keystone = { workspace = true }
 rustfs-kms = { workspace = true }
 rustfs-lock.workspace = true
 rustfs-madmin = { workspace = true }
-rustfs-metrics = { workspace = true }
 rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-protocols = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio.workspace = true
-rustfs-s3-common = { workspace = true }
+rustfs-s3-types = { workspace = true }
+rustfs-s3-ops = { workspace = true }
+rustfs-security-governance = { workspace = true }
+rustfs-data-usage = { workspace = true }
 rustfs-s3select-api = { workspace = true }
 rustfs-s3select-query = { workspace = true }
+rustfs-extension-schema = { workspace = true }
 rustfs-targets = { workspace = true }
+rustfs-storage-api = { workspace = true }
+rustfs-tls-runtime = { workspace = true }
 rustfs-trusted-proxies = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-zip = { workspace = true }
 rustfs-io-core = { workspace = true }
 rustfs-io-metrics = { workspace = true }
+rustfs-object-capacity = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-scanner = { workspace = true }
+tempfile = { workspace = true }
 
 # Async Runtime and Networking
 async-trait = { workspace = true }
 axum.workspace = true
 futures.workspace = true
+futures-lite.workspace = true
 futures-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -113,7 +125,6 @@ tower-http = { workspace = true, features = ["trace", "compression-full", "cors"
 # Serialization and Data Formats
 bytes = { workspace = true }
 flatbuffers.workspace = true
-walkdir = { workspace = true }
 rmp-serde.workspace = true
 rustfs-signer.workspace = true
 serde.workspace = true
@@ -122,8 +133,8 @@ serde_urlencoded = { workspace = true }
 
 # Cryptography and Security
 rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
 subtle = { workspace = true }
-chrono = { workspace = true }
 jiff = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 
@@ -131,7 +142,9 @@ time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 astral-tokio-tar = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
+async_zip = { workspace = true }
 base64 = { workspace = true }
+hmac = { workspace = true }
 sha2 = { workspace = true }
 base64-simd.workspace = true
 clap = { workspace = true }
@@ -141,7 +154,6 @@ hex-simd.workspace = true
 matchit = { workspace = true }
 md5.workspace = true
 mime_guess = { workspace = true }
-moka = { workspace = true }
 percent-encoding = { workspace = true }
 pin-project-lite.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
@@ -167,24 +179,21 @@ hashbrown = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
+# io-uring is Linux-only. Scope the feature to Linux targets.
+tokio = { workspace = true, features = ["io-uring"] }
 
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 
-
-
-# Only enable pprof-based profiling on non-Windows targets.
-[target.'cfg(all(not(target_os = "windows"), not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))'.dependencies]
-starshard = { workspace = true }
-backtrace = { workspace = true }
-rand = { workspace = true }
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 pprof = { workspace = true }
 
+# jemalloc-based allocator and memory profiling are only enabled on validated linux-gnu-x86_64 targets.
 [target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 jemalloc_pprof = { workspace = true }
-pprof = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
@@ -193,7 +202,11 @@ tempfile = { workspace = true }
 aws-config = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-temp-env = { workspace = true }
+temp-env = { workspace = true, features = ["async_closure"] }
+tracing-subscriber = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+rsa = { workspace = true }
+rcgen = { workspace = true }
 
 [build-dependencies]
 http.workspace = true

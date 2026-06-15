@@ -19,6 +19,23 @@ use std::{fmt::Display, path::Path};
 use tracing::debug;
 use url::{ParseError, Url};
 
+#[cfg(windows)]
+pub(crate) fn windows_fallback_local_path(
+    path: &str,
+    canonicalize_error: &std::io::Error,
+    context: &'static str,
+) -> std::io::Result<std::path::PathBuf> {
+    let absolute = Path::new(path).absolutize()?.to_path_buf();
+    tracing::warn!(
+        path = %path,
+        canonicalize_error = %canonicalize_error,
+        resolved = ?absolute,
+        context = context,
+        "using windows fallback path resolution for local endpoint"
+    );
+    Ok(absolute)
+}
+
 /// enum for endpoint type.
 #[derive(PartialEq, Eq, Debug)]
 pub enum EndpointType {
@@ -82,17 +99,22 @@ impl TryFrom<&str> for Endpoint {
                 #[cfg(not(windows))]
                 let path = Path::new(&path).absolutize()?;
 
-                // On windows having a preceding SlashSeparator will cause problems, if the
-                // command line already has C:/<export-folder/ in it. Final resulting
-                // path on windows might become C:/C:/ this will cause problems
-                // of starting rustfs server properly in distributed mode on windows.
-                // As a special case make sure to trim the separator.
                 #[cfg(windows)]
-                let path = Path::new(&path[1..]).absolutize()?;
+                let path = if has_leading_slash_windows_drive(&path) {
+                    // Url::path() exposes file-like Windows paths as `/C:/...`.
+                    // Strip only that synthetic leading slash; plain URL paths
+                    // such as `/export1` must stay URL paths, not become
+                    // relative paths under the current drive.
+                    Path::new(&path[1..]).absolutize()?.to_string_lossy().into_owned()
+                } else {
+                    path
+                };
+                #[cfg(windows)]
+                let path = Path::new(&path);
 
                 debug!("endpoint try_from: path={}", path.display());
 
-                if path.parent().is_none() || Path::new("").eq(&path) {
+                if path.parent().is_none() || path.as_os_str().is_empty() {
                     return Err(Error::other("empty or root path is not supported in URL endpoint"));
                 }
 
@@ -217,6 +239,12 @@ impl Endpoint {
     }
 }
 
+#[cfg(windows)]
+fn has_leading_slash_windows_drive(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 4 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' && bytes[3] == b'/'
+}
+
 /// parse a file path into a URL.
 fn url_parse_from_file_path(value: &str) -> Result<Url> {
     // Only check if the arg is an ip address and ask for scheme since its absent.
@@ -242,6 +270,14 @@ fn url_parse_from_file_path(value: &str) -> Result<Url> {
 mod test {
     use super::*;
 
+    fn expected_file_path(path: &str) -> String {
+        Path::new(path).absolutize().unwrap().to_string_lossy().replace('\\', "/")
+    }
+
+    fn expected_file_url(path: &str) -> Url {
+        url_parse_from_file_path(path).unwrap()
+    }
+
     #[test]
     fn test_new_endpoint() {
         #[derive(Default)]
@@ -255,7 +291,7 @@ mod test {
         let u2 = Url::parse("https://example.org/path").unwrap();
         let u4 = Url::parse("http://192.168.253.200/path").unwrap();
         let u6 = Url::parse("http://server:/path").unwrap();
-        let root_slash_foo = Url::from_file_path("/foo").unwrap();
+        let root_slash_foo = expected_file_url("/foo");
 
         let test_cases = [
             TestCase {
@@ -416,7 +452,7 @@ mod test {
         // Test file path display
         let file_endpoint = Endpoint::try_from("/tmp/data").unwrap();
         let display_str = format!("{file_endpoint}");
-        assert_eq!(display_str, "/tmp/data");
+        assert_eq!(display_str, expected_file_path("/tmp/data"));
 
         // Test URL display
         let url_endpoint = Endpoint::try_from("http://example.com:9000/path").unwrap();
@@ -479,10 +515,23 @@ mod test {
     #[test]
     fn test_endpoint_get_file_path() {
         let file_endpoint = Endpoint::try_from("/tmp/data").unwrap();
-        assert_eq!(file_endpoint.get_file_path(), "/tmp/data");
+        assert_eq!(file_endpoint.get_file_path(), expected_file_path("/tmp/data"));
 
         let url_endpoint = Endpoint::try_from("http://example.com:9000/path/to/data").unwrap();
         assert_eq!(url_endpoint.get_file_path(), "/path/to/data");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_url_drive_path_requires_separator_after_colon() {
+        let drive_path_endpoint = Endpoint::try_from("http://host/C:/data").unwrap();
+        assert_eq!(drive_path_endpoint.get_type(), EndpointType::Url);
+        assert!(has_leading_slash_windows_drive(Url::parse("http://host/C:/data").unwrap().path()));
+
+        let url_path_endpoint = Endpoint::try_from("http://host/C:foo").unwrap();
+        assert_eq!(url_path_endpoint.get_type(), EndpointType::Url);
+        assert!(!has_leading_slash_windows_drive(Url::parse("http://host/C:foo").unwrap().path()));
+        assert_eq!(url_path_endpoint.get_file_path(), "/C:foo");
     }
 
     #[test]
@@ -503,7 +552,7 @@ mod test {
         // Test with complex paths
         let complex_path = "/var/lib/rustfs/data/bucket1";
         let endpoint = Endpoint::try_from(complex_path).unwrap();
-        assert_eq!(endpoint.get_file_path(), complex_path);
+        assert_eq!(endpoint.get_file_path(), expected_file_path(complex_path));
         assert!(endpoint.is_local);
         assert_eq!(endpoint.get_type(), EndpointType::Path);
     }
@@ -512,7 +561,7 @@ mod test {
     fn test_endpoint_with_spaces_in_path() {
         let path_with_spaces = "/Users/test/Library/Application Support/rustfs/data";
         let endpoint = Endpoint::try_from(path_with_spaces).unwrap();
-        assert_eq!(endpoint.get_file_path(), path_with_spaces);
+        assert_eq!(endpoint.get_file_path(), expected_file_path(path_with_spaces));
         assert!(endpoint.is_local);
         assert_eq!(endpoint.get_type(), EndpointType::Path);
     }
@@ -532,7 +581,7 @@ mod test {
         // Verify that get_file_path() decodes the percent-encoded path correctly
         assert_eq!(
             endpoint.get_file_path(),
-            "/Users/test/Library/Application Support/rustfs/data",
+            expected_file_path("/Users/test/Library/Application Support/rustfs/data"),
             "get_file_path() should decode percent-encoded spaces"
         );
     }
@@ -544,7 +593,7 @@ mod test {
         let endpoint = Endpoint::try_from(path_with_special).unwrap();
 
         // get_file_path() should return the original path with decoded characters
-        assert_eq!(endpoint.get_file_path(), path_with_special);
+        assert_eq!(endpoint.get_file_path(), expected_file_path(path_with_special));
     }
 
     #[test]

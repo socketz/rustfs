@@ -25,6 +25,16 @@ Current `test-and-lint` gate includes:
 
 - `cargo nextest run --all --exclude e2e_test`
 - `cargo test --all --doc`
+- `cargo test -p rustfs get_object_chunk_fast_path`
+- `cargo test -p rustfs materialize_chunk_stream_before_commit`
+- `touch rustfs/build.rs`
+- `cargo build -p rustfs --bins --jobs 2`
+- `cargo test -p e2e_test archive_multipart_roundtrip_preserves_bytes`
+- `cargo test -p e2e_test presigned_get_and_reverse_proxy_preserve_multipart_bytes_with_fast_path`
 - `cargo fmt --all --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo nextest run -p rustfs -p rustfs-ecstore --features rio-v2`
+- `cargo test -p rustfs --doc --features rio-v2`
+- `cargo clippy -p rustfs -p rustfs-ecstore --all-targets --features rio-v2 -- -D warnings`
 - `./scripts/check_layer_dependencies.sh`
+- `./scripts/check_architecture_migration_rules.sh`

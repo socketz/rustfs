@@ -7,6 +7,7 @@
   <a href="https://github.com/rustfs/rustfs/actions/workflows/docker.yml"><img alt="Build and Push Docker Images" src="https://github.com/rustfs/rustfs/actions/workflows/docker.yml/badge.svg" /></a>
   <img alt="GitHub commit activity" src="https://img.shields.io/github/commit-activity/m/rustfs/rustfs"/>
   <img alt="Github Last Commit" src="https://img.shields.io/github/last-commit/rustfs/rustfs"/>
+  <a href="https://discord.gg/NcKBCEJp6P"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join%20Chat-5865F2?logo=discord&logoColor=white" /></a>
   <a href="https://hellogithub.com/repository/rustfs/rustfs" target="_blank"><img src="https://abroad.hellogithub.com/v1/widgets/recommend.svg?rid=b95bcb72bdc340b68f16fdf6790b7d5b&claim_uid=MsbvjYeLDKAH457&theme=small" alt="Featured｜HelloGitHub" /></a>
 </p>
 
@@ -100,28 +101,35 @@ To get started with RustFS, follow these steps:
 curl -O https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
 ```
 
-### 2\. Docker Quick Start (Option 2)
+### 2. Docker Quick Start (Option 2)
 
-The RustFS container runs as a non-root user `rustfs` (UID `10001`). If you run Docker with `-v` to mount a host directory, please ensure the host directory owner is set to `10001`, otherwise you will encounter permission denied errors.
+The RustFS container runs as a non-root user `rustfs` (UID/GID `10001:10001`). If you bind-mount host directories with Docker or Compose, every mounted path must be writable by that user, otherwise startup may fail with permission denied errors. This applies to data directories, log directories, and TLS certificate directories when `RUSTFS_TLS_PATH` is enabled.
 
 ```bash
- # Create data and logs directories
- mkdir -p data logs
+# Create data and logs directories
+mkdir -p data logs
 
- # Change the owner of these directories
- chown -R 10001:10001 data logs
+# Change the owner of these directories
+chown -R 10001:10001 data logs
 
- # Using latest version
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
+# Using latest version
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
- # Using specific version
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-alpha.76
+# Using specific version
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.8
 ```
 
 If you use [podman](https://github.com/containers/podman) instead of docker, you can install the RustFS with the below command
 
 ```bash
- podman run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
+podman run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
+```
+
+If you enable TLS with a bind-mounted certificate directory, prepare that mount the same way:
+
+```bash
+mkdir -p certs
+chown -R 10001:10001 certs
 ```
 
 You can also use Docker Compose. Using the `docker-compose.yml` file in the root directory:
@@ -130,13 +138,37 @@ You can also use Docker Compose. Using the `docker-compose.yml` file in the root
 docker compose --profile observability up -d
 ```
 
+Before running Compose with host bind mounts:
+
+- Ensure every mounted host path is writable by `10001:10001`.
+- If you enable TLS, ensure the certificate mount for `/opt/tls` is also readable by `10001:10001`.
+- If matching host ownership is not practical, run the `rustfs` service with `user: "<host-uid>:<host-gid>"` instead.
+- `docker-compose-simple.yml` includes a `volume-permission-helper` service for named volumes. `docker-compose.yml` relies on you to prepare bind-mounted host paths in advance.
+
 Similarly, you can run the command with podman
 
 ```bash
 podman compose --profile observability up -d
 ```
 
-**NOTE**: We recommend reviewing the `docker-compose.yaml` file before running. It defines several services including Grafana, Prometheus, and Jaeger, which are helpful for RustFS observability. If you wish to start Redis or Nginx containers, you can specify the corresponding profiles.
+Webhook notification quick start (Docker):
+
+```bash
+docker run -d --name rustfs -p 9000:9000 \
+  -e RUSTFS_NOTIFY_ENABLE=true \
+  -e RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY=on \
+  -e RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY=http://<host-ip>:3020/webhook \
+  -e RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY=/tmp/rustfs-events \
+  rustfs/rustfs:latest
+```
+
+Notes:
+- `RUSTFS_NOTIFY_ENABLE=true` enables the global notify module switch.
+- For ARN `arn:rustfs:sqs::primary:webhook`, use instance-scoped env vars with `_PRIMARY`.
+- If queue dir is omitted, default is `/opt/rustfs/events`; ensure it is writable by the container runtime user.
+- `RUSTFS_NOTIFY_WEBHOOK_SKIP_TLS_VERIFY_PRIMARY` defaults to `false`; enabling it skips webhook TLS certificate verification, allows MITM attacks, and emits a startup warning. Prefer `RUSTFS_NOTIFY_WEBHOOK_CLIENT_CA_PRIMARY` for private CAs.
+
+**NOTE**: We recommend reviewing the `docker-compose.yml` file before running. It defines several services including Grafana, Prometheus, and Jaeger, which are helpful for RustFS observability. If you wish to start Redis or Nginx containers, you can specify the corresponding profiles.
 
 ### 3\. Build from Source (Option 3) - Advanced Users
 
@@ -177,6 +209,12 @@ make help-docker                      # Show all Docker-related commands
 ### 4\. Build with Helm Chart (Option 4) - Cloud Native
 
 Follow the instructions in the [Helm Chart README](https://charts.rustfs.com/) to install RustFS on a Kubernetes cluster.
+
+For scanner pacing, cycle budgets, bitrot cadence, lifecycle transition status,
+and single-node single-disk idle CPU tuning, see
+[Scanner Runtime Controls](docs/operations/scanner-runtime-controls.md). For
+repeatable scanner-pressure validation, see
+[Scanner Benchmark Runbook](docs/operations/scanner-benchmark-runbook.md).
 
 ### 5\. Nix Flake (Option 5)
 
@@ -219,6 +257,48 @@ rustfs --help
 
 **NOTE**: To access the RustFS instance via `https`, please refer to the [TLS Configuration Docs](https://docs.rustfs.com/integration/tls-configured.html).
 
+### OIDC Roles Claim (Microsoft Entra ID)
+
+RustFS supports mapping an OIDC claim containing role values into the existing
+authorization pipeline. The `roles_claim` setting is **optional**: when unset or
+empty, only the `groups` claim contributes to authorization (same as older
+RustFS releases). For Microsoft Entra ID app roles, set `roles_claim=roles` so
+both console admin checks and bucket IAM policies can evaluate those roles.
+
+Example environment configuration (opt-in roles claim):
+
+```bash
+RUSTFS_IDENTITY_OPENID_ENABLE=on
+RUSTFS_IDENTITY_OPENID_CONFIG_URL="https://login.microsoftonline.com/<tenant-id>/v2.0/.well-known/openid-configuration"
+RUSTFS_IDENTITY_OPENID_CLIENT_ID="<client-id>"
+RUSTFS_IDENTITY_OPENID_CLIENT_SECRET="<client-secret>"
+RUSTFS_IDENTITY_OPENID_SCOPES="openid,profile,email"
+RUSTFS_IDENTITY_OPENID_GROUPS_CLAIM="groups"
+RUSTFS_IDENTITY_OPENID_ROLES_CLAIM="roles"
+```
+
+Policy condition example (evaluate app roles directly with `jwt:roles`; when
+`roles_claim` is configured, RustFS also merges those values into `jwt:groups`
+for backward compatibility with older policies):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["admin:*"],
+      "Resource": ["arn:aws:s3:::*"],
+      "Condition": {
+        "ForAnyValue:StringEquals": {
+          "jwt:roles": ["RustFS.ConsoleAdmin"]
+        }
+      }
+    }
+  ]
+}
+```
+
 ## Documentation
 
 For detailed documentation, including configuration options, API references, and advanced usage, please visit our [Documentation](https://docs.rustfs.com).
@@ -236,6 +316,7 @@ If you have any questions or need assistance:
 - [Documentation](https://docs.rustfs.com) - The manual you should read
 - [Changelog](https://github.com/rustfs/rustfs/releases) - What we broke and fixed
 - [GitHub Discussions](https://github.com/rustfs/rustfs/discussions) - Where the community lives
+- [Discord](https://discord.gg/NcKBCEJp6P) - Chat with the RustFS community
 
 ## Contact
 

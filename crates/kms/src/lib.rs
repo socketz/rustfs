@@ -20,7 +20,7 @@
 //!
 //! ## Features
 //!
-//! - **Multiple Backends**: Local file storage and Vault (optional)
+//! - **Multiple Backends**: Local file storage, Vault KV2+Transit, and Vault Transit (optional)
 //! - **Object Encryption**: Transparent S3-compatible object encryption
 //! - **Streaming Encryption**: Memory-efficient encryption for large files
 //! - **Key Management**: Full lifecycle management of encryption keys
@@ -29,9 +29,17 @@
 //! ## Architecture
 //!
 //! The KMS follows a three-layer key hierarchy:
-//! - **Master Keys**: Managed by KMS backends (Local/Vault)
+//! - **Master Keys**: Managed by KMS backends (Local / Vault KV2 / Vault Transit)
 //! - **Data Encryption Keys (DEK)**: Generated per object, encrypted by master keys
 //! - **Object Data**: Encrypted using DEKs with AES-256-GCM or ChaCha20-Poly1305
+//!
+//! ## Caching Discipline
+//!
+//! KMS may cache stable master-key metadata, but it must not cache or reuse generated
+//! data encryption keys by master key id alone. A generated DEK and its encrypted
+//! ciphertext can be bound to the object encryption context, such as the bucket and
+//! object path. Reusing it for another object can break context validation and would
+//! also violate the expected per-object DEK model for SSE-S3 and SSE-KMS.
 //!
 //! ## Example
 //!
@@ -45,7 +53,7 @@
 //!     let service_manager = init_global_kms_service_manager();
 //!
 //!     // Configure with local backend
-//!     let config = KmsConfig::local(PathBuf::from("./kms_keys"));
+//!     let config = KmsConfig::local(PathBuf::from("./kms_keys")).with_insecure_development_defaults();
 //!     service_manager.configure(config).await?;
 //!
 //!     // Start the KMS service
@@ -71,8 +79,8 @@ pub mod types;
 // Re-export public API
 pub use api_types::{
     CacheSummary, ConfigureKmsRequest, ConfigureKmsResponse, ConfigureLocalKmsRequest, ConfigureVaultKmsRequest,
-    KmsConfigSummary, KmsStatusResponse, StartKmsRequest, StartKmsResponse, StopKmsResponse, TagKeyRequest, TagKeyResponse,
-    UntagKeyRequest, UntagKeyResponse, UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
+    ConfigureVaultTransitKmsRequest, KmsConfigSummary, KmsStatusResponse, StartKmsRequest, StartKmsResponse, StopKmsResponse,
+    TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse, UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
 };
 pub use config::*;
 pub use error::{KmsError, Result};
@@ -127,7 +135,7 @@ mod tests {
 
         // Test configuration and start
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = KmsConfig::local(temp_dir.path().to_path_buf());
+        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
 
         manager.configure(config).await.expect("Configuration should succeed");
         manager.start().await.expect("Start should succeed");
@@ -152,7 +160,7 @@ mod tests {
 
         // Start first service
         let temp_dir1 = TempDir::new().expect("Failed to create temp dir");
-        let config1 = KmsConfig::local(temp_dir1.path().to_path_buf());
+        let config1 = KmsConfig::local(temp_dir1.path().to_path_buf()).with_insecure_development_defaults();
         manager
             .configure(config1.clone())
             .await
@@ -168,7 +176,7 @@ mod tests {
 
         // Reconfigure to new service (zero-downtime)
         let temp_dir2 = TempDir::new().expect("Failed to create temp dir");
-        let config2 = KmsConfig::local(temp_dir2.path().to_path_buf());
+        let config2 = KmsConfig::local(temp_dir2.path().to_path_buf()).with_insecure_development_defaults();
         manager.reconfigure(config2).await.expect("Reconfiguration should succeed");
 
         // Verify version 2
@@ -197,7 +205,7 @@ mod tests {
         let base_path = temp_dir.path().to_path_buf();
 
         // Initial configuration
-        let config1 = KmsConfig::local(base_path.clone());
+        let config1 = KmsConfig::local(base_path.clone()).with_insecure_development_defaults();
         manager.configure(config1).await.expect("Configuration should succeed");
         manager.start().await.expect("Start should succeed");
 
@@ -207,7 +215,7 @@ mod tests {
             let manager_clone = manager.clone();
             let path = base_path.clone();
             let handle = tokio::spawn(async move {
-                let config = KmsConfig::local(path);
+                let config = KmsConfig::local(path).with_insecure_development_defaults();
                 manager_clone.reconfigure(config).await
             });
             handles.push(handle);

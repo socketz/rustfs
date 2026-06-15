@@ -14,8 +14,12 @@
 
 #![allow(clippy::map_entry)]
 
+use crate::bucket::bandwidth::monitor::Monitor;
 use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
-use crate::bucket::lifecycle::bucket_lifecycle_ops::{enqueue_transition_immediate, init_background_expiry};
+use crate::bucket::lifecycle::bucket_lifecycle_ops::{
+    enqueue_immediate_expiry, enqueue_transition_immediate, init_background_expiry,
+};
+use crate::bucket::metadata_sys::get_global_bucket_metadata_sys;
 use crate::bucket::metadata_sys::{self, set_bucket_metadata};
 use crate::bucket::utils::check_abort_multipart_args;
 use crate::bucket::utils::check_complete_multipart_args;
@@ -29,7 +33,7 @@ use crate::bucket::utils::check_object_args;
 use crate::bucket::utils::check_put_object_args;
 use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
-use crate::config::GLOBAL_STORAGE_CLASS;
+use crate::config::get_global_storage_class;
 use crate::config::storageclass;
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
@@ -38,11 +42,12 @@ use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found,
     is_err_read_quorum, is_err_version_not_found, to_object_err,
 };
+use crate::event_notification::EventNotifier;
 use crate::global::{
     DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME,
-    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr, get_global_bucket_monitor,
-    get_global_deployment_id, get_global_endpoints, init_global_bucket_monitor, is_dist_erasure, is_erasure_sd,
-    set_global_deployment_id, set_object_layer,
+    GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, TypeLocalDiskSetDrives, get_global_deployment_id, get_global_endpoints,
+    get_global_region, get_global_tier_config_mgr, init_global_bucket_monitor, is_erasure_sd, set_global_deployment_id,
+    set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
@@ -52,6 +57,7 @@ use crate::store_api::{
     ListMultipartsInfo, ListObjectVersionsInfo, ListPartsInfo, MultipartInfo, ObjectIO, ObjectInfoOrErr, WalkOptions,
 };
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
+use crate::tier::tier::TierConfigMgr;
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
@@ -61,7 +67,8 @@ use crate::{
     store_api::{
         BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
         HTTPRangeSpec, HealOperations, ListObjectsV2Info, ListOperations, MakeBucketOptions, MultipartOperations,
-        MultipartUploadResult, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI,
+        MultipartUploadResult, NamespaceLocking, ObjectInfo, ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo,
+        PutObjReader, StorageAPI,
     },
     store_init,
 };
@@ -70,7 +77,8 @@ use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::RngExt as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
-use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
+use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
+use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
@@ -81,7 +89,11 @@ use std::net::SocketAddr;
 use std::process::exit;
 use std::slice::Iter;
 use std::time::SystemTime;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::RwLock;
@@ -134,7 +146,8 @@ async fn enqueue_transition_after_write(result: Result<ObjectInfo>, src: LcEvent
     match result {
         Ok(oi) => {
             if should_enqueue_transition_immediately(&oi) {
-                enqueue_transition_immediate(&oi, src).await;
+                enqueue_transition_immediate(&oi, src.clone()).await;
+                enqueue_immediate_expiry(&oi, src).await;
             }
             Ok(oi)
         }
@@ -160,10 +173,9 @@ mod rebalance;
 use peer::init_local_peer;
 pub use peer::{
     all_local_disk, all_local_disk_path, find_local_disk, find_local_disk_by_ref, get_disk_infos, get_disk_via_endpoint,
-    has_space_for, init_local_disks, init_lock_clients,
+    has_space_for, init_local_disks, init_lock_clients, prewarm_local_disk_id_map,
 };
 
-#[derive(Debug)]
 pub struct ECStore {
     pub id: Uuid,
     // pub disks: Vec<DiskStore>,
@@ -174,6 +186,114 @@ pub struct ECStore {
     pub pool_meta: RwLock<PoolMeta>,
     pub rebalance_meta: RwLock<Option<RebalanceMeta>>,
     pub decommission_cancelers: RwLock<Vec<Option<CancellationToken>>>,
+
+    // Phase 2 migration pending - do not use directly.
+    /// Local disk maps (migrated from GLOBAL_LOCAL_DISK_MAP/ID_MAP/SET_DRIVES)
+    pub(crate) local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
+    pub(crate) local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
+    pub(crate) local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
+    /// Tier config manager (migrated from GLOBAL_TierConfigMgr)
+    pub(crate) tier_config_mgr: Arc<RwLock<TierConfigMgr>>,
+    /// Event notifier (migrated from GLOBAL_EventNotifier)
+    pub(crate) event_notifier: Arc<RwLock<EventNotifier>>,
+    /// Bucket monitor (migrated from GLOBAL_BUCKET_MONITOR)
+    pub(crate) bucket_monitor: OnceLock<Arc<Monitor>>,
+}
+
+impl std::fmt::Debug for ECStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ECStore")
+            .field("id", &self.id)
+            .field("disk_map", &self.disk_map)
+            .field("pools", &self.pools)
+            .field("pool_meta", &self.pool_meta)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Phase 2: Accessor methods for config globals
+/// These delegate to the process-global statics. No local state — the globals
+/// remain the single source of truth until the migration is complete.
+impl ECStore {
+    /// Get server configuration (delegates to global)
+    pub fn get_server_config(&self) -> Option<Config> {
+        get_global_server_config()
+    }
+
+    /// Set server configuration (delegates to global)
+    pub fn set_server_config(&self, cfg: Config) {
+        set_global_server_config(cfg);
+    }
+
+    /// Get storage class configuration (delegates to global)
+    pub fn get_storage_class(&self) -> Option<crate::config::storageclass::Config> {
+        crate::config::get_global_storage_class()
+    }
+
+    /// Set storage class configuration (delegates to global)
+    pub fn set_storage_class(&self, cfg: crate::config::storageclass::Config) {
+        crate::config::set_global_storage_class(cfg);
+    }
+}
+
+/// Phase 3: Accessor methods for service globals
+/// These provide a unified API through ECStore for accessing cross-cutting
+/// service singletons. The globals remain the source of truth.
+impl ECStore {
+    /// Get the notification system
+    pub fn notification_system(&self) -> Option<&'static crate::notification_sys::NotificationSys> {
+        get_global_notification_sys()
+    }
+
+    /// Get the bucket metadata system
+    pub fn bucket_metadata_sys(&self) -> Option<Arc<tokio::sync::RwLock<crate::bucket::metadata_sys::BucketMetadataSys>>> {
+        get_global_bucket_metadata_sys()
+    }
+
+    /// Get the global endpoints
+    pub fn endpoints(&self) -> EndpointServerPools {
+        get_global_endpoints()
+    }
+
+    /// Get the global region
+    pub fn region(&self) -> Option<s3s::region::Region> {
+        get_global_region()
+    }
+
+    /// Get the tier config manager
+    pub fn tier_config_mgr(&self) -> Arc<tokio::sync::RwLock<crate::tier::tier::TierConfigMgr>> {
+        get_global_tier_config_mgr()
+    }
+
+    /// Get the server configuration
+    pub fn server_config(&self) -> Option<Config> {
+        get_global_server_config()
+    }
+
+    /// Get the storage class configuration
+    pub fn storage_class(&self) -> Option<crate::config::storageclass::Config> {
+        get_global_storage_class()
+    }
+}
+
+/// Phase 4: Server address accessors
+/// These provide a unified API through ECStore for accessing server-level
+/// configuration globals. The globals remain the source of truth.
+impl ECStore {
+    /// Get the server port
+    pub fn port(&self) -> u16 {
+        crate::global::global_rustfs_port()
+    }
+
+    /// Get the server host
+    pub async fn host(&self) -> String {
+        GLOBAL_RUSTFS_HOST.read().await.clone()
+    }
+
+    /// Get the server address (host:port)
+    pub async fn addr(&self) -> String {
+        GLOBAL_RUSTFS_ADDR.read().await.clone()
+    }
 }
 
 // impl Clone for ECStore {
@@ -584,26 +704,40 @@ impl HealOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl StorageAPI for ECStore {
+impl StorageAPI for ECStore {}
+
+#[async_trait::async_trait]
+impl NamespaceLocking for ECStore {
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.handle_new_ns_lock(bucket, object).await
     }
+}
+
+#[async_trait::async_trait]
+impl rustfs_storage_api::StorageAdminApi for ECStore {
+    type BackendInfo = rustfs_madmin::BackendInfo;
+    type StorageInfo = rustfs_madmin::StorageInfo;
+    type Disk = DiskStore;
+    type Error = Error;
+
     #[instrument(skip(self))]
-    async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
+    async fn backend_info(&self) -> Self::BackendInfo {
         self.handle_backend_info().await
     }
+
     #[instrument(skip(self))]
-    async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
+    async fn storage_info(&self) -> Self::StorageInfo {
         self.handle_storage_info().await
     }
+
     #[instrument(skip(self))]
-    async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
+    async fn local_storage_info(&self) -> Self::StorageInfo {
         self.handle_local_storage_info().await
     }
 
     #[instrument(skip(self))]
-    async fn get_disks(&self, pool_idx: usize, set_idx: usize) -> Result<Vec<Option<DiskStore>>> {
-        self.handle_get_disks(pool_idx, set_idx).await
+    async fn disk_set_inventory(&self, selector: rustfs_storage_api::DiskSetSelector) -> Result<Vec<Option<Self::Disk>>> {
+        self.handle_get_disks(selector.pool_idx, selector.set_idx).await
     }
 
     #[instrument(skip(self))]
@@ -668,6 +802,17 @@ impl ServerPoolsAvailableSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::endpoints::{Endpoints, PoolEndpoints};
+    use crate::global::{GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES};
+    use crate::store_init::{connect_load_init_formats, init_disks};
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    async fn reset_local_disk_globals() {
+        GLOBAL_LOCAL_DISK_MAP.write().await.clear();
+        GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
+        GLOBAL_LOCAL_DISK_SET_DRIVES.write().await.clear();
+    }
 
     #[tokio::test]
     async fn test_get_disk_infos() {
@@ -718,6 +863,73 @@ mod tests {
     async fn test_find_local_disk() {
         let result = find_local_disk(&"/nonexistent/path".to_string()).await;
         assert!(result.is_none(), "Should return None for nonexistent path");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_find_local_disk_by_ref_backfills_uuid_map() {
+        reset_local_disk_globals().await;
+
+        let temp_dir = TempDir::new().expect("create temp dir for local disk ref test");
+        let disk_paths = (0..4)
+            .map(|idx| temp_dir.path().join(format!("disk{}", idx + 1)))
+            .collect::<Vec<_>>();
+        for disk_path in &disk_paths {
+            std::fs::create_dir_all(disk_path).expect("create disk path");
+        }
+
+        let mut endpoints = Vec::new();
+        for (idx, disk_path) in disk_paths.iter().enumerate() {
+            let mut endpoint = Endpoint::try_from(disk_path.to_str().expect("disk path to str")).expect("endpoint");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(idx);
+            endpoints.push(endpoint);
+        }
+
+        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "find-local-disk-by-ref-test".to_string(),
+            platform: "test".to_string(),
+        }]);
+
+        init_local_disks(endpoint_pools.clone()).await.expect("init local disks");
+
+        let (disks, errs) = init_disks(
+            &endpoint_pools.as_ref().first().expect("pool endpoints").endpoints,
+            &DiskOption {
+                cleanup: true,
+                health_check: false,
+            },
+        )
+        .await;
+
+        assert!(errs.iter().all(|err| err.is_none()), "disk init should succeed: {errs:?}");
+        connect_load_init_formats(true, &disks, 1, 4, None)
+            .await
+            .expect("initialize format metadata");
+
+        GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
+
+        let local_disks = all_local_disk().await;
+        let first_disk = local_disks.first().expect("local disk exists");
+        let disk_id = first_disk
+            .get_disk_id()
+            .await
+            .expect("get disk id should succeed")
+            .expect("disk id should exist");
+
+        let found = find_local_disk_by_ref(&disk_id.to_string()).await;
+        assert!(found.is_some(), "disk lookup by id should backfill cache");
+        assert_eq!(
+            GLOBAL_LOCAL_DISK_ID_MAP.read().await.get(&disk_id).cloned(),
+            Some(first_disk.endpoint().to_string())
+        );
+
+        reset_local_disk_globals().await;
     }
 
     #[tokio::test]

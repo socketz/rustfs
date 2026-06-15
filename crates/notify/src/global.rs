@@ -12,14 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{BucketNotificationConfig, Event, EventArgs, LifecycleError, NotificationError, NotificationSystem};
-use rustfs_ecstore::config::Config;
-use rustfs_s3_common::EventName;
+use crate::{
+    BucketNotificationConfig, Event, EventArgs, LifecycleError, NotificationError, NotificationMetricSnapshot,
+    NotificationSystem, NotificationTargetMetricSnapshot,
+};
+use rustfs_config::server_config::Config;
+use rustfs_s3_types::EventName;
 use rustfs_targets::arn::TargetID;
 use std::sync::{Arc, OnceLock};
 use tracing::error;
 
 static NOTIFICATION_SYSTEM: OnceLock<Arc<NotificationSystem>> = OnceLock::new();
+const LOG_COMPONENT_NOTIFY: &str = "notify";
+const LOG_SUBSYSTEM_GLOBAL: &str = "global";
+const EVENT_NOTIFY_GLOBAL_STATE: &str = "notify_global_state";
 
 /// Initialize the global notification system with the given configuration.
 /// This function should only be called once throughout the application life cycle.
@@ -35,10 +41,41 @@ pub async fn initialize(config: Config) -> Result<(), NotificationError> {
     }
 }
 
+/// Initialize the global notification system only for live in-process consumers.
+///
+/// This does not load configured notification targets or bucket rules. It exists so
+/// ListenBucketNotification clients can receive live events even when external
+/// notification targets are disabled.
+pub fn initialize_live_events() -> Result<(), NotificationError> {
+    let system = NotificationSystem::new(Config::new());
+
+    match NOTIFICATION_SYSTEM.set(Arc::new(system)) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(NotificationError::Lifecycle(LifecycleError::AlreadyInitialized)),
+    }
+}
+
 /// Returns a handle to the global NotificationSystem instance.
 /// Return None if the system has not been initialized.
 pub fn notification_system() -> Option<Arc<NotificationSystem>> {
     NOTIFICATION_SYSTEM.get().cloned()
+}
+
+/// Returns aggregate notification delivery metrics for Prometheus collection.
+pub fn notification_metrics_snapshot() -> NotificationMetricSnapshot {
+    NOTIFICATION_SYSTEM
+        .get()
+        .map(|system| system.snapshot_metrics())
+        .unwrap_or_default()
+}
+
+/// Returns per-target notification delivery metrics for Prometheus collection.
+pub async fn notification_target_metrics() -> Vec<NotificationTargetMetricSnapshot> {
+    if let Some(system) = notification_system() {
+        system.snapshot_target_metrics().await
+    } else {
+        Vec::new()
+    }
 }
 
 /// Check if the notification system has been initialized.
@@ -68,7 +105,13 @@ pub mod notifier_global {
             // If the notification system itself cannot be retrieved, it will be returned directly
             Some(sys) => sys,
             None => {
-                error!("Notification system is not initialized.");
+                error!(
+                    event = EVENT_NOTIFY_GLOBAL_STATE,
+                    component = LOG_COMPONENT_NOTIFY,
+                    subsystem = LOG_SUBSYSTEM_GLOBAL,
+                    state = "uninitialized",
+                    "notify global state"
+                );
                 return;
             }
         };

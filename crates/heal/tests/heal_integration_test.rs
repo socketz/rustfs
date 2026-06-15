@@ -133,7 +133,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
 
     // init bucket metadata system
     let buckets_list = ecstore
-        .list_bucket(&rustfs_ecstore::store_api::BucketOptions {
+        .list_bucket(&rustfs_storage_api::BucketOptions {
             no_metadata: true,
             ..Default::default()
         })
@@ -277,10 +277,12 @@ mod serial_tests {
             HealPriority::Normal,
         );
 
-        let task_id = heal_manager
+        let task_id = heal_request.id.clone();
+        let admission = heal_manager
             .submit_heal_request(heal_request)
             .await
             .expect("Failed to submit bucket heal request");
+        assert!(admission.is_admitted(), "bucket heal request should be admitted");
 
         info!("Submitted bucket heal request with task ID: {}", task_id);
 

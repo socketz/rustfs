@@ -147,15 +147,22 @@ impl WarmBackend for WarmBackendS3 {
 
     async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
         let client = self.client.clone();
-        let Ok(res) = client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(&self.get_dest(object))
-            .send()
-            .await
-        else {
-            return Err(std::io::Error::other("get_object error"));
-        };
+        let mut req = client.get_object().bucket(&self.bucket).key(&self.get_dest(object));
+
+        if !rv.is_empty() {
+            req = req.version_id(rv);
+        }
+
+        if opts.start_offset >= 0 && opts.length > 0 {
+            let end = opts
+                .start_offset
+                .checked_add(opts.length)
+                .and_then(|v| v.checked_sub(1))
+                .ok_or_else(|| std::io::Error::other("invalid range: overflow"))?;
+            req = req.range(format!("bytes={}-{}", opts.start_offset, end));
+        }
+
+        let res = req.send().await.map_err(|e| std::io::Error::other(e.to_string()))?;
 
         Ok(ReadCloser::new(std::io::Cursor::new(
             res.body.collect().await.map(|data| data.into_bytes().to_vec())?,
@@ -164,15 +171,13 @@ impl WarmBackend for WarmBackendS3 {
 
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
         let client = self.client.clone();
-        if let Err(_) = client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(&self.get_dest(object))
-            .send()
-            .await
-        {
-            return Err(std::io::Error::other("delete_object error"));
+        let mut req = client.delete_object().bucket(&self.bucket).key(&self.get_dest(object));
+
+        if !rv.is_empty() {
+            req = req.version_id(rv);
         }
+
+        req.send().await.map_err(|e| std::io::Error::other(e.to_string()))?;
 
         Ok(())
     }
@@ -190,6 +195,6 @@ impl WarmBackend for WarmBackendS3 {
             return Err(std::io::Error::other("list_objects_v2 error"));
         };
 
-        Ok(res.common_prefixes.unwrap().len() > 0 || res.contents.unwrap().len() > 0)
+        Ok(res.common_prefixes.unwrap_or_default().len() > 0 || res.contents.unwrap_or_default().len() > 0)
     }
 }

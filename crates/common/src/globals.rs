@@ -17,6 +17,7 @@
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
 
@@ -27,6 +28,7 @@ pub static GLOBAL_RUSTFS_ADDR: LazyLock<RwLock<String>> = LazyLock::new(|| RwLoc
 pub static GLOBAL_CONN_MAP: LazyLock<RwLock<HashMap<String, Channel>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
 pub static GLOBAL_ROOT_CERT: LazyLock<RwLock<Option<Vec<u8>>>> = LazyLock::new(|| RwLock::new(None));
 pub static GLOBAL_MTLS_IDENTITY: LazyLock<RwLock<Option<MtlsIdentityPem>>> = LazyLock::new(|| RwLock::new(None));
+pub static GLOBAL_OUTBOUND_TLS_GENERATION: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
 /// Global initialization time of the RustFS node.
 pub static GLOBAL_INIT_TIME: LazyLock<RwLock<Option<DateTime<Utc>>>> = LazyLock::new(|| RwLock::new(None));
 
@@ -88,6 +90,16 @@ pub async fn set_global_mtls_identity(identity: Option<MtlsIdentityPem>) {
     *GLOBAL_MTLS_IDENTITY.write().await = identity;
 }
 
+/// Set the global outbound TLS generation.
+pub fn set_global_outbound_tls_generation(generation: u64) {
+    GLOBAL_OUTBOUND_TLS_GENERATION.store(generation, Ordering::Relaxed);
+}
+
+/// Get the global outbound TLS generation.
+pub fn get_global_outbound_tls_generation() -> u64 {
+    GLOBAL_OUTBOUND_TLS_GENERATION.load(Ordering::Relaxed)
+}
+
 /// Evict a stale/dead connection from the global connection cache.
 /// This is critical for cluster recovery when a node dies unexpectedly (e.g., power-off).
 /// By removing the cached connection, subsequent requests will establish a fresh connection.
@@ -97,7 +109,10 @@ pub async fn set_global_mtls_identity(identity: Option<MtlsIdentityPem>) {
 pub async fn evict_connection(addr: &str) {
     let removed = GLOBAL_CONN_MAP.write().await.remove(addr);
     if removed.is_some() {
-        tracing::warn!("Evicted stale connection from cache: {}", addr);
+        tracing::info!(
+            addr = %addr,
+            "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
+        );
     }
 }
 

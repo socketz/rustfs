@@ -81,7 +81,15 @@ impl ProxyChainAnalyzer {
         current_proxy_ip: IpAddr,
         headers: &HeaderMap,
     ) -> Result<ChainAnalysis, ProxyError> {
-        trace!("Analyzing proxy chain: {:?} with current proxy: {}", proxy_chain, current_proxy_ip);
+        trace!(
+            event = "proxy_chain.analyze",
+            component = "trusted_proxies",
+            subsystem = "chain",
+            validation_mode = self.config.validation_mode.as_str(),
+            proxy_chain_len = proxy_chain.len(),
+            current_proxy_ip = %current_proxy_ip,
+            "proxy chain analysis started"
+        );
 
         // Validate all IP addresses in the chain.
         self.validate_ip_addresses(proxy_chain)?;
@@ -140,7 +148,7 @@ impl ProxyChainAnalyzer {
             return (client_ip, chain.to_vec(), chain.len());
         }
 
-        let client_ip = chain.first().copied().unwrap_or(IpAddr::from([0, 0, 0, 0]));
+        let client_ip = chain.first().copied().unwrap_or_else(|| IpAddr::from([0, 0, 0, 0]));
         (client_ip, Vec::new(), 0)
     }
 
@@ -156,7 +164,7 @@ impl ProxyChainAnalyzer {
             }
         }
 
-        let client_ip = chain.first().copied().unwrap_or(IpAddr::from([0, 0, 0, 0]));
+        let client_ip = chain.first().copied().unwrap_or_else(|| IpAddr::from([0, 0, 0, 0]));
         Ok((client_ip, chain.to_vec(), chain.len()))
     }
 
@@ -228,7 +236,7 @@ impl ProxyChainAnalyzer {
     }
 
     /// Checks if an IP address is trusted based on the configuration.
-    fn is_ip_trusted(&self, ip: &IpAddr) -> bool {
+    pub(crate) fn is_ip_trusted(&self, ip: &IpAddr) -> bool {
         if self.trusted_ip_cache.contains(ip) {
             return true;
         }

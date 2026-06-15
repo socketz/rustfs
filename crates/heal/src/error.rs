@@ -59,6 +59,9 @@ pub enum Error {
     #[error("Heal task already exists: {task_id}")]
     TaskAlreadyExists { task_id: String },
 
+    #[error("Invalid heal client token")]
+    InvalidClientToken,
+
     #[error("Heal manager is not running")]
     ManagerNotRunning,
 
@@ -67,6 +70,9 @@ pub enum Error {
 
     #[error("Invalid heal type: {heal_type}")]
     InvalidHealType { heal_type: String },
+
+    #[error("Transient heal skip: {message}")]
+    TransientSkip { message: String },
 
     #[error("Heal task cancelled")]
     TaskCancelled,
@@ -91,6 +97,11 @@ impl Error {
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         Error::Other(error.into().to_string())
+    }
+
+    /// Create a transient skip error for retryable background heal checks.
+    pub fn transient_skip(message: impl Into<String>) -> Self {
+        Error::TransientSkip { message: message.into() }
     }
 }
 
