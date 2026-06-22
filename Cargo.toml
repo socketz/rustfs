@@ -157,7 +157,7 @@ tonic = { version = "0.14.6", features = ["gzip", "deflate"] }
 tonic-prost = { version = "0.14.6" }
 tonic-prost-build = { version = "0.14.6" }
 tower = { version = "0.5.3", features = ["timeout"] }
-tower-http = { version = "0.6.11", features = ["cors"] }
+tower-http = { version = "0.7.0", features = ["cors"] }
 
 # Serialization and Data Formats
 bytes = { version = "1.11.1", features = ["serde"] }
@@ -316,7 +316,7 @@ pyroscope = { version = "=2.0.5", features = ["backend-pprof-rs", "backend-jemal
 # FTP and SFTP
 libunftp = { version = "0.23.0", features = ["experimental"] }
 unftp-core = "0.1.0"
-suppaftp = { version = "8.0.4", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
+suppaftp = { version = "9.0.0", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.8"
 russh = { version = "0.61.2", features = ["serde"] }
 russh-sftp = "2.3.0"
