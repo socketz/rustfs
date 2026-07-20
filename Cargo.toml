@@ -136,7 +136,7 @@ futures = "0.3.32"
 futures-core = "0.3.32"
 futures-lite = "2.6.1"
 futures-util = "0.3.32"
-pollster = "0.4.0"
+pollster = "1.0.1"
 pulsar = { version = "6.8.0", default-features = false, features = ["tokio-rustls-runtime"] }
 lapin = { version = "4.10.0", default-features = false, features = ["tokio", "rustls", "rustls--aws_lc_rs"] }
 hyper = { version = "1.10.1", features = ["http2", "http1", "server"] }
@@ -157,7 +157,7 @@ tonic = { version = "0.14.6", features = ["gzip", "deflate"] }
 tonic-prost = { version = "0.14.6" }
 tonic-prost-build = { version = "0.14.6" }
 tower = { version = "0.5.3", features = ["timeout"] }
-tower-http = { version = "0.6.11", features = ["cors"] }
+tower-http = { version = "0.7.0", features = ["cors"] }
 
 # Serialization and Data Formats
 bytes = { version = "1.11.1", features = ["serde"] }
@@ -166,7 +166,7 @@ byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
 prost = "0.14.4"
-quick-xml = "0.40.1"
+quick-xml = "0.41.0"
 rmp = { version = "0.8.15" }
 rmp-serde = { version = "1.3.1" }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -252,9 +252,9 @@ moka = { version = "0.12.15", features = ["future"] }
 netif = "0.1.6"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.12.1"
-object_store = "0.13.2"
+object_store = "0.14.1"
 parking_lot = "0.12.5"
-path-absolutize = "3.1.1"
+path-absolutize = "4.0.1"
 path-clean = "1.0.1"
 percent-encoding = "2.3.2"
 pin-project-lite = "0.2.17"
@@ -316,7 +316,7 @@ pyroscope = { version = "=2.0.5", features = ["backend-pprof-rs", "backend-jemal
 # FTP and SFTP
 libunftp = { version = "0.23.0", features = ["experimental"] }
 unftp-core = "0.1.0"
-suppaftp = { version = "8.0.4", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
+suppaftp = { version = "10.0.1", features = ["tokio", "tokio-rustls-aws-lc-rs"] }
 rcgen = "0.14.8"
 russh = { version = "0.61.2", features = ["serde"] }
 russh-sftp = "2.3.0"
