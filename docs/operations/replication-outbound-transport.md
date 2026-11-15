@@ -1,0 +1,53 @@
+# Replication outbound transport
+
+**Use this when:** a bucket-replication or site-replication target rejects, corrupts, or silently transforms uploads from RustFS, or you need to know which integrity headers RustFS sends to a remote target and how to change them.
+**Source of truth:** `crates/ecstore/src/bucket/remote_s3_client.rs` (`replication_request_checksum_calculation`), `crates/ecstore/src/bucket/bucket_target_sys.rs` (`TargetClient::put_object`, `PutObjectOptions::header`), `crates/ecstore/src/bucket/replication/replication_resyncer.rs` (`verify_single_part_replica`).
+
+## What a replication PUT carries by default
+
+- A plain signed body with an exact `Content-Length`. The SDK does not add a streaming trailer checksum, so the body is never wrapped in `aws-chunked` framing (rustfs#6853: a target that does not decode that framing stored the frames verbatim while RustFS recorded COMPLETED).
+- For a single-part object, the checksum the source object was uploaded with, forwarded as its `x-amz-checksum-<algorithm>` header (the value the source verified on upload). A multipart replica is rebuilt through CreateMultipartUpload/UploadPart and carries no object-level checksum header. Managed-SSE objects forward none.
+- On a PUT that carries Object Lock parameters and no forwarded checksum: `Content-MD5` derived from the source ETag, or an SDK CRC32 checksum when the ETag is not the MD5 of the wire bytes (rustfs#7082).
+- The source ETag, mtime and version id on `x-rustfs-source-*` headers (with `x-minio-source-*` twins), and the Object Lock mode, retain-until date and legal hold of the source version when present.
+- After the PUT, the target's ETag is compared with the source ETag when both are plain single-part MD5s and the source is unencrypted; a mismatch fails the replication instead of reporting a corrupted replica as COMPLETED. A managed-SSE (SSE-S3 / SSE-KMS) or SSE-C source is not audited this way: its stored ETag is a keyed fingerprint (new writes, see `docs/operations/encrypted-etags.md`) or a legacy plaintext MD5, and the target re-encrypts what it receives, so the two ETags are never comparable. Managed-SSE sources also forward no checksum (above), so a target that transforms their payload is not detected; an SSE-C ciphertext passthrough keeps its HEAD-back evidence audit.
+
+## Target classes and their known requirements
+
+| Target behavior | Effect on RustFS replication | Detected by |
+| --- | --- | --- |
+| Rejects or mis-stores `aws-chunked` bodies (SeaweedFS 3.97) | Handled by the plain-payload default above. | Outbound target matrix, `RejectAwsChunked` mode |
+| Requires `Content-MD5` or `x-amz-checksum-*` on a PutObject with Object Lock parameters (AWS S3, MinIO, Impossible Cloud, most compatible stores) | Satisfied: a locked single PUT carries `Content-MD5` derived from the source ETag (plaintext objects whose ETag is the MD5 of the wire bytes) or an SDK CRC32 checksum (multipart-layout ETags, managed SSE, SSE-C passthrough — this one is an `aws-chunked` trailer, so a target that also rejects that framing cannot take such objects). Releases before this fix (`1.0.0-rc.5`) need `RUSTFS_REPLICATION_STREAMING_CHECKSUMS=true` as a workaround. | Outbound target matrix, `RequireChecksumWithObjectLock` mode |
+| Stores `x-amz-checksum-*` from a PutObject and returns it on `HEAD ?ChecksumMode=ENABLED` (AWS S3, Wasabi, RustFS) | Satisfied for single-part objects: the replica answers with the source's checksum. Before this fix (`1.0.0-rc.5`) the checksum left the source as `x-amz-meta-<algorithm>` user metadata and no replica carried it (rustfs/backlog#2340). | Outbound target matrix, `Checksummed` shape |
+| Mints its own version ids (AWS S3, Wasabi, Impossible Cloud) | Data lands, and later mutations converge through the target-version ledger: the id the target assigned is recorded on the source version (internal key `replication-target-version-<arn>`) and version deletes, tag and Object Lock updates address it (tag/retention/legal-hold through the metadata-only APIs, never a re-PUT). A replica the ledger does not name (written before the ledger existed, or a PUT whose response was lost) is located by exact key + ETag, minus the candidates other generations of the key already claim; an ambiguous remainder is refused with a one-hour backoff (`replication_purge_replica_unresolved`). An encrypted source whose ETag the target does not report is matched by size and write time instead, and only a unique match is adopted (`docs/operations/encrypted-etags.md`). `NoSuchVersion` on a version-addressed DELETE counts as purged. See rustfs/backlog#2340, rustfs/backlog#2085 and `docs/operations/replication-check.md` (VersionFidelity). | `replication-check`, outbound target matrix, `MintOwnVersionIds` mode (also models Wasabi's 404 `NoSuchVersion` on unknown ids); `matrix_mint_own_version_ids_encrypted_redrive_does_not_duplicate` for SSE-S3 on an ETag-computing target |
+| Ignores `x-rustfs-source-etag` / `x-minio-source-etag` and reports the MD5 of the received plaintext as the ETag (AWS S3, generic S3 services) | Plaintext single-part replicas are verified against the source ETag. Encrypted sources skip the comparison (see above). In `1.0.2`, the first release with encrypted-ETag fingerprints, every single-part SSE-S3 object (and SSE-KMS where the target does not echo `aws:kms`) failed with `replica etag mismatch` and was retried indefinitely; the only workaround there is `RUSTFS_REPLICATION_REPLICA_ETAG_VERIFY=false`, which disables the check for every object. RustFS and MinIO targets adopt the source ETag and were not affected. | Outbound target matrix, `ComputesOwnEtags` mode, `SseS3` shape |
+| Returns an ETag that is not the content MD5 without announcing SSE | Every single-part object fails ETag verification. Set `RUSTFS_REPLICATION_REPLICA_ETAG_VERIFY=false`. | Replication status FAILED with `replica etag mismatch` |
+
+## Environment knobs
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RUSTFS_REPLICATION_STREAMING_CHECKSUMS` | unset (plain payloads) | `true` or `1` restores SDK trailer checksums (`RequestChecksumCalculation::WhenSupported`). Every streaming upload is then `aws-chunked` with an `x-amz-trailer`, except a single-part PUT that forwards the source's `x-amz-checksum-*` header, which is sent plain so the target does not receive a second algorithm; use only when every target decodes that framing. |
+| `RUSTFS_REPLICATION_REPLICA_ETAG_VERIFY` | enabled | `false` or `0` disables the post-PUT ETag comparison for targets whose 32-hex ETags are legitimately not the content MD5. |
+| `RUSTFS_REPLICATION_REQUEST_TIMEOUT_SECS` | `60` | SDK operation budget for replication requests, including retries; also the response deadline after an upload finishes sending its body. Values outside `1..=86400` fall back to the default. |
+| `RUSTFS_REPLICATION_COMPLETE_TIMEOUT_SECS` | `900` | Independent operation budget for multipart completion, including a target that sends keepalive whitespace without completing. Values outside `1..=86400` fall back to the default. |
+| `RUSTFS_REPLICATION_MIN_TRANSFER_RATE_BYTES_PER_SEC` | `1048576` | Rate used to calculate upload transmission headroom. Zero falls back to the default; positive values are accepted. This is a timeout calculation, not a bandwidth throttle. |
+
+These settings are read by the RustFS process that owns the replication target, at client build time; restart the server after changing them.
+
+PUT and UploadPart use an operation budget of the request timeout plus `ceil(body_bytes / minimum_transfer_rate) * max_attempts` seconds. The current retry policy allows three attempts; the separate response deadline still starts after each upload finishes sending. Multipart completion uses its own completion budget. These defaults apply to every replication target class, including custom S3-compatible endpoints; increase them when a supported target needs longer to acknowledge a request.
+
+### Remote tier transport timeouts
+
+Remote tier S3-compatible clients use separate transport budgets. These settings do not change bucket or site replication clients.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RUSTFS_TIER_REMOTE_CONNECT_TIMEOUT_SECS` | `10` | Maximum time to establish the remote tier TCP connection. |
+| `RUSTFS_TIER_REMOTE_REQUEST_TIMEOUT_SECS` | `86400` | Maximum time for a remote tier request to reach response headers. The long default preserves large transition-upload headroom. |
+| `RUSTFS_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS` | `60` | Maximum time without a non-empty response-body chunk. Empty HTTP/2 frames do not count as progress. |
+
+All three values must be positive integers. Zero fails tier client initialization instead of silently disabling the boundary. An invalid integer is logged and falls back to the default; very large values are accepted and provide a correspondingly long effective budget. The values are read when the tier client is built; recreate or reload the tier configuration after changing them.
+
+## Before changing any of this
+
+Follow the SOP in `docs/postmortems/2026-09-03-replication-checksum-default-regression.md`: inventory the target-side rules the current default satisfies, run the outbound target matrix, and document any new knob here in the same PR.

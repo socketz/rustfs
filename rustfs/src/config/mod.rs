@@ -50,9 +50,35 @@ mod snapshot;
 mod config_test;
 
 // Re-export public types
+#[cfg(test)]
+pub(crate) use cli::Cli;
+pub use cli::ConnectHealthOpts;
+pub use cli::ConnectSiteReplicationPerformanceOpts;
 pub use cli::{CommandResult, InfoOpts, InfoType};
+pub use cli::{
+    ConnectClientPerformanceOperation, ConnectClientPerformanceOpts, ConnectDrivePerformanceOpts, ConnectNetworkPerformanceOpts,
+    ConnectPerformanceCommands,
+};
+pub use cli::{ConnectEnvironmentInventoryOpts, ConnectInventoryCommands};
+pub use cli::{ConnectInspectCommands, ConnectInspectObjectOpts, ConnectInspectOpts};
+pub use cli::{
+    ConnectLicenseArtifactOpts, ConnectLicenseCommands, ConnectLicenseRelayExportOpts, ConnectLicenseRelayImportOpts,
+    ConnectLicenseRenewOpts, ConnectLicenseScopeOpts,
+};
+pub use cli::{ConnectLogsMode, ConnectLogsOpts};
+pub use cli::{ConnectObjectPerformanceOperation, ConnectObjectPerformanceOpts};
+pub use cli::{ConnectProfileOpts, ConnectProfileTool, ConnectThreadProfileScope};
+pub use cli::{ConnectRelayMaterialKind, ConnectRelayOpts};
+pub use cli::{ConnectReportCommands, ConnectReportOpts, ConnectReportUploadOpts};
+pub use cli::{
+    ConnectTelemetryArtifactOpts, ConnectTelemetryCommands, ConnectTelemetryOtlpOpts, ConnectTelemetryRecordOpts,
+    ConnectTelemetryReplayOpts,
+};
+pub use cli::{ConnectTopCaptureOpts, ConnectTopCommands};
+pub use cli::{DiagnoseFormat, DiagnoseOpts};
+pub use cli::{InspectBucketMetaOpts, InspectCommands, InspectOpts};
 pub use cli::{TlsCommands, TlsInspectOpts, TlsOpts};
-pub use config_struct::Config;
+pub use config_struct::{Config, InvalidS3Stack, S3Stack};
 pub use info::execute_info;
 pub use opt::Opt;
 pub(crate) use snapshot::get_config_snapshot;

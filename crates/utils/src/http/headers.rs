@@ -47,6 +47,8 @@ pub const AMZ_DELETE_MARKER: &str = "x-amz-delete-marker";
 
 // S3 object tagging
 pub const AMZ_OBJECT_TAGGING: &str = "X-Amz-Tagging";
+/// Lowercase wire form of [`AMZ_OBJECT_TAGGING`] for `HeaderMap` insertion.
+pub const AMZ_OBJECT_TAGGING_LOWER: &str = "x-amz-tagging";
 pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
 pub const AMZ_TAG_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
 
@@ -103,6 +105,18 @@ pub const AMZ_RUSTFS_SNOWBALL_PREFIX: &str = "X-Amz-Meta-Rustfs-Snowball-Prefix"
 pub const AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Dirs";
 pub const AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Errors";
 
+/// Transport controls must not become commands when stored metadata is sent to a tier.
+/// Accepts both persisted metadata names and their HTTP header spellings.
+pub fn is_snowball_transport_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let name = key.strip_prefix("x-amz-meta-").unwrap_or(&key);
+    name == "snowball-auto-extract"
+        || key == "x-amz-snowball-auto-extract"
+        || ["snowball-prefix", "snowball-ignore-dirs", "snowball-ignore-errors"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+}
+
 // Object lock enabled
 pub const AMZ_OBJECT_LOCK_ENABLED: &str = "x-amz-bucket-object-lock-enabled";
 
@@ -156,7 +170,11 @@ pub const REQUEST_ID_HEADER: &str = "x-request-id";
 pub const AMZ_REQUEST_ID: &str = "x-amz-request-id";
 pub const AMZ_REQUEST_HOST_ID: &str = "x-amz-id-2";
 
-// Content Checksums
+// Content Checksums. The standard five x-amz-checksum-* names also exist in
+// the zero-internal-dependency rustfs-checksums leaf crate
+// (crates/checksums/src/http.rs, which additionally owns the RustFS
+// extension names); values are pinned by the S3 wire protocol — keep both
+// sides in sync (backlog#1833).
 pub const AMZ_CHECKSUM_ALGO: &str = "x-amz-checksum-algorithm";
 pub const AMZ_CHECKSUM_CRC32: &str = "x-amz-checksum-crc32";
 pub const AMZ_CHECKSUM_CRC32C: &str = "x-amz-checksum-crc32c";
@@ -176,6 +194,8 @@ pub const AMZ_META_UNENCRYPTED_CONTENT_LENGTH: &str = "X-Amz-Meta-X-Amz-Unencryp
 pub const AMZ_META_UNENCRYPTED_CONTENT_MD5: &str = "X-Amz-Meta-X-Amz-Unencrypted-Content-Md5";
 
 pub const AMZ_TAGGING_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
+/// Lowercase wire form of [`AMZ_TAGGING_DIRECTIVE`] for `HeaderMap` insertion.
+pub const AMZ_TAGGING_DIRECTIVE_LOWER: &str = "x-amz-tagging-directive";
 
 // SSEC encryption header constants
 pub const SSEC_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
@@ -232,16 +252,14 @@ static SUPPORTED_HEADERS: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
     m.insert("x-amz-replication-status".to_string(), true);
     m
 });
-static SSE_HEADERS: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
-    let mut m = HashMap::new();
-    m.insert("x-amz-server-side-encryption".to_string(), true);
-    m.insert("x-amz-server-side-encryption-aws-kms-key-id".to_string(), true);
-    m.insert("x-amz-server-side-encryption-context".to_string(), true);
-    m.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), true);
-    m.insert("x-amz-server-side-encryption-customer-key".to_string(), true);
-    m.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), true);
-    m
-});
+const SSE_HEADERS: &[&str] = &[
+    AMZ_SERVER_SIDE_ENCRYPTION,
+    AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
+    AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,
+    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM,
+    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
+    AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
+];
 
 pub fn is_standard_query_value(qs_key: &str) -> bool {
     *SUPPORTED_QUERY_VALUES.get(qs_key).unwrap_or(&false)
@@ -256,7 +274,9 @@ pub fn is_standard_header(header_key: &str) -> bool {
 }
 
 pub fn is_sse_header(header_key: &str) -> bool {
-    *SSE_HEADERS.get(&header_key.to_lowercase()).unwrap_or(&false)
+    let matches = |key: &str| SSE_HEADERS.iter().any(|header| key.eq_ignore_ascii_case(header));
+    // Stored metadata retains the historical Unicode case-folding behavior.
+    matches(header_key) || (!header_key.is_ascii() && matches(&header_key.to_lowercase()))
 }
 
 pub fn is_amz_header(header_key: &str) -> bool {
@@ -274,4 +294,71 @@ pub fn is_rustfs_header(header_key: &str) -> bool {
 
 pub fn is_minio_header(header_key: &str) -> bool {
     header_key.to_lowercase().starts_with("x-minio-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_snowball_transport_key, is_sse_header};
+    use proptest::prelude::*;
+
+    #[test]
+    fn snowball_transport_keys_cover_header_and_stored_aliases() {
+        for key in [
+            "snowball-auto-extract",
+            "X-Amz-Meta-Snowball-Auto-Extract",
+            "X-Amz-Snowball-Auto-Extract",
+            "snowball-prefix",
+            "minio-snowball-ignore-dirs",
+            "rustfs-snowball-ignore-errors",
+            "x-amz-meta-other-vendor-snowball-prefix",
+            "other-vendor-snowball-ignore-errors",
+        ] {
+            assert!(is_snowball_transport_key(key), "{key}");
+        }
+        for key in [
+            "owner",
+            "snowball-auto-extract-extra",
+            "snowball-prefix-extra",
+            "content-type",
+        ] {
+            assert!(!is_snowball_transport_key(key), "{key}");
+        }
+    }
+
+    const STORED_SSE_HEADERS: &[&str] = &[
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+        "x-amz-server-side-encryption-context",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key",
+        "x-amz-server-side-encryption-customer-key-md5",
+    ];
+
+    #[test]
+    fn sse_header_matching_preserves_stored_names_and_unicode_case_folding() {
+        for header in STORED_SSE_HEADERS {
+            assert!(is_sse_header(header), "stored SSE header: {header}");
+            assert!(is_sse_header(&header.to_uppercase()), "uppercase SSE header: {header}");
+            assert!(!is_sse_header(&format!("{header}-extra")), "unrecognized suffix: {header}");
+        }
+        assert!(is_sse_header("X-Amz-Server-Side-Encryption-Customer-Key"));
+        assert!(is_sse_header("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id"));
+        for header in [
+            "",
+            "content-type",
+            "x-amz-server-side-encryption-customer-original-size",
+            "x-amz-copy-source-server-side-encryption-customer-key",
+            "x-amz-server-side-encryptİon",
+        ] {
+            assert!(!is_sse_header(header), "non-SSE header: {header}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn sse_header_matching_agrees_with_unicode_lowercase_lookup(header in ".*") {
+            let normalized = header.to_lowercase();
+            prop_assert_eq!(is_sse_header(&header), STORED_SSE_HEADERS.contains(&normalized.as_str()));
+        }
+    }
 }

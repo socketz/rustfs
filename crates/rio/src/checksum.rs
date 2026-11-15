@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::errors::ChecksumMismatch;
-use base64::{Engine as _, engine::general_purpose};
+use base64_simd::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use http::HeaderMap;
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -30,6 +30,29 @@ pub const RUSTFS_MULTIPART_CHECKSUM: &str = "x-rustfs-multipart-checksum";
 pub const RUSTFS_MULTIPART_CHECKSUM_TYPE: &str = "x-rustfs-multipart-checksum-type";
 
 /// Checksum type enumeration with flags
+///
+/// This bitset owns the **on-disk xl.meta encoding** — the raw `u32` is
+/// varint-serialized into xl.meta (see `append_to`), so bits are append-only
+/// and must never be renumbered. Canonical per-algorithm metadata (wire
+/// names, headers, digest lengths, checksum-type capabilities) lives in
+/// `rustfs_checksums::ChecksumAlgorithm` (crates/checksums/src/lib.rs), which
+/// the MinIO-port client's `ChecksumMode`
+/// (crates/s3-client/src/checksum.rs) consumes through its `algorithm()`
+/// bridge (backlog#1844).
+///
+/// The hasher implementations below stay rio-native rather than delegating
+/// to rustfs-checksums (backlog#1844 PR3 verdict): `ChecksumHasher` needs a
+/// non-consuming `finalize` plus `reset` on the server hot path, while the
+/// checksums `Checksum` trait finalizes by consuming the box; MD5 is a base
+/// type here (x-amz-checksum-md5, bit 14) but deliberately not a
+/// `ChecksumAlgorithm` variant; and both crates already drive the same
+/// backends (crc_fast, sha1/sha2, xxhash_rust, md5). Equivalence is enforced
+/// instead by pinning both sides to the same official known-answer vectors —
+/// see `hashers_match_rustfs_checksums_known_answer_vectors` below and the
+/// digest tests in crates/checksums. When adding an algorithm: extend
+/// `ChecksumAlgorithm` (exhaustive matches force the metadata), bridge it in
+/// the client, allocate a bit + hasher here, and pin the shared vector in
+/// both test suites (or record why a surface is skipped).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChecksumType(pub u32);
 
@@ -64,10 +87,33 @@ impl ChecksumType {
     /// Full object checksum
     pub const FULL_OBJECT: ChecksumType = ChecksumType(1 << 9);
 
+    // --- S3 additional checksum algorithms (AWS 2026-04). New base-type bits are
+    // append-only above bit 9; existing bits must never be renumbered because the
+    // raw `checksum_type.0` value is varint-serialized into xl.meta (see append_to).
+
+    /// XXHash3 (64-bit) checksum. COMPOSITE-only per AWS.
+    pub const XXHASH3: ChecksumType = ChecksumType(1 << 10);
+
+    /// XXHash64 checksum.
+    pub const XXHASH64: ChecksumType = ChecksumType(1 << 11);
+
+    /// XXHash128 checksum.
+    pub const XXHASH128: ChecksumType = ChecksumType(1 << 12);
+
+    /// SHA-512 checksum.
+    pub const SHA512: ChecksumType = ChecksumType(1 << 13);
+
+    /// MD5 as an ADDITIONAL checksum (x-amz-checksum-md5), distinct from the legacy
+    /// Content-MD5 / ETag path.
+    pub const MD5: ChecksumType = ChecksumType(1 << 14);
+
     /// No checksum
     pub const NONE: ChecksumType = ChecksumType(0);
 
-    const BASE_TYPE_MASK: u32 = Self::SHA256.0 | Self::SHA1.0 | Self::CRC32.0 | Self::CRC32C.0 | Self::CRC64_NVME.0;
+    /// Base-type mask, derived from [`BASE_CHECKSUM_TYPES`] as the single source of
+    /// truth. A new base type added to that list is automatically covered here, so
+    /// `base()` can never silently strip a wired-up algorithm (see #1252 / #1254).
+    const BASE_TYPE_MASK: u32 = compute_base_type_mask(BASE_CHECKSUM_TYPES);
 
     /// Check if this checksum type has all flags of the given type
     pub fn is(self, t: ChecksumType) -> bool {
@@ -96,6 +142,11 @@ impl ChecksumType {
             Self::SHA1 => Some("x-amz-checksum-sha1"),
             Self::SHA256 => Some("x-amz-checksum-sha256"),
             Self::CRC64_NVME => Some("x-amz-checksum-crc64nvme"),
+            Self::XXHASH3 => Some("x-amz-checksum-xxhash3"),
+            Self::XXHASH64 => Some("x-amz-checksum-xxhash64"),
+            Self::XXHASH128 => Some("x-amz-checksum-xxhash128"),
+            Self::SHA512 => Some("x-amz-checksum-sha512"),
+            Self::MD5 => Some("x-amz-checksum-md5"),
             _ => None,
         }
     }
@@ -107,6 +158,10 @@ impl ChecksumType {
             Self::SHA1 => 20,
             Self::SHA256 => SHA256_SIZE,
             Self::CRC64_NVME => 8,
+            Self::XXHASH3 | Self::XXHASH64 => 8,
+            Self::XXHASH128 => 16,
+            Self::SHA512 => 64,
+            Self::MD5 => 16,
             _ => 0,
         }
     }
@@ -129,6 +184,11 @@ impl ChecksumType {
             Self::SHA1 => Some(Box::new(Sha1Hasher::new())),
             Self::SHA256 => Some(Box::new(Sha256Hasher::new())),
             Self::CRC64_NVME => Some(Box::new(Crc64NvmeHasher::new())),
+            Self::XXHASH3 => Some(Box::new(Xxh3Hasher::new())),
+            Self::XXHASH64 => Some(Box::new(Xxh64Hasher::new())),
+            Self::XXHASH128 => Some(Box::new(Xxh128Hasher::new())),
+            Self::SHA512 => Some(Box::new(Sha512Hasher::new())),
+            Self::MD5 => Some(Box::new(Md5Hasher::new())),
             _ => None,
         }
     }
@@ -141,6 +201,12 @@ impl ChecksumType {
     /// Check if full object checksum was requested
     pub fn full_object_requested(self) -> bool {
         (self.0 & Self::FULL_OBJECT.0) == Self::FULL_OBJECT.0 || self.is(Self::CRC64_NVME)
+    }
+
+    /// True for the five legacy algorithms currently handled by RustFS's named
+    /// response fields. Additional algorithms use the extended response path.
+    pub fn is_s3s_typed(self) -> bool {
+        matches!(self.base(), Self::CRC32 | Self::CRC32C | Self::SHA1 | Self::SHA256 | Self::CRC64_NVME)
     }
 
     /// Get object type string for x-amz-checksum-type header
@@ -177,32 +243,37 @@ impl ChecksumType {
             _ => return Self::INVALID,
         };
 
-        match alg.to_uppercase().as_str() {
-            "CRC32" => ChecksumType(Self::CRC32.0 | full.0),
-            "CRC32C" => ChecksumType(Self::CRC32C.0 | full.0),
-            "SHA1" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::SHA1
-            }
-            "SHA256" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::SHA256
-            }
-            "CRC64NVME" => {
-                // AWS seems to ignore full value and just assume it
-                Self::CRC64_NVME
-            }
-            "" => {
-                if full != Self::NONE {
-                    return Self::INVALID;
-                }
-                Self::NONE
-            }
-            _ => Self::INVALID,
+        // Case-insensitive matching WITHOUT allocating: to_uppercase() allocated a
+        // String on every checksummed request, and this path is hot. Composite-only
+        // algorithms reject an explicit FULL_OBJECT request — they cannot be linearly
+        // combined into a full-object checksum the way CRCs can (same rule as SHA1/256).
+        let composite_only = |ty: ChecksumType| -> ChecksumType { if full != Self::NONE { Self::INVALID } else { ty } };
+
+        if alg.eq_ignore_ascii_case("CRC32") {
+            ChecksumType(Self::CRC32.0 | full.0)
+        } else if alg.eq_ignore_ascii_case("CRC32C") {
+            ChecksumType(Self::CRC32C.0 | full.0)
+        } else if alg.eq_ignore_ascii_case("CRC64NVME") {
+            // AWS ignores the full-object flag here and just assumes it.
+            Self::CRC64_NVME
+        } else if alg.eq_ignore_ascii_case("SHA1") {
+            composite_only(Self::SHA1)
+        } else if alg.eq_ignore_ascii_case("SHA256") {
+            composite_only(Self::SHA256)
+        } else if alg.eq_ignore_ascii_case("SHA512") {
+            composite_only(Self::SHA512)
+        } else if alg.eq_ignore_ascii_case("XXHASH3") {
+            composite_only(Self::XXHASH3)
+        } else if alg.eq_ignore_ascii_case("XXHASH64") {
+            composite_only(Self::XXHASH64)
+        } else if alg.eq_ignore_ascii_case("XXHASH128") {
+            composite_only(Self::XXHASH128)
+        } else if alg.eq_ignore_ascii_case("MD5") {
+            composite_only(Self::MD5)
+        } else if alg.is_empty() {
+            composite_only(Self::NONE)
+        } else {
+            Self::INVALID
         }
     }
 }
@@ -215,20 +286,44 @@ impl std::fmt::Display for ChecksumType {
             Self::SHA1 => write!(f, "SHA1"),
             Self::SHA256 => write!(f, "SHA256"),
             Self::CRC64_NVME => write!(f, "CRC64NVME"),
+            Self::XXHASH3 => write!(f, "XXHASH3"),
+            Self::XXHASH64 => write!(f, "XXHASH64"),
+            Self::XXHASH128 => write!(f, "XXHASH128"),
+            Self::SHA512 => write!(f, "SHA512"),
+            Self::MD5 => write!(f, "MD5"),
             Self::NONE => write!(f, ""),
             _ => write!(f, "invalid"),
         }
     }
 }
 
-/// Base checksum types list
+/// Base checksum types list. This is the single source of truth for which base
+/// algorithms exist: [`ChecksumType::BASE_TYPE_MASK`] is derived from it, so adding
+/// a new algorithm here cannot leave `base()` silently stripping it (see #1254).
 pub const BASE_CHECKSUM_TYPES: &[ChecksumType] = &[
     ChecksumType::SHA256,
     ChecksumType::SHA1,
     ChecksumType::CRC32,
     ChecksumType::CRC64_NVME,
     ChecksumType::CRC32C,
+    ChecksumType::XXHASH3,
+    ChecksumType::XXHASH64,
+    ChecksumType::XXHASH128,
+    ChecksumType::SHA512,
+    ChecksumType::MD5,
 ];
+
+/// Fold the base-type bits of `types` into a mask. Used to derive
+/// [`ChecksumType::BASE_TYPE_MASK`] from [`BASE_CHECKSUM_TYPES`] at compile time.
+const fn compute_base_type_mask(types: &[ChecksumType]) -> u32 {
+    let mut mask = 0u32;
+    let mut i = 0;
+    while i < types.len() {
+        mask |= types[i].0;
+        i += 1;
+    }
+    mask
+}
 
 /// Checksum structure containing type and encoded value
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -249,7 +344,7 @@ impl Checksum {
         let mut hasher = checksum_type.hasher()?;
         hasher.write_all(data).ok()?;
         let raw = hasher.finalize();
-        let encoded = general_purpose::STANDARD.encode(&raw);
+        let encoded = BASE64_STANDARD.encode_to_string(&raw);
 
         let checksum = Checksum {
             checksum_type,
@@ -288,7 +383,7 @@ impl Checksum {
             value_string = value.to_string();
         }
         // let raw = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(&value_string).ok()?;
-        let raw = general_purpose::STANDARD.decode(&value_string).ok()?;
+        let raw = BASE64_STANDARD.decode_to_vec(&value_string).ok()?;
 
         let checksum = Checksum {
             checksum_type,
@@ -332,14 +427,14 @@ impl Checksum {
         if self.want_parts > 0 && self.want_parts != parts {
             return Err(ChecksumMismatch {
                 want: format!("{}-{}", self.encoded, self.want_parts),
-                got: format!("{}-{}", general_purpose::STANDARD.encode(&sum), parts),
+                got: format!("{}-{}", base64_simd::STANDARD.encode_to_string(&sum), parts),
             });
         }
 
         if sum != self.raw {
             return Err(ChecksumMismatch {
                 want: self.encoded.clone(),
-                got: general_purpose::STANDARD.encode(&sum),
+                got: base64_simd::STANDARD.encode_to_string(&sum),
             });
         }
 
@@ -488,7 +583,7 @@ impl Checksum {
             }
         }
 
-        self.encoded = general_purpose::STANDARD.encode(&self.raw);
+        self.encoded = base64_simd::STANDARD.encode_to_string(&self.raw);
         Ok(())
     }
 }
@@ -824,6 +919,206 @@ impl ChecksumHasher for Crc64NvmeHasher {
     }
 }
 
+/// XXHash3 (64-bit) hasher, seed 0. Digest encoded big-endian (S3 canonical form,
+/// matching the AWS CRT wire representation).
+pub struct Xxh3Hasher {
+    hasher: xxhash_rust::xxh3::Xxh3,
+}
+
+impl Default for Xxh3Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Xxh3Hasher {
+    pub fn new() -> Self {
+        Self {
+            hasher: xxhash_rust::xxh3::Xxh3::new(),
+        }
+    }
+}
+
+impl Write for Xxh3Hasher {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ChecksumHasher for Xxh3Hasher {
+    fn finalize(&mut self) -> Vec<u8> {
+        self.hasher.digest().to_be_bytes().to_vec()
+    }
+
+    fn reset(&mut self) {
+        self.hasher = xxhash_rust::xxh3::Xxh3::new();
+    }
+}
+
+/// XXHash128 hasher, seed 0. Digest encoded big-endian over the full 128 bits.
+pub struct Xxh128Hasher {
+    hasher: xxhash_rust::xxh3::Xxh3,
+}
+
+impl Default for Xxh128Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Xxh128Hasher {
+    pub fn new() -> Self {
+        Self {
+            hasher: xxhash_rust::xxh3::Xxh3::new(),
+        }
+    }
+}
+
+impl Write for Xxh128Hasher {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ChecksumHasher for Xxh128Hasher {
+    fn finalize(&mut self) -> Vec<u8> {
+        self.hasher.digest128().to_be_bytes().to_vec()
+    }
+
+    fn reset(&mut self) {
+        self.hasher = xxhash_rust::xxh3::Xxh3::new();
+    }
+}
+
+/// XXHash64 hasher, seed 0. Digest encoded big-endian.
+pub struct Xxh64Hasher {
+    hasher: xxhash_rust::xxh64::Xxh64,
+}
+
+impl Default for Xxh64Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Xxh64Hasher {
+    pub fn new() -> Self {
+        Self {
+            hasher: xxhash_rust::xxh64::Xxh64::new(0),
+        }
+    }
+}
+
+impl Write for Xxh64Hasher {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ChecksumHasher for Xxh64Hasher {
+    fn finalize(&mut self) -> Vec<u8> {
+        self.hasher.digest().to_be_bytes().to_vec()
+    }
+
+    fn reset(&mut self) {
+        self.hasher = xxhash_rust::xxh64::Xxh64::new(0);
+    }
+}
+
+/// SHA-512 hasher.
+pub struct Sha512Hasher {
+    hasher: Sha512,
+}
+
+impl Default for Sha512Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha512Hasher {
+    pub fn new() -> Self {
+        Self { hasher: Sha512::new() }
+    }
+}
+
+impl Write for Sha512Hasher {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ChecksumHasher for Sha512Hasher {
+    fn finalize(&mut self) -> Vec<u8> {
+        self.hasher.clone().finalize().to_vec()
+    }
+
+    fn reset(&mut self) {
+        self.hasher = Sha512::new();
+    }
+}
+
+/// MD5 hasher for the ADDITIONAL checksum (x-amz-checksum-md5). Separate from the
+/// legacy Content-MD5 / ETag machinery — this only serves the flexible-checksum path.
+pub struct Md5Hasher {
+    hasher: rustfs_utils::FastMd5,
+}
+
+impl Default for Md5Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Md5Hasher {
+    pub fn new() -> Self {
+        Self {
+            hasher: rustfs_utils::FastMd5::new(),
+        }
+    }
+}
+
+impl Write for Md5Hasher {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ChecksumHasher for Md5Hasher {
+    fn finalize(&mut self) -> Vec<u8> {
+        self.hasher.finalize_bytes().to_vec()
+    }
+
+    fn reset(&mut self) {
+        self.hasher.reset();
+    }
+}
+
 /// Encode unsigned integer as varint
 fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
@@ -877,7 +1172,7 @@ pub fn read_checksums(mut buf: &[u8], part: i32) -> (HashMap<String, String>, bo
 
         let checksum_bytes = &buf[..length];
         buf = &buf[length..];
-        let mut checksum_str = general_purpose::STANDARD.encode(checksum_bytes);
+        let mut checksum_str = base64_simd::STANDARD.encode_to_string(checksum_bytes);
 
         if checksum_type.is(ChecksumType::MULTIPART) {
             is_multipart = true;
@@ -907,7 +1202,7 @@ pub fn read_checksums(mut buf: &[u8], part: i32) -> (HashMap<String, String>, bo
                 if part > 0 && (part as u64) <= parts_count {
                     let offset = ((part - 1) as usize) * length;
                     let part_checksum = &buf[offset..offset + length];
-                    checksum_str = general_purpose::STANDARD.encode(part_checksum);
+                    checksum_str = base64_simd::STANDARD.encode_to_string(part_checksum);
                 }
                 buf = &buf[want_len..];
             }
@@ -966,7 +1261,7 @@ pub fn read_part_checksums(mut buf: &[u8]) -> Vec<HashMap<String, String>> {
 
             let checksum_bytes = &buf[..length];
             buf = &buf[length..];
-            let checksum_str = general_purpose::STANDARD.encode(checksum_bytes);
+            let checksum_str = base64_simd::STANDARD.encode_to_string(checksum_bytes);
 
             part_checksum.insert(checksum_type.to_string(), checksum_str);
         }
@@ -1185,5 +1480,516 @@ mod tests {
 
         assert_eq!(combined.encoded, expected.encoded);
         assert_eq!(combined.raw, expected.raw);
+    }
+
+    // Guardrail (#1254): every base algorithm must round-trip through EVERY dispatch
+    // site. This fails loudly if a future algorithm is added to the enum but a match
+    // arm (base/is_set/hasher/key/raw_byte_len/Display/from_string) or BASE_TYPE_MASK
+    // is forgotten — the silent-drop footgun that reintroduced #4800.
+    #[test]
+    fn base_checksum_types_round_trip_all_dispatch_sites() {
+        use super::BASE_CHECKSUM_TYPES;
+        use std::io::Write;
+
+        for &t in BASE_CHECKSUM_TYPES {
+            assert_eq!(t.base(), t, "base() stripped {t:?}; BASE_TYPE_MASK is missing its bit");
+            assert!(t.is_set(), "{t:?} is not is_set()");
+            assert!(t.hasher().is_some(), "{t:?} has no hasher()");
+            assert!(t.key().is_some(), "{t:?} has no header key()");
+            assert!(t.raw_byte_len() > 0, "{t:?} has zero raw_byte_len()");
+
+            let name = t.to_string();
+            assert_ne!(name, "invalid", "{t:?} Display returns \"invalid\"");
+            assert_ne!(name, "", "{t:?} Display returns empty");
+            assert_eq!(
+                ChecksumType::from_string(&name).base(),
+                t,
+                "from_string({name}) does not round-trip to {t:?}"
+            );
+
+            let mut hasher = t.hasher().expect("hasher present");
+            hasher.write_all(b"rustfs checksum round-trip").expect("write");
+            assert_eq!(
+                hasher.finalize().len(),
+                t.raw_byte_len(),
+                "{t:?} finalized digest length != raw_byte_len()"
+            );
+        }
+    }
+
+    // The new AWS 2026-04 algorithms are COMPOSITE-only: an explicit FULL_OBJECT
+    // request must be rejected (they cannot be linearly combined like CRCs), and they
+    // must never be routed through add_part()/can_merge().
+    #[test]
+    fn new_algorithms_are_composite_only() {
+        for alg in ["XXHASH3", "XXHASH64", "XXHASH128", "SHA512", "MD5"] {
+            let composite = ChecksumType::from_string_with_obj_type(alg, "COMPOSITE");
+            assert!(composite.is_set(), "{alg} COMPOSITE should be valid");
+            assert!(!composite.can_merge(), "{alg} must not be mergeable (composite-only)");
+
+            let full = ChecksumType::from_string_with_obj_type(alg, "FULL_OBJECT");
+            assert_eq!(full, ChecksumType::INVALID, "{alg} FULL_OBJECT must be rejected");
+        }
+    }
+
+    // Known-answer vectors (#1255). The empty-input digests are the OFFICIAL upstream
+    // xxHash / SHA-512 test vectors (seed 0), pinned in big-endian to guarantee the
+    // stored/echoed value byte-for-byte matches what AWS SDKs (awscrt) compute. If the
+    // finalize() byte order or seed ever drifts, these fail loudly.
+    fn raw_hex(t: ChecksumType, data: &[u8]) -> String {
+        let c = Checksum::new_from_data(t, data).expect("checksum");
+        assert_eq!(c.raw.len(), t.raw_byte_len(), "raw len mismatch for {t:?}");
+        c.raw.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn xxhash_sha512_known_answer_vectors_empty_input() {
+        // XXH3-64("") = 0x2D06800538D394C2 (official)
+        assert_eq!(raw_hex(ChecksumType::XXHASH3, b""), "2d06800538d394c2");
+        // XXH64("")   = 0xEF46DB3751D8E999 (official)
+        assert_eq!(raw_hex(ChecksumType::XXHASH64, b""), "ef46db3751d8e999");
+        // XXH3-128("") = 0x99AA06D3014798D86001C324468D497F (official)
+        assert_eq!(raw_hex(ChecksumType::XXHASH128, b""), "99aa06d3014798d86001c324468d497f");
+        // SHA-512("") (official)
+        assert_eq!(
+            raw_hex(ChecksumType::SHA512, b""),
+            "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
+             47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+        );
+        // MD5("") = d41d8cd98f00b204e9800998ecf8427e (official)
+        assert_eq!(raw_hex(ChecksumType::MD5, b""), "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    // Regression lock for a non-empty payload: values are produced by this
+    // implementation and must stay stable across refactors. Base64 (S3 wire form) is
+    // asserted alongside the raw hex so both the digest and its encoding are pinned.
+    #[test]
+    fn xxhash_sha512_regression_lock_non_empty() {
+        let data = b"The quick brown fox jumps over the lazy dog";
+
+        // XXH3-64(fox) = 0xce7d19a5418fb365 is the official upstream vector.
+        for (t, want_hex) in [
+            (ChecksumType::XXHASH3, "ce7d19a5418fb365"),
+            (ChecksumType::XXHASH64, "0b242d361fda71bc"),
+        ] {
+            let c = Checksum::new_from_data(t, data).expect("checksum");
+            let got_hex: String = c.raw.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(got_hex, want_hex, "{t:?} raw hex drifted");
+            // encoded field must be the standard-base64 of raw (S3 wire form)
+            assert_eq!(
+                c.encoded,
+                base64_simd::STANDARD.encode_to_string(&c.raw),
+                "{t:?} encoded field != base64(raw)"
+            );
+        }
+    }
+
+    // On-disk (xl.meta) serialization round-trip for the new algorithms (#1260):
+    // to_bytes() -> read_checksums() must recover the value under the Display key.
+    #[test]
+    fn on_disk_round_trip_new_algorithms() {
+        use super::read_checksums;
+        let data = b"rustfs on-disk checksum round-trip payload";
+
+        for (t, name) in [
+            (ChecksumType::XXHASH3, "XXHASH3"),
+            (ChecksumType::XXHASH64, "XXHASH64"),
+            (ChecksumType::XXHASH128, "XXHASH128"),
+            (ChecksumType::SHA512, "SHA512"),
+        ] {
+            let c = Checksum::new_from_data(t, data).expect("checksum");
+            let buf = c.to_bytes(&[]);
+            let (map, is_multipart) = read_checksums(&buf, 0);
+            assert!(!is_multipart, "{name} single-object must not be multipart");
+            assert_eq!(map.get(name), Some(&c.encoded), "{name} did not round-trip on-disk");
+        }
+    }
+
+    // Forward-compat / rolling-upgrade contract (#1260): a node that does not know a
+    // future base-type bit must DEGRADE SAFELY — skip the entry and return without
+    // panicking or decoding a wrong length — never crash or corrupt.
+    #[test]
+    fn unknown_future_type_bit_degrades_safely() {
+        use super::{encode_varint, read_checksums, read_part_checksums};
+
+        // A base-type bit far above any allocated one (append-only rule guarantees
+        // real bits stay below this), followed by 8 bytes of would-be digest.
+        let mut buf = Vec::new();
+        encode_varint(&mut buf, 1 << 20);
+        buf.extend_from_slice(&[0xAB; 8]);
+
+        let (map, is_multipart) = read_checksums(&buf, 0);
+        assert!(map.is_empty(), "unknown type must yield no checksum, got {map:?}");
+        assert!(!is_multipart);
+        assert!(read_part_checksums(&buf).is_empty());
+    }
+
+    // Multipart COMPOSITE assembly for the composite-only algorithms (#1261). Mirrors
+    // set_disk complete_multipart_upload: the object checksum is H(concat of per-part
+    // raw digests), and these algorithms must NOT be routed through add_part().
+    #[test]
+    fn composite_multipart_assembly_new_algorithms() {
+        let part1 = b"first multipart chunk bytes";
+        let part2 = b"second multipart chunk bytes";
+
+        for t in [
+            ChecksumType::XXHASH3,
+            ChecksumType::XXHASH64,
+            ChecksumType::XXHASH128,
+            ChecksumType::SHA512,
+            ChecksumType::MD5,
+        ] {
+            let c1 = Checksum::new_from_data(t, part1).expect("part1");
+            let c2 = Checksum::new_from_data(t, part2).expect("part2");
+
+            // Concatenate raw part digests, then hash again with the same algorithm.
+            let mut combined = c1.raw.clone();
+            combined.extend_from_slice(&c2.raw);
+            let composite = Checksum::new_from_data(t, &combined).expect("composite");
+            assert_eq!(composite.raw.len(), t.raw_byte_len(), "{t:?} composite len");
+            assert!(!composite.encoded.is_empty());
+
+            // Composite-only: full-object merge must be refused.
+            let mut acc = Checksum {
+                checksum_type: t,
+                ..Default::default()
+            };
+            assert!(acc.add_part(&c1, part1.len() as i64).is_err(), "{t:?} must not be full-object mergeable");
+        }
+    }
+
+    // Drift lock for the backlog#1844 PR3 verdict: rio keeps its own hasher
+    // shells instead of delegating to rustfs-checksums, so both sides pin the
+    // SAME input and official digests (crates/checksums/src/lib.rs pins these
+    // values for "test data" in its own tests). If either implementation ever
+    // changes backend, seed, or byte order, one of the two suites fails loudly.
+    #[test]
+    fn hashers_match_rustfs_checksums_known_answer_vectors() {
+        for (t, want_hex) in [
+            (ChecksumType::CRC32, "d308aeb2"),
+            (ChecksumType::CRC32C, "3379b4ca"),
+            (ChecksumType::CRC64_NVME, "aecaf3af9c98a855"),
+            (ChecksumType::SHA1, "f48dd853820860816c75d54d0f584dc863327a7c"),
+            (ChecksumType::SHA256, "916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"),
+        ] {
+            assert_eq!(raw_hex(t, b"test data"), want_hex, "{t:?} digest drifted from the shared vector");
+        }
+    }
+
+    // S11: from_string_with_obj_type dropped to_uppercase() (a per-request heap alloc)
+    // for eq_ignore_ascii_case. Lock that this did not change any behaviour.
+    #[test]
+    fn from_string_is_case_insensitive_and_behaviour_preserved() {
+        assert_eq!(ChecksumType::from_string("crc32").base(), ChecksumType::CRC32);
+        assert_eq!(ChecksumType::from_string("Crc32C").base(), ChecksumType::CRC32C);
+        assert_eq!(ChecksumType::from_string("xxHASH3").base(), ChecksumType::XXHASH3);
+        assert_eq!(ChecksumType::from_string("Md5").base(), ChecksumType::MD5);
+        assert_eq!(ChecksumType::from_string("sha512").base(), ChecksumType::SHA512);
+
+        // Unknown / empty preserved.
+        assert_eq!(ChecksumType::from_string("nope"), ChecksumType::INVALID);
+        assert_eq!(ChecksumType::from_string(""), ChecksumType::NONE);
+
+        // CRC64NVME still assumes full-object; CRC32 still accepts explicit FULL_OBJECT.
+        assert!(ChecksumType::from_string("crc64nvme").full_object_requested());
+        assert!(ChecksumType::from_string_with_obj_type("crc32", "FULL_OBJECT").full_object_requested());
+
+        // Composite-only algorithms still reject FULL_OBJECT; invalid obj_type still rejected.
+        assert_eq!(ChecksumType::from_string_with_obj_type("xxhash3", "FULL_OBJECT"), ChecksumType::INVALID);
+        assert_eq!(ChecksumType::from_string_with_obj_type("crc32", "bogus"), ChecksumType::INVALID);
+    }
+
+    // is_s3s_typed is the single source of truth for the "five typed fields" vs
+    // "additional algorithms carried as raw headers" split used across the handlers.
+    #[test]
+    fn is_s3s_typed_split_is_exhaustive() {
+        for t in [
+            ChecksumType::CRC32,
+            ChecksumType::CRC32C,
+            ChecksumType::SHA1,
+            ChecksumType::SHA256,
+            ChecksumType::CRC64_NVME,
+        ] {
+            assert!(t.is_s3s_typed(), "{t:?} must be s3s-typed");
+        }
+        for t in [
+            ChecksumType::XXHASH3,
+            ChecksumType::XXHASH64,
+            ChecksumType::XXHASH128,
+            ChecksumType::SHA512,
+            ChecksumType::MD5,
+        ] {
+            assert!(!t.is_s3s_typed(), "{t:?} must NOT be s3s-typed (additional algorithm)");
+        }
+        assert!(!ChecksumType::NONE.is_s3s_typed());
+        // Flags on top of a base type must not change the classification.
+        let crc32_full = ChecksumType(ChecksumType::CRC32.0 | ChecksumType::FULL_OBJECT.0);
+        assert!(crc32_full.is_s3s_typed());
+        let xxh3_multipart = ChecksumType(ChecksumType::XXHASH3.0 | ChecksumType::MULTIPART.0);
+        assert!(!xxh3_multipart.is_s3s_typed());
+    }
+
+    #[test]
+    fn checksum_matches_covers_positive_and_negative_branches() {
+        let payload = b"durability check payload";
+        let valid = Checksum::new_from_data(ChecksumType::CRC32C, payload).expect("valid crc32c");
+
+        // Positive match with no multipart count.
+        assert!(valid.matches(payload, 0).is_ok());
+
+        // Empty encoded checksum is a no-op success.
+        let mut empty_encoded = valid.clone();
+        empty_encoded.encoded.clear();
+        assert!(empty_encoded.matches(b"anything", 0).is_ok());
+
+        // Non-empty encoded checksum with unset/no-hasher type fails closed.
+        let no_hasher = Checksum {
+            checksum_type: ChecksumType::NONE,
+            encoded: valid.encoded.clone(),
+            raw: valid.raw.clone(),
+            want_parts: 0,
+        };
+        let err = no_hasher.matches(payload, 0).expect_err("NONE hasher must fail");
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("no hasher available"), "unexpected error: {err_msg}");
+
+        // Multipart want_parts mismatch fails with formatted "<encoded>-<parts>" want/got.
+        let mp = Checksum::new_with_type(ChecksumType::CRC32C, &format!("{}-3", valid.encoded)).expect("multipart checksum");
+        assert_eq!(mp.want_parts, 3);
+        let err = mp.matches(payload, 2).expect_err("parts count mismatch must fail");
+        let err_msg = err.to_string();
+        assert!(err_msg.contains(&format!("{}-3", valid.encoded)), "missing want parts: {err_msg}");
+        assert!(err_msg.contains(&format!("{}-2", valid.encoded)), "missing got parts: {err_msg}");
+        assert!(mp.matches(payload, 3).is_ok(), "matching parts count should succeed");
+
+        // Payload digest mismatch fails closed.
+        let err = valid
+            .matches(b"corrupted payload", 0)
+            .expect_err("corrupted payload must fail");
+        assert_eq!(err.want, valid.encoded);
+        assert_ne!(err.got, valid.encoded);
+    }
+
+    #[test]
+    fn checksum_constructors_add_part_and_header_negative_branches() {
+        use super::get_content_checksum;
+        use http::{HeaderMap, HeaderValue};
+
+        // new_with_type negative branches
+        assert!(Checksum::new_with_type(ChecksumType::NONE, "AAAA").is_none());
+        assert!(Checksum::new_with_type(ChecksumType::CRC32, "AAAA-1-2").is_none());
+        assert!(Checksum::new_with_type(ChecksumType::CRC32, "AAAA-notanint").is_none());
+        assert!(Checksum::new_with_type(ChecksumType::CRC32, "!!!not_base64!!!").is_none());
+        let short_b64 = base64_simd::STANDARD.encode_to_string([1u8, 2u8]);
+        assert!(Checksum::new_with_type(ChecksumType::CRC32, &short_b64).is_none());
+
+        // as_map returns None when raw length does not match raw_byte_len()
+        let mut invalid_raw = Checksum::new_from_data(ChecksumType::CRC32, b"hello").expect("crc32");
+        assert!(invalid_raw.as_map().is_some());
+        invalid_raw.raw.pop();
+        assert!(invalid_raw.as_map().is_none());
+
+        // obj_type and from_header coverage
+        assert_eq!(ChecksumType::CRC64_NVME.obj_type(), "FULL_OBJECT");
+        assert_eq!(ChecksumType(ChecksumType::SHA256.0 | ChecksumType::MULTIPART.0).obj_type(), "COMPOSITE");
+        assert_eq!(ChecksumType::NONE.obj_type(), "");
+
+        let mut headers = HeaderMap::new();
+        assert_eq!(ChecksumType::from_header(&headers), ChecksumType::NONE);
+        headers.insert("x-amz-checksum-algorithm", HeaderValue::from_static("CRC32C"));
+        headers.insert("x-amz-checksum-type", HeaderValue::from_static("FULL_OBJECT"));
+        let parsed = ChecksumType::from_header(&headers);
+        assert!(parsed.is(ChecksumType::CRC32C) && parsed.full_object_requested());
+
+        // add_part positive and negative branches
+        let part_a = b"hello ";
+        let part_b = b"world!";
+        let part_b_len = part_b.len() as i64;
+        for t in [ChecksumType::CRC32, ChecksumType::CRC32C, ChecksumType::CRC64_NVME] {
+            let mut acc = Checksum::new_from_data(t, part_a).expect("part a");
+            let b_sum = Checksum::new_from_data(t, part_b).expect("part b");
+            let full = Checksum::new_from_data(t, b"hello world!").expect("full");
+            // size == 0 is a no-op
+            acc.add_part(&b_sum, 0).expect("zero size no-op");
+            assert_eq!(acc.encoded, Checksum::new_from_data(t, part_a).unwrap().encoded);
+            // size > 0 combines CRCs into full-object digest
+            acc.add_part(&b_sum, part_b_len).expect("combine");
+            assert_eq!(acc.encoded, full.encoded, "combined CRC mismatch for {t:?}");
+        }
+
+        // add_part rejects unmergeable algorithm, mismatched types, and invalid raw lengths
+        let mut sha_a = Checksum::new_from_data(ChecksumType::SHA256, part_a).expect("sha256");
+        let sha_b = Checksum::new_from_data(ChecksumType::SHA256, part_b).expect("sha256");
+        let err = sha_a
+            .add_part(&sha_b, part_b_len)
+            .expect_err("unmergeable algorithm must fail");
+        assert!(err.contains("checksum type cannot be merged"), "unexpected error: {err}");
+
+        let mut crc32_a = Checksum::new_from_data(ChecksumType::CRC32, part_a).expect("crc32");
+        let crc32c_b = Checksum::new_from_data(ChecksumType::CRC32C, part_b).expect("crc32c");
+        let err = crc32_a
+            .add_part(&crc32c_b, part_b_len)
+            .expect_err("mismatched types must fail");
+        assert!(err.contains("checksum type does not match"), "unexpected error: {err}");
+
+        let mut bad_base = crc32_a.clone();
+        bad_base.raw.truncate(1);
+        let err = bad_base
+            .add_part(&crc32_a, part_b_len)
+            .expect_err("invalid base raw len must fail");
+        assert!(err.contains("invalid base checksum"), "unexpected error: {err}");
+
+        let mut bad_part = crc32_a.clone();
+        bad_part.raw.truncate(1);
+        let err = crc32_a
+            .add_part(&bad_part, part_b_len)
+            .expect_err("invalid part raw len must fail");
+        assert!(err.contains("invalid part checksum"), "unexpected error: {err}");
+
+        // get_content_checksum negative branches
+        let mut dup_trailer = HeaderMap::new();
+        dup_trailer.insert("x-amz-trailer", HeaderValue::from_static("x-amz-checksum-crc32, x-amz-checksum-crc32c"));
+        let err = get_content_checksum(&dup_trailer).expect_err("duplicate trailer checksums must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Invalid checksum"), "unexpected error: {err}");
+
+        let mut unmergeable_full_trailer = HeaderMap::new();
+        unmergeable_full_trailer.insert("x-amz-trailer", HeaderValue::from_static("x-amz-checksum-sha256"));
+        unmergeable_full_trailer.insert("x-amz-checksum-type", HeaderValue::from_static("FULL_OBJECT"));
+        let err = get_content_checksum(&unmergeable_full_trailer).expect_err("FULL_OBJECT SHA256 trailer must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Invalid checksum"), "unexpected error: {err}");
+
+        let mut invalid_type_header = HeaderMap::new();
+        invalid_type_header.insert("x-amz-trailer", HeaderValue::from_static("x-amz-checksum-crc32"));
+        invalid_type_header.insert("x-amz-checksum-type", HeaderValue::from_static("BOGUS_TYPE"));
+        let err = get_content_checksum(&invalid_type_header).expect_err("BOGUS_TYPE checksum-type must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Invalid checksum"), "unexpected error: {err}");
+
+        let mut malformed_direct = HeaderMap::new();
+        malformed_direct.insert("x-amz-checksum-crc32", HeaderValue::from_static("not_valid_base64!"));
+        let err = get_content_checksum(&malformed_direct).expect_err("malformed base64 header must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid checksum value"), "unexpected error: {err}");
+    }
+
+    fn software_crc32_bitwise(reflected_poly: u32, data: &[u8]) -> [u8; 4] {
+        let mut crc = !0u32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (reflected_poly & mask);
+            }
+        }
+        (!crc).to_be_bytes()
+    }
+
+    fn software_crc64_nvme_bitwise(data: &[u8]) -> [u8; 8] {
+        let reflected_poly = super::CRC64_NVME_POLYNOMIAL.reverse_bits();
+        let mut crc = !0u64;
+        for &b in data {
+            crc ^= u64::from(b);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (reflected_poly & mask);
+            }
+        }
+        (!crc).to_be_bytes()
+    }
+
+    #[test]
+    fn rio_crc_simd_matches_bitwise_scalar_across_tail_and_vector_boundaries() {
+        for &size in &[
+            0usize,
+            1,
+            7,
+            8,
+            15,
+            16,
+            17,
+            31,
+            32,
+            33,
+            63,
+            64,
+            65,
+            127,
+            128,
+            129,
+            255,
+            256,
+            257,
+            1024,
+            4096 + 17,
+            64 * 1024,
+        ] {
+            let payload: Vec<u8> = (0..size).map(|i| ((i * 31 + 17) % 251) as u8).collect();
+            let crc32_simd = Checksum::new_from_data(ChecksumType::CRC32, &payload).expect("crc32");
+            let crc32c_simd = Checksum::new_from_data(ChecksumType::CRC32C, &payload).expect("crc32c");
+            let crc64_simd = Checksum::new_from_data(ChecksumType::CRC64_NVME, &payload).expect("crc64nvme");
+
+            let crc32_sw = software_crc32_bitwise(0xEDB88320, &payload);
+            let crc32c_sw = software_crc32_bitwise(0x82F63B78, &payload);
+            let crc64_sw = software_crc64_nvme_bitwise(&payload);
+
+            assert_eq!(crc32_simd.raw.as_slice(), &crc32_sw, "CRC32 SIMD vs scalar mismatch at {size}B");
+            assert_eq!(crc32c_simd.raw.as_slice(), &crc32c_sw, "CRC32C SIMD vs scalar mismatch at {size}B");
+            assert_eq!(crc64_simd.raw.as_slice(), &crc64_sw, "CRC64_NVME SIMD vs scalar mismatch at {size}B");
+        }
+    }
+
+    #[test]
+    #[ignore = "utility throughput microbenchmark; run via cargo test -p rustfs-rio --lib --release -- --ignored --nocapture"]
+    fn microbench_rio_checksum_simd_vs_scalar_and_all_base_algorithms() {
+        use std::hint::black_box;
+        use std::io::Write as _;
+        use std::time::Instant;
+
+        for &(size, iters) in &[(1024usize, 100usize), (64 * 1024, 20), (1024 * 1024, 4)] {
+            let payload: Vec<u8> = (0..size).map(|i| ((i * 31 + 17) % 251) as u8).collect();
+            let total_mib = (size * iters) as f64 / (1024.0 * 1024.0);
+
+            // Verify SIMD-accelerated CRC32 / CRC32C / CRC64_NVME against bitwise scalar reference at 1 KiB & 64 KiB.
+            if size <= 64 * 1024 {
+                let crc32_simd = Checksum::new_from_data(ChecksumType::CRC32, &payload).expect("crc32");
+                let crc32c_simd = Checksum::new_from_data(ChecksumType::CRC32C, &payload).expect("crc32c");
+                let crc64_simd = Checksum::new_from_data(ChecksumType::CRC64_NVME, &payload).expect("crc64nvme");
+
+                let t_sw = Instant::now();
+                let crc32_sw = software_crc32_bitwise(0xEDB88320, black_box(&payload));
+                let crc32c_sw = software_crc32_bitwise(0x82F63B78, black_box(&payload));
+                let crc64_sw = software_crc64_nvme_bitwise(black_box(&payload));
+                let sw_elapsed = t_sw.elapsed();
+
+                assert_eq!(crc32_simd.raw.as_slice(), &crc32_sw, "CRC32 SIMD vs scalar mismatch at {size}B");
+                assert_eq!(crc32c_simd.raw.as_slice(), &crc32c_sw, "CRC32C SIMD vs scalar mismatch at {size}B");
+                assert_eq!(crc64_simd.raw.as_slice(), &crc64_sw, "CRC64_NVME SIMD vs scalar mismatch at {size}B");
+                println!(
+                    "[microbench][rio::checksum] size={size}B bitwise scalar reference check passed in {:?}",
+                    sw_elapsed
+                );
+            }
+
+            for &checksum_type in super::BASE_CHECKSUM_TYPES {
+                let mut hasher = checksum_type.hasher().expect("base checksum type must have hasher");
+                let t0 = Instant::now();
+                let mut digest = Vec::new();
+                for _ in 0..iters {
+                    hasher.reset();
+                    hasher.write_all(black_box(&payload)).expect("hasher write_all");
+                    digest = hasher.finalize();
+                    black_box(&digest);
+                }
+                let elapsed = t0.elapsed();
+                assert_eq!(digest.len(), checksum_type.raw_byte_len());
+                let mibs = total_mib / elapsed.as_secs_f64().max(1e-9);
+                println!(
+                    "[microbench][rio::checksum] size={size}B algo={} throughput={mibs:.1} MiB/s",
+                    checksum_type
+                );
+            }
+        }
     }
 }

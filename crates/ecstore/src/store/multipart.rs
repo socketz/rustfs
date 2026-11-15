@@ -13,8 +13,494 @@
 // limitations under the License.
 
 use super::*;
+use crate::core::pools::{DecommissionCapacityOwner, ensure_decommission_capacity_mutation_id};
+use crate::multipart_listing::paginate_multipart_listing;
+use crate::set_disk::get_lock_acquire_timeout;
+use crate::storage_api_contracts::multipart::MultipartOperations as _;
+use crate::storage_api_contracts::object::ObjectOperations as _;
+use futures::{StreamExt, stream};
+use rustfs_utils::path::encode_dir_object_ref;
+use std::collections::HashSet;
+
+const MULTIPART_LIST_SET_CONCURRENCY: usize = 4;
+
+#[async_trait::async_trait]
+impl crate::storage_api_contracts::multipart::MultipartUploadInspection for ECStore {
+    type Error = Error;
+
+    async fn ensure_no_multipart_uploads(&self, bucket: &str) -> Result<()> {
+        let (_, lifecycle_guard) = self
+            .guard_multipart_bucket_incarnation(bucket, &ObjectOptions::default())
+            .await?;
+        for pool in &self.pools {
+            for set in &pool.disk_set {
+                set.ensure_no_multipart_uploads(bucket).await?;
+            }
+        }
+        ensure_multipart_bucket_lifecycle_guard_held(lifecycle_guard.as_ref(), bucket, "")
+    }
+}
+
+#[cfg(test)]
+static DATA_MOVEMENT_MULTIPART_DISCOVERY_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn data_movement_multipart_discovery_counts() -> &'static std::sync::Mutex<std::collections::HashMap<Uuid, usize>> {
+    DATA_MOVEMENT_MULTIPART_DISCOVERY_COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+type OrphanMultipartCleanupPause = (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>);
+
+#[cfg(test)]
+static ORPHAN_MULTIPART_CLEANUP_PAUSES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, OrphanMultipartCleanupPause>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn pause_orphan_multipart_cleanup_for_test(
+    bucket: &str,
+) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+    let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let previous = ORPHAN_MULTIPART_CLEANUP_PAUSES
+        .get_or_init(Default::default)
+        .lock()
+        .expect("orphan cleanup pause mutex should not poison")
+        .insert(bucket.to_owned(), (arrived_tx, release_rx));
+    assert!(previous.is_none(), "each bucket has at most one orphan cleanup pause");
+    (arrived_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn pause_orphan_multipart_cleanup(bucket: &str) {
+    let pause = ORPHAN_MULTIPART_CLEANUP_PAUSES
+        .get_or_init(Default::default)
+        .lock()
+        .expect("orphan cleanup pause mutex should not poison")
+        .remove(bucket);
+    if let Some((arrived, release)) = pause {
+        let _ = arrived.send(());
+        let _ = release.await;
+    }
+}
+
+/// Why a decommission multipart cleanup cannot decide whether its staged
+/// identity reached the target pool. These are identity proofs, not free-space
+/// decisions, so they stay out of the capacity-blocked error and its minimum
+/// free drive wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum DecommissionMultipartTargetProofError {
+    #[error("decommission multipart cleanup cannot prove exact target absence without a modification time")]
+    MissingModTime,
+    #[error("decommission multipart cleanup exact target version id is invalid")]
+    InvalidVersionId,
+    #[error("decommission multipart cleanup found the staged version id with a different modification time")]
+    AmbiguousVersion,
+    #[error("decommission multipart cleanup found the exact staged target without its ownership proof")]
+    UnownedExactTarget,
+}
+
+impl From<DecommissionMultipartTargetProofError> for Error {
+    fn from(err: DecommissionMultipartTargetProofError) -> Self {
+        Error::other(err)
+    }
+}
+
+/// Decide whether the cleanup of a staged decommission upload may clear the
+/// mutation's pending capacity intent, from the exact-version lookup of the
+/// staged identity on the target pool.
+///
+/// The staged upload itself is already proven absent. `true` means its
+/// identity is not published on the target either: no target, or a target that
+/// is a different object. A different version id is a different object. A null
+/// version has one slot per key, so a null target with another modification
+/// time replaced whatever was there: a newer unversioned write that superseded
+/// the source, or an object the staged copy never reached. In those cases the
+/// staged copy holds no bytes on the target. `false` means the exact staged
+/// identity is published and owned, so its pending intent stays for the commit
+/// to charge. A versioned target with the staged version id but another
+/// modification time cannot be told apart and fails closed.
+///
+/// Known residual: a metadata-only self-copy (CopyObject with REPLACE) keeps
+/// an object's data and only moves its modification time. If the staged copy
+/// was already published but not yet charged (an adopted completion, or a
+/// pending intent left by an ambiguous commit) and is then rewritten that way,
+/// this cleanup releases its marker and one object's bytes stay uncharged. That
+/// is a bounded estimate error with no data loss; failing closed here instead
+/// stalled the decommission for good, so no fence is added for it.
+fn decommission_multipart_target_clear_pending(opts: &ObjectOptions, target: Option<&ObjectInfo>) -> Result<bool> {
+    let expected_mod_time = opts.mod_time.ok_or(DecommissionMultipartTargetProofError::MissingModTime)?;
+    let expected_version_id = opts
+        .version_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| DecommissionMultipartTargetProofError::InvalidVersionId)?
+        .filter(|version_id| !version_id.is_nil());
+    let Some(target) = target else {
+        return Ok(true);
+    };
+    let target_version_id = target.version_id.filter(|version_id| !version_id.is_nil());
+    if target_version_id != expected_version_id {
+        return Ok(true);
+    }
+    if target.mod_time != Some(expected_mod_time) {
+        if expected_version_id.is_none() {
+            return Ok(true);
+        }
+        return Err(DecommissionMultipartTargetProofError::AmbiguousVersion.into());
+    }
+    if !crate::data_movement::is_owned_data_movement_target(target) {
+        return Err(DecommissionMultipartTargetProofError::UnownedExactTarget.into());
+    }
+    Ok(false)
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct MultipartUploadListRequest {
+    pub(super) prefix: String,
+    pub(super) key_marker: Option<String>,
+    pub(super) upload_id_marker: Option<String>,
+    pub(super) delimiter: Option<String>,
+    pub(super) max_uploads: usize,
+    pub(super) expected_incarnation_id: Option<Uuid>,
+}
+
+fn map_multipart_namespace_lock_error(
+    bucket: &str,
+    object: &str,
+    mode: &'static str,
+    err: rustfs_lock::LockError,
+) -> StorageError {
+    match err {
+        rustfs_lock::LockError::QuorumNotReached { required, achieved } => StorageError::NamespaceLockQuorumUnavailable {
+            mode,
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            required,
+            achieved,
+        },
+        other => StorageError::Lock(other),
+    }
+}
+
+fn ensure_multipart_bucket_lifecycle_guard_held(
+    guard: Option<&super::BucketIncarnationFenceGuard>,
+    bucket: &str,
+    object: &str,
+) -> Result<()> {
+    if guard.is_some_and(super::BucketIncarnationFenceGuard::is_lock_lost) {
+        return Err(StorageError::NamespaceLockQuorumUnavailable {
+            mode: "multipart_bucket_generation",
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+struct DataMovementMultipartCompletionBarrierState {
+    bucket: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct DataMovementMultipartCompletionBarrier {
+    state: Arc<DataMovementMultipartCompletionBarrierState>,
+}
+
+#[cfg(test)]
+static DATA_MOVEMENT_MULTIPART_COMPLETION_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<DataMovementMultipartCompletionBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl DataMovementMultipartCompletionBarrier {
+    pub(crate) fn install(bucket: &str) -> Self {
+        let state = Arc::new(DataMovementMultipartCompletionBarrierState {
+            bucket: bucket.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = DATA_MOVEMENT_MULTIPART_COMPLETION_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("data movement multipart completion barrier mutex should not poison");
+        assert!(slot.is_none(), "data movement multipart completion barrier must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("data movement multipart operation should reach selected completion");
+    }
+}
+
+#[cfg(test)]
+impl Drop for DataMovementMultipartCompletionBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = DATA_MOVEMENT_MULTIPART_COMPLETION_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("data movement multipart completion barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_data_movement_multipart_before_selected_completion(bucket: &str) {
+    let barrier = DATA_MOVEMENT_MULTIPART_COMPLETION_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("data movement multipart completion barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+async fn pool_has_multipart_upload_for_key(
+    pool: &crate::core::sets::Sets,
+    bucket: &str,
+    object: &str,
+    expected_incarnation_id: Option<Uuid>,
+) -> Result<bool> {
+    let results = stream::iter(pool.disk_set.iter().cloned())
+        .map(|set| async move {
+            set.has_multipart_upload_for_key(bucket, object, expected_incarnation_id)
+                .await
+        })
+        .buffer_unordered(MULTIPART_LIST_SET_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut found = false;
+    for result in results {
+        // Preserve errors from every set instead of hiding them behind a hit.
+        found |= result?;
+    }
+    Ok(found)
+}
+
+async fn list_pool_multipart_uploads_for_incarnation(
+    pool: &crate::core::sets::Sets,
+    bucket: &str,
+    request: &MultipartUploadListRequest,
+) -> Result<ListMultipartsInfo> {
+    let per_set_limit = request.max_uploads.saturating_add(1);
+    let results = stream::iter(pool.disk_set.iter().cloned())
+        .map(|set| {
+            let request = request.clone();
+            async move {
+                set.list_multipart_uploads_for_incarnation(
+                    bucket,
+                    &request.prefix,
+                    request.key_marker,
+                    request.upload_id_marker,
+                    request.delimiter,
+                    per_set_limit,
+                    request.expected_incarnation_id,
+                )
+                .await
+            }
+        })
+        .buffer_unordered(MULTIPART_LIST_SET_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut uploads = Vec::new();
+    let mut common_prefixes = HashSet::new();
+    let mut source_truncated = false;
+    for result in results {
+        let page = result?;
+        uploads.extend(page.uploads);
+        common_prefixes.extend(page.common_prefixes);
+        source_truncated |= page.is_truncated;
+    }
+
+    let page = paginate_multipart_listing(
+        uploads,
+        common_prefixes.into_iter().collect(),
+        request.key_marker.as_deref(),
+        request.key_marker.as_ref().and(request.upload_id_marker.as_deref()),
+        request.max_uploads,
+        source_truncated,
+    );
+
+    Ok(ListMultipartsInfo {
+        key_marker: request.key_marker.clone(),
+        upload_id_marker: request.upload_id_marker.clone(),
+        next_key_marker: page.next_key_marker,
+        next_upload_id_marker: page.next_upload_id_marker,
+        max_uploads: request.max_uploads,
+        is_truncated: page.is_truncated,
+        uploads: page.uploads,
+        common_prefixes: page.common_prefixes,
+        prefix: request.prefix.clone(),
+        delimiter: request.delimiter.clone(),
+    })
+}
 
 impl ECStore {
+    #[cfg(all(test, feature = "test-util"))]
+    pub(crate) fn reset_data_movement_multipart_discovery_count_for_test(&self) {
+        data_movement_multipart_discovery_counts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.id, 0);
+    }
+
+    #[cfg(all(test, feature = "test-util"))]
+    pub(crate) fn data_movement_multipart_discovery_count_for_test(&self) -> usize {
+        data_movement_multipart_discovery_counts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(crate) async fn acquire_decommission_multipart_mutation_fence(
+        &self,
+        owner: DecommissionCapacityOwner,
+    ) -> Result<ObjectLockDiagGuard> {
+        let mutation_id = owner
+            .mutation_id
+            .ok_or_else(|| Error::other("decommission multipart mutation identity is missing"))?;
+        let object = format!(
+            "decommission-multipart/{}/{}/{}/{}",
+            owner.source_pool_index, owner.operation_id, owner.generation, mutation_id
+        );
+        self.acquire_object_write_lock("decommission_multipart_mutation", crate::disk::RUSTFS_META_MULTIPART_BUCKET, &object)
+            .await
+    }
+
+    async fn existing_multipart_pool_order(&self) -> Vec<usize> {
+        // A draining source must not hide a valid UploadID in an active target,
+        // while physical order within each phase preserves fail-closed errors.
+        let mut active = Vec::with_capacity(self.pools.len());
+        let mut draining = Vec::new();
+        for (idx, pool) in self.pools.iter().enumerate() {
+            if self.is_pool_rebalancing(pool.pool_idx).await {
+                continue;
+            }
+            if self.is_suspended(pool.pool_idx).await {
+                draining.push(idx);
+            } else {
+                active.push(idx);
+            }
+        }
+        active.extend(draining);
+        active
+    }
+
+    async fn multipart_upload_pool_idx(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<usize> {
+        for pool_idx in self.existing_multipart_pool_order().await {
+            match self.pools[pool_idx].get_multipart_info(bucket, object, upload_id, opts).await {
+                Ok(_) => return Ok(pool_idx),
+                Err(err) if is_err_invalid_upload_id(&err) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_multipart_uploads_for_bucket_incarnation(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
+        max_uploads: usize,
+        expected_incarnation_id: Uuid,
+    ) -> Result<ListMultipartsInfo> {
+        self.handle_list_multipart_uploads(
+            bucket,
+            MultipartUploadListRequest {
+                prefix: prefix.to_string(),
+                key_marker,
+                upload_id_marker,
+                delimiter,
+                max_uploads,
+                expected_incarnation_id: Some(expected_incarnation_id),
+            },
+        )
+        .await
+    }
+
+    /// Multipart lock order is bucket lifecycle, generation validation, then
+    /// object/upload locks in the selected set.
+    pub(super) async fn guard_multipart_bucket_incarnation(
+        &self,
+        bucket: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectOptions, Option<super::BucketIncarnationFenceGuard>)> {
+        let mut opts = opts.clone();
+        if is_meta_bucketname(bucket) {
+            return Ok((opts, None));
+        }
+        let expected = match opts.expected_bucket_incarnation_id {
+            Some(expected) => expected,
+            None => {
+                let expected = self.bucket_incarnation_id(bucket).await?;
+                opts.expected_bucket_incarnation_id = Some(expected);
+                expected
+            }
+        };
+        if opts.bucket_lifecycle_lock_fence.is_some() {
+            let current = crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
+            if current != expected {
+                return Err(StorageError::BucketNotFound(bucket.to_owned()));
+            }
+            return Ok((opts, None));
+        }
+        let guard = self
+            .acquire_bucket_incarnation_fence_with_options(bucket, expected, Some(&opts))
+            .await?;
+        guard.attach_to_object_options(&mut opts);
+        Ok((opts, Some(guard)))
+    }
+
+    async fn acquire_list_parts_read_lock(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<Option<rustfs_lock::NamespaceLockGuard>> {
+        if opts.no_lock {
+            return Ok(None);
+        }
+
+        let ns_lock = self.handle_new_ns_lock(bucket, object).await?;
+        ns_lock
+            .get_read_lock(get_lock_acquire_timeout())
+            .await
+            .map(Some)
+            .map_err(|err| map_multipart_namespace_lock_error(bucket, object, "read", err))
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_list_object_parts(
         &self,
@@ -26,8 +512,12 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<ListPartsInfo> {
         check_list_parts_args(bucket, object, upload_id)?;
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let opts = &opts;
 
-        // TODO: nslock
+        let _object_lock_guard = self.acquire_list_parts_read_lock(bucket, object, opts).await?;
 
         if self.single_pool() {
             return self.pools[0]
@@ -35,10 +525,8 @@ impl ECStore {
                 .await;
         }
 
-        for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
-                continue;
-            }
+        for pool_idx in self.existing_multipart_pool_order().await {
+            let pool = &self.pools[pool_idx];
             return match pool
                 .list_object_parts(bucket, object, upload_id, part_number_marker, max_parts, opts)
                 .await
@@ -60,51 +548,79 @@ impl ECStore {
     pub(super) async fn handle_list_multipart_uploads(
         &self,
         bucket: &str,
-        prefix: &str,
-        key_marker: Option<String>,
-        upload_id_marker: Option<String>,
-        delimiter: Option<String>,
-        max_uploads: usize,
+        request: MultipartUploadListRequest,
     ) -> Result<ListMultipartsInfo> {
-        check_list_multipart_args(bucket, prefix, &key_marker, &upload_id_marker, &delimiter)?;
+        check_list_multipart_args(
+            bucket,
+            &request.prefix,
+            &request.key_marker,
+            &request.upload_id_marker,
+            &request.delimiter,
+        )?;
+        let guard_opts = ObjectOptions {
+            expected_bucket_incarnation_id: request.expected_incarnation_id,
+            ..Default::default()
+        };
+        let (opts, bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, &guard_opts).await?;
+        let expected_incarnation_id = opts.expected_bucket_incarnation_id;
 
-        if prefix.is_empty() {
-            // TODO: return from cache
+        if request.prefix.is_empty() {
+            // TODO(backlog): return cached multipart listing when prefix is empty
         }
 
         if self.single_pool() {
-            return self.pools[0]
-                .list_multipart_uploads(bucket, prefix, key_marker, upload_id_marker, delimiter, max_uploads)
-                .await;
+            let result = list_pool_multipart_uploads_for_incarnation(
+                &self.pools[0],
+                bucket,
+                &MultipartUploadListRequest {
+                    expected_incarnation_id,
+                    ..request.clone()
+                },
+            )
+            .await;
+            ensure_multipart_bucket_lifecycle_guard_held(bucket_lifecycle_guard.as_ref(), bucket, &request.prefix)?;
+            return result;
         }
 
         let mut uploads = Vec::new();
+        let mut common_prefixes = HashSet::new();
+        let mut source_truncated = false;
 
-        for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
-                continue;
-            }
-            let res = pool
-                .list_multipart_uploads(
-                    bucket,
-                    prefix,
-                    key_marker.clone(),
-                    upload_id_marker.clone(),
-                    delimiter.clone(),
-                    max_uploads,
-                )
-                .await?;
+        for pool_idx in self.existing_multipart_pool_order().await {
+            let pool = &self.pools[pool_idx];
+            let res = list_pool_multipart_uploads_for_incarnation(
+                pool,
+                bucket,
+                &MultipartUploadListRequest {
+                    expected_incarnation_id,
+                    ..request.clone()
+                },
+            )
+            .await?;
             uploads.extend(res.uploads);
+            common_prefixes.extend(res.common_prefixes);
+            source_truncated |= res.is_truncated;
         }
 
+        // Each pool caps its own page at `max_uploads`, so the concatenation is
+        // unordered across pools and may exceed the global cap. Re-sort, re-cap,
+        // and derive the truncation markers so a bucket whose uploads span pools
+        // pages correctly instead of being silently reported complete.
+        let page =
+            merge_multipart_upload_pages(uploads, common_prefixes.into_iter().collect(), request.max_uploads, source_truncated);
+        ensure_multipart_bucket_lifecycle_guard_held(bucket_lifecycle_guard.as_ref(), bucket, &request.prefix)?;
+
         Ok(ListMultipartsInfo {
-            key_marker,
-            upload_id_marker,
-            max_uploads,
-            uploads,
-            prefix: prefix.to_owned(),
-            delimiter: delimiter.to_owned(),
-            ..Default::default()
+            key_marker: request.key_marker,
+            upload_id_marker: request.upload_id_marker,
+            next_key_marker: page.next_key_marker,
+            next_upload_id_marker: page.next_upload_id_marker,
+            max_uploads: request.max_uploads,
+            is_truncated: page.is_truncated,
+            uploads: page.uploads,
+            common_prefixes: page.common_prefixes,
+            prefix: request.prefix,
+            delimiter: request.delimiter,
         })
     }
 
@@ -115,9 +631,9 @@ impl ECStore {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<MultipartUploadResult> {
-        self.handle_new_multipart_upload_with_pool_idx(bucket, object, opts)
+        self.handle_new_multipart_upload_with_pool_idx(bucket, object, opts, None)
             .await
-            .map(|(res, _)| res)
+            .map(|(res, _, _)| res)
     }
 
     pub(crate) async fn handle_new_multipart_upload_with_pool_idx(
@@ -125,27 +641,82 @@ impl ECStore {
         bucket: &str,
         object: &str,
         opts: &ObjectOptions,
-    ) -> Result<(MultipartUploadResult, usize)> {
-        check_new_multipart_args(bucket, object)?;
+        mutation_fence: Option<&ObjectLockDiagGuard>,
+    ) -> Result<(MultipartUploadResult, usize, Option<Uuid>)> {
+        check_new_object_args(bucket, object, opts.data_movement)?;
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
+        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
 
         if self.single_pool() {
-            return self.pools[0]
-                .new_multipart_upload(bucket, object, opts)
-                .await
-                .map(|res| (res, 0));
+            self.apply_decommission_target_mutation_fence(0, object, &mut opts, mutation_fence)
+                .await;
+            let result = self.pools[0].new_multipart_upload(bucket, object, &opts).await?;
+            return Ok((result, 0, opts.expected_bucket_incarnation_id));
+        }
+        if opts.http_preconditions.is_some()
+            && !opts.data_movement
+            && let Some(err) = self.check_write_precondition(bucket, object, &opts, false).await
+        {
+            return Err(err);
+        }
+
+        let capacity_owner = DecommissionCapacityOwner::from_options(&opts);
+        if opts.data_movement && (opts.version_id.is_some() || capacity_owner.is_some()) {
+            // Capacity-owned decommission writes must remain on the target
+            // selected by the durable reservation, including unversioned
+            // objects whose ObjectOptions carry no version ID.
+            let idx = self.select_data_movement_pool_idx(bucket, object, -1, &opts, false).await?;
+            if idx == opts.src_pool_idx {
+                return Err(StorageError::DataMovementOverwriteErr(
+                    bucket.to_owned(),
+                    object.to_owned(),
+                    opts.version_id.clone().unwrap_or_default(),
+                ));
+            }
+            self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence)
+                .await;
+            let res = self
+                .run_decommission_capacity_temporary_mutation(idx, capacity_owner, None, || async {
+                    self.pools[idx].new_multipart_upload(bucket, object, &opts).await
+                })
+                .await?;
+            return Ok((res, idx, opts.expected_bucket_incarnation_id));
+        }
+
+        if self.single_pool() && !self.is_suspended(0).await && !self.is_pool_rebalancing(0).await {
+            self.apply_decommission_target_mutation_fence(0, object, &mut opts, mutation_fence)
+                .await;
+            let expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id;
+            let lock_object = encode_dir_object(object);
+            let res = self
+                .run_external_decommission_capacity_object_mutation(0, bucket, &lock_object, object, opts, |opts| async move {
+                    self.pools[0].new_multipart_upload(bucket, object, &opts).await
+                })
+                .await?;
+            return Ok((res, 0, expected_bucket_incarnation_id));
         }
 
         for (idx, pool) in self.pools.iter().enumerate() {
             if self.is_suspended(idx).await || self.is_pool_rebalancing(idx).await {
                 continue;
             }
-            let res = pool
-                .list_multipart_uploads(bucket, object, None, None, None, MAX_UPLOADS_LIST)
-                .await?;
-
-            if !res.uploads.is_empty() {
-                let res = self.pools[idx].new_multipart_upload(bucket, object, opts).await?;
-                return Ok((res, idx));
+            if pool_has_multipart_upload_for_key(pool, bucket, object, opts.expected_bucket_incarnation_id).await? {
+                self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence)
+                    .await;
+                let expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id;
+                let lock_object = encode_dir_object(object);
+                let res = self
+                    .run_external_decommission_capacity_object_mutation(
+                        idx,
+                        bucket,
+                        &lock_object,
+                        object,
+                        opts,
+                        |opts| async move { self.pools[idx].new_multipart_upload(bucket, object, &opts).await },
+                    )
+                    .await?;
+                return Ok((res, idx, expected_bucket_incarnation_id));
             }
         }
         let idx = self.get_pool_idx(bucket, object, -1).await?;
@@ -157,8 +728,25 @@ impl ECStore {
             ));
         }
 
-        let res = self.pools[idx].new_multipart_upload(bucket, object, opts).await?;
-        Ok((res, idx))
+        self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence)
+            .await;
+        let expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id;
+        let res = if opts.data_movement {
+            self.run_decommission_capacity_temporary_mutation(
+                idx,
+                DecommissionCapacityOwner::from_options(&opts),
+                None,
+                || async { self.pools[idx].new_multipart_upload(bucket, object, &opts).await },
+            )
+            .await?
+        } else {
+            let lock_object = encode_dir_object(object);
+            self.run_external_decommission_capacity_object_mutation(idx, bucket, &lock_object, object, opts, |opts| async move {
+                self.pools[idx].new_multipart_upload(bucket, object, &opts).await
+            })
+            .await?
+        };
+        Ok((res, idx, expected_bucket_incarnation_id))
     }
 
     #[instrument(skip(self))]
@@ -179,13 +767,13 @@ impl ECStore {
     ) -> Result<()> {
         check_new_multipart_args(src_bucket, src_object)?;
 
-        // TODO: PutObjectReader
-        // self.put_object_part(dst_bucket, dst_object, upload_id, part_id, data, opts)
-
+        // The full UploadPartCopy path still requires the higher S3/request layer to
+        // derive encryption, compression, and multipart checksum write semantics.
         Err(StorageError::NotImplemented)
     }
 
     #[instrument(skip(self, data))]
+    #[hotpath::measure(impl_type = "ECStore")]
     pub(super) async fn handle_put_object_part(
         &self,
         bucket: &str,
@@ -196,6 +784,16 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
         check_put_object_part_args(bucket, object, upload_id)?;
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
+        let (mut opts, bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        if let Some(guard) = bucket_lifecycle_guard {
+            opts.bucket_lifecycle_lock_owner = Some(Arc::new(guard));
+        }
+        if !self.single_pool() {
+            opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+        }
+        let opts = &opts;
 
         if self.single_pool() {
             return self.pools[0]
@@ -203,28 +801,92 @@ impl ECStore {
                 .await;
         }
 
-        for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
-                continue;
-            }
-            let err = match pool.put_object_part(bucket, object, upload_id, part_id, data, opts).await {
-                Ok(res) => return Ok(res),
-                Err(err) => {
-                    if is_err_invalid_upload_id(&err) {
-                        None
-                    } else {
-                        Some(err)
-                    }
-                }
-            };
+        let pool_idx = self.multipart_upload_pool_idx(bucket, object, upload_id, opts).await?;
+        self.pools[pool_idx]
+            .put_object_part(bucket, object, upload_id, part_id, data, opts)
+            .await
+    }
 
-            if let Some(err) = err {
-                error!("put_object_part err: {:?}", err);
-                return Err(err);
+    pub(crate) async fn put_object_part_for_data_movement(
+        &self,
+        target_pool_idx: usize,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<PartInfo> {
+        let part_id = opts
+            .part_number
+            .ok_or_else(|| Error::other("targeted multipart upload requires a part number"))?;
+        check_put_object_part_args(bucket, object, upload_id)?;
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
+        if !opts.data_movement {
+            return Err(Error::other("targeted multipart upload requires data_movement options"));
+        }
+        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        ensure_decommission_capacity_mutation_id(bucket, object, &mut opts);
+        let pool = self.pools.get(target_pool_idx).ok_or_else(|| {
+            Error::InvalidArgument("data-movement".to_string(), "target-pool".to_string(), target_pool_idx.to_string())
+        })?;
+        let expected_data_bytes = usize::try_from(data.size()).ok();
+        self.run_decommission_capacity_temporary_mutation_with_capacity_lease(
+            target_pool_idx,
+            DecommissionCapacityOwner::from_options(&opts),
+            expected_data_bytes,
+            |capacity_lease| async move {
+                if let Some(capacity_lease) = capacity_lease {
+                    opts.add_namespace_lock_lost_signal(capacity_lease);
+                }
+                pool.put_object_part(bucket, object, upload_id, part_id, data, &opts).await
+            },
+        )
+        .await
+    }
+
+    /// Observe an upload's original namespace without recovering or acknowledging it.
+    ///
+    /// Only ordinary active metadata is returned for application preflight. This
+    /// observation grants no right to publish; completion revalidates under its locks.
+    /// Cancellation leaves storage unchanged, and callers may retry this lookup.
+    ///
+    /// # Errors
+    /// Preserves argument, bucket lifetime, access, I/O and quorum errors. Fallback
+    /// discovery runs only after every ordinary probe reports InvalidUploadID.
+    pub async fn lookup_multipart_completion_binding(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<Option<crate::object_api::MultipartCompletionBinding>> {
+        check_list_parts_args(bucket, object, upload_id)?;
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let order = if self.single_pool() {
+            vec![0]
+        } else {
+            self.existing_multipart_pool_order().await
+        };
+        for &index in &order {
+            match self.pools[index].get_multipart_info(bucket, object, upload_id, &opts).await {
+                Ok(info) => return Ok(Some(crate::object_api::MultipartCompletionBinding::active(info))),
+                Err(error) if is_err_invalid_upload_id(&error) => {}
+                Err(error) => return Err(error),
             }
         }
-
-        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+        for index in order {
+            if let Some(binding) = self.pools[index]
+                .get_disks_by_key(object)
+                .lookup_recorded_multipart_completion(bucket, object, upload_id, &opts)
+                .await?
+            {
+                return Ok(Some(binding));
+            }
+        }
+        Ok(None)
     }
 
     #[instrument(skip(self))]
@@ -236,14 +898,16 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<MultipartInfo> {
         check_list_parts_args(bucket, object, upload_id)?;
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
+        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let opts = &opts;
         if self.single_pool() {
             return self.pools[0].get_multipart_info(bucket, object, upload_id, opts).await;
         }
 
-        for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
-                continue;
-            }
+        for pool_idx in self.existing_multipart_pool_order().await {
+            let pool = &self.pools[pool_idx];
 
             return match pool.get_multipart_info(bucket, object, upload_id, opts).await {
                 Ok(res) => Ok(res),
@@ -269,19 +933,14 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<()> {
         check_abort_multipart_args(bucket, object, upload_id)?;
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
+        let (opts, bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
 
-        // TODO: defer DeleteUploadID
+        for pool_idx in self.existing_multipart_pool_order().await {
+            let pool = &self.pools[pool_idx];
 
-        if self.single_pool() {
-            return self.pools[0].abort_multipart_upload(bucket, object, upload_id, opts).await;
-        }
-
-        for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
-                continue;
-            }
-
-            let err = match pool.abort_multipart_upload(bucket, object, upload_id, opts).await {
+            let err = match pool.abort_multipart_upload(bucket, object, upload_id, &opts).await {
                 Ok(_) => return Ok(()),
                 Err(err) => {
                     //
@@ -294,7 +953,318 @@ impl ECStore {
             }
         }
 
-        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+        self.recover_orphan_multipart_upload(bucket, object, upload_id, opts, bucket_lifecycle_guard)
+            .await
+    }
+
+    async fn recover_orphan_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: ObjectOptions,
+        bucket_lifecycle_guard: Option<super::BucketIncarnationFenceGuard>,
+    ) -> Result<()> {
+        let invalid_upload = || StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned());
+        // Without upload metadata this path has no recorded owner to authorize.
+        if opts.multipart_abort_authorization.is_some() || self.ctx.lock_manager().is_disabled() {
+            return Err(invalid_upload());
+        }
+        let Some(bucket_lifecycle_guard) = bucket_lifecycle_guard else {
+            // A signal borrowed from an enclosing operation cannot keep its lock
+            // alive when the request waiter disappears during physical cleanup.
+            return Err(invalid_upload());
+        };
+        let Some(expected_incarnation) = opts.expected_bucket_incarnation_id.filter(|id| !id.is_nil()) else {
+            return Err(invalid_upload());
+        };
+        // Recovery is a side path of an idempotent Abort. Until the first
+        // deletion is issued, anything that stops staging absence from being
+        // proven (an offline disk, lock contention, partially overlapping lock
+        // domains, unreadable bucket metadata) keeps the upload reported as
+        // gone, exactly as before recovery existed; only failures inside the
+        // deletion task are request failures, because a retry can finish them.
+        let (metadata, persisted) =
+            match crate::bucket::metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    debug!(bucket, object, upload_id, %error, "orphan multipart cleanup skipped: bucket metadata unavailable");
+                    return Err(invalid_upload());
+                }
+            };
+        if !persisted
+            || !metadata.bucket_creation_committed
+            || !metadata.bucket_incarnation_sidecar
+            || metadata.bucket_incarnation_id != expected_incarnation
+        {
+            return Err(invalid_upload());
+        }
+
+        // Lock order: bucket lifecycle, then upload locks in pool-index order.
+        // Prove metadata absence across every pool before deleting any staging.
+        let mut cleanup_guards = Vec::with_capacity(self.pools.len());
+        for pool in &self.pools {
+            let guard = match pool
+                .get_disks_by_key(object)
+                .lock_orphan_multipart_cleanup(bucket, object, upload_id, &opts, &cleanup_guards)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    if !is_err_invalid_upload_id(&error) {
+                        debug!(bucket, object, upload_id, %error, "orphan multipart cleanup skipped: staging absence not proven");
+                    }
+                    return Err(invalid_upload());
+                }
+            };
+            cleanup_guards.push(guard);
+        }
+        let bucket = bucket.to_owned();
+        let object = object.to_owned();
+        let upload_id = upload_id.to_owned();
+        tokio::spawn(async move {
+            // Own both the real bucket guard and all upload guards until every
+            // disk deletion settles, including after cancellation of the waiter.
+            let _bucket_lifecycle_guard = bucket_lifecycle_guard;
+            #[cfg(test)]
+            pause_orphan_multipart_cleanup(&bucket).await;
+            let mut recovered = false;
+            for guard in &cleanup_guards {
+                recovered |= guard.delete(&bucket, &object, &opts).await?;
+            }
+            if recovered {
+                Ok(())
+            } else {
+                Err(StorageError::InvalidUploadID(bucket, object, upload_id))
+            }
+        })
+        .await
+        .map_err(|error| Error::other_with_context("orphan multipart cleanup task failed", error))?
+    }
+
+    pub(crate) async fn abort_multipart_upload_for_data_movement(
+        &self,
+        target_pool_idx: usize,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        let upload_identity = crate::data_movement::data_movement_upload_identity_from_options(opts);
+        self.abort_multipart_uploads_for_data_movement(
+            target_pool_idx,
+            bucket,
+            object,
+            &[upload_id.to_owned()],
+            &upload_identity,
+            opts,
+        )
+        .await
+    }
+
+    pub(crate) async fn reconcile_multipart_uploads_for_data_movement(
+        &self,
+        target_pool_idx: usize,
+        bucket: &str,
+        object: &str,
+        upload_identity: &str,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        self.pools
+            .get(target_pool_idx)
+            .ok_or_else(|| Error::other(format!("data movement target pool {target_pool_idx} is out of range")))?;
+        let owner = DecommissionCapacityOwner::from_options(opts)
+            .ok_or_else(|| Error::other("data movement multipart cleanup is missing its capacity owner"))?;
+        if !self
+            .decommission_capacity_cleanup_target_indices(owner)
+            .await?
+            .contains(&target_pool_idx)
+        {
+            return Err(Error::DecommissionCapacityBlocked {
+                message: format!(
+                    "data movement multipart cleanup target pool {target_pool_idx} is outside its capacity reservation"
+                ),
+            });
+        }
+        if !self
+            .has_decommission_capacity_temporary_mutation_state(target_pool_idx, owner)
+            .await
+        {
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            *data_movement_multipart_discovery_counts()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(self.id)
+                .or_default() += 1;
+        }
+        self.abort_multipart_uploads_for_data_movement(target_pool_idx, bucket, object, &[], upload_identity, opts)
+            .await
+    }
+
+    async fn abort_multipart_uploads_for_data_movement(
+        &self,
+        target_pool_idx: usize,
+        bucket: &str,
+        object: &str,
+        upload_ids: &[String],
+        expected_upload_identity: &str,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        check_new_multipart_args(bucket, object)?;
+        for upload_id in upload_ids {
+            check_abort_multipart_args(bucket, object, upload_id)?;
+        }
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
+        if !opts.data_movement {
+            return Err(Error::other("targeted multipart abort requires data_movement options"));
+        }
+        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        ensure_decommission_capacity_mutation_id(bucket, object, &mut opts);
+        let capacity_owner = DecommissionCapacityOwner::from_options(&opts);
+        let pool = self
+            .pools
+            .get(target_pool_idx)
+            .ok_or_else(|| Error::other(format!("data movement target pool {target_pool_idx} is out of range")))?;
+        opts.no_lock = true;
+        let set = pool.get_disks_by_key(object);
+        // Discover and lock uploads only after the target capacity gate is held.
+        // Return the guards so they remain alive through the final capacity save.
+        let (cleanup_decision_error, guards) = self
+            .run_decommission_capacity_temporary_release_with_capacity_lease(target_pool_idx, capacity_owner, |capacity_lease| {
+                let mut delete_opts = opts.clone();
+                let set = &set;
+                let pool = &pool;
+                async move {
+                    if let Some(capacity_lease) = capacity_lease.as_ref() {
+                        delete_opts.add_namespace_lock_lost_signal(Arc::clone(capacity_lease));
+                    }
+                    let mut candidate_upload_ids = upload_ids.to_vec();
+                    candidate_upload_ids.extend(
+                        set.data_movement_multipart_upload_ids(
+                            bucket,
+                            object,
+                            delete_opts.expected_bucket_incarnation_id,
+                            expected_upload_identity,
+                        )
+                        .await?,
+                    );
+                    candidate_upload_ids.sort_unstable();
+                    candidate_upload_ids.dedup();
+
+                    let mut guards = Vec::with_capacity(candidate_upload_ids.len());
+                    for upload_id in &candidate_upload_ids {
+                        match set
+                            .lock_data_movement_multipart_abort(
+                                bucket,
+                                object,
+                                upload_id,
+                                Some(expected_upload_identity),
+                                &delete_opts,
+                            )
+                            .await
+                        {
+                            Ok(Some(guard)) => {
+                                guard.add_namespace_lock_fence(&mut delete_opts);
+                                guards.push(guard);
+                            }
+                            Ok(None) => {}
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    for guard in &guards {
+                        match guard.delete(set, bucket, object, &delete_opts).await {
+                            Ok(()) => {}
+                            Err(err) if is_err_invalid_upload_id(&err) => {}
+                            Err(err) => return Err(err),
+                        }
+                    }
+
+                    if !set
+                        .data_movement_multipart_upload_ids(
+                            bucket,
+                            object,
+                            delete_opts.expected_bucket_incarnation_id,
+                            expected_upload_identity,
+                        )
+                        .await?
+                        .is_empty()
+                    {
+                        return Err(Error::DecommissionCapacityBlocked {
+                            message: "multipart cleanup could not prove the exact staged uploads are absent".to_string(),
+                        });
+                    }
+
+                    // The target capacity gate makes the exact target proof,
+                    // upload absence proof, and pending-ledger decision one
+                    // critical section with cleanup finalize.
+                    let (clear_pending, cleanup_decision_error) = if capacity_owner.is_some() {
+                        let mut lookup_opts = ObjectOptions {
+                            versioned: delete_opts.versioned,
+                            version_suspended: delete_opts.version_suspended,
+                            // The abort options keep an id-less null version as
+                            // `None` for the upload identity; the target proof
+                            // must still look up that exact version.
+                            version_id: Some(delete_opts.version_id.clone().unwrap_or_else(|| Uuid::nil().to_string())),
+                            metadata_chg: true,
+                            no_lock: true,
+                            ..Default::default()
+                        };
+                        if let Some(capacity_lease) = capacity_lease {
+                            lookup_opts.add_namespace_lock_lost_signal(capacity_lease);
+                        }
+                        let target = match pool.get_object_info(bucket, object, &lookup_opts).await {
+                            Ok(target) => Some(target),
+                            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
+                            Err(err) => return Err(err),
+                        };
+                        match decommission_multipart_target_clear_pending(&delete_opts, target.as_ref()) {
+                            Ok(clear_pending) => (clear_pending, None),
+                            Err(err) => (false, Some(err)),
+                        }
+                    } else {
+                        (true, None)
+                    };
+                    Ok(((cleanup_decision_error, guards), clear_pending))
+                }
+            })
+            .await?;
+        drop(guards);
+        if let Some(err) = cleanup_decision_error {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    async fn check_write_precondition(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        require_all_pools: bool,
+    ) -> Option<StorageError> {
+        let mut lookup_opts = opts.clone();
+        let http_preconditions = lookup_opts.http_preconditions?;
+        lookup_opts.http_preconditions = None;
+        lookup_opts.no_lock = true;
+        let oi = if require_all_pools {
+            lookup_opts.metadata_cache_safe = false;
+            lookup_opts.suppress_read_repair = true;
+            // Only completion uses this branch, after validating bucket and object.
+            let encoded_object = encode_dir_object_ref(object);
+            self.get_latest_object_info_for_conditional_write(bucket, encoded_object.as_ref(), &lookup_opts)
+                .await
+                .and_then(|(info, _)| {
+                    lookup_opts.precondition_check(&info)?;
+                    Ok(info)
+                })
+        } else {
+            self.get_object_info_for_delete(bucket, object, &lookup_opts).await
+        };
+        crate::set_disk::SetDisks::evaluate_write_precondition(oi, &http_preconditions, bucket, object, opts)
     }
 
     #[instrument(skip(self))]
@@ -307,36 +1277,975 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         check_complete_multipart_args(bucket, object, upload_id)?;
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
+        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
+            // The set-level commit judges the null version this completion
+            // replaces; give it the same authoritative snapshot a PUT carries.
+            let expected_incarnation_id = opts
+                .expected_bucket_incarnation_id
+                .ok_or_else(|| Error::other("multipart completion is missing its bucket incarnation"))?;
+            let lifecycle_fence = opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .ok_or_else(|| Error::other("multipart completion is missing its bucket lifecycle fence"))?;
+            let snapshot = match opts.object_lock_config_snapshot.as_ref() {
+                Some(snapshot) => Arc::clone(snapshot),
+                None => {
+                    self.object_lock_config_snapshot_under_lifecycle_fence(bucket, lifecycle_fence)
+                        .await?
+                }
+            };
+            if !snapshot.is_valid_for_destructive_put(self.id, bucket, expected_incarnation_id) {
+                return Err(Error::other(
+                    "Object Lock snapshot does not hold valid target bucket generation and configuration fences",
+                ));
+            }
+            snapshot.add_lock_fences(&mut opts);
+            opts.object_lock_config_snapshot = Some(snapshot);
+        }
+        if !self.single_pool() {
+            opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+        }
+        let opts = &opts;
 
         if self.single_pool() {
-            return self.pools[0]
+            let result = self.pools[0]
                 .clone()
                 .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
                 .await;
+            return enqueue_transition_after_write(self.as_ref(), result, LcEventSrc::S3CompleteMultipartUpload, opts).await;
+        }
+        if opts.http_preconditions.is_some() && !opts.data_movement {
+            // Preserve explicitly scoped internal reads and borrowed-lock callers.
+            let require_all_pools =
+                !opts.replication_request && !opts.no_lock && !opts.skip_decommissioned && !opts.skip_rebalancing;
+            if let Some(err) = self.check_write_precondition(bucket, object, opts, require_all_pools).await {
+                return Err(err);
+            }
         }
 
-        for pool in self.pools.iter() {
-            if self.is_suspended(pool.pool_idx).await {
-                continue;
+        let result = match self.multipart_upload_pool_idx(bucket, object, upload_id, opts).await {
+            Ok(pool_idx) => {
+                self.pools[pool_idx]
+                    .clone()
+                    .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
+                    .await
             }
+            // The staging upload is already gone. The completed object lives on
+            // the pool that published it; other pools answer InvalidUploadID.
+            Err(err) if is_err_invalid_upload_id(&err) => {
+                let mut missing = err;
+                let mut found = None;
+                for pool_idx in self.existing_multipart_pool_order().await {
+                    match self.pools[pool_idx]
+                        .clone()
+                        .complete_multipart_upload(bucket, object, upload_id, uploaded_parts.clone(), opts)
+                        .await
+                    {
+                        Ok(info) => {
+                            found = Some(Ok(info));
+                            break;
+                        }
+                        Err(err) if is_err_invalid_upload_id(&err) => missing = err,
+                        Err(err) => {
+                            found = Some(Err(err));
+                            break;
+                        }
+                    }
+                }
+                found.unwrap_or(Err(missing))
+            }
+            Err(err) => Err(err),
+        };
+        enqueue_transition_after_write(self.as_ref(), result, LcEventSrc::S3CompleteMultipartUpload, opts).await
+    }
 
-            let pool = pool.clone();
-            let err = match pool
-                .complete_multipart_upload(bucket, object, upload_id, uploaded_parts.clone(), opts)
-                .await
-            {
-                Ok(res) => return Ok(res),
-                Err(err) => {
-                    //
-                    if is_err_invalid_upload_id(&err) { None } else { Some(err) }
+    #[cfg(all(test, feature = "test-util"))]
+    pub(crate) async fn complete_multipart_upload_for_data_movement(
+        self: Arc<Self>,
+        target: (usize, Option<&ObjectLockDiagGuard>),
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        uploaded_parts: Vec<CompletePart>,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        self.complete_multipart_upload_for_data_movement_inner(target, bucket, object, upload_id, uploaded_parts, opts, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn complete_multipart_upload_for_data_movement_with_publication_fence(
+        self: Arc<Self>,
+        target_pool_idx: usize,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        uploaded_parts: Vec<CompletePart>,
+        opts: &ObjectOptions,
+        publication_fence: RemoteTuplePublicationFence,
+    ) -> Result<ObjectInfo> {
+        self.complete_multipart_upload_for_data_movement_inner(
+            (target_pool_idx, None),
+            bucket,
+            object,
+            upload_id,
+            uploaded_parts,
+            opts,
+            Some(publication_fence),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_multipart_upload_for_data_movement_inner(
+        self: Arc<Self>,
+        target: (usize, Option<&ObjectLockDiagGuard>),
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        uploaded_parts: Vec<CompletePart>,
+        opts: &ObjectOptions,
+        publication_fence: Option<RemoteTuplePublicationFence>,
+    ) -> Result<ObjectInfo> {
+        let request_opts = opts;
+        let (target_pool_idx, mutation_fence) = target;
+        check_complete_multipart_args(bucket, object, upload_id)?;
+        let encoded_object = encode_dir_object_ref(object);
+        let object = encoded_object.as_ref();
+        if !opts.data_movement {
+            return Err(Error::other("targeted multipart completion requires data_movement options"));
+        }
+        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        ensure_decommission_capacity_mutation_id(bucket, object, &mut opts);
+        if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
+            let expected_incarnation_id = opts
+                .expected_bucket_incarnation_id
+                .ok_or_else(|| Error::other("data movement completion is missing its bucket incarnation"))?;
+            let lifecycle_fence = opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .ok_or_else(|| Error::other("data movement completion is missing its bucket lifecycle fence"))?;
+            let snapshot = match opts.object_lock_config_snapshot.as_ref() {
+                Some(snapshot) => Arc::clone(snapshot),
+                None => {
+                    self.object_lock_config_snapshot_under_lifecycle_fence(bucket, lifecycle_fence)
+                        .await?
                 }
             };
+            if !snapshot.is_valid_for_destructive_put(self.id, bucket, expected_incarnation_id) {
+                return Err(Error::other(
+                    "data movement Object Lock snapshot does not match the target bucket generation",
+                ));
+            }
+            snapshot.add_lock_fences(&mut opts);
+            opts.object_lock_config_snapshot = Some(snapshot);
+        }
+        let fixed_read_anchor = publication_fence
+            .as_ref()
+            .and_then(RemoteTuplePublicationFence::fixed_read_anchor_guard);
+        self.apply_decommission_target_mutation_fence(target_pool_idx, object, &mut opts, mutation_fence.or(fixed_read_anchor))
+            .await;
+        // NewMultipart/UploadPart are staging only. Acquire and consume the
+        // non-cloneable publication capability immediately before Complete,
+        // then retain its guards until Complete has drained the commit path.
+        let publication_object = encode_dir_object(object);
+        let publication_guard = match publication_fence {
+            Some(publication_fence) => {
+                let guard = publication_fence
+                    .into_commit_guard(target_pool_idx, bucket, &publication_object)
+                    .await?;
+                guard.add_namespace_lock_fence(&mut opts);
+                opts.no_lock = true;
+                Some(guard)
+            }
+            None => {
+                if rustfs_utils::http::metadata_compat::contains_key_str(
+                    &opts.user_defined,
+                    rustfs_utils::http::SUFFIX_TRANSITION_STATUS,
+                ) {
+                    return Err(Error::other(
+                        "data movement multipart completion cannot publish transition ownership without a publication capability",
+                    ));
+                }
+                None
+            }
+        };
+        #[cfg(test)]
+        pause_data_movement_multipart_before_selected_completion(bucket).await;
+        let pool = self
+            .pools
+            .get(target_pool_idx)
+            .ok_or_else(|| Error::other(format!("data movement target pool {target_pool_idx} is out of range")))?
+            .clone();
+        // Data movement already owns the pool-meta write lease. Forward its
+        // loss signal into SetDisks so commit fencing observes the same lease
+        // without trying to reacquire the namespace.
+        let mut transition_opts = opts.clone();
+        let result = self
+            .run_decommission_capacity_admitted_mutation_with_capacity_lease(
+                target_pool_idx,
+                DecommissionCapacityOwner::from_options(&opts),
+                opts.capacity_expected_data_bytes(),
+                |capacity_lease| async move {
+                    if let Some(capacity_lease) = capacity_lease {
+                        opts.add_namespace_lock_lost_signal(capacity_lease);
+                    }
+                    pool.complete_multipart_upload(bucket, object, upload_id, uploaded_parts, &opts)
+                        .await
+                },
+            )
+            .await;
+        drop(publication_guard);
+        transition_opts.no_lock = request_opts.no_lock;
+        let result =
+            enqueue_transition_after_write(self.as_ref(), result, LcEventSrc::S3CompleteMultipartUpload, &transition_opts).await;
+        if result.is_ok() {
+            list_objects::observe_scanner_namespace_mutations(bucket, 1);
+        }
+        result
+    }
+}
 
-            if let Some(er) = err {
-                return Err(er);
+/// Merges per-pool `ListMultipartUploads` pages into a single globally paginated
+/// page.
+///
+/// Each pool independently applies the `max_uploads` cap, so the concatenated
+/// input can hold up to `pools * max_uploads` entries and is unordered across
+/// pools. This re-sorts the union by `(key, upload_id)` — the order S3 clients
+/// page through — caps it to `max_uploads`, and derives the truncation markers
+/// from the first overflow element (used only as a probe, never returned) so a
+/// bucket whose uploads span pools can be paged without loss or duplication.
+fn merge_multipart_upload_pages(
+    uploads: Vec<MultipartInfo>,
+    common_prefixes: Vec<String>,
+    max_uploads: usize,
+    source_truncated: bool,
+) -> crate::multipart_listing::MultipartListingPage {
+    paginate_multipart_listing(uploads, common_prefixes, None, None, max_uploads, source_truncated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{
+        endpoints::{Endpoints, PoolEndpoints},
+        format::FormatV3,
+    };
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn create_multipart_pool_selection_uses_only_an_exact_key_upload() {
+        use crate::bucket::metadata_sys::init_bucket_metadata_sys;
+        use crate::runtime::instance::InstanceContext;
+
+        let mut dirs = Vec::new();
+        let mut pools = Vec::new();
+        for pool_index in 0..2 {
+            let mut endpoints = Vec::new();
+            for disk_index in 0..4 {
+                let directory = tempfile::tempdir().expect("temporary disk");
+                let mut endpoint = Endpoint::try_from(directory.path().to_str().expect("disk path")).expect("local endpoint");
+                endpoint.set_pool_index(pool_index);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(disk_index);
+                dirs.push(directory);
+                endpoints.push(endpoint);
+            }
+            pools.push(PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: 4,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: format!("exact-multipart-pool-{pool_index}"),
+                platform: "test".to_owned(),
+            });
+        }
+        let endpoints = EndpointServerPools(pools);
+        let ctx = Arc::new(InstanceContext::new());
+        crate::store::init_local_disks_with_instance_ctx(&ctx, endpoints.clone())
+            .await
+            .expect("initialize local disks");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let store = ECStore::new_with_instance_ctx("127.0.0.1:0".parse().expect("test address"), endpoints, cancel.clone(), ctx)
+            .await
+            .expect("initialize two pools");
+        init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = "exact-pool-selection";
+        let other_bucket = "other-pool-selection";
+        for bucket in [bucket, other_bucket] {
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+        }
+        for (upload_bucket, key) in [(bucket, "report-long"), (bucket, "report/"), (other_bucket, "report")] {
+            let (opts, _guard) = store
+                .guard_multipart_bucket_incarnation(upload_bucket, &ObjectOptions::default())
+                .await
+                .expect("pin upload incarnation");
+            store.pools[0]
+                .new_multipart_upload(upload_bucket, &encode_dir_object(key), &opts)
+                .await
+                .expect("seed nonmatching upload in first pool");
+        }
+        let (opts, _guard) = store
+            .guard_multipart_bucket_incarnation(bucket, &ObjectOptions::default())
+            .await
+            .expect("pin target incarnation");
+        assert!(
+            !pool_has_multipart_upload_for_key(&store.pools[0], bucket, "report", opts.expected_bucket_incarnation_id)
+                .await
+                .expect("first pool contains only other keys")
+        );
+        store.pools[1]
+            .new_multipart_upload(bucket, "report", &opts)
+            .await
+            .expect("seed exact upload in second pool");
+        let (created, pool_index, incarnation) = store
+            .handle_new_multipart_upload_with_pool_idx(bucket, "report", &ObjectOptions::default(), None)
+            .await
+            .expect("create another upload for the exact key");
+        assert_eq!(pool_index, 1, "prefix matches in the first pool must not change placement");
+        assert_eq!(incarnation, opts.expected_bucket_incarnation_id);
+        assert!(!created.upload_id.is_empty());
+        assert!(
+            !pool_has_multipart_upload_for_key(&store.pools[0], bucket, "report", incarnation)
+                .await
+                .expect("new upload must not appear in first pool")
+        );
+        assert!(
+            !pool_has_multipart_upload_for_key(&store.pools[1], bucket, "report", Some(Uuid::new_v4()))
+                .await
+                .expect("old bucket incarnations must not affect placement")
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn multipart_directory_keys_preserve_the_bare_object_and_round_trip() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::object::ObjectIO as _;
+        use sha2::Digest;
+        use tokio::io::AsyncReadExt;
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        for versioned in [false, true] {
+            let bucket = if versioned {
+                "directory-mpu-versioned"
+            } else {
+                "directory-mpu-unversioned"
+            };
+            store
+                .make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            if versioned {
+                store
+                    .update_bucket_metadata_config(
+                        bucket,
+                        "versioning.xml",
+                        br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#.to_vec(),
+                    )
+                    .await
+                    .expect("enable versioning");
+            }
+            let opts = ObjectOptions {
+                versioned,
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            };
+            let original = store
+                .put_object(
+                    bucket,
+                    "protected",
+                    &mut PutObjReader::from_vec(b"private original".to_vec()),
+                    &ObjectOptions {
+                        user_defined: HashMap::from([(
+                            rustfs_utils::http::headers::AMZ_OBJECT_TAGGING.to_string(),
+                            "classification=secret".to_string(),
+                        )]),
+                        ..opts.clone()
+                    },
+                )
+                .await
+                .expect("write protected bare object");
+            let upload = store
+                .new_multipart_upload(bucket, "protected/", &opts)
+                .await
+                .expect("create directory upload");
+            let part = store
+                .put_object_part(
+                    bucket,
+                    "protected/",
+                    &upload.upload_id,
+                    1,
+                    &mut PutObjReader::from_vec(b"directory payload".to_vec()),
+                    &opts,
+                )
+                .await
+                .expect("write directory part");
+            store
+                .put_object_part(
+                    bucket,
+                    "protected/",
+                    &upload.upload_id,
+                    2,
+                    &mut PutObjReader::from_vec(b"unselected private bytes".to_vec()),
+                    &opts,
+                )
+                .await
+                .expect("write an unselected part");
+            let upload_sha = hex_simd::encode_to_string(
+                sha2::Sha256::digest(format!("{bucket}/protected__XLDIR__").as_bytes()),
+                hex_simd::AsciiCase::Lower,
+            );
+            let upload_uuid = crate::runtime::sources::upload_uuid_suffix(&upload.upload_id);
+            for dir in &dirs {
+                let staging = dir
+                    .path()
+                    .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                    .join(&upload_sha)
+                    .join(&upload_uuid);
+                let metadata = rustfs_filemeta::FileMeta::load(&std::fs::read(staging.join("xl.meta")).expect("upload metadata"))
+                    .expect("decode upload metadata");
+                let versions = metadata
+                    .get_file_info_versions(bucket, "protected__XLDIR__", true)
+                    .expect("upload file info");
+                let data_dir = versions
+                    .versions
+                    .first()
+                    .expect("upload version")
+                    .data_dir
+                    .expect("staging data directory");
+                assert!(
+                    staging.join(data_dir.to_string()).join("part.2").is_file(),
+                    "unselected part exists before completion"
+                );
+            }
+            assert_eq!(
+                store
+                    .get_multipart_info(bucket, "protected/", &upload.upload_id, &opts)
+                    .await
+                    .expect("upload info")
+                    .object,
+                "protected/"
+            );
+            assert_eq!(
+                store
+                    .list_object_parts(bucket, "protected/", &upload.upload_id, None, 10, &opts)
+                    .await
+                    .expect("list parts")
+                    .object,
+                "protected/"
+            );
+            let uploads = store
+                .list_multipart_uploads(bucket, "protected/", None, None, None, 10)
+                .await
+                .expect("list logical prefix");
+            assert_eq!(uploads.uploads.len(), 1);
+            assert_eq!(uploads.uploads[0].object, "protected/");
+            assert_eq!(crate::runtime::sources::upload_uuid_suffix(&uploads.uploads[0].upload_id), upload_uuid,);
+            let completed = store
+                .clone()
+                .complete_multipart_upload(
+                    bucket,
+                    "protected/",
+                    &upload.upload_id,
+                    vec![CompletePart {
+                        part_num: part.part_num,
+                        etag: part.etag,
+                        ..Default::default()
+                    }],
+                    &opts,
+                )
+                .await
+                .expect("complete directory upload");
+            assert_eq!(completed.name, "protected/");
+            for (key, expected) in [
+                ("protected", b"private original".as_slice()),
+                ("protected/", b"directory payload".as_slice()),
+            ] {
+                let mut reader = store
+                    .get_object_reader(bucket, key, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("read distinct object");
+                let mut bytes = Vec::new();
+                reader.stream.read_to_end(&mut bytes).await.expect("read body");
+                assert_eq!(bytes, expected);
+            }
+            let preserved = store
+                .get_object_info(bucket, "protected", &ObjectOptions::default())
+                .await
+                .expect("bare metadata");
+            assert_eq!(preserved.version_id, original.version_id);
+            assert_eq!(preserved.etag, original.etag);
+            assert_eq!(preserved.user_tags.as_str(), "classification=secret");
+            for dir in &dirs {
+                assert!(dir.path().join(bucket).join("protected/xl.meta").is_file());
+                assert!(dir.path().join(bucket).join("protected__XLDIR__/xl.meta").is_file());
+                let data = dir
+                    .path()
+                    .join(bucket)
+                    .join("protected__XLDIR__")
+                    .join(completed.data_dir.expect("multipart data directory").to_string());
+                assert!(data.join("part.1").is_file());
+                assert!(!data.join("part.2").exists(), "unselected part must never be published");
+                assert!(
+                    !dir.path()
+                        .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                        .join(&upload_sha)
+                        .join(&upload_uuid)
+                        .exists(),
+                    "original staging must be cleaned"
+                );
+            }
+            let abandoned = store
+                .new_multipart_upload(bucket, "protected/", &opts)
+                .await
+                .expect("create abort control");
+            store
+                .abort_multipart_upload(bucket, "protected/", &abandoned.upload_id, &opts)
+                .await
+                .expect("abort encoded upload");
+            assert!(
+                store
+                    .get_multipart_info(bucket, "protected/", &abandoned.upload_id, &opts)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                store
+                    .get_object_info(bucket, "protected/", &ObjectOptions::default())
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn new_control_character_keys_are_rejected_without_trapping_legacy_objects() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::object::ObjectIO as _;
+        use tokio::io::AsyncReadExt;
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = "xml-key-admission";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        for byte in (1u8..32).filter(|byte| !matches!(byte, 9 | 10 | 13)) {
+            let key = format!("bad-{}", char::from(byte));
+            assert!(
+                store
+                    .put_object(bucket, &key, &mut PutObjReader::from_vec(b"body".to_vec()), &ObjectOptions::default())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                store
+                    .new_multipart_upload(bucket, &key, &ObjectOptions::default())
+                    .await
+                    .is_err()
+            );
+            for dir in &dirs {
+                assert!(!dir.path().join(bucket).join(&key).exists());
             }
         }
+        let legacy_key = "legacy-\u{1}";
+        store.pools[0]
+            .get_disks_by_key(legacy_key)
+            .put_object(
+                bucket,
+                legacy_key,
+                &mut PutObjReader::from_vec(b"legacy payload".to_vec()),
+                &ObjectOptions {
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed a pre-upgrade object below new-key admission");
+        let mut reader = store
+            .get_object_reader(bucket, legacy_key, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("legacy GET stays usable");
+        let mut bytes = Vec::new();
+        reader.stream.read_to_end(&mut bytes).await.expect("legacy bytes");
+        assert_eq!(bytes, b"legacy payload");
+        drop(reader);
+        store
+            .delete_object(bucket, legacy_key, ObjectOptions::default())
+            .await
+            .expect("legacy DELETE stays usable");
+        assert!(
+            store
+                .get_object_info(bucket, legacy_key, &ObjectOptions::default())
+                .await
+                .is_err()
+        );
+    }
 
-        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+    fn mp(object: &str, upload_id: &str) -> MultipartInfo {
+        MultipartInfo {
+            bucket: "bucket".to_string(),
+            object: object.to_string(),
+            upload_id: upload_id.to_string(),
+            initiated: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn decommission_multipart_cleanup_requires_exact_target_evidence() {
+        let version_id = Uuid::new_v4();
+        let mod_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(7);
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(version_id.to_string()),
+            mod_time: Some(mod_time),
+            ..Default::default()
+        };
+
+        assert!(
+            decommission_multipart_target_clear_pending(&opts, None)
+                .expect("an exact target miss should authorize pending cleanup")
+        );
+
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_DATA_MOVED, "true".to_string());
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_DATA_MOVED_TAGS, "v1:".to_string());
+        let owned_target = ObjectInfo {
+            version_id: Some(version_id),
+            mod_time: Some(mod_time),
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        assert!(
+            !decommission_multipart_target_clear_pending(&opts, Some(&owned_target))
+                .expect("an exact owned target should preserve pending capacity")
+        );
+
+        let assert_proof_error = |result: Result<bool>, expected: DecommissionMultipartTargetProofError| {
+            let err = result.expect_err("an unprovable target identity must fail closed");
+            assert!(
+                !matches!(err, Error::DecommissionCapacityBlocked { .. }),
+                "a target identity proof is not a capacity block: {err}"
+            );
+            assert!(!err.to_string().contains("minimum free drive"), "{err}");
+            let Error::Io(io_err) = &err else {
+                panic!("the target proof error must stay typed: {err:?}");
+            };
+            assert_eq!(
+                io_err
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<DecommissionMultipartTargetProofError>()),
+                Some(&expected)
+            );
+        };
+
+        let missing_identity = ObjectOptions {
+            mod_time: None,
+            ..opts.clone()
+        };
+        assert_proof_error(
+            decommission_multipart_target_clear_pending(&missing_identity, None),
+            DecommissionMultipartTargetProofError::MissingModTime,
+        );
+
+        let other_version_target = ObjectInfo {
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(mod_time),
+            ..Default::default()
+        };
+        assert!(
+            decommission_multipart_target_clear_pending(&opts, Some(&other_version_target))
+                .expect("another version is not the staged identity")
+        );
+
+        let rewritten_version_target = ObjectInfo {
+            version_id: Some(version_id),
+            mod_time: Some(mod_time + time::Duration::seconds(1)),
+            ..Default::default()
+        };
+        assert_proof_error(
+            decommission_multipart_target_clear_pending(&opts, Some(&rewritten_version_target)),
+            DecommissionMultipartTargetProofError::AmbiguousVersion,
+        );
+
+        let unowned_target = ObjectInfo {
+            version_id: Some(version_id),
+            mod_time: Some(mod_time),
+            ..Default::default()
+        };
+        assert_proof_error(
+            decommission_multipart_target_clear_pending(&opts, Some(&unowned_target)),
+            DecommissionMultipartTargetProofError::UnownedExactTarget,
+        );
+    }
+
+    /// A null version has one slot per key: a null target with another
+    /// modification time is a different object, such as a newer unversioned
+    /// write that superseded the source, so the staged copy holds nothing on
+    /// the target (rustfs/backlog#2873).
+    #[test]
+    fn decommission_multipart_cleanup_clears_pending_for_a_replaced_null_target() {
+        let mod_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(7);
+        for version_id in [None, Some(Uuid::nil().to_string())] {
+            let opts = ObjectOptions {
+                version_id: version_id.clone(),
+                mod_time: Some(mod_time),
+                ..Default::default()
+            };
+            for target_version_id in [None, Some(Uuid::nil())] {
+                for target_mod_time in [mod_time + time::Duration::seconds(1), mod_time - time::Duration::seconds(1)] {
+                    let replaced = ObjectInfo {
+                        version_id: target_version_id,
+                        mod_time: Some(target_mod_time),
+                        ..Default::default()
+                    };
+                    assert!(
+                        decommission_multipart_target_clear_pending(&opts, Some(&replaced))
+                            .expect("a replaced null target is not the staged identity"),
+                        "version_id={version_id:?} target_version_id={target_version_id:?} target_mod_time={target_mod_time}"
+                    );
+                }
+            }
+            let mut metadata = HashMap::new();
+            rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_DATA_MOVED, "true".to_string());
+            rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_DATA_MOVED_TAGS, "v1:".to_string());
+            let staged = ObjectInfo {
+                mod_time: Some(mod_time),
+                user_defined: Arc::new(metadata),
+                ..Default::default()
+            };
+            assert!(
+                !decommission_multipart_target_clear_pending(&opts, Some(&staged))
+                    .expect("the exact owned null target keeps its pending intent")
+            );
+        }
+    }
+
+    /// Models a single pool's `list_multipart_uploads`: returns uploads strictly
+    /// after the `(key, upload_id)` marker in `(key, upload_id)` order, capped at
+    /// `max_uploads` (mirroring the per-pool page cap).
+    fn pool_query(
+        pool: &[MultipartInfo],
+        key_marker: Option<&str>,
+        upload_id_marker: Option<&str>,
+        max_uploads: usize,
+    ) -> Vec<MultipartInfo> {
+        pool.iter()
+            .filter(|u| match (key_marker, upload_id_marker) {
+                (Some(k), Some(uid)) => (u.object.as_str(), u.upload_id.as_str()) > (k, uid),
+                (Some(k), None) => u.object.as_str() > k,
+                _ => true,
+            })
+            .take(max_uploads)
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn merge_multipart_upload_pages_sorts_and_caps_across_pools() {
+        // Union of two pools, unordered and exceeding the global cap.
+        let uploads = vec![mp("b", "u1"), mp("a", "u2"), mp("a", "u1"), mp("c", "u1"), mp("b", "u2")];
+
+        let page = merge_multipart_upload_pages(uploads, Vec::new(), 3, false);
+
+        assert!(page.is_truncated);
+        assert_eq!(page.uploads.len(), 3);
+        let ordered: Vec<(&str, &str)> = page
+            .uploads
+            .iter()
+            .map(|u| (u.object.as_str(), u.upload_id.as_str()))
+            .collect();
+        assert_eq!(ordered, vec![("a", "u1"), ("a", "u2"), ("b", "u1")]);
+        assert_eq!(page.next_key_marker.as_deref(), Some("b"));
+        assert_eq!(page.next_upload_id_marker.as_deref(), Some("u1"));
+    }
+
+    #[test]
+    fn merge_multipart_upload_pages_reports_complete_within_cap() {
+        let uploads = vec![mp("b", "u1"), mp("a", "u1")];
+
+        let page = merge_multipart_upload_pages(uploads, Vec::new(), 3, false);
+
+        assert_eq!(page.uploads.len(), 2);
+        assert!(!page.is_truncated);
+        assert!(page.next_key_marker.is_none());
+        assert!(page.next_upload_id_marker.is_none());
+    }
+
+    #[test]
+    fn merge_multipart_upload_pages_paginates_across_pools_without_loss() {
+        // Uploads for the same bucket spread across two pools, together exceeding
+        // the cap, so pagination must span multiple pages.
+        let pool0 = vec![mp("a", "u1"), mp("a", "u3"), mp("c", "u1"), mp("e", "u1")];
+        let pool1 = vec![mp("a", "u2"), mp("b", "u1"), mp("d", "u1"), mp("f", "u1")];
+
+        let mut expected: Vec<(String, String)> = pool0
+            .iter()
+            .chain(pool1.iter())
+            .map(|u| (u.object.clone(), u.upload_id.clone()))
+            .collect();
+        expected.sort();
+
+        let max_uploads = 3;
+        let mut key_marker: Option<String> = None;
+        let mut upload_id_marker: Option<String> = None;
+        let mut collected: Vec<(String, String)> = Vec::new();
+
+        for _ in 0..16 {
+            let mut merged = Vec::new();
+            for pool in [&pool0, &pool1] {
+                merged.extend(pool_query(pool, key_marker.as_deref(), upload_id_marker.as_deref(), max_uploads));
+            }
+
+            let page = merge_multipart_upload_pages(merged, Vec::new(), max_uploads, false);
+            assert!(page.uploads.len() <= max_uploads);
+            collected.extend(page.uploads.iter().map(|u| (u.object.clone(), u.upload_id.clone())));
+
+            if !page.is_truncated {
+                break;
+            }
+            key_marker = page.next_key_marker;
+            upload_id_marker = page.next_upload_id_marker;
+        }
+
+        assert_eq!(collected, expected, "pagination must return every upload exactly once, in sorted order");
+        let mut deduped = collected.clone();
+        deduped.dedup();
+        assert_eq!(deduped.len(), collected.len(), "pagination must not duplicate uploads");
+    }
+
+    #[test]
+    fn merge_multipart_upload_pages_includes_common_prefixes() {
+        let page = merge_multipart_upload_pages(
+            vec![mp("logs/root.bin", "u1")],
+            vec!["logs/2026/".to_string(), "logs/2025/".to_string()],
+            2,
+            false,
+        );
+
+        assert!(page.is_truncated);
+        assert!(page.uploads.is_empty());
+        assert_eq!(page.common_prefixes, vec!["logs/2025/", "logs/2026/"]);
+        assert_eq!(page.next_key_marker.as_deref(), Some("logs/2026/"));
+        assert!(page.next_upload_id_marker.is_none());
+    }
+
+    #[test]
+    fn merge_multipart_upload_pages_preserves_pool_truncation() {
+        let page = merge_multipart_upload_pages(vec![mp("a", "u1")], Vec::new(), 1, true);
+
+        assert!(page.is_truncated);
+        assert_eq!(page.next_key_marker.as_deref(), Some("a"));
+        assert_eq!(page.next_upload_id_marker.as_deref(), Some("u1"));
+    }
+
+    async fn new_multipart_lock_test_store() -> ECStore {
+        let format = FormatV3::new(1, 2);
+        let endpoints = vec![
+            Endpoint::try_from("http://127.0.0.1:9000/data0").expect("first endpoint should parse"),
+            Endpoint::try_from("http://127.0.0.1:9001/data1").expect("second endpoint should parse"),
+        ];
+        let pool_endpoints = PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "multipart-list-parts-lock-test".to_string(),
+            platform: "test".to_string(),
+        };
+        let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints.clone()]);
+        let sets = Sets::new(vec![None, None], &pool_endpoints, &format, 0, 1)
+            .await
+            .expect("test sets should be created with empty disks");
+
+        ECStore {
+            id: Uuid::new_v4(),
+            disk_map: HashMap::new(),
+            pools: vec![sets],
+            peer_sys: S3PeerSys::new(&endpoint_pools),
+            pool_meta: RwLock::new(PoolMeta::default()),
+            rebalance_meta: RwLock::new(None),
+            decommission_cancelers: RwLock::new(Vec::new()),
+            start_gate: Mutex::new(()),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
+            ctx: crate::runtime::instance::bootstrap_ctx(),
+            bucket_fence_registry: std::sync::Arc::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_parts_read_lock_blocks_object_writer_until_released() {
+        let store = new_multipart_lock_test_store().await;
+        let read_guard = store
+            .acquire_list_parts_read_lock("bucket", "object", &ObjectOptions::default())
+            .await
+            .expect("list parts read lock should be acquired")
+            .expect("default options should acquire a read lock");
+
+        let object_lock = store
+            .handle_new_ns_lock("bucket", "object")
+            .await
+            .expect("object namespace lock should be created");
+        let err = object_lock
+            .get_write_lock(Duration::from_millis(20))
+            .await
+            .expect_err("list parts read lock should block object writers");
+        assert!(matches!(err, rustfs_lock::LockError::Timeout { .. }));
+
+        drop(read_guard);
+        object_lock
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("object writer should proceed after list parts releases the read lock");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_parts_read_lock_respects_no_lock() {
+        let store = new_multipart_lock_test_store().await;
+        let object_lock = store
+            .handle_new_ns_lock("bucket", "object")
+            .await
+            .expect("object namespace lock should be created");
+        let _writer = object_lock
+            .get_write_lock(Duration::from_secs(1))
+            .await
+            .expect("outer write lock should be acquired");
+
+        let result = temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1"))], async {
+            store
+                .acquire_list_parts_read_lock("bucket", "object", &ObjectOptions::default())
+                .await
+        })
+        .await;
+        let err = match result {
+            Ok(_) => panic!("list parts read lock must wait behind an object writer"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, StorageError::Lock(rustfs_lock::LockError::Timeout { .. })));
+
+        let no_lock_guard = store
+            .acquire_list_parts_read_lock(
+                "bucket",
+                "object",
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("no_lock list parts path should not acquire an object lock");
+        assert!(no_lock_guard.is_none());
     }
 }

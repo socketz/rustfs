@@ -12,35 +12,475 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::s3_http_metrics::S3HttpOperationContext;
 use metrics::{counter, gauge};
+#[cfg(not(test))]
+use rustfs_s3_ops::S3Operation;
+use std::collections::HashMap;
 use std::sync::{
-    Arc, LazyLock,
+    Arc, LazyLock, OnceLock, RwLock,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const INTERNODE_OPERATION_READ_FILE_STREAM: &str = "read_file_stream";
 pub const INTERNODE_OPERATION_PUT_FILE_STREAM: &str = "put_file_stream";
+pub const INTERNODE_OPERATION_PUT_FILE_CAPABILITY: &str = "put_file_capability";
 pub const INTERNODE_OPERATION_WALK_DIR: &str = "walk_dir";
+pub const INTERNODE_OPERATION_NS_SCANNER: &str = "ns_scanner";
 pub const INTERNODE_OPERATION_GRPC_READ_ALL: &str = "grpc_read_all";
 pub const INTERNODE_OPERATION_GRPC_WRITE_ALL: &str = "grpc_write_all";
+pub const INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE: &str = "grpc_compare_and_update_file";
+pub const INTERNODE_OPERATION_GRPC_READ_MULTIPLE: &str = "grpc_read_multiple";
+pub const INTERNODE_OPERATION_GRPC_READ_VERSION: &str = "grpc_read_version";
+pub const INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION: &str = "grpc_batch_read_version";
+pub const INTERNODE_OPERATION_GRPC_LOCK: &str = "grpc_lock";
+pub const INTERNODE_OPERATION_GRPC_UNLOCK: &str = "grpc_unlock";
+pub const INTERNODE_OPERATION_GRPC_LOCK_BATCH: &str = "grpc_lock_batch";
+pub const INTERNODE_OPERATION_GRPC_UNLOCK_BATCH: &str = "grpc_unlock_batch";
+pub const INTERNODE_OPERATION_GRPC_REFRESH: &str = "grpc_refresh";
+pub const INTERNODE_OPERATION_GRPC_FORCE_UNLOCK: &str = "grpc_force_unlock";
+pub const INTERNODE_OPERATION_GRPC_OTHER: &str = "grpc_other";
 pub const INTERNODE_TRANSPORT_BACKEND_TCP_HTTP: &str = "tcp-http";
 pub const INTERNODE_TRANSPORT_BACKEND_GRPC: &str = "grpc";
+pub const INTERNODE_TRANSPORT_BACKEND_RDMA: &str = "rdma";
 pub const INTERNODE_TRANSPORT_BACKEND_UNKNOWN: &str = "unknown";
+
+/// Direction of a msgpack/JSON codec decode, for the JSON-fallback counter: a server decoding a
+/// peer's request vs a client decoding a peer's response (grpc-optimization P2).
+pub const INTERNODE_MSGPACK_DIRECTION_REQUEST: &str = "request";
+pub const INTERNODE_MSGPACK_DIRECTION_RESPONSE: &str = "response";
+pub const INTERNODE_MSGPACK_CODEC_MSGPACK: &str = "msgpack";
+pub const INTERNODE_MSGPACK_CODEC_JSON: &str = "json";
+pub const INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE: &str = "read_version_request_encode";
+pub const INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE: &str = "read_version_request_decode";
+pub const INTERNODE_STAGE_READ_VERSION_DISK_READ: &str = "read_version_disk_read";
+pub const INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE: &str = "read_version_response_json_encode";
+pub const INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE: &str = "read_version_response_msgpack_encode";
+pub const INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP: &str = "read_version_rpc_roundtrip";
+pub const INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE: &str = "read_version_response_decode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_ENCODE: &str = "batch_read_version_request_encode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE: &str = "batch_read_version_request_decode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ: &str = "batch_read_version_disk_read";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE: &str = "batch_read_version_response_json_encode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE: &str = "batch_read_version_response_msgpack_encode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP: &str = "batch_read_version_rpc_roundtrip";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_DECODE: &str = "batch_read_version_response_decode";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_COALESCER_WAIT: &str = "batch_read_version_coalescer_wait";
+pub const INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MAP: &str = "batch_read_version_response_map";
+
+const INTERNODE_READ_VERSION_REQUESTS_BY_CALLER_TOTAL: &str =
+    "rustfs_system_network_internode_read_version_requests_by_caller_total";
+
+/// An attribution dimension is absent, common to all items, or heterogeneous.
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadVersionAttribution<T> {
+    Absent,
+    Common(T),
+    Mixed,
+}
+
+/// Storage entry names describe call paths, not proof of an external request.
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadVersionEntrySource {
+    Unclassified,
+    ConfigRead,
+    ConfigWrite,
+    ScannerConfigWrite,
+    WritePreconditionRead,
+    ObjectInfoRead,
+    AppPutOwner,
+    PutCommitOwner,
+    LifecycleRecovery,
+    RecoveryDispositionMaintenance,
+    StoreObjectReader,
+    DataUsageCacheRead,
+    ServerInfoPools,
+    ScannerBacklogRead,
+    ScannerRevisionRead,
+    ScannerCycleStateRead,
+    TierConfigReload,
+    ObjectRead,
+    ListObjects,
+    MetadataRead,
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+impl ReadVersionEntrySource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unclassified => "unclassified",
+            Self::ConfigRead => "config_read",
+            Self::ConfigWrite => "config_write",
+            Self::ScannerConfigWrite => "scanner_config_write",
+            Self::WritePreconditionRead => "write_precondition_read",
+            Self::ObjectInfoRead => "object_info_read",
+            Self::AppPutOwner => "app_put_owner",
+            Self::PutCommitOwner => "put_commit_owner",
+            Self::LifecycleRecovery => "lifecycle_recovery",
+            Self::RecoveryDispositionMaintenance => "recovery_disposition_maintenance",
+            Self::StoreObjectReader => "store_object_reader",
+            Self::DataUsageCacheRead => "data_usage_cache_read",
+            Self::ServerInfoPools => "server_info_pools",
+            Self::ScannerBacklogRead => "scanner_backlog_read",
+            Self::ScannerRevisionRead => "scanner_revision_read",
+            Self::ScannerCycleStateRead => "scanner_cycle_state_read",
+            Self::TierConfigReload => "tier_config_reload",
+            Self::ObjectRead => "object_read",
+            Self::ListObjects => "list_objects",
+            Self::MetadataRead => "metadata_read",
+        }
+    }
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[derive(Clone, Copy, Debug)]
+pub enum ReadVersionContextBoundary {
+    Entry,
+    FullWait,
+    EarlyStop,
+    ListProducer,
+    ListGather,
+    CoalescerEnqueue,
+    UnaryFallback,
+    EntryToRpc,
+    RemoteRpc,
+    ScannerCacheLoad,
+    ScannerCycleStateLoad,
+    ConfigTask,
+    ConfigWrite,
+    ScannerConfigWrite,
+    WritePreconditionLookup,
+    ObjectInfoRead,
+    AppPutOwner,
+    PutCommitOwner,
+    TierFreeVersionSourceLookup,
+    BucketTask,
+    BackgroundTask,
+    DetachedMutation,
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+impl ReadVersionContextBoundary {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Entry => "entry",
+            Self::FullWait => "full_wait",
+            Self::EarlyStop => "early_stop",
+            Self::ListProducer => "list_producer",
+            Self::ListGather => "list_gather",
+            Self::CoalescerEnqueue => "coalescer_enqueue",
+            Self::UnaryFallback => "unary_fallback",
+            Self::EntryToRpc => "entry_to_rpc",
+            Self::RemoteRpc => "remote_rpc",
+            Self::ScannerCacheLoad => "scanner_cache_load",
+            Self::ScannerCycleStateLoad => "scanner_cycle_state_load",
+            Self::ConfigTask => "config_task",
+            Self::ConfigWrite => "config_write",
+            Self::ScannerConfigWrite => "scanner_config_write",
+            Self::WritePreconditionLookup => "write_precondition_lookup",
+            Self::ObjectInfoRead => "object_info_read",
+            Self::AppPutOwner => "app_put_owner",
+            Self::PutCommitOwner => "put_commit_owner",
+            Self::TierFreeVersionSourceLookup => "tier_free_version_source_lookup",
+            Self::BucketTask => "bucket_task",
+            Self::BackgroundTask => "background_task",
+            Self::DetachedMutation => "detached_mutation",
+        }
+    }
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+fn context_transition<T: Eq>(parent: Option<T>, child: Option<T>) -> &'static str {
+    match (parent, child) {
+        (None, None) => "absent",
+        (Some(_), None) => "lost",
+        (None, Some(_)) => "gained",
+        (Some(parent), Some(child)) if parent == child => "preserved",
+        (Some(_), Some(_)) => "changed",
+    }
+}
+
+/// Count observations separately from RPCs, using only bounded context labels.
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub fn record_read_version_context_transition(
+    source: ReadVersionEntrySource,
+    boundary: ReadVersionContextBoundary,
+    parent_api: Option<S3HttpOperationContext>,
+    child_api: Option<S3HttpOperationContext>,
+    parent_caller: Option<ReadVersionRequestCaller>,
+    child_caller: Option<ReadVersionRequestCaller>,
+    mode: Option<ReadVersionRequestMode>,
+) {
+    if !crate::get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_storage_diagnostic_context_transitions_total",
+        "entry_source" => source.as_str(),
+        "boundary" => boundary.as_str(),
+        "parent_api_operation" => parent_api.map(S3HttpOperationContext::operation_name).unwrap_or("unattributed"),
+        "child_api_operation" => child_api.map(S3HttpOperationContext::operation_name).unwrap_or("unattributed"),
+        "parent_caller" => parent_caller.map(ReadVersionRequestCaller::as_str).unwrap_or("unattributed"),
+        "child_caller" => child_caller.map(ReadVersionRequestCaller::as_str).unwrap_or("unattributed"),
+        "mode" => mode.map(ReadVersionRequestMode::as_str).unwrap_or("not_applicable"),
+        "api_context" => if source == ReadVersionEntrySource::Unclassified && matches!(boundary, ReadVersionContextBoundary::RemoteRpc) {
+            "unobserved"
+        } else { context_transition(parent_api, child_api) },
+        "caller_context" => if source == ReadVersionEntrySource::Unclassified && matches!(boundary, ReadVersionContextBoundary::RemoteRpc) {
+            "unobserved"
+        } else { context_transition(parent_caller, child_caller) },
+    )
+    .increment(1);
+}
+
+/// Count a native batch RPC once; item observations and unary fallback are separate.
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub fn record_batch_read_version_request_by_caller(
+    operation: ReadVersionAttribution<S3HttpOperationContext>,
+    caller: ReadVersionAttribution<ReadVersionRequestCaller>,
+    source: ReadVersionAttribution<ReadVersionEntrySource>,
+    mode: ReadVersionRequestMode,
+) {
+    let api_label = match operation {
+        ReadVersionAttribution::Absent => "unattributed",
+        ReadVersionAttribution::Common(operation) => operation.operation_name(),
+        ReadVersionAttribution::Mixed => "mixed",
+    };
+    let caller_label = match caller {
+        ReadVersionAttribution::Absent => "unattributed",
+        ReadVersionAttribution::Common(caller) => caller.as_str(),
+        ReadVersionAttribution::Mixed => "mixed",
+    };
+    let source_label = match source {
+        ReadVersionAttribution::Absent => "unclassified",
+        ReadVersionAttribution::Common(source) => source.as_str(),
+        ReadVersionAttribution::Mixed => "mixed",
+    };
+    counter!(
+        "rustfs_system_network_internode_batch_read_version_requests_by_caller_total",
+        "api_operation" => api_label,
+        "caller" => caller_label,
+        "entry_source" => source_label,
+        "mode" => mode.as_str(),
+    )
+    .increment(1);
+}
+#[cfg(not(test))]
+const READ_VERSION_REQUEST_MODE_COUNT: usize = 5;
+const READ_VERSION_REQUEST_CALLER_COUNT: usize = 18;
+
+#[cfg(not(test))]
+static READ_VERSION_CALLER_COUNTERS: LazyLock<Box<[OnceLock<metrics::Counter>]>> = LazyLock::new(|| {
+    std::iter::repeat_with(OnceLock::new)
+        .take((S3Operation::ALL.len() + 1) * READ_VERSION_REQUEST_MODE_COUNT * READ_VERSION_REQUEST_CALLER_COUNT)
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+});
+
+/// Coarse read mode for diagnostic attribution of remote metadata reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadVersionRequestMode {
+    MetadataOnly,
+    Data,
+    Healing,
+    IncludeFreeVersions,
+    Combined,
+}
+
+/// Bounded internal call-site class for an outgoing ReadVersion RPC.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(usize)]
+pub enum ReadVersionRequestCaller {
+    #[default]
+    Unattributed,
+    Peer,
+    Startup,
+    Heal,
+    ListObjects,
+    Object,
+    MetadataRead,
+    Multipart,
+    DiskStore,
+    DiskDispatch,
+    SetDiskRead,
+    SetDiskIo,
+    Rebalance,
+    Decommission,
+    Lifecycle,
+    TierRecovery,
+    CacheValue,
+    Other,
+}
+
+impl ReadVersionRequestCaller {
+    pub const ALL: [Self; READ_VERSION_REQUEST_CALLER_COUNT] = [
+        Self::Unattributed,
+        Self::Peer,
+        Self::Startup,
+        Self::Heal,
+        Self::ListObjects,
+        Self::Object,
+        Self::MetadataRead,
+        Self::Multipart,
+        Self::DiskStore,
+        Self::DiskDispatch,
+        Self::SetDiskRead,
+        Self::SetDiskIo,
+        Self::Rebalance,
+        Self::Decommission,
+        Self::Lifecycle,
+        Self::TierRecovery,
+        Self::CacheValue,
+        Self::Other,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unattributed => "unattributed",
+            Self::Peer => "peer",
+            Self::Startup => "startup",
+            Self::Heal => "heal",
+            Self::ListObjects => "list_objects",
+            Self::Object => "object",
+            Self::MetadataRead => "metadata_read",
+            Self::Multipart => "multipart",
+            Self::DiskStore => "disk_store",
+            Self::DiskDispatch => "disk_dispatch",
+            Self::SetDiskRead => "set_disk_read",
+            Self::SetDiskIo => "set_disk_io",
+            Self::Rebalance => "rebalance",
+            Self::Decommission => "decommission",
+            Self::Lifecycle => "lifecycle",
+            Self::TierRecovery => "tier_recovery",
+            Self::CacheValue => "cache_value",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl ReadVersionRequestMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MetadataOnly => "metadata_only",
+            Self::Data => "data",
+            Self::Healing => "healing",
+            Self::IncludeFreeVersions => "include_free_versions",
+            Self::Combined => "combined",
+        }
+    }
+}
+
+/// Record a bounded diagnostic caller class for one outgoing ReadVersion RPC.
+/// The caller label is either a fixed S3 operation name or `unattributed`.
+pub fn record_read_version_request_by_caller(
+    operation: Option<S3HttpOperationContext>,
+    caller: ReadVersionRequestCaller,
+    mode: ReadVersionRequestMode,
+) {
+    let api_operation = operation
+        .map(S3HttpOperationContext::operation_name)
+        .unwrap_or("unattributed");
+
+    #[cfg(test)]
+    counter!(
+        INTERNODE_READ_VERSION_REQUESTS_BY_CALLER_TOTAL,
+        "api_operation" => api_operation,
+        "caller" => caller.as_str(),
+        "mode" => mode.as_str(),
+    )
+    .increment(1);
+
+    #[cfg(not(test))]
+    {
+        let caller_index = operation.map_or(S3Operation::ALL.len(), |context| context.operation_index());
+        let counter_index = (caller_index * READ_VERSION_REQUEST_MODE_COUNT + mode as usize) * READ_VERSION_REQUEST_CALLER_COUNT
+            + caller as usize;
+        READ_VERSION_CALLER_COUNTERS[counter_index]
+            .get_or_init(|| {
+                counter!(
+                    INTERNODE_READ_VERSION_REQUESTS_BY_CALLER_TOTAL,
+                    "api_operation" => api_operation,
+                    "caller" => caller.as_str(),
+                    "mode" => mode.as_str(),
+                )
+            })
+            .increment(1);
+    }
+}
 
 const OPERATION_LABEL: &str = "operation";
 const BACKEND_LABEL: &str = "backend";
+const SERVER_LABEL: &str = "server";
 const CLASSIFICATION_LABEL: &str = "classification";
 const STAGE_LABEL: &str = "stage";
 const DOMINANT_ERROR_LABEL: &str = "dominant_error";
+const HTTP_VERSION_LABEL: &str = "http_version";
+const FAILURE_REASON_LABEL: &str = "failure_reason";
+const RPC_PATH_LABEL: &str = "rpc_path";
+const REASON_LABEL: &str = "reason";
+const DIRECTION_LABEL: &str = "direction";
+const MESSAGE_LABEL: &str = "message";
+const CODEC_LABEL: &str = "codec";
 const INTERNODE_OPERATION_SENT_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_sent_bytes_total";
 const INTERNODE_OPERATION_RECV_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_recv_bytes_total";
 const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_outgoing_total";
 const INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_incoming_total";
 const INTERNODE_OPERATION_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_errors_total";
+const INTERNODE_OPERATION_DURATION_MS: &str = "rustfs_system_network_internode_operation_duration_ms";
+const INTERNODE_OPERATION_SERVER_DURATION_MS: &str = "rustfs_system_network_internode_operation_server_duration_ms";
+const INTERNODE_RPC_ACTIVE: &str = "rustfs_system_network_internode_rpc_active";
+const INTERNODE_RPC_COMPLETIONS_TOTAL: &str = "rustfs_system_network_internode_rpc_completions_total";
+const INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL: &str = "rustfs_system_network_internode_channel_rebuild_attempts_total";
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+const INTERNODE_HTTP2_PING_TIMEOUTS_TOTAL: &str = "rustfs_system_network_internode_http2_ping_timeouts_total";
+const INTERNODE_BULK_BODY_WAIT_DURATION_MS: &str = "rustfs_system_network_internode_bulk_body_wait_duration_ms";
+const INTERNODE_BULK_BODY_WAITERS: &str = "rustfs_system_network_internode_bulk_body_waiters";
+const INTERNODE_BULK_BODY_ACTIVE: &str = "rustfs_system_network_internode_bulk_body_active";
+const INTERNODE_BULK_BODY_ADMISSIONS_TOTAL: &str = "rustfs_system_network_internode_bulk_body_admissions_total";
+const INTERNODE_OPERATION_STAGE_DURATION_MS: &str = "rustfs_system_network_internode_operation_stage_duration_ms";
 const INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_classified_errors_total";
 const INTERNODE_OPERATION_RETRIES_TOTAL: &str = "rustfs_system_network_internode_operation_retries_total";
 const INTERNODE_OPERATION_RETRY_SUCCESSES_TOTAL: &str = "rustfs_system_network_internode_operation_retry_successes_total";
+const INTERNODE_OPERATION_HTTP_VERSIONS_TOTAL: &str = "rustfs_system_network_internode_operation_http_versions_total";
+const INTERNODE_OPERATION_STALL_TIMEOUTS_TOTAL: &str = "rustfs_system_network_internode_operation_stall_timeouts_total";
+const INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL: &str =
+    "rustfs_system_network_internode_operation_write_shutdown_errors_total";
+const INTERNODE_RPC_AUTH_FAILURES_TOTAL: &str = "rustfs_system_network_internode_rpc_auth_failures_total";
+const INTERNODE_OPERATION_PAYLOAD_BYTES: &str = "rustfs_system_network_internode_operation_payload_bytes";
+const INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL: &str = "rustfs_system_network_internode_operation_large_payloads_total";
+const INTERNODE_MSGPACK_JSON_DECODE_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_decode_total";
+const INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_fallback_total";
+const INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL: &str = "rustfs_system_network_internode_msgpack_json_decode_error_total";
+const INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_signature_v1_fallback_total";
+const INTERNODE_BODY_DIGEST_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_body_digest_fallback_total";
+
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+tokio::task_local! {
+    static INTERNODE_HTTP2_CLIENT_TASK: ();
+}
+
+/// Scope a tonic/Hyper background task as an internode HTTP/2 client task.
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+pub async fn scope_internode_http2_client_task<T>(future: impl std::future::Future<Output = T>) -> T {
+    INTERNODE_HTTP2_CLIENT_TASK.scope((), future).await
+}
+
+/// Whether the current task belongs to an internode tonic/Hyper client.
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+pub fn is_internode_http2_client_task() -> bool {
+    INTERNODE_HTTP2_CLIENT_TASK.try_with(|()| ()).is_ok()
+}
+const INTERNODE_REPLAY_SCOPE_FALLBACK_TOTAL: &str = "rustfs_system_network_internode_replay_scope_fallback_total";
+const INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL: &str = "rustfs_system_network_internode_replay_cache_overflow_total";
+const INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL: &str =
+    "rustfs_system_network_internode_replay_cache_overflow_by_operation_total";
+const INTERNODE_REPLAY_CACHE_RECORDS_TOTAL: &str = "rustfs_system_network_internode_replay_cache_records_total";
+const INTERNODE_REPLAY_CACHE_ENTRIES: &str = "rustfs_system_network_internode_replay_cache_entries";
+const INTERNODE_REPLAY_CACHE_CAPACITY: &str = "rustfs_system_network_internode_replay_cache_capacity";
+const INTERNODE_REPLAY_CACHE_EVICTIONS_TOTAL: &str = "rustfs_system_network_internode_replay_cache_evictions_total";
 const ERASURE_WRITE_QUORUM_FAILURES_TOTAL: &str = "rustfs_system_storage_erasure_write_quorum_failures_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,48 +489,676 @@ pub struct InternodeOperationMetricDescriptor {
     pub labels: &'static [&'static str],
 }
 
-const OPERATION_BACKEND_LABELS: &[&str] = &[OPERATION_LABEL, BACKEND_LABEL];
-const OPERATION_BACKEND_CLASSIFICATION_LABELS: &[&str] = &[OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL];
-const QUORUM_FAILURE_LABELS: &[&str] = &[STAGE_LABEL, DOMINANT_ERROR_LABEL];
+const SERVER_OPERATION_BACKEND_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL];
+const SERVER_OPERATION_BACKEND_SIDE_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, "side"];
+const SERVER_OPERATION_BACKEND_OUTCOME_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, "outcome"];
+const SERVER_CLASS_REASON_OUTCOME_LABELS: &[&str] = &[SERVER_LABEL, "class", REASON_LABEL, "outcome"];
+const SERVER_OUTCOME_LABELS: &[&str] = &[SERVER_LABEL, "outcome"];
+const SERVER_OPERATION_BACKEND_CLASSIFICATION_LABELS: &[&str] =
+    &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL];
+const SERVER_OPERATION_BACKEND_HTTP_VERSION_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, HTTP_VERSION_LABEL];
+const SERVER_OPERATION_BACKEND_FAILURE_REASON_LABELS: &[&str] =
+    &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, FAILURE_REASON_LABEL];
+const SERVER_OPERATION_BACKEND_RPC_PATH_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL];
+const SERVER_OPERATION_BACKEND_STAGE_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, STAGE_LABEL];
+const SERVER_LABELS: &[&str] = &[SERVER_LABEL];
+const SERVER_REASON_LABELS: &[&str] = &[SERVER_LABEL, REASON_LABEL];
+const SERVER_QUORUM_FAILURE_LABELS: &[&str] = &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL];
 
 pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &[
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_SENT_BYTES_TOTAL,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_RECV_BYTES_TOTAL,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_ERRORS_TOTAL,
-        labels: OPERATION_BACKEND_LABELS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_DURATION_MS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_STAGE_DURATION_MS,
+        labels: SERVER_OPERATION_BACKEND_STAGE_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL,
-        labels: OPERATION_BACKEND_CLASSIFICATION_LABELS,
+        labels: SERVER_OPERATION_BACKEND_CLASSIFICATION_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_RETRIES_TOTAL,
-        labels: OPERATION_BACKEND_CLASSIFICATION_LABELS,
+        labels: SERVER_OPERATION_BACKEND_CLASSIFICATION_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: INTERNODE_OPERATION_RETRY_SUCCESSES_TOTAL,
-        labels: OPERATION_BACKEND_CLASSIFICATION_LABELS,
+        labels: SERVER_OPERATION_BACKEND_CLASSIFICATION_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_HTTP_VERSIONS_TOTAL,
+        labels: SERVER_OPERATION_BACKEND_HTTP_VERSION_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_STALL_TIMEOUTS_TOTAL,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_RPC_AUTH_FAILURES_TOTAL,
+        labels: SERVER_OPERATION_BACKEND_FAILURE_REASON_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL,
+        labels: SERVER_OPERATION_BACKEND_RPC_PATH_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_REPLAY_CACHE_RECORDS_TOTAL,
+        labels: SERVER_OPERATION_BACKEND_RPC_PATH_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_REPLAY_CACHE_ENTRIES,
+        labels: SERVER_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_REPLAY_CACHE_CAPACITY,
+        labels: SERVER_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_REPLAY_CACHE_EVICTIONS_TOTAL,
+        labels: SERVER_REASON_LABELS,
     },
     InternodeOperationMetricDescriptor {
         name: ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
-        labels: QUORUM_FAILURE_LABELS,
+        labels: SERVER_QUORUM_FAILURE_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_PAYLOAD_BYTES,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_SERVER_DURATION_MS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_RPC_ACTIVE,
+        labels: SERVER_OPERATION_BACKEND_SIDE_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_RPC_COMPLETIONS_TOTAL,
+        labels: SERVER_OPERATION_BACKEND_OUTCOME_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL,
+        labels: SERVER_CLASS_REASON_OUTCOME_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_BULK_BODY_WAIT_DURATION_MS,
+        labels: SERVER_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_BULK_BODY_WAITERS,
+        labels: SERVER_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_BULK_BODY_ACTIVE,
+        labels: SERVER_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_BULK_BODY_ADMISSIONS_TOTAL,
+        labels: SERVER_OUTCOME_LABELS,
     },
 ];
+
+static STABLE_SERVER_LABEL: OnceLock<String> = OnceLock::new();
+
+#[cfg(not(test))]
+struct InternodeServerMetricHandles {
+    sent_bytes: metrics::Counter,
+    recv_bytes: metrics::Counter,
+    outgoing_requests: metrics::Counter,
+    incoming_requests: metrics::Counter,
+    errors: metrics::Counter,
+}
+
+#[cfg(not(test))]
+impl InternodeServerMetricHandles {
+    fn new(server: &'static str) -> Self {
+        Self {
+            sent_bytes: counter!("rustfs_system_network_internode_sent_bytes_total", SERVER_LABEL => server),
+            recv_bytes: counter!("rustfs_system_network_internode_recv_bytes_total", SERVER_LABEL => server),
+            outgoing_requests: counter!("rustfs_system_network_internode_requests_outgoing_total", SERVER_LABEL => server),
+            incoming_requests: counter!("rustfs_system_network_internode_requests_incoming_total", SERVER_LABEL => server),
+            errors: counter!("rustfs_system_network_internode_errors_total", SERVER_LABEL => server),
+        }
+    }
+}
+
+#[cfg(not(test))]
+static INTERNODE_SERVER_METRIC_HANDLES: LazyLock<InternodeServerMetricHandles> =
+    LazyLock::new(|| InternodeServerMetricHandles::new(current_server_label()));
+
+/// Measures a unary handler from entry through its returned response or cancellation. The
+/// handler metric is separate from client round trips, which include transport and body decode.
+pub struct InternodeRpcDurationGuard {
+    started_at: Instant,
+    handles: UnaryRpcMetricHandles,
+    outcome: RpcOutcome,
+}
+
+#[derive(Clone)]
+struct UnaryRpcMetricHandles {
+    duration: metrics::Histogram,
+    active: metrics::Gauge,
+    completion: Option<(metrics::Counter, metrics::Counter, metrics::Counter)>,
+}
+
+#[derive(Clone, Copy)]
+enum RpcOutcome {
+    Success,
+    Error,
+    Cancelled,
+}
+
+impl UnaryRpcMetricHandles {
+    fn new(operation: &'static str, client: bool, detailed: bool) -> Self {
+        let server = current_server_label();
+        let duration_name = if client {
+            INTERNODE_OPERATION_DURATION_MS
+        } else {
+            INTERNODE_OPERATION_SERVER_DURATION_MS
+        };
+        let duration = metrics::histogram!(
+            duration_name,
+            SERVER_LABEL => server, OPERATION_LABEL => operation, BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+        );
+        let active = if detailed {
+            metrics::gauge!(
+                INTERNODE_RPC_ACTIVE,
+                SERVER_LABEL => server, OPERATION_LABEL => operation, BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC,
+                "side" => if client { "client" } else { "server" }
+            )
+        } else {
+            metrics::Gauge::noop()
+        };
+        let completion = (client && detailed).then(|| {
+            let counter = |outcome| {
+                metrics::counter!(
+                    INTERNODE_RPC_COMPLETIONS_TOTAL,
+                    SERVER_LABEL => server, OPERATION_LABEL => operation,
+                    BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC, "outcome" => outcome
+                )
+            };
+            (counter("success"), counter("error"), counter("cancelled"))
+        });
+        Self {
+            duration,
+            active,
+            completion,
+        }
+    }
+}
+
+// Register once after recorder installation and node identity publication. Before that point,
+// use uncached handles so startup no-op instruments cannot poison the process-lifetime cache.
+#[cfg(not(test))]
+fn cached_unary_rpc_handles(operation: &'static str, client: bool) -> Option<UnaryRpcMetricHandles> {
+    const OPERATIONS: [&str; 4] = [
+        INTERNODE_OPERATION_GRPC_READ_ALL,
+        INTERNODE_OPERATION_GRPC_WRITE_ALL,
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+    ];
+    static CLIENT: LazyLock<[UnaryRpcMetricHandles; 4]> =
+        LazyLock::new(|| OPERATIONS.map(|op| UnaryRpcMetricHandles::new(op, true, true)));
+    static SERVER: LazyLock<[UnaryRpcMetricHandles; 4]> =
+        LazyLock::new(|| OPERATIONS.map(|op| UnaryRpcMetricHandles::new(op, false, true)));
+    if !crate::metrics_enabled() {
+        return None;
+    }
+    STABLE_SERVER_LABEL.get()?;
+    let index = OPERATIONS.iter().position(|candidate| *candidate == operation)?;
+    Some(if client {
+        CLIENT[index].clone()
+    } else {
+        SERVER[index].clone()
+    })
+}
+
+impl InternodeRpcDurationGuard {
+    /// Start timing a server handler. `operation` must be a bounded RPC operation constant.
+    pub fn handler(operation: &'static str) -> Self {
+        Self::new(operation, false)
+    }
+
+    fn new(operation: &'static str, client: bool) -> Self {
+        #[cfg(not(test))]
+        let handles = cached_unary_rpc_handles(operation, client)
+            .unwrap_or_else(|| UnaryRpcMetricHandles::new(operation, client, crate::metrics_enabled()));
+        #[cfg(test)]
+        let handles = UnaryRpcMetricHandles::new(operation, client, crate::metrics_enabled());
+        handles.active.increment(1.0);
+        Self {
+            started_at: Instant::now(),
+            handles,
+            outcome: RpcOutcome::Cancelled,
+        }
+    }
+}
+
+impl Drop for InternodeRpcDurationGuard {
+    fn drop(&mut self) {
+        self.handles.duration.record(self.started_at.elapsed().as_secs_f64() * 1000.0);
+        self.handles.active.decrement(1.0);
+        if let Some((success, error, cancelled)) = &self.handles.completion {
+            match self.outcome {
+                RpcOutcome::Success => success,
+                RpcOutcome::Error => error,
+                RpcOutcome::Cancelled => cancelled,
+            }
+            .increment(1);
+        }
+    }
+}
+
+/// Measure one complete client unary attempt, including body consumption by the supplied
+/// future. Dropping a pending attempt records its elapsed time. General metrics enable the
+/// active gauge and success/error/cancelled completion counters alongside the duration.
+/// Transport deadlines returned by the future are errors; outer deadlines cancel the attempt.
+/// Retries should call this once per attempt. `operation` must be a bounded RPC constant.
+pub async fn measure_client_rpc<T, E>(
+    operation: &'static str,
+    future: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let mut guard = InternodeRpcDurationGuard::new(operation, true);
+    let result = future.await;
+    guard.outcome = if result.is_ok() {
+        RpcOutcome::Success
+    } else {
+        RpcOutcome::Error
+    };
+    result
+}
+
+/// Record one attempt to publish a replacement after a bounded cached-channel eviction.
+pub fn record_channel_rebuild_attempt(class: &'static str, reason: &'static str, connected: bool) {
+    if !crate::metrics_enabled() {
+        return;
+    }
+    let class = match class {
+        "control" | "bulk" | "recovery" => class,
+        _ => "unknown",
+    };
+    let reason = match reason {
+        "rpc_failure"
+        | "operation_timeout"
+        | "transport_failure"
+        | "lock_timeout"
+        | "lock_transport"
+        | "peer_probe"
+        | "tls_generation_changed"
+        | "manual" => reason,
+        _ => "unknown",
+    };
+    metrics::counter!(
+        INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL,
+        SERVER_LABEL => current_server_label(),
+        "class" => class,
+        REASON_LABEL => reason,
+        "outcome" => if connected { "connected" } else { "failed_or_cancelled" }
+    )
+    .increment(1);
+}
+
+/// Record one Hyper-confirmed HTTP/2 keepalive PING ACK timeout.
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+pub fn record_http2_ping_timeout() {
+    if !crate::metrics_enabled() {
+        return;
+    }
+    metrics::counter!(
+        INTERNODE_HTTP2_PING_TIMEOUTS_TOTAL,
+        SERVER_LABEL => current_server_label()
+    )
+    .increment(1);
+}
+
+#[derive(Clone)]
+struct BulkBodyAdmissionMetricHandles {
+    wait_duration: metrics::Histogram,
+    waiters: metrics::Gauge,
+    active: metrics::Gauge,
+    admitted: metrics::Counter,
+    cancelled: metrics::Counter,
+    timed_out: metrics::Counter,
+}
+
+impl BulkBodyAdmissionMetricHandles {
+    fn new() -> Self {
+        let server = current_server_label();
+        Self {
+            wait_duration: metrics::histogram!(INTERNODE_BULK_BODY_WAIT_DURATION_MS, SERVER_LABEL => server),
+            waiters: metrics::gauge!(INTERNODE_BULK_BODY_WAITERS, SERVER_LABEL => server),
+            active: metrics::gauge!(INTERNODE_BULK_BODY_ACTIVE, SERVER_LABEL => server),
+            admitted: metrics::counter!(
+                INTERNODE_BULK_BODY_ADMISSIONS_TOTAL,
+                SERVER_LABEL => server,
+                "outcome" => "admitted"
+            ),
+            cancelled: metrics::counter!(
+                INTERNODE_BULK_BODY_ADMISSIONS_TOTAL,
+                SERVER_LABEL => server,
+                "outcome" => "cancelled"
+            ),
+            timed_out: metrics::counter!(
+                INTERNODE_BULK_BODY_ADMISSIONS_TOTAL,
+                SERVER_LABEL => server,
+                "outcome" => "timeout"
+            ),
+        }
+    }
+}
+
+#[cfg(not(test))]
+static BULK_BODY_ADMISSION_METRICS: LazyLock<BulkBodyAdmissionMetricHandles> = LazyLock::new(BulkBodyAdmissionMetricHandles::new);
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BulkBodyAdmissionState {
+    Waiting,
+    Active,
+    Finished,
+}
+
+/// Tracks one wait for complete-unary admission and, after admission, keeps the active gauge
+/// elevated until the decoded and validated response is released.
+pub struct InternodeBulkBodyAdmissionGuard {
+    started_at: Option<Instant>,
+    handles: Option<BulkBodyAdmissionMetricHandles>,
+    state: BulkBodyAdmissionState,
+}
+
+impl InternodeBulkBodyAdmissionGuard {
+    pub fn waiting() -> Self {
+        #[cfg(not(test))]
+        let handles =
+            (crate::metrics_enabled() && STABLE_SERVER_LABEL.get().is_some()).then(|| BULK_BODY_ADMISSION_METRICS.clone());
+        #[cfg(test)]
+        let handles = crate::metrics_enabled().then(BulkBodyAdmissionMetricHandles::new);
+        if let Some(handles) = &handles {
+            handles.waiters.increment(1.0);
+        }
+        Self {
+            started_at: handles.as_ref().map(|_| Instant::now()),
+            handles,
+            state: BulkBodyAdmissionState::Waiting,
+        }
+    }
+
+    pub fn admitted(&mut self) {
+        if self.state == BulkBodyAdmissionState::Active {
+            return;
+        }
+        if let Some(handles) = &self.handles {
+            handles.waiters.decrement(1.0);
+            handles.active.increment(1.0);
+            handles.admitted.increment(1);
+            if let Some(started_at) = self.started_at.take() {
+                handles.wait_duration.record(started_at.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        self.state = BulkBodyAdmissionState::Active;
+    }
+
+    pub fn timed_out(&mut self) {
+        if self.state != BulkBodyAdmissionState::Waiting {
+            return;
+        }
+        if let Some(handles) = &self.handles {
+            handles.waiters.decrement(1.0);
+            handles.timed_out.increment(1);
+            if let Some(started_at) = self.started_at.take() {
+                handles.wait_duration.record(started_at.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+        self.state = BulkBodyAdmissionState::Finished;
+    }
+}
+
+impl Drop for InternodeBulkBodyAdmissionGuard {
+    fn drop(&mut self) {
+        let Some(handles) = &self.handles else {
+            return;
+        };
+        match self.state {
+            BulkBodyAdmissionState::Waiting => {
+                handles.waiters.decrement(1.0);
+                handles.cancelled.increment(1);
+                if let Some(started_at) = self.started_at.take() {
+                    handles.wait_duration.record(started_at.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            BulkBodyAdmissionState::Active => handles.active.decrement(1.0),
+            BulkBodyAdmissionState::Finished => {}
+        }
+    }
+}
+
+#[cfg(not(test))]
+struct GrpcReadVersionMetricHandles {
+    sent_bytes: metrics::Counter,
+    recv_bytes: metrics::Counter,
+    outgoing_requests: metrics::Counter,
+    incoming_requests: metrics::Counter,
+    errors: metrics::Counter,
+    duration: metrics::Histogram,
+    request_encode: metrics::Histogram,
+    request_decode: metrics::Histogram,
+    disk_read: metrics::Histogram,
+    response_json_encode: metrics::Histogram,
+    response_msgpack_encode: metrics::Histogram,
+    rpc_roundtrip: metrics::Histogram,
+    response_decode: metrics::Histogram,
+}
+
+#[cfg(not(test))]
+impl GrpcReadVersionMetricHandles {
+    fn new(server: &'static str) -> Self {
+        Self {
+            sent_bytes: counter!(
+                INTERNODE_OPERATION_SENT_BYTES_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            recv_bytes: counter!(
+                INTERNODE_OPERATION_RECV_BYTES_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            outgoing_requests: counter!(
+                INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            incoming_requests: counter!(
+                INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            errors: counter!(
+                INTERNODE_OPERATION_ERRORS_TOTAL,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            duration: metrics::histogram!(
+                INTERNODE_OPERATION_DURATION_MS,
+                SERVER_LABEL => server,
+                OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+                BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+            ),
+            request_encode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE),
+            request_decode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE),
+            disk_read: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_DISK_READ),
+            response_json_encode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE),
+            response_msgpack_encode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE),
+            rpc_roundtrip: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP),
+            response_decode: Self::stage_duration(server, INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE),
+        }
+    }
+
+    fn stage_duration(server: &'static str, stage: &'static str) -> metrics::Histogram {
+        metrics::histogram!(
+            INTERNODE_OPERATION_STAGE_DURATION_MS,
+            SERVER_LABEL => server,
+            OPERATION_LABEL => INTERNODE_OPERATION_GRPC_READ_VERSION,
+            BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC,
+            STAGE_LABEL => stage
+        )
+    }
+
+    fn stage_duration_for(&self, stage: &'static str) -> Option<&metrics::Histogram> {
+        match stage {
+            INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE => Some(&self.request_encode),
+            INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE => Some(&self.request_decode),
+            INTERNODE_STAGE_READ_VERSION_DISK_READ => Some(&self.disk_read),
+            INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE => Some(&self.response_json_encode),
+            INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE => Some(&self.response_msgpack_encode),
+            INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP => Some(&self.rpc_roundtrip),
+            INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE => Some(&self.response_decode),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(not(test))]
+static GRPC_READ_VERSION_METRIC_HANDLES: LazyLock<GrpcReadVersionMetricHandles> =
+    LazyLock::new(|| GrpcReadVersionMetricHandles::new(current_server_label()));
+
+#[cfg(not(test))]
+static GRPC_READ_MULTIPLE_DURATION: LazyLock<metrics::Histogram> = LazyLock::new(|| {
+    operation_duration_histogram(
+        INTERNODE_OPERATION_DURATION_MS,
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    )
+});
+
+#[cfg(not(test))]
+static GRPC_BATCH_READ_VERSION_DURATION: LazyLock<metrics::Histogram> = LazyLock::new(|| {
+    operation_duration_histogram(
+        INTERNODE_OPERATION_DURATION_MS,
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    )
+});
+
+#[cfg(not(test))]
+static GRPC_READ_MULTIPLE_SERVER_DURATION: LazyLock<metrics::Histogram> = LazyLock::new(|| {
+    operation_duration_histogram(
+        INTERNODE_OPERATION_SERVER_DURATION_MS,
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    )
+});
+
+#[cfg(not(test))]
+static GRPC_BATCH_READ_VERSION_SERVER_DURATION: LazyLock<metrics::Histogram> = LazyLock::new(|| {
+    operation_duration_histogram(
+        INTERNODE_OPERATION_SERVER_DURATION_MS,
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    )
+});
+
+#[cfg(not(test))]
+fn grpc_operation_duration_if_ready(operation: &'static str, backend: &'static str) -> Option<&'static metrics::Histogram> {
+    STABLE_SERVER_LABEL.get()?;
+    if backend != INTERNODE_TRANSPORT_BACKEND_GRPC {
+        return None;
+    }
+    match operation {
+        INTERNODE_OPERATION_GRPC_READ_VERSION => Some(&GRPC_READ_VERSION_METRIC_HANDLES.duration),
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE => Some(&GRPC_READ_MULTIPLE_DURATION),
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION => Some(&GRPC_BATCH_READ_VERSION_DURATION),
+        _ => None,
+    }
+}
+
+#[cfg(not(test))]
+fn grpc_server_duration_if_ready(operation: &'static str, backend: &'static str) -> Option<&'static metrics::Histogram> {
+    STABLE_SERVER_LABEL.get()?;
+    if backend != INTERNODE_TRANSPORT_BACKEND_GRPC {
+        return None;
+    }
+    match operation {
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE => Some(&GRPC_READ_MULTIPLE_SERVER_DURATION),
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION => Some(&GRPC_BATCH_READ_VERSION_SERVER_DURATION),
+        _ => None,
+    }
+}
+
+fn operation_duration_histogram(name: &'static str, operation: &'static str, backend: &'static str) -> metrics::Histogram {
+    metrics::histogram!(
+        name,
+        SERVER_LABEL => current_server_label(),
+        OPERATION_LABEL => operation,
+        BACKEND_LABEL => backend
+    )
+}
+
+#[cfg(not(test))]
+fn server_metric_handles_if_ready() -> Option<&'static InternodeServerMetricHandles> {
+    STABLE_SERVER_LABEL.get()?;
+    Some(&INTERNODE_SERVER_METRIC_HANDLES)
+}
+
+#[cfg(not(test))]
+fn grpc_read_version_metric_handles_if_ready(
+    operation: &'static str,
+    backend: &'static str,
+) -> Option<&'static GrpcReadVersionMetricHandles> {
+    STABLE_SERVER_LABEL.get()?;
+    if operation == INTERNODE_OPERATION_GRPC_READ_VERSION && backend == INTERNODE_TRANSPORT_BACKEND_GRPC {
+        Some(&GRPC_READ_VERSION_METRIC_HANDLES)
+    } else {
+        None
+    }
+}
+
+/// Injects the stable server label (node name or address) stamped on
+/// internode metrics. The runtime calls this when the local node name is
+/// published (see ecstore's `set_local_node_name`); the first write wins.
+/// io-metrics is a leaf crate and no longer resolves node identity itself
+/// (backlog#1834) — before injection the label reads "unset".
+pub fn set_internode_server_label(label: impl Into<String>) {
+    let _ = STABLE_SERVER_LABEL.set(label.into());
+}
+
+fn current_server_label() -> &'static str {
+    STABLE_SERVER_LABEL.get().map(String::as_str).unwrap_or("unset")
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InternodeMetricsSnapshot {
@@ -102,6 +1170,17 @@ pub struct InternodeMetricsSnapshot {
     pub dial_errors_total: u64,
     pub dial_avg_time_nanos: u64,
     pub last_dial_unix_millis: u64,
+    pub operation_http_versions_total: u64,
+    pub operation_stall_timeouts_total: u64,
+    pub operation_write_shutdown_errors_total: u64,
+    pub rpc_auth_failures_total: u64,
+    pub signature_v1_fallback_total: u64,
+    pub body_digest_fallback_total: u64,
+    pub replay_scope_fallback_total: u64,
+    pub replay_cache_overflow_total: u64,
+    pub replay_cache_entries: u64,
+    pub replay_cache_capacity: u64,
+    pub replay_cache_evictions_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -115,6 +1194,23 @@ pub struct InternodeMetrics {
     dial_total_time_nanos: AtomicU64,
     dial_samples_total: AtomicU64,
     last_dial_unix_millis: AtomicU64,
+    operation_http_versions_total: AtomicU64,
+    operation_stall_timeouts_total: AtomicU64,
+    operation_write_shutdown_errors_total: AtomicU64,
+    rpc_auth_failures_total: AtomicU64,
+    msgpack_json_decode_total: AtomicU64,
+    msgpack_json_decode_error_total: AtomicU64,
+    signature_v1_fallback_total: AtomicU64,
+    body_digest_fallback_total: AtomicU64,
+    replay_scope_fallback_total: AtomicU64,
+    replay_cache_overflow_total: AtomicU64,
+    replay_cache_entries: AtomicU64,
+    replay_cache_capacity: AtomicU64,
+    replay_cache_evictions_total: AtomicU64,
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 impl InternodeMetrics {
@@ -124,7 +1220,12 @@ impl InternodeMetrics {
             return;
         }
         self.sent_bytes_total.fetch_add(bytes, Ordering::Relaxed);
-        counter!("rustfs_system_network_internode_sent_bytes_total").increment(bytes);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.sent_bytes.increment(bytes);
+            return;
+        }
+        counter!("rustfs_system_network_internode_sent_bytes_total", SERVER_LABEL => current_server_label()).increment(bytes);
     }
 
     pub fn record_sent_bytes_for_operation(&self, operation: &'static str, bytes: usize) {
@@ -138,7 +1239,18 @@ impl InternodeMetrics {
         if bytes == 0 {
             return;
         }
-        counter!(INTERNODE_OPERATION_SENT_BYTES_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(bytes);
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.sent_bytes.increment(bytes);
+            return;
+        }
+        counter!(
+            INTERNODE_OPERATION_SENT_BYTES_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(bytes);
     }
 
     pub fn record_recv_bytes(&self, bytes: usize) {
@@ -147,7 +1259,12 @@ impl InternodeMetrics {
             return;
         }
         self.recv_bytes_total.fetch_add(bytes, Ordering::Relaxed);
-        counter!("rustfs_system_network_internode_recv_bytes_total").increment(bytes);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.recv_bytes.increment(bytes);
+            return;
+        }
+        counter!("rustfs_system_network_internode_recv_bytes_total", SERVER_LABEL => current_server_label()).increment(bytes);
     }
 
     pub fn record_recv_bytes_for_operation(&self, operation: &'static str, bytes: usize) {
@@ -161,12 +1278,28 @@ impl InternodeMetrics {
         if bytes == 0 {
             return;
         }
-        counter!(INTERNODE_OPERATION_RECV_BYTES_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(bytes);
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.recv_bytes.increment(bytes);
+            return;
+        }
+        counter!(
+            INTERNODE_OPERATION_RECV_BYTES_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(bytes);
     }
 
     pub fn record_outgoing_request(&self) {
         self.outgoing_requests_total.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs_system_network_internode_requests_outgoing_total").increment(1);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.outgoing_requests.increment(1);
+            return;
+        }
+        counter!("rustfs_system_network_internode_requests_outgoing_total", SERVER_LABEL => current_server_label()).increment(1);
     }
 
     pub fn record_outgoing_request_for_operation(&self, operation: &'static str) {
@@ -175,13 +1308,28 @@ impl InternodeMetrics {
 
     pub fn record_outgoing_request_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_outgoing_request();
-        counter!(INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend)
-            .increment(1);
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.outgoing_requests.increment(1);
+            return;
+        }
+        counter!(
+            INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(1);
     }
 
     pub fn record_incoming_request(&self) {
         self.incoming_requests_total.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs_system_network_internode_requests_incoming_total").increment(1);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.incoming_requests.increment(1);
+            return;
+        }
+        counter!("rustfs_system_network_internode_requests_incoming_total", SERVER_LABEL => current_server_label()).increment(1);
     }
 
     pub fn record_incoming_request_for_operation(&self, operation: &'static str) {
@@ -190,13 +1338,28 @@ impl InternodeMetrics {
 
     pub fn record_incoming_request_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_incoming_request();
-        counter!(INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend)
-            .increment(1);
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.incoming_requests.increment(1);
+            return;
+        }
+        counter!(
+            INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(1);
     }
 
     pub fn record_error(&self) {
         self.errors_total.fetch_add(1, Ordering::Relaxed);
-        counter!("rustfs_system_network_internode_errors_total").increment(1);
+        #[cfg(not(test))]
+        if let Some(handles) = server_metric_handles_if_ready() {
+            handles.errors.increment(1);
+            return;
+        }
+        counter!("rustfs_system_network_internode_errors_total", SERVER_LABEL => current_server_label()).increment(1);
     }
 
     pub fn record_error_for_operation(&self, operation: &'static str) {
@@ -205,7 +1368,70 @@ impl InternodeMetrics {
 
     pub fn record_error_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
         self.record_error();
-        counter!(INTERNODE_OPERATION_ERRORS_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(1);
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
+            handles.errors.increment(1);
+            return;
+        }
+        counter!(
+            INTERNODE_OPERATION_ERRORS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(1);
+    }
+
+    pub fn record_duration_for_operation_and_backend(&self, operation: &'static str, backend: &'static str, duration: Duration) {
+        let duration_ms = duration.as_secs_f64() * 1000.0;
+        #[cfg(not(test))]
+        if let Some(histogram) = grpc_operation_duration_if_ready(operation, backend) {
+            histogram.record(duration_ms);
+            return;
+        }
+        operation_duration_histogram(INTERNODE_OPERATION_DURATION_MS, operation, backend).record(duration_ms);
+    }
+
+    /// Records server-side handler latency in a separate histogram from client RPC duration.
+    /// The caller supplies the handler lifetime, including any error or cancellation path.
+    pub fn record_server_duration_for_operation_and_backend(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        duration: Duration,
+    ) {
+        let duration_ms = duration.as_secs_f64() * 1000.0;
+        #[cfg(not(test))]
+        if let Some(histogram) = grpc_server_duration_if_ready(operation, backend) {
+            histogram.record(duration_ms);
+            return;
+        }
+        operation_duration_histogram(INTERNODE_OPERATION_SERVER_DURATION_MS, operation, backend).record(duration_ms);
+    }
+
+    pub fn record_stage_duration_for_operation_and_backend(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        stage: &'static str,
+        duration: Duration,
+    ) {
+        let duration_ms = duration.as_secs_f64() * 1000.0;
+        #[cfg(not(test))]
+        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend)
+            && let Some(histogram) = handles.stage_duration_for(stage)
+        {
+            histogram.record(duration_ms);
+            return;
+        }
+        metrics::histogram!(
+            INTERNODE_OPERATION_STAGE_DURATION_MS,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            STAGE_LABEL => stage
+        )
+        .record(duration_ms);
     }
 
     pub fn record_classified_error_for_operation_and_backend(
@@ -216,6 +1442,7 @@ impl InternodeMetrics {
     ) {
         counter!(
             INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL,
+            SERVER_LABEL => current_server_label(),
             OPERATION_LABEL => operation,
             BACKEND_LABEL => backend,
             CLASSIFICATION_LABEL => classification
@@ -231,6 +1458,7 @@ impl InternodeMetrics {
     ) {
         counter!(
             INTERNODE_OPERATION_RETRIES_TOTAL,
+            SERVER_LABEL => current_server_label(),
             OPERATION_LABEL => operation,
             BACKEND_LABEL => backend,
             CLASSIFICATION_LABEL => classification
@@ -246,6 +1474,7 @@ impl InternodeMetrics {
     ) {
         counter!(
             INTERNODE_OPERATION_RETRY_SUCCESSES_TOTAL,
+            SERVER_LABEL => current_server_label(),
             OPERATION_LABEL => operation,
             BACKEND_LABEL => backend,
             CLASSIFICATION_LABEL => classification
@@ -253,9 +1482,236 @@ impl InternodeMetrics {
         .increment(1);
     }
 
+    pub fn record_http_version_for_operation_and_backend(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        http_version: &'static str,
+    ) {
+        self.operation_http_versions_total.fetch_add(1, Ordering::Relaxed);
+        counter!(
+            INTERNODE_OPERATION_HTTP_VERSIONS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            HTTP_VERSION_LABEL => http_version
+        )
+        .increment(1);
+    }
+
+    pub fn record_stall_timeout_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
+        self.operation_stall_timeouts_total.fetch_add(1, Ordering::Relaxed);
+        counter!(
+            INTERNODE_OPERATION_STALL_TIMEOUTS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(1);
+    }
+
+    pub fn record_write_shutdown_error_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
+        self.operation_write_shutdown_errors_total.fetch_add(1, Ordering::Relaxed);
+        counter!(
+            INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(1);
+    }
+
+    pub fn record_rpc_auth_failure_for_operation_and_backend(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        failure_reason: &'static str,
+    ) {
+        self.rpc_auth_failures_total.fetch_add(1, Ordering::Relaxed);
+        counter!(
+            INTERNODE_RPC_AUTH_FAILURES_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            FAILURE_REASON_LABEL => failure_reason
+        )
+        .increment(1);
+    }
+
+    /// Record the payload size (bytes) of a completed internode operation into a histogram
+    /// keyed by operation+backend. Used to size which unary `bytes`-carrying RPCs
+    /// (`ReadAll`/`ReadMultiple`/`WriteAll`) would benefit from being moved off the shared
+    /// control-plane channel (see docs/grpc-optimization P1).
+    pub fn record_operation_payload_bytes(&self, operation: &'static str, backend: &'static str, bytes: usize) {
+        metrics::histogram!(
+            INTERNODE_OPERATION_PAYLOAD_BYTES,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .record(bytes as f64);
+    }
+
+    /// Increment the large-payload counter for an operation+backend whose payload exceeded the
+    /// caller-configured warning threshold. Feeds alerting on large unary RPCs that contend with
+    /// latency-sensitive control-plane traffic on the shared connection.
+    pub fn record_large_operation_payload(&self, operation: &'static str, backend: &'static str) {
+        counter!(
+            INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend
+        )
+        .increment(1);
+    }
+
+    /// Count a decode that fell back to the JSON compatibility field because the msgpack `_bin`
+    /// payload was absent. Both internode RPC directions dual-encode msgpack + JSON today; this
+    /// counter must read zero across a release window before the redundant JSON fields can be
+    /// dropped (grpc-optimization P2). `direction` is [`INTERNODE_MSGPACK_DIRECTION_REQUEST`] or
+    /// [`INTERNODE_MSGPACK_DIRECTION_RESPONSE`]; `message` is the low-cardinality value name.
+    pub fn record_msgpack_json_fallback(&self, direction: &'static str, message: &'static str) {
+        counter!(
+            INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            DIRECTION_LABEL => direction,
+            MESSAGE_LABEL => message
+        )
+        .increment(1);
+    }
+
+    pub fn record_msgpack_json_decode(&self, direction: &'static str, message: &'static str, codec: &'static str) {
+        self.msgpack_json_decode_total.fetch_add(1, Ordering::Relaxed);
+        counter!(
+            INTERNODE_MSGPACK_JSON_DECODE_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            DIRECTION_LABEL => direction,
+            MESSAGE_LABEL => message,
+            CODEC_LABEL => codec
+        )
+        .increment(1);
+    }
+
+    pub fn record_msgpack_json_decode_error(&self, direction: &'static str, message: &'static str, codec: &'static str) {
+        self.msgpack_json_decode_error_total.fetch_add(1, Ordering::Relaxed);
+        counter!(
+            INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            DIRECTION_LABEL => direction,
+            MESSAGE_LABEL => message,
+            CODEC_LABEL => codec
+        )
+        .increment(1);
+    }
+
+    #[doc(hidden)]
+    pub fn msgpack_json_decode_error_total_for_test(&self) -> u64 {
+        self.msgpack_json_decode_error_total.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn msgpack_json_decode_total_for_test(&self) -> u64 {
+        self.msgpack_json_decode_total.load(Ordering::Relaxed)
+    }
+
+    /// Count an internode gRPC request that was accepted through the legacy constant-target
+    /// signature because it carried no v2 auth headers (rolling-upgrade fallback, see
+    /// <https://github.com/rustfs/backlog/issues/1327>). Only accepted requests count: rejected
+    /// requests never authenticated, so they are not a rollout signal. This counter must read zero
+    /// across a release window fleet-wide before `RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT` may be
+    /// enabled; after the strict flip the legacy fallback path is closed and the counter stays flat.
+    pub fn record_signature_v1_fallback(&self) {
+        self.signature_v1_fallback_total.fetch_add(1, Ordering::Relaxed);
+        counter!(INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL, SERVER_LABEL => current_server_label()).increment(1);
+    }
+
+    /// Count a mutating internode disk RPC that was accepted without a signature-bound canonical
+    /// body digest (rolling-upgrade fallback, see
+    /// <https://github.com/rustfs/backlog/issues/1327>). Only accepted requests count. This counter
+    /// must read zero across a release window fleet-wide before
+    /// `RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT` may be enabled; after the strict flip digestless
+    /// mutations are rejected and the counter stays flat.
+    pub fn record_body_digest_fallback(&self) {
+        self.body_digest_fallback_total.fetch_add(1, Ordering::Relaxed);
+        counter!(INTERNODE_BODY_DIGEST_FALLBACK_TOTAL, SERVER_LABEL => current_server_label()).increment(1);
+    }
+
+    /// Count an accepted v1/v2 request that does not carry the replay-scoped signature. This is
+    /// the convergence signal for `RUSTFS_INTERNODE_RPC_REPLAY_SCOPE_STRICT`.
+    pub fn record_replay_scope_fallback(&self) {
+        self.replay_scope_fallback_total.fetch_add(1, Ordering::Relaxed);
+        counter!(INTERNODE_REPLAY_SCOPE_FALLBACK_TOTAL, SERVER_LABEL => current_server_label()).increment(1);
+    }
+
+    /// Count a body-bound internode RPC rejected because the replay-protection nonce cache was
+    /// full. Overflow fails closed, so a sustained non-zero rate means
+    /// `RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY` is undersized for this node's peak legitimate
+    /// mutation rate and writes are being refused — alert on this counter.
+    pub fn record_replay_cache_overflow(&self) {
+        self.replay_cache_overflow_total.fetch_add(1, Ordering::Relaxed);
+        counter!(INTERNODE_REPLAY_CACHE_OVERFLOW_TOTAL, SERVER_LABEL => current_server_label()).increment(1);
+    }
+
+    pub fn record_replay_cache_overflow_for_operation_and_backend_path(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        rpc_path: &str,
+    ) {
+        self.record_replay_cache_overflow();
+        counter!(
+            INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            RPC_PATH_LABEL => rpc_path.to_owned()
+        )
+        .increment(1);
+    }
+
+    pub fn record_replay_cache_record_for_operation_and_backend_path(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        rpc_path: &str,
+    ) {
+        counter!(
+            INTERNODE_REPLAY_CACHE_RECORDS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            RPC_PATH_LABEL => rpc_path.to_owned()
+        )
+        .increment(1);
+    }
+
+    pub fn record_replay_cache_state(&self, entries: usize, capacity: usize) {
+        let entries = usize_to_u64_saturating(entries);
+        let capacity = usize_to_u64_saturating(capacity);
+        self.replay_cache_entries.store(entries, Ordering::Relaxed);
+        self.replay_cache_capacity.store(capacity, Ordering::Relaxed);
+        gauge!(INTERNODE_REPLAY_CACHE_ENTRIES, SERVER_LABEL => current_server_label()).set(entries as f64);
+        gauge!(INTERNODE_REPLAY_CACHE_CAPACITY, SERVER_LABEL => current_server_label()).set(capacity as f64);
+    }
+
+    pub fn record_replay_cache_evictions(&self, reason: &'static str, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let count = usize_to_u64_saturating(count);
+        self.replay_cache_evictions_total.fetch_add(count, Ordering::Relaxed);
+        counter!(
+            INTERNODE_REPLAY_CACHE_EVICTIONS_TOTAL,
+            SERVER_LABEL => current_server_label(),
+            REASON_LABEL => reason
+        )
+        .increment(count);
+    }
+
     pub fn record_erasure_write_quorum_failure(&self, stage: &'static str, dominant_error: &'static str) {
         counter!(
             ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
+            SERVER_LABEL => current_server_label(),
             STAGE_LABEL => stage,
             DOMINANT_ERROR_LABEL => dominant_error
         )
@@ -267,11 +1723,12 @@ impl InternodeMetrics {
         self.dial_total_time_nanos.fetch_add(elapsed_nanos, Ordering::Relaxed);
         let samples = self.dial_samples_total.fetch_add(1, Ordering::Relaxed) + 1;
         let total = self.dial_total_time_nanos.load(Ordering::Relaxed);
-        gauge!("rustfs_system_network_internode_dial_avg_time_nanos").set(total as f64 / samples as f64);
+        gauge!("rustfs_system_network_internode_dial_avg_time_nanos", SERVER_LABEL => current_server_label())
+            .set(total as f64 / samples as f64);
 
         if !success {
             self.dial_errors_total.fetch_add(1, Ordering::Relaxed);
-            counter!("rustfs_system_network_internode_dial_errors_total").increment(1);
+            counter!("rustfs_system_network_internode_dial_errors_total", SERVER_LABEL => current_server_label()).increment(1);
         }
 
         let now_ms = SystemTime::now()
@@ -296,6 +1753,17 @@ impl InternodeMetrics {
             dial_errors_total: self.dial_errors_total.load(Ordering::Relaxed),
             dial_avg_time_nanos,
             last_dial_unix_millis: self.last_dial_unix_millis.load(Ordering::Relaxed),
+            operation_http_versions_total: self.operation_http_versions_total.load(Ordering::Relaxed),
+            operation_stall_timeouts_total: self.operation_stall_timeouts_total.load(Ordering::Relaxed),
+            operation_write_shutdown_errors_total: self.operation_write_shutdown_errors_total.load(Ordering::Relaxed),
+            rpc_auth_failures_total: self.rpc_auth_failures_total.load(Ordering::Relaxed),
+            signature_v1_fallback_total: self.signature_v1_fallback_total.load(Ordering::Relaxed),
+            body_digest_fallback_total: self.body_digest_fallback_total.load(Ordering::Relaxed),
+            replay_scope_fallback_total: self.replay_scope_fallback_total.load(Ordering::Relaxed),
+            replay_cache_overflow_total: self.replay_cache_overflow_total.load(Ordering::Relaxed),
+            replay_cache_entries: self.replay_cache_entries.load(Ordering::Relaxed),
+            replay_cache_capacity: self.replay_cache_capacity.load(Ordering::Relaxed),
+            replay_cache_evictions_total: self.replay_cache_evictions_total.load(Ordering::Relaxed),
         }
     }
 
@@ -310,6 +1778,19 @@ impl InternodeMetrics {
         self.dial_total_time_nanos.store(0, Ordering::Relaxed);
         self.dial_samples_total.store(0, Ordering::Relaxed);
         self.last_dial_unix_millis.store(0, Ordering::Relaxed);
+        self.operation_http_versions_total.store(0, Ordering::Relaxed);
+        self.operation_stall_timeouts_total.store(0, Ordering::Relaxed);
+        self.operation_write_shutdown_errors_total.store(0, Ordering::Relaxed);
+        self.rpc_auth_failures_total.store(0, Ordering::Relaxed);
+        self.msgpack_json_decode_total.store(0, Ordering::Relaxed);
+        self.msgpack_json_decode_error_total.store(0, Ordering::Relaxed);
+        self.signature_v1_fallback_total.store(0, Ordering::Relaxed);
+        self.body_digest_fallback_total.store(0, Ordering::Relaxed);
+        self.replay_scope_fallback_total.store(0, Ordering::Relaxed);
+        self.replay_cache_overflow_total.store(0, Ordering::Relaxed);
+        self.replay_cache_entries.store(0, Ordering::Relaxed);
+        self.replay_cache_capacity.store(0, Ordering::Relaxed);
+        self.replay_cache_evictions_total.store(0, Ordering::Relaxed);
     }
 }
 
@@ -318,9 +1799,338 @@ pub fn global_internode_metrics() -> &'static Arc<InternodeMetrics> {
     &GLOBAL_INTERNODE_METRICS
 }
 
+// ── Cluster peer online/offline health (grpc-optimization P3) ──
+// Tracks reachability of each internode peer and exposes the count of offline peers as a gauge,
+// for parity with MinIO's `minio_cluster_servers_offline_total`. This is pure observability: it
+// does not change peer selection or quorum. A peer flips offline after a configured number of
+// consecutive failures and back online on the next successful dial.
+
+/// Gauge: number of internode peers currently considered offline.
+const CLUSTER_SERVERS_OFFLINE_TOTAL: &str = "rustfs_cluster_servers_offline_total";
+
+#[derive(Debug)]
+struct PeerHealthState {
+    online: bool,
+    consecutive_failures: u32,
+    /// Last time a request was let through to re-probe an offline peer (grpc-optimization P3
+    /// offline bypass). `None` means "not yet re-probed since going offline".
+    last_reprobe: Option<Instant>,
+}
+
+impl Default for PeerHealthState {
+    fn default() -> Self {
+        // A newly observed peer is assumed online until it accrues failures.
+        Self {
+            online: true,
+            consecutive_failures: 0,
+            last_reprobe: None,
+        }
+    }
+}
+
+/// Read-mostly: the hot `cluster_peer_should_bypass` check per internode RPC only
+/// reads the map for the common (unknown/online) peer; a `RwLock` lets those run
+/// concurrently instead of serializing every internode RPC on one mutex. Writes
+/// (dial reachable/unreachable, and recording an offline peer's re-probe) are rare.
+static CLUSTER_PEER_HEALTH: LazyLock<RwLock<HashMap<String, PeerHealthState>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn publish_offline_gauge(peers: &HashMap<String, PeerHealthState>) {
+    let offline = peers.values().filter(|peer| !peer.online).count();
+    gauge!(CLUSTER_SERVERS_OFFLINE_TOTAL).set(offline as f64);
+}
+
+/// Canonicalize a peer address before using it as the `CLUSTER_PEER_HEALTH` key.
+///
+/// The same physical peer is referenced by different subsystems in slightly different string forms
+/// — the data path keys by `endpoint.grid_host()` (`scheme://host:port`, no trailing slash) while
+/// the lock path keys by `url::Url::to_string()` (`scheme://host:port/`, trailing slash). Without
+/// normalization each form becomes its own health entry, so one downed node counts as 2 in the
+/// `rustfs_cluster_servers_offline_total` gauge (and 2N for N nodes). Trimming trailing slashes
+/// collapses them to a single canonical key.
+fn normalize_peer_key(addr: &str) -> &str {
+    addr.trim_end_matches('/')
+}
+
+/// Record that a cluster peer is reachable: mark it online and reset its consecutive-failure
+/// counter. Called on a successful dial to `addr`.
+pub fn record_peer_reachable(addr: &str) {
+    // Recover from a poisoned lock so peer-health tracking and the offline gauge never stall permanently.
+    let mut peers = CLUSTER_PEER_HEALTH.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = peers.entry(normalize_peer_key(addr).to_string()).or_default();
+    entry.online = true;
+    entry.consecutive_failures = 0;
+    entry.last_reprobe = None;
+    publish_offline_gauge(&peers);
+}
+
+/// Record a successful interaction with a cluster peer, but only when the peer is currently
+/// marked offline. This is the fast recovery path for cached-channel RPCs, recovery probes,
+/// and lock-path successes that do not go through a fresh dial.
+///
+/// Fast path (peer unknown or already online): a shared read lock, no write, no gauge
+/// republish — the overwhelmingly common case on a healthy cluster. Slow path (offline →
+/// online transition): upgrades to the write lock and delegates to [`record_peer_reachable`].
+pub fn record_peer_reachable_if_offline(addr: &str) {
+    let key = normalize_peer_key(addr);
+    // Fast path: read lock to check whether the peer is currently offline.
+    {
+        let peers = CLUSTER_PEER_HEALTH.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match peers.get(key) {
+            None => return,
+            Some(entry) if entry.online => return,
+            Some(_) => {} // offline: fall through to the write path
+        }
+    }
+    // Slow path: the peer is offline, so flip it back online and republish the gauge.
+    record_peer_reachable(addr);
+}
+
+/// Record a failed interaction with a cluster peer (dial failure or RPC-triggered eviction). After
+/// `failure_threshold` (>= 1) consecutive failures the peer flips offline.
+pub fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
+    // Recover from a poisoned lock so peer-health tracking and the offline gauge never stall permanently.
+    let mut peers = CLUSTER_PEER_HEALTH.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = peers.entry(normalize_peer_key(addr).to_string()).or_default();
+    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+    if entry.consecutive_failures >= failure_threshold.max(1) {
+        entry.online = false;
+    }
+    publish_offline_gauge(&peers);
+}
+
+/// Whether a cluster peer is currently considered offline (known and marked offline).
+pub fn cluster_peer_is_offline(addr: &str) -> bool {
+    let peers = CLUSTER_PEER_HEALTH.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    peers.get(normalize_peer_key(addr)).map(|peer| !peer.online).unwrap_or(false)
+}
+
+/// Return the last observed online/offline state for a peer, if this process has observed one.
+pub fn cluster_peer_observed_online_status(addr: &str) -> Option<bool> {
+    let peers = CLUSTER_PEER_HEALTH.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    peers.get(normalize_peer_key(addr)).map(|peer| peer.online)
+}
+
+/// Decide whether to fast-fail (bypass) an offline peer instead of attempting to reach it
+/// (grpc-optimization P3 offline bypass). Returns `true` to bypass.
+///
+/// Self-healing: for an offline peer this returns `true` most of the time, but lets one request
+/// through every `reprobe_interval` (returning `false` and recording the re-probe time) so the peer
+/// can recover via a normal dial even if no background monitor is running. Online peers are never
+/// bypassed.
+pub fn cluster_peer_should_bypass(addr: &str, reprobe_interval: Duration) -> bool {
+    let key = normalize_peer_key(addr);
+
+    // Fast path: the overwhelmingly common cases — an unknown peer or an online
+    // one — are read-only, so take a shared read lock and let concurrent internode
+    // RPCs check peer health without serializing on a single lock.
+    {
+        let peers = CLUSTER_PEER_HEALTH.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match peers.get(key) {
+            None => return false,
+            Some(entry) if entry.online => return false,
+            Some(_) => {} // offline: fall through to the write path below
+        }
+    }
+
+    // Slow path: the peer is offline, which may require recording a re-probe, so
+    // take the write lock. Re-fetch and re-check because the state can change
+    // between releasing the read lock and acquiring the write lock (e.g. a
+    // successful dial flipped it back online).
+    let mut peers = CLUSTER_PEER_HEALTH.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(entry) = peers.get_mut(key) else {
+        return false;
+    };
+    if entry.online {
+        return false;
+    }
+    let now = Instant::now();
+    let due = match entry.last_reprobe {
+        None => true,
+        Some(last) => now.duration_since(last) >= reprobe_interval,
+    };
+    if due {
+        // Let this request through to re-probe; do not bypass.
+        entry.last_reprobe = Some(now);
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(test)]
+fn cluster_peer_online(addr: &str) -> Option<bool> {
+    CLUSTER_PEER_HEALTH
+        .read()
+        .ok()?
+        .get(normalize_peer_key(addr))
+        .map(|peer| peer.online)
+}
+
+#[cfg(test)]
+fn cluster_peer_health_keys() -> Vec<String> {
+    CLUSTER_PEER_HEALTH
+        .read()
+        .map(|peers| peers.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics::with_local_recorder;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn unary_rpc_metrics_separate_handler_and_client_and_cover_cancellation() {
+        use std::future::{Future, pending};
+        use std::task::{Context, Poll, Waker};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let previously_enabled = crate::metrics_enabled();
+        crate::set_metrics_enabled(true);
+        with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let operation = INTERNODE_OPERATION_GRPC_READ_MULTIPLE;
+                assert_eq!(measure_client_rpc(operation, async { Ok::<_, ()>(7) }).await, Ok(7));
+                assert_eq!(measure_client_rpc(operation, async { Err::<(), _>("transport") }).await, Err("transport"));
+                let mut cancelled = Box::pin(measure_client_rpc(operation, pending::<Result<(), ()>>()));
+                assert!(matches!(cancelled.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+                drop(cancelled);
+                drop(InternodeRpcDurationGuard::handler(operation));
+            });
+        });
+        crate::set_metrics_enabled(previously_enabled);
+        let entries = snapshotter.snapshot().into_vec();
+        let histogram_samples = |name| {
+            entries
+                .iter()
+                .find_map(|(key, _, _, value)| {
+                    if key.key().name() != name {
+                        return None;
+                    }
+                    match value {
+                        DebugValue::Histogram(values) => Some(values.len()),
+                        _ => None,
+                    }
+                })
+                .expect("duration histogram")
+        };
+        assert_eq!(histogram_samples(INTERNODE_OPERATION_DURATION_MS), 3);
+        assert_eq!(histogram_samples(INTERNODE_OPERATION_SERVER_DURATION_MS), 1);
+        let mut outcomes = HashSet::new();
+        let mut active_sides = HashSet::new();
+        for (key, _, _, value) in entries {
+            match key.key().name() {
+                INTERNODE_RPC_COMPLETIONS_TOTAL => {
+                    assert!(matches!(value, DebugValue::Counter(1)));
+                    outcomes.insert(
+                        key.key()
+                            .labels()
+                            .find(|label| label.key() == "outcome")
+                            .expect("outcome")
+                            .value()
+                            .to_owned(),
+                    );
+                }
+                INTERNODE_RPC_ACTIVE => {
+                    assert!(matches!(value, DebugValue::Gauge(value) if value.into_inner() == 0.0));
+                    active_sides.insert(
+                        key.key()
+                            .labels()
+                            .find(|label| label.key() == "side")
+                            .expect("side")
+                            .value()
+                            .to_owned(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            outcomes,
+            HashSet::from(["success".to_owned(), "error".to_owned(), "cancelled".to_owned()])
+        );
+        assert_eq!(active_sides, HashSet::from(["client".to_owned(), "server".to_owned()]));
+    }
+
+    #[test]
+    fn transport_lifecycle_metrics_use_bounded_labels() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let previously_enabled = crate::metrics_enabled();
+        crate::set_metrics_enabled(true);
+        with_local_recorder(&recorder, || {
+            record_channel_rebuild_attempt("bulk", "tls_generation_changed", true);
+            record_channel_rebuild_attempt("control", "transport_failure", false);
+            record_channel_rebuild_attempt("untrusted-class", "untrusted-reason", false);
+            #[cfg(feature = "diagnostic-internode-http2-ping")]
+            record_http2_ping_timeout();
+        });
+        crate::set_metrics_enabled(previously_enabled);
+        let entries = snapshotter.snapshot().into_vec();
+        let rebuild = entries
+            .iter()
+            .filter(|(key, _, _, _)| key.key().name() == INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL)
+            .count();
+        assert_eq!(rebuild, 3);
+        assert!(entries.iter().any(|(key, _, _, _)| {
+            key.key().name() == INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL
+                && key.key().labels().filter(|label| label.value() == "unknown").count() == 2
+        }));
+        #[cfg(feature = "diagnostic-internode-http2-ping")]
+        assert!(entries.iter().any(|(key, _, _, value)| {
+            key.key().name() == INTERNODE_HTTP2_PING_TIMEOUTS_TOTAL && matches!(value, DebugValue::Counter(1))
+        }));
+    }
+
+    #[test]
+    fn bulk_body_admission_metrics_balance_wait_cancel_and_active() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let previously_enabled = crate::metrics_enabled();
+        crate::set_metrics_enabled(true);
+        with_local_recorder(&recorder, || {
+            drop(InternodeBulkBodyAdmissionGuard::waiting());
+            let mut active = InternodeBulkBodyAdmissionGuard::waiting();
+            active.admitted();
+            drop(active);
+            let mut timed_out = InternodeBulkBodyAdmissionGuard::waiting();
+            timed_out.timed_out();
+            drop(timed_out);
+        });
+        crate::set_metrics_enabled(previously_enabled);
+        let entries = snapshotter.snapshot().into_vec();
+        for name in [INTERNODE_BULK_BODY_WAITERS, INTERNODE_BULK_BODY_ACTIVE] {
+            let value = entries
+                .iter()
+                .find(|(key, _, _, _)| key.key().name() == name)
+                .map(|(_, _, _, value)| value)
+                .expect("admission gauge");
+            assert!(matches!(value, DebugValue::Gauge(value) if value.into_inner() == 0.0));
+        }
+        let outcomes = entries
+            .iter()
+            .filter(|(key, _, _, _)| key.key().name() == INTERNODE_BULK_BODY_ADMISSIONS_TOTAL)
+            .map(|(key, _, _, value)| {
+                assert!(matches!(value, DebugValue::Counter(1)));
+                key.key()
+                    .labels()
+                    .find(|label| label.key() == "outcome")
+                    .expect("outcome")
+                    .value()
+                    .to_owned()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            outcomes,
+            HashSet::from(["admitted".to_owned(), "cancelled".to_owned(), "timeout".to_owned()])
+        );
+    }
 
     #[test]
     fn snapshot_reports_recorded_values() {
@@ -371,6 +2181,13 @@ mod tests {
             INTERNODE_TRANSPORT_BACKEND_GRPC,
         );
         metrics.record_error_for_operation_and_backend(INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP);
+        metrics.record_rpc_auth_failure_for_operation_and_backend(
+            INTERNODE_OPERATION_GRPC_OTHER,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            "missing_v2_signature",
+        );
+        metrics.record_replay_cache_state(64, 1024);
+        metrics.record_replay_cache_evictions("expired", 3);
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.sent_bytes_total, 128);
@@ -378,27 +2195,187 @@ mod tests {
         assert_eq!(snapshot.outgoing_requests_total, 1);
         assert_eq!(snapshot.incoming_requests_total, 1);
         assert_eq!(snapshot.errors_total, 1);
+        assert_eq!(snapshot.rpc_auth_failures_total, 1);
+        assert_eq!(snapshot.replay_cache_entries, 64);
+        assert_eq!(snapshot.replay_cache_capacity, 1024);
+        assert_eq!(snapshot.replay_cache_evictions_total, 3);
+    }
+
+    #[test]
+    fn read_version_caller_metric_uses_only_bounded_labels() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        with_local_recorder(&recorder, || {
+            let mut request = crate::s3_http_metrics::S3HttpRequestGuard::new("GET");
+            let operation = request
+                .in_scope(|| {
+                    crate::s3_http_metrics::observe_s3_http_operation(rustfs_s3_ops::S3Operation::GetObject);
+                    crate::s3_http_metrics::current_s3_http_operation_context()
+                })
+                .expect("S3 request should expose its dispatched operation");
+            record_read_version_request_by_caller(
+                Some(operation),
+                ReadVersionRequestCaller::SetDiskRead,
+                ReadVersionRequestMode::Data,
+            );
+            record_read_version_request_by_caller(None, ReadVersionRequestCaller::Peer, ReadVersionRequestMode::MetadataOnly);
+        });
+
+        let rows = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_READ_VERSION_REQUESTS_BY_CALLER_TOTAL)
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        let labels = rows
+            .iter()
+            .map(|(composite, _, _, _)| {
+                composite
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect::<HashMap<_, _>>()
+            })
+            .collect::<Vec<_>>();
+        assert!(labels.iter().any(|labels| {
+            labels.get("api_operation").map(String::as_str) == Some("s3:GetObject")
+                && labels.get("caller").map(String::as_str) == Some("set_disk_read")
+                && labels.get("mode").map(String::as_str) == Some("data")
+        }));
+        assert!(labels.iter().any(|labels| {
+            labels.get("api_operation").map(String::as_str) == Some("unattributed")
+                && labels.get("mode").map(String::as_str) == Some("metadata_only")
+                && labels.get("caller").map(String::as_str) == Some("peer")
+        }));
+        assert!(labels.iter().all(|labels| {
+            labels.len() == 3
+                && labels
+                    .keys()
+                    .all(|key| key == "api_operation" || key == "caller" || key == "mode")
+        }));
+    }
+
+    #[test]
+    fn operation_stage_duration_records_low_cardinality_stage_labels() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let metrics = InternodeMetrics::default();
+
+        with_local_recorder(&recorder, || {
+            metrics.record_stage_duration_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+                INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP,
+                Duration::from_micros(125),
+            );
+        });
+
+        let entries: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_OPERATION_STAGE_DURATION_MS)
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let labels: HashMap<_, _> = entries[0]
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key().to_string(), label.value().to_string()))
+            .collect();
+        assert_eq!(
+            labels.get(OPERATION_LABEL).map(String::as_str),
+            Some(INTERNODE_OPERATION_GRPC_READ_VERSION)
+        );
+        assert_eq!(labels.get(BACKEND_LABEL).map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_GRPC));
+        assert_eq!(
+            labels.get(STAGE_LABEL).map(String::as_str),
+            Some(INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP)
+        );
+        assert!(labels.get(SERVER_LABEL).is_some_and(|value| !value.is_empty()));
+        match &entries[0].3 {
+            DebugValue::Histogram(samples) => assert_eq!(samples.iter().map(|sample| sample.0).collect::<Vec<_>>(), vec![0.125]),
+            other => panic!("{INTERNODE_OPERATION_STAGE_DURATION_MS} must be a histogram, got {other:?}"),
+        }
     }
 
     #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 9);
-        for metric in &INTERNODE_OPERATION_METRICS[..5] {
-            assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 30);
+        assert_eq!(INTERNODE_OPERATION_METRICS[23].name, INTERNODE_RPC_ACTIVE);
+        assert_eq!(INTERNODE_OPERATION_METRICS[23].labels, SERVER_OPERATION_BACKEND_SIDE_LABELS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[24].name, INTERNODE_RPC_COMPLETIONS_TOTAL);
+        assert_eq!(INTERNODE_OPERATION_METRICS[24].labels, SERVER_OPERATION_BACKEND_OUTCOME_LABELS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[25].name, INTERNODE_CHANNEL_REBUILD_ATTEMPTS_TOTAL);
+        assert_eq!(INTERNODE_OPERATION_METRICS[25].labels, SERVER_CLASS_REASON_OUTCOME_LABELS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[26].name, INTERNODE_BULK_BODY_WAIT_DURATION_MS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[26].labels, SERVER_LABELS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[27].name, INTERNODE_BULK_BODY_WAITERS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[27].labels, SERVER_LABELS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[28].name, INTERNODE_BULK_BODY_ACTIVE);
+        assert_eq!(INTERNODE_OPERATION_METRICS[28].labels, SERVER_LABELS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[29].name, INTERNODE_BULK_BODY_ADMISSIONS_TOTAL);
+        assert_eq!(INTERNODE_OPERATION_METRICS[29].labels, SERVER_OUTCOME_LABELS);
+        for metric in &INTERNODE_OPERATION_METRICS[..6] {
+            assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         }
-        for metric in &INTERNODE_OPERATION_METRICS[5..8] {
-            assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL]);
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[6].labels,
+            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, STAGE_LABEL]
+        );
+        for metric in &INTERNODE_OPERATION_METRICS[7..10] {
+            assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL]);
         }
-        assert_eq!(INTERNODE_OPERATION_METRICS[8].labels, &[STAGE_LABEL, DOMINANT_ERROR_LABEL]);
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[10].labels,
+            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, HTTP_VERSION_LABEL]
+        );
+        for metric in &INTERNODE_OPERATION_METRICS[11..13] {
+            assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        }
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[13].labels,
+            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, FAILURE_REASON_LABEL]
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[14].labels,
+            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL]
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[15].labels,
+            &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, RPC_PATH_LABEL]
+        );
+        for metric in &INTERNODE_OPERATION_METRICS[16..18] {
+            assert_eq!(metric.labels, &[SERVER_LABEL]);
+        }
+        assert_eq!(INTERNODE_OPERATION_METRICS[18].labels, &[SERVER_LABEL, REASON_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[19].labels, &[SERVER_LABEL, STAGE_LABEL, DOMINANT_ERROR_LABEL]);
+        // Payload histogram + large-payload counter carry operation+backend labels.
+        assert_eq!(INTERNODE_OPERATION_METRICS[20].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[21].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[22].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[22].name, INTERNODE_OPERATION_SERVER_DURATION_MS);
     }
 
     #[test]
     fn operation_metric_names_and_low_cardinality_values_are_stable() {
         assert_eq!(INTERNODE_OPERATION_READ_FILE_STREAM, "read_file_stream");
         assert_eq!(INTERNODE_OPERATION_PUT_FILE_STREAM, "put_file_stream");
+        assert_eq!(INTERNODE_OPERATION_PUT_FILE_CAPABILITY, "put_file_capability");
         assert_eq!(INTERNODE_OPERATION_WALK_DIR, "walk_dir");
         assert_eq!(INTERNODE_OPERATION_GRPC_READ_ALL, "grpc_read_all");
         assert_eq!(INTERNODE_OPERATION_GRPC_WRITE_ALL, "grpc_write_all");
+        assert_eq!(INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE, "grpc_compare_and_update_file");
+        assert_eq!(INTERNODE_OPERATION_GRPC_READ_VERSION, "grpc_read_version");
+        assert_eq!(INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, "grpc_batch_read_version");
+        assert_eq!(INTERNODE_OPERATION_GRPC_LOCK, "grpc_lock");
+        assert_eq!(INTERNODE_OPERATION_GRPC_UNLOCK, "grpc_unlock");
+        assert_eq!(INTERNODE_OPERATION_GRPC_LOCK_BATCH, "grpc_lock_batch");
+        assert_eq!(INTERNODE_OPERATION_GRPC_UNLOCK_BATCH, "grpc_unlock_batch");
+        assert_eq!(INTERNODE_OPERATION_GRPC_REFRESH, "grpc_refresh");
+        assert_eq!(INTERNODE_OPERATION_GRPC_FORCE_UNLOCK, "grpc_force_unlock");
+        assert_eq!(INTERNODE_OPERATION_GRPC_OTHER, "grpc_other");
 
         assert_eq!(INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, "tcp-http");
         assert_eq!(INTERNODE_TRANSPORT_BACKEND_GRPC, "grpc");
@@ -406,20 +2383,515 @@ mod tests {
 
         assert_eq!(
             INTERNODE_OPERATION_METRICS[5].name,
-            "rustfs_system_network_internode_operation_classified_errors_total"
+            "rustfs_system_network_internode_operation_duration_ms"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[6].name,
-            "rustfs_system_network_internode_operation_retries_total"
+            "rustfs_system_network_internode_operation_stage_duration_ms"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[7].name,
-            "rustfs_system_network_internode_operation_retry_successes_total"
+            "rustfs_system_network_internode_operation_classified_errors_total"
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[8].name,
+            "rustfs_system_network_internode_operation_retries_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[9].name,
+            "rustfs_system_network_internode_operation_retry_successes_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[10].name,
+            "rustfs_system_network_internode_operation_http_versions_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[11].name,
+            "rustfs_system_network_internode_operation_stall_timeouts_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[12].name,
+            "rustfs_system_network_internode_operation_write_shutdown_errors_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[13].name,
+            "rustfs_system_network_internode_rpc_auth_failures_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[14].name,
+            "rustfs_system_network_internode_replay_cache_overflow_by_operation_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[15].name,
+            "rustfs_system_network_internode_replay_cache_records_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[16].name,
+            "rustfs_system_network_internode_replay_cache_entries"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[17].name,
+            "rustfs_system_network_internode_replay_cache_capacity"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[18].name,
+            "rustfs_system_network_internode_replay_cache_evictions_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[19].name,
             "rustfs_system_storage_erasure_write_quorum_failures_total"
         );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[20].name,
+            "rustfs_system_network_internode_operation_payload_bytes"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[21].name,
+            "rustfs_system_network_internode_operation_large_payloads_total"
+        );
+        assert_eq!(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, "grpc_read_multiple");
+        assert_eq!(
+            INTERNODE_MSGPACK_JSON_DECODE_TOTAL,
+            "rustfs_system_network_internode_msgpack_json_decode_total"
+        );
+        assert_eq!(
+            INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL,
+            "rustfs_system_network_internode_msgpack_json_fallback_total"
+        );
+        assert_eq!(
+            INTERNODE_MSGPACK_JSON_DECODE_ERROR_TOTAL,
+            "rustfs_system_network_internode_msgpack_json_decode_error_total"
+        );
+        assert_eq!(INTERNODE_MSGPACK_DIRECTION_REQUEST, "request");
+        assert_eq!(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "response");
+        assert_eq!(INTERNODE_MSGPACK_CODEC_MSGPACK, "msgpack");
+        assert_eq!(INTERNODE_MSGPACK_CODEC_JSON, "json");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_REQUEST_ENCODE, "read_version_request_encode");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE, "read_version_request_decode");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_DISK_READ, "read_version_disk_read");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE, "read_version_response_json_encode");
+        assert_eq!(
+            INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE,
+            "read_version_response_msgpack_encode"
+        );
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_RPC_ROUNDTRIP, "read_version_rpc_roundtrip");
+        assert_eq!(INTERNODE_STAGE_READ_VERSION_RESPONSE_DECODE, "read_version_response_decode");
+        assert_eq!(INTERNODE_STAGE_BATCH_READ_VERSION_COALESCER_WAIT, "batch_read_version_coalescer_wait");
+        assert_eq!(INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MAP, "batch_read_version_response_map");
+        assert_eq!(
+            INTERNODE_SIGNATURE_V1_FALLBACK_TOTAL,
+            "rustfs_system_network_internode_signature_v1_fallback_total"
+        );
+        assert_eq!(
+            INTERNODE_REPLAY_CACHE_RECORDS_TOTAL,
+            "rustfs_system_network_internode_replay_cache_records_total"
+        );
+        assert_eq!(FAILURE_REASON_LABEL, "failure_reason");
+        assert_eq!(RPC_PATH_LABEL, "rpc_path");
+        assert_eq!(REASON_LABEL, "reason");
+    }
+
+    #[test]
+    fn rpc_auth_failure_counter_records_low_cardinality_labels() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let metrics = InternodeMetrics::default();
+
+        with_local_recorder(&recorder, || {
+            metrics.record_rpc_auth_failure_for_operation_and_backend(
+                INTERNODE_OPERATION_GRPC_READ_ALL,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+                "invalid_v2_signature",
+            );
+        });
+
+        assert_eq!(metrics.snapshot().rpc_auth_failures_total, 1);
+        let entries: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_RPC_AUTH_FAILURES_TOTAL)
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let labels: HashMap<_, _> = entries[0]
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key().to_string(), label.value().to_string()))
+            .collect();
+        assert_eq!(labels.get(OPERATION_LABEL).map(String::as_str), Some(INTERNODE_OPERATION_GRPC_READ_ALL));
+        assert_eq!(labels.get(BACKEND_LABEL).map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_GRPC));
+        assert_eq!(labels.get(FAILURE_REASON_LABEL).map(String::as_str), Some("invalid_v2_signature"));
+        assert!(labels.get(SERVER_LABEL).is_some_and(|value| !value.is_empty()));
+    }
+
+    #[test]
+    fn replay_cache_metrics_record_state_eviction_and_overflow_scope() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let metrics = InternodeMetrics::default();
+
+        with_local_recorder(&recorder, || {
+            metrics.record_replay_cache_state(7, 11);
+            metrics.record_replay_cache_evictions("expired", 5);
+            metrics.record_replay_cache_overflow_for_operation_and_backend_path(
+                INTERNODE_OPERATION_GRPC_READ_ALL,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+                "/node_service.NodeService/ReadAll",
+            );
+            metrics.record_replay_cache_record_for_operation_and_backend_path(
+                INTERNODE_OPERATION_GRPC_READ_VERSION,
+                INTERNODE_TRANSPORT_BACKEND_GRPC,
+                "/node_service.NodeService/ReadVersion",
+            );
+        });
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.replay_cache_entries, 7);
+        assert_eq!(snapshot.replay_cache_capacity, 11);
+        assert_eq!(snapshot.replay_cache_evictions_total, 5);
+        assert_eq!(snapshot.replay_cache_overflow_total, 1);
+
+        let entries: Vec<_> = snapshotter.snapshot().into_vec();
+        assert!(
+            entries
+                .iter()
+                .any(|(composite, _, _, _)| composite.key().name() == INTERNODE_REPLAY_CACHE_ENTRIES)
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(composite, _, _, _)| composite.key().name() == INTERNODE_REPLAY_CACHE_CAPACITY)
+        );
+
+        let overflow: Vec<_> = entries
+            .iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_REPLAY_CACHE_OVERFLOW_BY_OPERATION_TOTAL)
+            .collect();
+        assert_eq!(overflow.len(), 1);
+        let labels: HashMap<_, _> = overflow[0]
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key().to_string(), label.value().to_string()))
+            .collect();
+        assert_eq!(labels.get(OPERATION_LABEL).map(String::as_str), Some(INTERNODE_OPERATION_GRPC_READ_ALL));
+        assert_eq!(labels.get(BACKEND_LABEL).map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_GRPC));
+        assert_eq!(labels.get(RPC_PATH_LABEL).map(String::as_str), Some("/node_service.NodeService/ReadAll"));
+        assert!(labels.get(SERVER_LABEL).is_some_and(|value| !value.is_empty()));
+
+        let records: Vec<_> = entries
+            .iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_REPLAY_CACHE_RECORDS_TOTAL)
+            .collect();
+        assert_eq!(records.len(), 1);
+        let labels: HashMap<_, _> = records[0]
+            .0
+            .key()
+            .labels()
+            .map(|label| (label.key().to_string(), label.value().to_string()))
+            .collect();
+        assert_eq!(
+            labels.get(OPERATION_LABEL).map(String::as_str),
+            Some(INTERNODE_OPERATION_GRPC_READ_VERSION)
+        );
+        assert_eq!(labels.get(BACKEND_LABEL).map(String::as_str), Some(INTERNODE_TRANSPORT_BACKEND_GRPC));
+        assert_eq!(
+            labels.get(RPC_PATH_LABEL).map(String::as_str),
+            Some("/node_service.NodeService/ReadVersion")
+        );
+        assert!(labels.get(SERVER_LABEL).is_some_and(|value| !value.is_empty()));
+    }
+
+    #[test]
+    fn direct_internode_metrics_emit_stable_server_label() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let metrics = InternodeMetrics::default();
+
+        with_local_recorder(&recorder, || {
+            metrics.record_sent_bytes_for_operation_and_backend(
+                INTERNODE_OPERATION_READ_FILE_STREAM,
+                INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+                128,
+            );
+            metrics.record_recv_bytes_for_operation_and_backend(
+                INTERNODE_OPERATION_PUT_FILE_STREAM,
+                INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+                256,
+            );
+            metrics.record_dial_result(Duration::from_millis(3), false);
+        });
+
+        let observed: Vec<(String, HashSet<String>, Option<String>)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| {
+                matches!(
+                    composite.key().name(),
+                    "rustfs_system_network_internode_sent_bytes_total"
+                        | "rustfs_system_network_internode_recv_bytes_total"
+                        | INTERNODE_OPERATION_SENT_BYTES_TOTAL
+                        | INTERNODE_OPERATION_RECV_BYTES_TOTAL
+                        | "rustfs_system_network_internode_dial_avg_time_nanos"
+                        | "rustfs_system_network_internode_dial_errors_total"
+                )
+            })
+            .map(|(composite, _, _, _)| {
+                let labels = composite.key().labels();
+                let keys = labels.clone().map(|label| label.key().to_string()).collect();
+                let server = labels
+                    .filter(|label| label.key() == SERVER_LABEL)
+                    .map(|label| label.value().to_string())
+                    .next();
+                (composite.key().name().to_string(), keys, server)
+            })
+            .collect();
+
+        assert_eq!(observed.len(), 6);
+        for (name, keys, server) in observed {
+            assert!(keys.contains(SERVER_LABEL), "{name} must carry the server label");
+            assert!(server.is_some_and(|value| !value.is_empty()), "{name} server label must not be empty");
+        }
+    }
+
+    #[test]
+    fn msgpack_json_fallback_counter_separates_the_two_directions() {
+        // Previously a smoke test that asserted nothing; the counter carries no
+        // in-struct total, so the emission itself is what has to be checked
+        // (rustfs/backlog#1836).
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let metrics = InternodeMetrics::default();
+
+        metrics::with_local_recorder(&recorder, || {
+            metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo");
+            metrics.record_msgpack_json_fallback(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "RawFileInfo");
+        });
+
+        let observed: Vec<(String, String, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == INTERNODE_MSGPACK_JSON_FALLBACK_TOTAL)
+            .map(|(composite, _, _, value)| {
+                let labels: HashMap<String, String> = composite
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect();
+                let count = match value {
+                    DebugValue::Counter(count) => count,
+                    other => panic!("fallback total must be a counter, got {other:?}"),
+                };
+                (
+                    labels.get(DIRECTION_LABEL).cloned().unwrap_or_default(),
+                    labels.get(MESSAGE_LABEL).cloned().unwrap_or_default(),
+                    count,
+                )
+            })
+            .collect();
+
+        // Each direction/message pair is its own series, so a regression that
+        // dropped a label would collapse these into one row.
+        assert_eq!(observed.len(), 2, "each direction must land in its own series: {observed:?}");
+        assert!(observed.contains(&(INTERNODE_MSGPACK_DIRECTION_REQUEST.to_string(), "FileInfo".to_string(), 1)));
+        assert!(observed.contains(&(INTERNODE_MSGPACK_DIRECTION_RESPONSE.to_string(), "RawFileInfo".to_string(), 1)));
+    }
+
+    #[test]
+    fn msgpack_json_decode_counter_tracks_codec_direction_and_message() {
+        let metrics = InternodeMetrics::default();
+        assert_eq!(metrics.msgpack_json_decode_total_for_test(), 0);
+
+        metrics.record_msgpack_json_decode(INTERNODE_MSGPACK_DIRECTION_REQUEST, "FileInfo", INTERNODE_MSGPACK_CODEC_MSGPACK);
+        metrics.record_msgpack_json_decode(INTERNODE_MSGPACK_DIRECTION_RESPONSE, "RawFileInfo", INTERNODE_MSGPACK_CODEC_JSON);
+
+        assert_eq!(metrics.msgpack_json_decode_total_for_test(), 2);
+        metrics.reset_for_test();
+        assert_eq!(metrics.msgpack_json_decode_total_for_test(), 0);
+    }
+
+    #[test]
+    fn msgpack_json_decode_error_counter_tracks_codec_direction_and_message() {
+        let metrics = InternodeMetrics::default();
+        assert_eq!(metrics.msgpack_json_decode_error_total_for_test(), 0);
+
+        metrics.record_msgpack_json_decode_error(
+            INTERNODE_MSGPACK_DIRECTION_REQUEST,
+            "FileInfo",
+            INTERNODE_MSGPACK_CODEC_MSGPACK,
+        );
+        metrics.record_msgpack_json_decode_error(
+            INTERNODE_MSGPACK_DIRECTION_RESPONSE,
+            "RawFileInfo",
+            INTERNODE_MSGPACK_CODEC_JSON,
+        );
+
+        assert_eq!(metrics.msgpack_json_decode_error_total_for_test(), 2);
+        metrics.reset_for_test();
+        assert_eq!(metrics.msgpack_json_decode_error_total_for_test(), 0);
+    }
+
+    #[test]
+    fn signature_v1_fallback_counter_updates_snapshot_and_resets() {
+        // Instance-local metrics keep this independent of the process-global registry.
+        let metrics = InternodeMetrics::default();
+        assert_eq!(metrics.snapshot().signature_v1_fallback_total, 0);
+
+        metrics.record_signature_v1_fallback();
+        metrics.record_signature_v1_fallback();
+        assert_eq!(metrics.snapshot().signature_v1_fallback_total, 2);
+
+        metrics.reset_for_test();
+        assert_eq!(metrics.snapshot().signature_v1_fallback_total, 0);
+    }
+
+    #[test]
+    fn replay_scope_fallback_counter_updates_snapshot_and_resets() {
+        let metrics = InternodeMetrics::default();
+        assert_eq!(metrics.snapshot().replay_scope_fallback_total, 0);
+
+        metrics.record_replay_scope_fallback();
+        metrics.record_replay_scope_fallback();
+        assert_eq!(metrics.snapshot().replay_scope_fallback_total, 2);
+
+        metrics.reset_for_test();
+        assert_eq!(metrics.snapshot().replay_scope_fallback_total, 0);
+    }
+
+    #[test]
+    fn cluster_peer_flips_offline_after_threshold_and_back_online() {
+        // Unique addr keeps this independent of the process-global registry / other tests.
+        let addr = "http://cluster-peer-health-unit-test:9000";
+        assert_eq!(cluster_peer_online(addr), None);
+
+        record_peer_unreachable(addr, 3);
+        record_peer_unreachable(addr, 3);
+        assert_eq!(cluster_peer_online(addr), Some(true), "still online below threshold");
+
+        record_peer_unreachable(addr, 3);
+        assert_eq!(cluster_peer_online(addr), Some(false), "offline at threshold");
+
+        record_peer_reachable(addr);
+        assert_eq!(cluster_peer_online(addr), Some(true), "back online after a reachable dial");
+    }
+
+    #[test]
+    fn cluster_peer_threshold_is_clamped_to_at_least_one() {
+        let addr = "http://cluster-peer-health-clamp-test:9000";
+        // A zero threshold must not mean "never offline"; one failure suffices.
+        record_peer_unreachable(addr, 0);
+        assert_eq!(cluster_peer_online(addr), Some(false));
+        record_peer_reachable(addr);
+        assert_eq!(cluster_peer_online(addr), Some(true));
+    }
+
+    #[test]
+    fn peer_health_key_is_normalized_across_address_forms() {
+        // Same physical peer, two address forms the codebase actually uses: the data path's
+        // grid_host() (no trailing slash) and the lock path's url::Url::to_string() (trailing slash).
+        // They MUST collapse to one health entry, else one downed node counts as 2 in the gauge.
+        let bare = "http://cluster-peer-health-normalize-test:9000";
+        let slashed = "http://cluster-peer-health-normalize-test:9000/";
+
+        record_peer_unreachable(bare, 1);
+        record_peer_unreachable(slashed, 1);
+
+        let keys: Vec<String> = cluster_peer_health_keys()
+            .into_iter()
+            .filter(|k| k.contains("cluster-peer-health-normalize-test"))
+            .collect();
+        assert_eq!(keys.len(), 1, "two address forms of one peer must be a single health entry, got {keys:?}");
+
+        // Either form observes the peer offline, and a reachable dial via one form clears the other.
+        assert!(cluster_peer_is_offline(bare));
+        assert!(cluster_peer_is_offline(slashed));
+        record_peer_reachable(slashed);
+        assert!(!cluster_peer_is_offline(bare), "reachable via one form must mark the shared entry online");
+    }
+
+    #[test]
+    fn cluster_peer_observed_online_status_reports_known_and_unknown_peers() {
+        let addr = "http://cluster-peer-snapshot-status-test:9000";
+        assert_eq!(cluster_peer_observed_online_status(addr), None);
+
+        record_peer_reachable(addr);
+        assert_eq!(cluster_peer_observed_online_status(addr), Some(true));
+
+        record_peer_unreachable(addr, 1);
+        assert_eq!(cluster_peer_observed_online_status(addr), Some(false));
+    }
+
+    #[test]
+    fn cluster_servers_offline_total_name_is_stable() {
+        assert_eq!(CLUSTER_SERVERS_OFFLINE_TOTAL, "rustfs_cluster_servers_offline_total");
+    }
+
+    #[test]
+    fn record_peer_reachable_if_offline_recovers_stale_offline_state() {
+        let addr = "http://cluster-peer-recover-if-offline-test:9000";
+
+        // Mark the peer offline.
+        record_peer_unreachable(addr, 1);
+        assert!(cluster_peer_is_offline(addr));
+
+        // A successful cached-channel RPC (no fresh dial) clears the offline state.
+        record_peer_reachable_if_offline(addr);
+        assert!(!cluster_peer_is_offline(addr));
+        assert_eq!(cluster_peer_observed_online_status(addr), Some(true));
+    }
+
+    #[test]
+    fn record_peer_reachable_if_offline_no_op_for_online_peer() {
+        let addr = "http://cluster-peer-recover-noop-test:9000";
+
+        record_peer_reachable(addr);
+        // Should not panic or change state for an already-online peer.
+        record_peer_reachable_if_offline(addr);
+        assert_eq!(cluster_peer_observed_online_status(addr), Some(true));
+
+        // Should also be a no-op for unknown peers.
+        record_peer_reachable_if_offline("http://cluster-peer-recover-unknown-test:9000");
+        assert_eq!(cluster_peer_observed_online_status("http://cluster-peer-recover-unknown-test:9000"), None);
+    }
+
+    #[test]
+    fn cluster_peer_should_bypass_is_self_healing() {
+        let addr = "http://cluster-peer-bypass-selfheal-test:9000";
+        let interval = Duration::from_secs(30);
+
+        // Online peer: never bypassed.
+        record_peer_reachable(addr);
+        assert!(!cluster_peer_should_bypass(addr, interval));
+
+        // Take it offline (threshold 1 for the test).
+        record_peer_unreachable(addr, 1);
+        assert!(cluster_peer_is_offline(addr));
+
+        // First decision after going offline is a re-probe (not bypassed)...
+        assert!(!cluster_peer_should_bypass(addr, interval));
+        // ...and subsequent ones within the interval are bypassed.
+        assert!(cluster_peer_should_bypass(addr, interval));
+        assert!(cluster_peer_should_bypass(addr, interval));
+
+        // A zero interval always allows a re-probe (never strands the peer).
+        assert!(!cluster_peer_should_bypass(addr, Duration::ZERO));
+
+        // Recovery clears bypass entirely.
+        record_peer_reachable(addr);
+        assert!(!cluster_peer_should_bypass(addr, interval));
+    }
+
+    #[test]
+    fn cluster_peer_should_bypass_ignores_unknown_and_online_peers() {
+        let addr = "http://cluster-peer-bypass-unknown-test:9000";
+        // Unknown peer: not bypassed.
+        assert!(!cluster_peer_should_bypass(addr, Duration::from_secs(5)));
+        // Known-online peer: not bypassed.
+        record_peer_reachable(addr);
+        assert!(!cluster_peer_should_bypass(addr, Duration::from_secs(5)));
     }
 
     #[test]
@@ -441,6 +2913,19 @@ mod tests {
             INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
             "connection_reset",
         );
+        metrics.record_http_version_for_operation_and_backend(
+            INTERNODE_OPERATION_PUT_FILE_STREAM,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            "http/1.1",
+        );
+        metrics.record_stall_timeout_for_operation_and_backend(
+            INTERNODE_OPERATION_READ_FILE_STREAM,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        );
+        metrics.record_write_shutdown_error_for_operation_and_backend(
+            INTERNODE_OPERATION_PUT_FILE_STREAM,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        );
         metrics.record_erasure_write_quorum_failure("write", "connection_reset");
 
         let snapshot = metrics.snapshot();
@@ -448,5 +2933,8 @@ mod tests {
         assert_eq!(snapshot.recv_bytes_total, 0);
         assert_eq!(snapshot.outgoing_requests_total, 0);
         assert_eq!(snapshot.incoming_requests_total, 0);
+        assert_eq!(snapshot.operation_http_versions_total, 1);
+        assert_eq!(snapshot.operation_stall_timeouts_total, 1);
+        assert_eq!(snapshot.operation_write_shutdown_errors_total, 1);
     }
 }

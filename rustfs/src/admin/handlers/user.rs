@@ -14,23 +14,25 @@
 
 use super::iam_error::iam_error_to_s3_error;
 use super::{account_info, group, service_account, user_iam, user_lifecycle, user_policy_binding};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::{
+    admin::runtime_sources::current_action_credentials,
     admin::{
-        auth::validate_admin_request,
+        auth::{authorize_admin_envelope, validate_admin_request},
         handlers::site_replication::site_replication_iam_change_hook,
-        router::{AdminOperation, Operation, S3Router},
+        router::{AdminOperation, S3Router},
         utils::{encode_compatible_admin_payload, has_space_be, read_compatible_admin_body},
     },
     auth::{check_key_valid, constant_time_eq, get_session_token},
-    server::RemoteAddr,
 };
+use http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
-use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_SIZE};
-use rustfs_credentials::{Credentials, get_global_action_cred};
+use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_EXPANDED_SIZE, MAX_IAM_IMPORT_SIZE};
+use rustfs_credentials::Credentials;
 use rustfs_iam::{
     store::{GroupInfo, MappedPolicy, UserType},
-    sys::{NewServiceAccountOpts, UpdateServiceAccountOpts},
+    sys::{NewServiceAccountOpts, SITE_REPLICATOR_SERVICE_ACCOUNT, UpdateServiceAccountOpts},
 };
 use rustfs_madmin::{
     AccountStatus, AddOrUpdateUserReq, IAMEntities, IAMErrEntities, IAMErrEntity, IAMErrPolicyEntity, SITE_REPL_API_VERSION,
@@ -38,12 +40,8 @@ use rustfs_madmin::{
     user::{ImportIAMResult, SRSessionPolicy, SRSvcAccCreate},
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use rustfs_utils::path::path_join_buf;
-use s3s::{
-    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
-    header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE},
-    s3_error,
-};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use std::io::{Read as _, Write};
@@ -119,6 +117,22 @@ fn should_check_deny_only(target_access_key: &str, requester: &Credentials) -> b
     target_access_key == requester.access_key && requester.parent_user.is_empty()
 }
 
+/// Returns `true` when a derived credential (Console/STS session or service account) targets the
+/// long-term IAM user it was minted from.
+///
+/// SECURITY: [`should_check_deny_only`] relaxes the admin policy check to deny-only for exactly
+/// this target, so without this guard an AddUser call could rewrite the parent's stored secret key
+/// and status, turning a short-lived session into permanent control of the account. The parent is
+/// resolved the same way [`should_check_deny_only`] resolves it, since some stores persist the
+/// parent only inside the session token.
+fn add_user_targets_requester_parent(target_access_key: &str, requester: &Credentials) -> bool {
+    if !requester.is_temp() && !requester.is_service_account() {
+        return false;
+    }
+
+    temp_identity_parent(requester).is_some_and(|parent| parent == target_access_key)
+}
+
 fn should_reject_group_import_name(group_name: &str, group_lookup: &rustfs_iam::error::Error) -> bool {
     has_space_be(group_name) || !matches!(group_lookup, rustfs_iam::error::Error::NoSuchGroup(_))
 }
@@ -146,13 +160,17 @@ fn imported_service_account_status(status: &str) -> Option<String> {
 const SERVICE_ACCOUNT_PARENT_SCOPE_ERROR: &str = "service account parent is outside requester scope";
 const SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR: &str = "service account access key does not match import entry";
 
-fn imported_service_account_parent_allowed(parent: &str, requester: &Credentials, owner: bool) -> bool {
+fn imported_service_account_parent_allowed(root_access_key: &str, parent: &str, requester: &Credentials, owner: bool) -> bool {
     if parent.is_empty() {
         return false;
     }
 
     if owner {
         return true;
+    }
+
+    if parent == root_access_key {
+        return false;
     }
 
     if requester.is_temp() || requester.is_service_account() {
@@ -163,14 +181,28 @@ fn imported_service_account_parent_allowed(parent: &str, requester: &Credentials
 }
 
 fn imported_service_account_parent_scope_failure(
+    root_access_key: &str,
     access_key: &str,
     parent: &str,
     requester: &Credentials,
     owner: bool,
 ) -> Option<IAMErrEntity> {
-    (!imported_service_account_parent_allowed(parent, requester, owner)).then(|| IAMErrEntity {
+    (!imported_service_account_parent_allowed(root_access_key, parent, requester, owner)).then(|| IAMErrEntity {
         name: access_key.to_string(),
         error: SERVICE_ACCOUNT_PARENT_SCOPE_ERROR.to_string(),
+    })
+}
+
+fn retain_exportable_service_accounts(accounts: &mut HashMap<String, rustfs_policy::auth::UserIdentity>) {
+    accounts.retain(|key, account| {
+        key != SITE_REPLICATOR_SERVICE_ACCOUNT && account.credentials.access_key != SITE_REPLICATOR_SERVICE_ACCOUNT
+    });
+}
+
+fn imported_service_account_reserved_failure(access_key: &str) -> Option<IAMErrEntity> {
+    (access_key == SITE_REPLICATOR_SERVICE_ACCOUNT).then(|| IAMErrEntity {
+        name: access_key.to_owned(),
+        error: "service account name is reserved for site replication".to_owned(),
     })
 }
 
@@ -182,11 +214,36 @@ fn imported_service_account_access_key_failure(entry_access_key: &str, payload_a
 }
 
 pub struct AddUser {}
+
+fn map_add_user_create_error(err: rustfs_iam::error::Error) -> S3Error {
+    match err {
+        rustfs_iam::error::Error::AccessKeyAlreadyExists => iam_error_to_s3_error(err),
+        rustfs_iam::error::Error::IAMActionNotAllowed => S3Error::new(S3ErrorCode::AccessDenied),
+        err => S3Error::with_message(S3ErrorCode::InternalError, format!("failed to create user: {err}")),
+    }
+}
+
+/// The caller's current secret when the request rotates the caller's own key,
+/// `None` when it creates or updates another user (which does not read it).
+///
+/// # Errors
+///
+/// `AccessDenied` for a self-rotation whose verified credential carries no
+/// secret key.
+fn self_rotation_secret(check_deny_only: bool, secret: Option<&str>) -> S3Result<Option<&str>> {
+    if !check_deny_only {
+        return Ok(None);
+    }
+    secret
+        .map(Some)
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::AccessDenied, "the request credential carries no secret key"))
+}
+
 #[async_trait::async_trait]
 impl Operation for AddUser {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AddUserQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
@@ -195,12 +252,15 @@ impl Operation for AddUser {
             }
         };
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
+        // The caller's current secret outlives the body read below. Only a
+        // self-rotation reads it; creating another user does not.
+        let input_secret = input_cred.secret_key().map(str::to_owned);
 
         let ak = query.access_key.as_deref().unwrap_or_default();
 
@@ -208,30 +268,31 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await?;
+        let body =
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, req.uri().path(), &cred.secret_key).await?;
 
-        // let body_bytes = decrypt_data(input_cred.secret_key.expose().as_bytes(), &body)
+        // let body_bytes = decrypt_data(input_cred.secret_key().as_bytes(), &body)
         //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, format!("decrypt_data err {}", e)))?;
 
-        let args: AddOrUpdateUserReq = serde_json::from_slice(&body)
+        let mut args: AddOrUpdateUserReq = serde_json::from_slice(&body)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid JSON: {e}")))?;
 
         if args.secret_key.is_empty() {
             return Err(s3_error!(InvalidArgument, "secret key is required"));
         }
 
-        if let Some(sys_cred) = get_global_action_cred()
+        if let Some(sys_cred) = current_action_credentials()
             && constant_time_eq(&sys_cred.access_key, ak)
         {
             return Err(s3_error!(InvalidArgument, "cannot create a user with the system access key"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
         if let Some(user) = iam_store.get_user(ak).await {
-            if (user.credentials.is_temp() || user.credentials.is_service_account()) && cred.parent_user == ak {
+            if user.credentials.is_temp() || user.credentials.is_service_account() {
                 return Err(s3_error!(InvalidArgument, "cannot create a user with a service account access key"));
             }
         } else if has_space_be(ak) {
@@ -240,6 +301,13 @@ impl Operation for AddUser {
 
         if from_utf8(ak.as_bytes()).is_err() {
             return Err(s3_error!(InvalidArgument, "access key is not valid UTF-8"));
+        }
+
+        if add_user_targets_requester_parent(ak, &cred) {
+            return Err(s3_error!(
+                InvalidArgument,
+                "cannot change the credentials of the parent user of this session"
+            ));
         }
 
         let check_deny_only = should_check_deny_only(ak, &cred);
@@ -264,19 +332,28 @@ impl Operation for AddUser {
 
         // For eligible self operations, only explicit Deny should block the request.
         validate_admin_request(
-            &req.headers,
+            req.headers(),
             &cred,
             owner,
             check_deny_only,
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            req.policy_source_addr(),
         )
         .await?;
 
-        let updated_at = iam_store
-            .create_user(ak, &args)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to create user: {e}")))?;
+        let rotation_secret = self_rotation_secret(check_deny_only, input_secret.as_deref())?;
+        let updated_at = if let Some(current_secret) = rotation_secret {
+            let (updated_at, status, _) = iam_store
+                .change_own_secret_key(ak, current_secret, &args.secret_key)
+                .await
+                .map_err(map_add_user_create_error)?;
+            args.status = status;
+            // A self-service secret rotation does not change policy attachment.
+            args.policy = None;
+            updated_at
+        } else {
+            iam_store.create_user(ak, &args).await.map_err(map_add_user_create_error)?
+        };
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
             r#type: "iam-user".to_string(),
@@ -305,18 +382,18 @@ impl Operation for AddUser {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::empty(), header))
     }
 }
 
 pub struct SetUserStatus {}
 #[async_trait::async_trait]
 impl Operation for SetUserStatus {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AddUserQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
@@ -331,43 +408,62 @@ impl Operation for SetUserStatus {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
-        if constant_time_eq(&input_cred.access_key, ak) {
+        if constant_time_eq(input_cred.access_key(), ak) {
             return Err(s3_error!(InvalidArgument, "cannot change the status of the current user"));
         }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::EnableUserAdminAction)]).await?;
 
         let status = AccountStatus::try_from(query.status.as_deref().unwrap_or_default())
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, e))?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
-        iam_store
-            .set_user_status(ak, status)
+        let updated_at = iam_store
+            .set_user_status(ak, status.clone())
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to set user status: {e}")))?;
 
+        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+            r#type: "iam-user".to_string(),
+            iam_user: Some(SRIAMUser {
+                access_key: ak.to_string(),
+                is_delete_req: false,
+                user_req: Some(AddOrUpdateUserReq {
+                    secret_key: String::new(),
+                    policy: None,
+                    status: status.clone(),
+                }),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_USER,
+                event = EVENT_ADMIN_USER_STATE,
+                access_key = %ak,
+                action = "set_user_status",
+                result = "site_replication_hook_failed",
+                error = ?err,
+                "admin user state"
+            );
+        }
+
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::empty(), header))
     }
 }
 
@@ -379,26 +475,15 @@ pub struct BucketQuery {
 pub struct ListUsers {}
 #[async_trait::async_trait]
 impl Operation for ListUsers {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ListUsersAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let cred = authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ListUsersAdminAction)]).await?;
 
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: BucketQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
@@ -407,7 +492,7 @@ impl Operation for ListUsers {
             }
         };
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -427,38 +512,28 @@ impl Operation for ListUsers {
 
         let data = serde_json::to_vec(&users)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
-        let (data, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, data)?;
+        let (data, content_type) = encode_compatible_admin_payload(req.uri().path(), &cred.secret_key, data)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
 pub struct RemoveUser {}
 #[async_trait::async_trait]
 impl Operation for RemoveUser {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::DeleteUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let actions = vec![Action::AdminAction(AdminAction::DeleteUserAdminAction)];
+        let cred = authorize_admin_envelope(req.envelope(), actions).await?;
 
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AddUserQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
@@ -473,36 +548,29 @@ impl Operation for RemoveUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let sys_cred = get_global_action_cred()
+        let sys_cred = current_action_credentials()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "failed to load global credentials"))?;
 
         if ak == sys_cred.access_key || ak == cred.access_key || cred.parent_user == ak {
             return Err(s3_error!(InvalidArgument, "cannot remove the current user"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
-        let (is_temp, _) = iam_store.is_temp_user(ak).await.map_err(|e| {
-            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to query temporary user state: {e}"))
-        })?;
+        let (is_temp, _) = iam_store.is_temp_user(ak).await.map_err(iam_error_to_s3_error)?;
 
         if is_temp {
             return Err(s3_error!(InvalidArgument, "cannot remove a temporary user"));
         }
 
-        let (is_service_account, _) = iam_store.is_service_account(ak).await.map_err(|e| {
-            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to query service account state: {e}"))
-        })?;
+        let (is_service_account, _) = iam_store.is_service_account(ak).await.map_err(iam_error_to_s3_error)?;
         if is_service_account {
             return Err(s3_error!(InvalidArgument, "cannot remove a service account"));
         }
 
-        iam_store
-            .delete_user(ak, true)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to delete user: {e}")))?;
+        iam_store.delete_user(ak, true).await.map_err(iam_error_to_s3_error)?;
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
             r#type: "iam-user".to_string(),
@@ -531,18 +599,18 @@ impl Operation for RemoveUser {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::empty(), header))
     }
 }
 
 pub struct GetUserInfo {}
 #[async_trait::async_trait]
 impl Operation for GetUserInfo {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AddUserQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
@@ -557,16 +625,16 @@ impl Operation for GetUserInfo {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
         let check_deny_only = should_check_deny_only(ak, &cred);
 
@@ -590,12 +658,12 @@ impl Operation for GetUserInfo {
 
         // For eligible self operations, only explicit Deny should block the request.
         validate_admin_request(
-            &req.headers,
+            req.headers(),
             &cred,
             owner,
             check_deny_only,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            req.policy_source_addr(),
         )
         .await?;
 
@@ -605,9 +673,9 @@ impl Operation for GetUserInfo {
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -635,25 +703,14 @@ const IAM_EXPORT_FILES: &[&str] = &[
 pub struct ExportIam {}
 #[async_trait::async_trait]
 impl Operation for ExportIam {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ExportIAMAction)]).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ExportIAMAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
-
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -665,7 +722,7 @@ impl Operation for ExportIam {
             match file {
                 ALL_POLICIES_FILE => {
                     let policies: HashMap<String, rustfs_policy::policy::Policy> = iam_store
-                        .list_polices("")
+                        .list_policies("")
                         .await
                         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
                     let json_str = serde_json::to_vec(&policies)
@@ -736,12 +793,9 @@ impl Operation for ExportIam {
                         .await
                         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
+                    retain_exportable_service_accounts(&mut service_accounts);
                     let mut svc_accts: HashMap<String, SRSvcAccCreate> = HashMap::new();
                     for (k, acc) in service_accounts {
-                        if k == "siteReplicatorSvcAcc" {
-                            continue;
-                        }
-
                         let claims = iam_store
                             .get_claims_for_svc_acc(&acc.credentials.access_key)
                             .await
@@ -839,35 +893,63 @@ impl Operation for ExportIam {
             .finish()
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/zip".parse().unwrap());
-        header.insert(CONTENT_DISPOSITION, "attachment; filename=iam-assets.zip".parse().unwrap());
-        header.insert(CONTENT_LENGTH, zip_bytes.get_ref().len().to_string().parse().unwrap());
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(zip_bytes.into_inner())), header))
+        header.insert(CONTENT_TYPE, "application/zip".parse().expect("valid header value"));
+        header.insert(
+            CONTENT_DISPOSITION,
+            "attachment; filename=iam-assets.zip".parse().expect("valid header value"),
+        );
+        header.insert(CONTENT_LENGTH, zip_bytes.get_ref().len().to_string().parse().expect("valid header value"));
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(zip_bytes.into_inner()), header))
     }
+}
+
+/// Read one member of an IAM import archive, drawing from a shared expansion budget.
+///
+/// `MAX_IAM_IMPORT_SIZE` bounds the compressed upload only. Deflate ratios well above
+/// 100:1 are easy to construct, so reading members with `read_to_end` lets a small
+/// archive expand without bound. The budget is shared across every member so the
+/// archive as a whole is capped, not each member independently.
+fn read_import_member(file: &mut impl std::io::Read, budget: &mut u64) -> S3Result<Vec<u8>> {
+    let mut file_content = Vec::new();
+    // Read one byte past the budget: if it arrives, the member exceeded what is left.
+    let read = file
+        .take(budget.saturating_add(1))
+        .read_to_end(&mut file_content)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))? as u64;
+
+    if read > *budget {
+        return Err(s3_error!(
+            EntityTooLarge,
+            "IAM import archive expands beyond the {MAX_IAM_IMPORT_EXPANDED_SIZE} byte limit"
+        ));
+    }
+
+    *budget -= read;
+    Ok(file_content)
 }
 
 pub struct ImportIam {}
 #[async_trait::async_trait]
 impl Operation for ImportIam {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
         validate_admin_request(
-            &req.headers,
+            req.headers(),
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ImportIAMAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            req.policy_source_addr(),
         )
         .await?;
 
-        let mut input = req.input;
+        let mut input = req.take_body();
         let body = match input.store_all_limited(MAX_IAM_IMPORT_SIZE).await {
             Ok(b) => b,
             Err(e) => {
@@ -887,7 +969,11 @@ impl Operation for ImportIam {
         let mut zip_reader =
             ZipArchive::new(Cursor::new(body)).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        // Shared across every member below, so the archive as a whole is bounded rather
+        // than each member being allowed the full limit.
+        let mut expansion_budget = MAX_IAM_IMPORT_EXPANDED_SIZE;
+
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -903,10 +989,7 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
@@ -932,7 +1015,7 @@ impl Operation for ImportIam {
             }
         }
 
-        let Some(sys_cred) = get_global_action_cred() else {
+        let Some(sys_cred) = current_action_credentials() else {
             return Err(s3_error!(InvalidRequest, "get sys cred failed"));
         };
 
@@ -943,10 +1026,7 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
@@ -985,10 +1065,7 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
@@ -1029,17 +1106,14 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
             if let Some(file_content) = file_content {
                 let svc_accts: HashMap<String, SRSvcAccCreate> = serde_json::from_slice(&file_content)
                     .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                for (ak, req) in svc_accts {
+                for (ak, mut req) in svc_accts {
                     if skipped.service_accounts.contains(&ak) {
                         continue;
                     }
@@ -1056,12 +1130,19 @@ impl Operation for ImportIam {
                         return Err(s3_error!(InvalidArgument, "has space be {ak}"));
                     }
 
+                    if let Some(err) = imported_service_account_reserved_failure(&ak) {
+                        failed.service_accounts.push(err);
+                        continue;
+                    }
+
                     if let Some(err) = imported_service_account_access_key_failure(&ak, &req.access_key) {
                         failed.service_accounts.push(err);
                         continue;
                     }
 
-                    if let Some(err) = imported_service_account_parent_scope_failure(&ak, &req.parent, &cred, owner) {
+                    if let Some(err) =
+                        imported_service_account_parent_scope_failure(&sys_cred.access_key, &ak, &req.parent, &cred, owner)
+                    {
                         failed.service_accounts.push(err);
                         continue;
                     }
@@ -1084,6 +1165,9 @@ impl Operation for ImportIam {
                         })?;
                     }
 
+                    if !owner {
+                        let _ = rustfs_iam::sys::remove_verified_federated_policy(&mut req.claims);
+                    }
                     let opts = NewServiceAccountOpts {
                         session_policy: sp,
                         access_key: ak.clone(),
@@ -1093,6 +1177,7 @@ impl Operation for ImportIam {
                         expiration: req.expiration,
                         allow_site_replicator_account: false,
                         claims: Some(req.claims),
+                        status: None,
                     };
 
                     let groups = if req.groups.is_empty() { None } else { Some(req.groups) };
@@ -1116,6 +1201,8 @@ impl Operation for ImportIam {
                                         description: None,
                                         expiration: None,
                                         status: Some(status),
+                                        parent_user: None,
+                                        allow_site_replicator_account: false,
                                     },
                                 )
                                 .await
@@ -1139,10 +1226,7 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
@@ -1190,10 +1274,7 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
@@ -1231,10 +1312,7 @@ impl Operation for ImportIam {
                 Err(_) => return Err(s3_error!(InvalidRequest, "get file failed")),
                 Ok(file) => {
                     let mut file = file;
-                    let mut file_content = Vec::new();
-                    file.read_to_end(&mut file_content)
-                        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
-                    Some(file_content)
+                    Some(read_import_member(&mut file, &mut expansion_budget)?)
                 }
             };
 
@@ -1286,28 +1364,241 @@ impl Operation for ImportIam {
             failed,
         };
 
+        // The entities are already imported locally. A snapshot that cannot be
+        // scheduled is a convergence delay the reconcile pass still closes, so
+        // it must not turn a completed import into a failed request - the same
+        // best-effort contract every other site-replication hook here follows.
+        if let Err(err) =
+            crate::site_replication::enqueue_site_replication_iam_snapshot("iam import scheduled a full snapshot").await
+        {
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_USER,
+                event = EVENT_ADMIN_USER_STATE,
+                action = "import_iam",
+                result = "site_replication_snapshot_not_scheduled",
+                error = ?err,
+                "admin user state"
+            );
+        }
+
         let body = serde_json::to_vec(&ret).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), header))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        GROUP_POLICY_MAPPING_USER_TYPE, SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR,
-        imported_service_account_access_key_failure, imported_service_account_parent_allowed,
-        imported_service_account_parent_scope_failure, imported_service_account_status, should_check_deny_only,
-        should_reject_group_import_name, should_restore_group_as_disabled,
+        ExportIam, GROUP_POLICY_MAPPING_USER_TYPE, HeaderMap, ListUsers, MAX_IAM_IMPORT_EXPANDED_SIZE, MAX_IAM_IMPORT_SIZE,
+        Operation, Params, RemoveUser, SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR,
+        SetUserStatus, add_user_targets_requester_parent, imported_service_account_access_key_failure,
+        imported_service_account_parent_allowed, imported_service_account_parent_scope_failure, imported_service_account_status,
+        map_add_user_create_error, read_import_member, should_check_deny_only, should_reject_group_import_name,
+        should_restore_group_as_disabled,
     };
+    use crate::admin::operation::AdminRequest;
+    use http::{Extensions, Method, Uri};
     use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
     use rustfs_iam::error::Error as IamError;
     use rustfs_madmin::user::SRSvcAccCreate;
+    use rustfs_s3_types::Body;
+    use rustfs_s3_types::S3ErrorCode;
     use serde_json::Value;
     use std::collections::HashMap;
+
+    #[test]
+    fn self_rotation_without_a_secret_key_is_refused() {
+        let err = super::self_rotation_secret(true, None).expect_err("self-rotation needs the current secret");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
+
+    #[test]
+    fn creating_another_user_does_not_read_the_secret_key() {
+        assert_eq!(super::self_rotation_secret(false, None).expect("create path proceeds"), None);
+        assert_eq!(super::self_rotation_secret(false, Some("current")).expect("create path"), None);
+    }
+
+    #[test]
+    fn self_rotation_uses_the_presented_secret_key() {
+        assert_eq!(super::self_rotation_secret(true, Some("current")).expect("rotation"), Some("current"));
+    }
+
+    fn credential_less_request(method: Method, uri: &'static str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(method, Uri::from_static(uri))
+            .headers(HeaderMap::new())
+            .extensions(Extensions::new())
+            .body(Body::empty())
+            .build()
+    }
+
+    async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str, message: &str) {
+        let err = operation
+            .call(credential_less_request(method, uri), Params::new())
+            .await
+            .expect_err("a user admin request without credentials must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some(message));
+    }
+
+    fn source_block<'a>(production: &'a str, marker: &str) -> &'a str {
+        let block = production
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("{marker} should exist"))
+            .1;
+        let end = ["\npub struct ", "\nfn ", "\nconst ", "\n#[cfg(test)]"]
+            .into_iter()
+            .filter_map(|boundary| block.find(boundary))
+            .min()
+            .unwrap_or(block.len());
+        &block[..end]
+    }
+
+    fn assert_shared_gate_wiring(block: &str, item: &str, actions: &[&str], binds_credentials: bool) {
+        assert_eq!(
+            block.matches("authorize_admin_envelope(").count(),
+            1,
+            "{item} must use exactly one shared gate"
+        );
+        assert_eq!(
+            block.matches("Action::AdminAction(").count(),
+            actions.len(),
+            "{item} must preserve its exact action-vector length"
+        );
+        for action in actions {
+            assert!(block.contains(&format!("AdminAction::{action}")), "{item} must authorize with {action}");
+        }
+        assert_eq!(
+            block.contains("let cred = authorize_admin_envelope("),
+            binds_credentials,
+            "{item} credential binding must match its payload-processing contract"
+        );
+    }
+
+    #[test]
+    fn add_user_maps_duplicate_access_keys_to_s3_errors() {
+        let err = map_add_user_create_error(IamError::AccessKeyAlreadyExists);
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(err.message(), Some("access key is already in use"));
+    }
+
+    #[test]
+    fn add_user_preserves_internal_error_fallback() {
+        let err = map_add_user_create_error(IamError::IamSysNotInitialized);
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("failed to create user: not initialized"));
+    }
+
+    #[test]
+    fn add_user_operation_maps_create_errors() {
+        let mapper_call = concat!("map_err(map_add_user_", "create_error)");
+        assert!(include_str!("user.rs").contains(mapper_call));
+    }
+
+    #[test]
+    fn remove_user_maps_iam_errors_to_s3_errors() {
+        let production = include_str!("user.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+        let body = source_block(production, "impl Operation for RemoveUser");
+
+        for call in ["is_temp_user(ak)", "is_service_account(ak)", "delete_user(ak, true)"] {
+            let start = body
+                .find(call)
+                .unwrap_or_else(|| panic!("RemoveUser should call {call} through the IAM store"));
+            let tail = &body[start..];
+            let end = tail.find("?;").unwrap_or(tail.len());
+            assert!(
+                tail[..end].contains("iam_error_to_s3_error"),
+                "{call} must map through iam_error_to_s3_error so a missing user is 404 NoSuchResource, not 500 InternalError"
+            );
+        }
+    }
+
+    #[test]
+    fn iam_export_excludes_site_replicator_credentials() {
+        let mut accounts = HashMap::from([
+            (
+                "site-replicator-0".to_owned(),
+                rustfs_policy::auth::UserIdentity::new(Credentials {
+                    access_key: "site-replicator-0".to_owned(),
+                    secret_key: "replicator-secret".to_owned(),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "ordinary-service".to_owned(),
+                rustfs_policy::auth::UserIdentity::new(Credentials {
+                    access_key: "ordinary-service".to_owned(),
+                    secret_key: "ordinary-secret".to_owned(),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "mismatched-entry".to_owned(),
+                rustfs_policy::auth::UserIdentity::new(Credentials {
+                    access_key: "site-replicator-0".to_owned(),
+                    secret_key: "aliased-replicator-secret".to_owned(),
+                    ..Default::default()
+                }),
+            ),
+        ]);
+        super::retain_exportable_service_accounts(&mut accounts);
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts["ordinary-service"].credentials.secret_key, "ordinary-secret");
+        let exported = serde_json::to_string(&accounts).expect("serialize selected export records");
+        assert!(!exported.contains("replicator"));
+    }
+
+    #[test]
+    fn iam_archives_preserve_the_reserved_site_replicator_identity() {
+        let failure = super::imported_service_account_reserved_failure(rustfs_iam::sys::SITE_REPLICATOR_SERVICE_ACCOUNT)
+            .expect("the site replicator must never be replaced by an IAM import");
+        assert_eq!(failure.name, "site-replicator-0");
+        assert_eq!(failure.error, "service account name is reserved for site replication");
+        assert!(super::imported_service_account_reserved_failure("ordinary-service-account").is_none());
+        let source = include_str!("user.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source");
+        let export = source_block(source, "impl Operation for ExportIam");
+        let guard = export
+            .find("retain_exportable_service_accounts(&mut service_accounts)")
+            .expect("export uses the canonical reserved identity");
+        assert!(
+            guard
+                < export
+                    .find("let svc_acc_create_req = SRSvcAccCreate")
+                    .expect("exported credentials")
+        );
+        let import = source_block(source, "impl Operation for ImportIam");
+        let guard = import
+            .find("imported_service_account_reserved_failure(&ak)")
+            .expect("import rejects the reserved identity");
+        assert!(
+            guard
+                < import
+                    .find(".delete_service_account(&ak")
+                    .expect("replacement deletes the original account")
+        );
+    }
+
+    #[test]
+    fn import_iam_enqueues_a_site_replication_snapshot() {
+        let body = source_block(include_str!("user.rs"), "impl Operation for ImportIam");
+
+        assert!(
+            body.contains("enqueue_site_replication_iam_snapshot"),
+            "a successful IAM import must schedule a full IAM snapshot for every remote site"
+        );
+    }
 
     #[test]
     fn test_should_check_deny_only_for_regular_self_request() {
@@ -1391,6 +1682,78 @@ mod tests {
     }
 
     #[test]
+    fn test_add_user_rejects_sts_session_targeting_its_parent() {
+        let cred = Credentials {
+            access_key: "VV0V3VYJK2PV6EG45X2Y".to_string(),
+            secret_key: "CS_TEST_SECRET_DO_NOT_LOG".to_string(),
+            session_token: "jwt-session-token".to_string(),
+            parent_user: "alice".to_string(),
+            ..Default::default()
+        };
+
+        // The relaxed deny-only admin check is reachable for exactly this target, so a guard on the
+        // write itself is what keeps the session from rewriting alice's long-term secret.
+        assert!(should_check_deny_only("alice", &cred));
+        assert!(add_user_targets_requester_parent("alice", &cred));
+        assert!(!add_user_targets_requester_parent("bob", &cred));
+    }
+
+    #[test]
+    fn test_add_user_rejects_sts_session_with_parent_only_in_jwt_claims() {
+        let mut claims = HashMap::new();
+        claims.insert("parent".to_string(), Value::String("alice".to_string()));
+        let cred = Credentials {
+            access_key: "39KNO04Z34D6T4AGL6E6".to_string(),
+            secret_key: "CS_TEST_SECRET_DO_NOT_LOG".to_string(),
+            session_token: "jwt-session-token".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        };
+
+        assert!(add_user_targets_requester_parent("alice", &cred));
+    }
+
+    #[test]
+    fn test_add_user_rejects_service_account_targeting_its_parent() {
+        let mut claims = HashMap::new();
+        claims.insert(IAM_POLICY_CLAIM_NAME_SA.to_string(), Value::String("policy".to_string()));
+        let cred = Credentials {
+            access_key: "service-account".to_string(),
+            parent_user: "alice".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        };
+
+        assert!(add_user_targets_requester_parent("alice", &cred));
+        assert!(!add_user_targets_requester_parent("bob", &cred));
+    }
+
+    #[test]
+    fn test_add_user_allows_long_term_credentials_to_manage_other_users() {
+        let cred = Credentials {
+            access_key: "admin".to_string(),
+            secret_key: "CS_TEST_SECRET_DO_NOT_LOG".to_string(),
+            ..Default::default()
+        };
+
+        assert!(!add_user_targets_requester_parent("alice", &cred));
+        assert!(!add_user_targets_requester_parent("admin", &cred));
+    }
+
+    #[test]
+    fn test_add_user_operation_guards_requester_parent_target() {
+        let guard_call = concat!("add_user_targets_requester_", "parent(ak, &cred)");
+        let source = include_str!("user.rs");
+        let guard_at = source
+            .find(guard_call)
+            .expect("AddUser must reject requests that target the requester's parent user");
+        let sink_at = source
+            .find("iam_store.create_user(ak, &args)")
+            .expect("AddUser create_user sink moved; re-anchor this guard test");
+        assert!(guard_at < sink_at, "the parent-user guard must run before the create_user write");
+    }
+
+    #[test]
     fn test_group_import_allows_missing_group_without_spaces() {
         assert!(!should_reject_group_import_name(
             "new-group",
@@ -1428,7 +1791,12 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!imported_service_account_parent_allowed("root-access-key", &requester, false));
+        assert!(!imported_service_account_parent_allowed(
+            "root-access-key",
+            "root-access-key",
+            &requester,
+            false
+        ));
     }
 
     #[test]
@@ -1437,13 +1805,26 @@ mod tests {
             access_key: "delegated-importer".to_string(),
             ..Default::default()
         };
-        let err = imported_service_account_parent_scope_failure("svc-access-key", "root-access-key", &requester, false)
-            .expect("non-owner must not import a service account for another parent");
+        let err = imported_service_account_parent_scope_failure(
+            "root-access-key",
+            "svc-access-key",
+            "root-access-key",
+            &requester,
+            false,
+        )
+        .expect("non-owner must not import a service account for another parent");
 
         assert_eq!(err.name, "svc-access-key");
         assert_eq!(err.error, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR);
         assert!(
-            imported_service_account_parent_scope_failure("svc-access-key", "delegated-importer", &requester, false).is_none()
+            imported_service_account_parent_scope_failure(
+                "root-access-key",
+                "svc-access-key",
+                "delegated-importer",
+                &requester,
+                false
+            )
+            .is_none()
         );
     }
 
@@ -1475,13 +1856,45 @@ mod tests {
     }
 
     #[test]
+    fn credential_boundary_root_derived_non_owner_import_rejects_owner_service_account() {
+        let root = "deployment-root";
+        for temporary in [false, true] {
+            let requester = Credentials {
+                access_key: "restricted-account".to_string(),
+                parent_user: root.to_string(),
+                session_token: "session-token".to_string(),
+                expiration: temporary.then(|| time::OffsetDateTime::now_utc() + time::Duration::hours(1)),
+                claims: (!temporary).then(|| {
+                    HashMap::from([(
+                        rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string(),
+                        serde_json::json!("inherited-policy"),
+                    )])
+                }),
+                ..Default::default()
+            };
+            assert_eq!(requester.is_service_account(), !temporary);
+            assert!(requester.is_temp());
+            let error = imported_service_account_parent_scope_failure(root, "backdoor", root, &requester, false)
+                .expect("a restricted root-derived caller must not import an owner account");
+            assert_eq!(error.name, "backdoor");
+            assert_eq!(error.error, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR);
+            assert!(imported_service_account_parent_allowed(root, root, &requester, true));
+        }
+    }
+
+    #[test]
     fn test_import_service_account_parent_allows_owner_restore() {
         let requester = Credentials {
             access_key: "root-access-key".to_string(),
             ..Default::default()
         };
 
-        assert!(imported_service_account_parent_allowed("any-imported-parent", &requester, true));
+        assert!(imported_service_account_parent_allowed(
+            "root-access-key",
+            "any-imported-parent",
+            &requester,
+            true
+        ));
     }
 
     #[test]
@@ -1491,7 +1904,12 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(imported_service_account_parent_allowed("delegated-importer", &requester, false));
+        assert!(imported_service_account_parent_allowed(
+            "root-access-key",
+            "delegated-importer",
+            &requester,
+            false
+        ));
     }
 
     #[test]
@@ -1503,8 +1921,18 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(imported_service_account_parent_allowed("parent-user", &requester, false));
-        assert!(!imported_service_account_parent_allowed("other-parent", &requester, false));
+        assert!(imported_service_account_parent_allowed(
+            "root-access-key",
+            "parent-user",
+            &requester,
+            false
+        ));
+        assert!(!imported_service_account_parent_allowed(
+            "root-access-key",
+            "other-parent",
+            &requester,
+            false
+        ));
     }
 
     #[test]
@@ -1561,5 +1989,109 @@ mod tests {
     #[test]
     fn test_group_policy_mappings_use_regular_user_type() {
         assert_eq!(GROUP_POLICY_MAPPING_USER_TYPE, rustfs_iam::store::UserType::Reg);
+    }
+
+    /// A single member must not be able to exhaust the archive's expansion budget:
+    /// `MAX_IAM_IMPORT_SIZE` bounds the compressed upload only, so an unbounded
+    /// `read_to_end` here would let a small archive expand without limit.
+    #[test]
+    fn import_member_read_is_bounded_by_the_expansion_budget() {
+        let oversized = vec![b'a'; 1024];
+        let mut budget: u64 = 512;
+
+        let err = read_import_member(&mut oversized.as_slice(), &mut budget)
+            .expect_err("a member larger than the remaining budget must be rejected");
+        assert!(
+            matches!(*err.code(), S3ErrorCode::EntityTooLarge),
+            "expected EntityTooLarge, got {:?}",
+            err.code()
+        );
+    }
+
+    /// The budget is shared across members, so successive reads draw it down and the
+    /// archive as a whole is capped rather than each member independently.
+    #[test]
+    fn import_member_budget_is_shared_across_members() {
+        let member = vec![b'a'; 400];
+        let mut budget: u64 = 1000;
+
+        let first = read_import_member(&mut member.as_slice(), &mut budget).expect("first member fits");
+        assert_eq!(first.len(), 400);
+        assert_eq!(budget, 600, "budget must be drawn down by what was read");
+
+        read_import_member(&mut member.as_slice(), &mut budget).expect("second member still fits");
+        assert_eq!(budget, 200);
+
+        read_import_member(&mut member.as_slice(), &mut budget)
+            .expect_err("third member must be rejected once the shared budget is exhausted");
+    }
+
+    /// Guards the bound from being set so tight that ordinary imports break.
+    #[test]
+    fn import_expansion_budget_leaves_headroom_over_the_compressed_cap() {
+        assert!(
+            MAX_IAM_IMPORT_EXPANDED_SIZE >= MAX_IAM_IMPORT_SIZE as u64,
+            "expanded budget must not be smaller than the compressed upload cap"
+        );
+    }
+
+    /// The shared admin gate answers a credential-less request with `InvalidRequest "get cred failed"`.
+    /// Each converted handler keeps a pre-check ahead of the gate so its own wire response survives
+    /// the refactor unchanged.
+    #[tokio::test]
+    async fn user_handlers_keep_their_missing_credentials_response() {
+        assert_missing_credentials(
+            &SetUserStatus {},
+            Method::PUT,
+            "/rustfs/admin/v3/set-user-status?accessKey=alice",
+            "authentication required",
+        )
+        .await;
+        assert_missing_credentials(&ListUsers {}, Method::GET, "/rustfs/admin/v3/list-users", "authentication required").await;
+        assert_missing_credentials(&RemoveUser {}, Method::DELETE, "/rustfs/admin/v3/remove-user", "authentication required")
+            .await;
+        assert_missing_credentials(&ExportIam {}, Method::GET, "/rustfs/admin/v3/export-iam", "get cred failed").await;
+    }
+
+    #[test]
+    fn user_handlers_use_the_shared_admin_gate_with_their_actions() {
+        let production = include_str!("user.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+
+        for (handler, action, binds_credentials) in [
+            ("SetUserStatus", "EnableUserAdminAction", false),
+            ("ListUsers", "ListUsersAdminAction", true),
+            ("RemoveUser", "DeleteUserAdminAction", true),
+            ("ExportIam", "ExportIAMAction", false),
+        ] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert_shared_gate_wiring(block, handler, &[action], binds_credentials);
+        }
+
+        // AddUser and GetUserInfo derive a per-request `deny_only` from `should_check_deny_only`, and
+        // ImportIam consumes the `owner` flag while restoring service accounts. The shared gate pins
+        // `deny_only = false` and hands back only the credentials, so these three keep the explicit
+        // `check_key_valid` + `validate_admin_request` preamble.
+        for (handler, marker) in [
+            ("AddUser", "should_check_deny_only(ak, &cred)"),
+            ("GetUserInfo", "should_check_deny_only(ak, &cred)"),
+            ("ImportIam", "if !owner {"),
+        ] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert!(
+                block.contains(marker),
+                "{handler} must keep the context that rules out the shared gate ({marker})"
+            );
+            assert!(
+                !block.contains("authorize_admin_envelope("),
+                "{handler} must not be routed through the shared gate"
+            );
+            assert!(
+                block.contains("validate_admin_request("),
+                "{handler} must keep its explicit validate_admin_request call"
+            );
+        }
     }
 }

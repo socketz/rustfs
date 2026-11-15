@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{config::Config, license::init_license, startup_runtime::init_startup_runtime_foundation};
-use rustfs_obs::{init_obs, set_global_guard};
+use crate::{config::Config, license::init_license, startup_runtime::init_startup_runtime_foundation, startup_runtime_sources};
 use rustfs_utils::{ExternalEnvCompatReport, apply_external_env_compat};
 use std::{
     fmt,
@@ -27,9 +26,10 @@ const EVENT_EXTERNAL_ENV_COMPAT_CONFLICT: &str = "external_env_compat_conflict";
 const EVENT_EXTERNAL_ENV_COMPAT_APPLIED: &str = "external_env_compat_applied";
 const EVENT_OBSERVABILITY_GUARD_SET: &str = "observability_guard_set";
 const EVENT_OBSERVABILITY_GUARD_SET_FAILED: &str = "observability_guard_set_failed";
+const EVENT_BUCKET_CONFIG_PARSE_MODE_SELECTED: &str = "bucket_config_parse_mode_selected";
 
 #[derive(Debug)]
-pub enum StartupServerPreflightError {
+pub(crate) enum StartupServerPreflightError {
     ObservabilityInit(Error),
     Other(Error),
 }
@@ -54,30 +54,42 @@ impl std::error::Error for StartupServerPreflightError {
     }
 }
 
-pub fn bootstrap_external_prefix_compat() -> Result<ExternalEnvCompatReport> {
+pub(crate) fn bootstrap_external_prefix_compat() -> Result<ExternalEnvCompatReport> {
     let env_compat_report = apply_external_env_compat();
     Ok(env_compat_report)
 }
 
-pub async fn init_startup_server_preflight(
+pub(crate) async fn init_startup_server_preflight(
     config: &Config,
     env_compat_report: &ExternalEnvCompatReport,
 ) -> std::result::Result<(), StartupServerPreflightError> {
+    #[cfg(feature = "fips")]
+    crate::startup_runtime_hooks::install_default_crypto_provider().map_err(StartupServerPreflightError::Other)?;
+
     crate::config::init_config_snapshot(config);
     init_license(config.license.clone());
     init_startup_observability(config.obs_endpoint.clone()).await?;
     log_external_prefix_compat_report(env_compat_report);
+    let parse_mode = crate::storage_api::startup::init::validate_bucket_config_parse_mode_env()
+        .map_err(|err| StartupServerPreflightError::Other(Error::other(err)))?;
+    info!(
+        event = EVENT_BUCKET_CONFIG_PARSE_MODE_SELECTED,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        mode = parse_mode.as_str(),
+        "Bucket config parse mode selected"
+    );
     init_startup_runtime_foundation(config)
         .await
         .map_err(StartupServerPreflightError::Other)
 }
 
 async fn init_startup_observability(obs_endpoint: String) -> std::result::Result<(), StartupServerPreflightError> {
-    let guard = init_obs(Some(obs_endpoint))
+    let guard = startup_runtime_sources::init_observability_guard(obs_endpoint)
         .await
         .map_err(|err| StartupServerPreflightError::ObservabilityInit(Error::other(err)))?;
 
-    match set_global_guard(guard).map_err(Error::other) {
+    match startup_runtime_sources::set_observability_guard(guard).map_err(Error::other) {
         Ok(_) => {
             debug!(
                 target: "rustfs::main",

@@ -1,3 +1,8 @@
+{{- $tls := .Values.tls | default dict -}}
+{{- $tlsEnabled := $tls.enabled | default false -}}
+{{- if and $tlsEnabled .Values.mtls.enabled -}}
+{{- fail "tls.enabled and mtls.enabled are mutually exclusive; use ingress TLS for public access to an mTLS backend" -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -16,8 +21,14 @@ data:
   {{- if .region }}
   RUSTFS_REGION: {{ .region | quote }}
   {{- end }}
+  {{- if .target_store_dir }}
+  RUSTFS_TARGET_STORE_DIR: {{ .target_store_dir | quote }}
+  {{- end }}
   {{- if .domains }}
   RUSTFS_SERVER_DOMAINS: {{ include "rustfs.serverDomains" $ | quote }}
+  {{- end }}
+  {{- if .ec.storage_class_standard }}
+  RUSTFS_STORAGE_CLASS_STANDARD: {{ .ec.storage_class_standard | quote }}
   {{- end }}
   {{- with .log_rotation }}
     {{- if .size }}
@@ -38,8 +49,12 @@ data:
   {{- end }}
   {{- if .Values.mtls.enabled }}
   RUSTFS_SERVER_MTLS_ENABLE: "1"
-  RUSTFS_TLS_KEYLOG: "1"
+  {{- end }}
+  {{- if or .Values.mtls.enabled $tlsEnabled }}
+  RUSTFS_TLS_KEYLOG: "0"
   RUSTFS_TLS_PATH: "/opt/tls"
+  RUSTFS_TLS_RELOAD_ENABLE: "1"
+  RUSTFS_TLS_RELOAD_INTERVAL: {{ $tls.reloadInterval | default 30 | quote }}
   {{- end }}
   {{- if .Values.config.rustfs.obs_endpoint.enabled }}
   RUSTFS_OBS_ENDPOINT: {{ .Values.config.rustfs.obs_endpoint.base_endpoint | quote }}
@@ -106,11 +121,23 @@ data:
     {{- if ne (toString .cache_save_timeout_secs) "" }}
   RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS: {{ .cache_save_timeout_secs | quote }}
     {{- end }}
+    {{- if ne (toString .recovery_backoff_cap_secs) "" }}
+  RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS: {{ .recovery_backoff_cap_secs | quote }}
+    {{- end }}
     {{- if ne (toString .max_concurrent_set_scans) "" }}
   RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS: {{ .max_concurrent_set_scans | quote }}
     {{- end }}
     {{- if ne (toString .max_concurrent_disk_scans) "" }}
   RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS: {{ .max_concurrent_disk_scans | quote }}
+    {{- end }}
+    {{- if ne (toString .walkers_per_disk) "" }}
+  RUSTFS_SCANNER_WALKERS_PER_DISK: {{ .walkers_per_disk | quote }}
+    {{- end }}
+    {{- if ne (toString .disk_io_budget_iops) "" }}
+  RUSTFS_SCANNER_DISK_IO_BUDGET_IOPS: {{ .disk_io_budget_iops | quote }}
+    {{- end }}
+    {{- if ne (toString .disk_io_budget_bytes_per_sec) "" }}
+  RUSTFS_SCANNER_DISK_IO_BUDGET_BYTES_PER_SEC: {{ .disk_io_budget_bytes_per_sec | quote }}
     {{- end }}
     {{- if ne (toString .yield_every_n_objects) "" }}
   RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS: {{ .yield_every_n_objects | quote }}
@@ -134,10 +161,16 @@ data:
   RUSTFS_KMS_ENABLE: "true"
   RUSTFS_KMS_BACKEND: {{ .vault_backend | quote }}
   RUSTFS_KMS_VAULT_ADDRESS: {{ .vault_address | quote }}
-  RUSTFS_KMS_VAULT_TOKEN: {{ .vault_token | quote }}
+  {{- /* RUSTFS_KMS_VAULT_TOKEN is a credential and is rendered into the KMS Secret
+         (templates/secret.yaml), never into this ConfigMap. */}}
   RUSTFS_KMS_DEFAULT_KEY_ID: {{ .default_key | quote }}
         {{- if eq .vault_backend "vault-transit" }}
   RUSTFS_KMS_VAULT_MOUNT_PATH: {{ .vault_mount_path | quote }}
+        {{- else if .vault_mount_path }}
+  {{- /* The KV2 backend never calls the Transit engine: its mount is the KV2
+         one, under a different variable. Emitted only when set, so an unset
+         value keeps falling back to the "secret" default. */}}
+  RUSTFS_KMS_VAULT_KV_MOUNT: {{ .vault_mount_path | quote }}
         {{- end }}
       {{- end }}
     {{- end }}

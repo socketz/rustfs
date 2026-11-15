@@ -12,21 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled};
+use super::access::{RequestedObjectLegalHold, RequestedObjectLockRetention};
+use super::{StorageError, add_object_lock_years, get_bucket_cors_config};
+use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
+use crate::storage::storage_api::ecfs_extend_consumer::contract::bucket::{BucketOperations, BucketOptions};
+use crate::storage::storage_api::ecfs_extend_consumer::contract::multipart::MAX_MULTIPART_PART_NUMBER;
+use crate::storage::storage_api::ecstore_bucket::metadata_sys::{self, ObjectLockConfigState};
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
-use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
-use rustfs_ecstore::bucket::object_lock::objectlock_sys;
-use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
-use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_ecstore::store_api::{BucketOperations, ObjectInfo, ObjectToDelete};
-use rustfs_storage_api::BucketOptions;
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{
@@ -34,19 +32,21 @@ use rustfs_utils::http::{
     SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, contains_key_str, insert_str, remove_str,
 };
 use s3s::dto::{
-    Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
-    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration,
-    TopicConfiguration,
+    Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+    ObjectLockRetention, ObjectLockRetentionMode, QueueConfiguration, TopicConfiguration,
 };
-use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
+use s3s::{S3Error, S3ErrorCode, S3Result};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
-use std::ops::Add;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use time::{format_description::FormatItem, macros::format_description};
 use tracing::{debug, warn};
+
+use crate::storage::storage_api::ecfs_extend_consumer::StorageObjectInfo as ObjectInfo;
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
@@ -88,24 +88,26 @@ pub(crate) fn remove_object_lock_metadata_for_copy(metadata: &mut HashMap<String
 }
 
 /// Apply bucket default Object Lock retention to object metadata if no explicit retention is set.
-pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfiguration>, metadata: &mut HashMap<String, String>) {
+pub(crate) fn apply_lock_retention(object_lock_config: Option<&ObjectLockConfiguration>, metadata: &mut HashMap<String, String>) {
     if has_object_lock_retention_metadata(metadata) {
         return;
     }
 
     let Some(config) = object_lock_config else { return };
 
-    if config.object_lock_enabled.as_ref().map(|e| e.as_str()) != Some(ObjectLockEnabled::ENABLED) {
+    if config.object_lock_enabled.as_deref() != Some("Enabled") {
         return;
     }
 
-    let Some(default_retention) = config.rule.and_then(|r| r.default_retention) else { return };
-    let Some(mode) = default_retention.mode else { return };
+    let Some(default_retention) = config.rule.as_ref().and_then(|r| r.default_retention.as_ref()) else {
+        return;
+    };
+    let Some(mode) = default_retention.mode.as_ref() else { return };
 
     let now = OffsetDateTime::now_utc();
     let retain_until = match (default_retention.days, default_retention.years) {
         (Some(days), _) => now.saturating_add(time::Duration::days(days as i64)),
-        (None, Some(years)) => objectlock_sys::add_years(now, years),
+        (None, Some(years)) => add_object_lock_years(now, years),
         _ => return,
     };
 
@@ -117,7 +119,7 @@ pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfigur
 }
 
 pub(crate) fn apply_default_lock_retention_metadata(
-    object_lock_configuration: Option<ObjectLockConfiguration>,
+    object_lock_configuration: Option<&ObjectLockConfiguration>,
     metadata: &mut HashMap<String, String>,
 ) -> bool {
     if has_object_lock_retention_metadata(metadata) {
@@ -134,40 +136,73 @@ pub(crate) fn apply_default_lock_retention_metadata(
     true
 }
 
-pub(crate) async fn apply_bucket_default_lock_retention(
+pub(crate) async fn load_bucket_object_lock_config_state(bucket: &str) -> S3Result<ObjectLockConfigState> {
+    map_bucket_object_lock_config_state(bucket, metadata_sys::get_object_lock_config_state(bucket).await)
+}
+
+pub(crate) fn map_bucket_object_lock_config_state(
     bucket: &str,
+    result: Result<ObjectLockConfigState, StorageError>,
+) -> S3Result<ObjectLockConfigState> {
+    match result {
+        Ok(ObjectLockConfigState::Fabricated) => {
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "object_lock_config_not_authoritative",
+                bucket = %bucket,
+                "Bucket Object Lock configuration is not authoritative"
+            );
+            Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Failed to load Object Lock configuration".to_string(),
+            ))
+        }
+        Ok(state) => Ok(state),
+        Err(err) => {
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "object_lock_config_load_failed",
+                bucket = %bucket,
+                error = ?err,
+                "Failed to load bucket object lock configuration"
+            );
+            Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Failed to load Object Lock configuration".to_string(),
+            ))
+        }
+    }
+}
+
+pub(crate) fn apply_bucket_default_lock_retention(
+    bucket: &str,
+    state: &ObjectLockConfigState,
     metadata: &mut HashMap<String, String>,
     has_explicit_retention: bool,
 ) -> S3Result<()> {
-    if has_explicit_retention {
-        return Ok(());
-    }
-
-    if has_object_lock_retention_metadata(metadata) {
-        return Ok(());
-    }
-
-    let object_lock_configuration = match metadata_sys::get_object_lock_config(bucket).await {
-        Ok((cfg, _created)) => Some(cfg),
-        Err(err) => {
-            if err == StorageError::ConfigNotFound {
-                None
-            } else {
-                warn!(
-                    component = LOG_COMPONENT_STORAGE,
-                    subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
-                    event = "object_lock_config_load_failed",
-                    bucket = %bucket,
-                    error = ?err,
-                    "Failed to load bucket object lock configuration"
-                );
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "Failed to load Object Lock configuration".to_string(),
-                ));
-            }
+    let object_lock_configuration = match state {
+        ObjectLockConfigState::Configured { config, .. } => Some(config),
+        ObjectLockConfigState::ConfirmedAbsent => None,
+        ObjectLockConfigState::Fabricated => {
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "object_lock_config_not_authoritative",
+                bucket = %bucket,
+                "Bucket Object Lock configuration is not authoritative"
+            );
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Failed to load Object Lock configuration".to_string(),
+            ));
         }
     };
+
+    if has_explicit_retention || has_object_lock_retention_metadata(metadata) {
+        return Ok(());
+    }
 
     apply_default_lock_retention_metadata(object_lock_configuration, metadata);
     Ok(())
@@ -219,7 +254,10 @@ pub(crate) async fn apply_bucket_default_lock_retention(
 /// );
 /// ```
 ///
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "exercised by ecfs_test; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<WorkloadProfile>) -> usize {
     let config = match profile {
         Some(p) => RustFSBufferConfig::new(p),
@@ -261,8 +299,8 @@ pub(crate) fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Opt
 /// ```
 pub(crate) fn get_buffer_size_opt_in(file_size: i64) -> usize {
     let buffer_size = if is_buffer_profile_enabled() {
-        // Use globally configured workload profile (enabled by default in Phase 3)
-        let config = get_global_buffer_config();
+        // Use the AppContext-owned profile when available, with global fallback during migration.
+        let config = runtime_sources::current_buffer_config();
         config.get_buffer_size(file_size)
     } else {
         // Opt-out mode: Use GeneralPurpose profile for consistent behavior
@@ -285,11 +323,36 @@ pub(crate) fn get_buffer_size_opt_in(file_size: i64) -> usize {
     buffer_size
 }
 
-/// Validate object key for control characters and log special characters
+/// Reject XML-incompatible and storage-sidecar keys at new object boundaries.
+pub(crate) fn validate_new_object_key(key: &str, operation: &str) -> S3Result<()> {
+    validate_object_key(key, operation)?;
+    // These persistent sidecar filenames share directories with client objects.
+    // Case-insensitive checks also protect case-insensitive disk deployments.
+    if key.split('/').any(|segment| {
+        ["xl.meta", "xl.meta.bkp", "delete-prepared", "delete-quorum-committed"]
+            .iter()
+            .any(|reserved| segment.eq_ignore_ascii_case(reserved))
+    }) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "Object key contains a reserved storage filename",
+        ));
+    }
+    if crate::storage::storage_api::ecstore_bucket::utils::has_xml_invalid_control_characters(key) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "Object key contains characters unsupported by XML listings",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate client object keys and log special characters
 ///
 /// This function:
 /// 1. Rejects keys containing control characters (null bytes, newlines, carriage returns)
-/// 2. Logs debug information for keys containing spaces, plus signs, or percent signs
+/// 2. Rejects reserved directory markers and invalid path segments
+/// 3. Logs debug information for keys containing spaces, plus signs, or percent signs
 ///
 /// The s3s library handles URL decoding, so keys are already decoded when they reach this function.
 /// This validation ensures that invalid characters that could cause issues are rejected early.
@@ -300,6 +363,23 @@ pub(crate) fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
             S3ErrorCode::InvalidArgument,
             format!("Object key contains invalid control characters: {key:?}"),
         ));
+    }
+
+    // Storage encodes directory objects as `<name>__XLDIR__` after this client-key
+    // boundary, and `scan_dir` decodes every entry with that suffix back into a
+    // marker. A client key carrying the suffix would be mistaken for a marker:
+    // the bare key `__XLDIR__` makes the walk schedule the directory it is
+    // scanning as its own child until the stack overflows, and keys below a
+    // `*__XLDIR__/` segment vanish from listings and quota accounting.
+    if key.contains(rustfs_utils::path::GLOBAL_DIR_SUFFIX) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "Object key contains a reserved directory marker",
+        ));
+    }
+
+    if key.is_empty() || !crate::storage::storage_api::ecstore_bucket::utils::is_valid_object_prefix(key) {
+        return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid object key"));
     }
 
     // Log debug info for keys with special characters to help diagnose encoding issues
@@ -352,6 +432,12 @@ pub(crate) fn validate_list_object_unordered_with_delimiter(
 }
 
 pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>) -> S3Result<HashMap<String, String>> {
+    parse_object_lock_retention_native(retention.as_ref().map(RequestedObjectLockRetention::from))
+}
+
+pub(crate) fn parse_object_lock_retention_native(
+    retention: Option<RequestedObjectLockRetention>,
+) -> S3Result<HashMap<String, String>> {
     let mut eval_metadata = HashMap::new();
 
     if let Some(v) = retention {
@@ -371,8 +457,7 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
         let now = OffsetDateTime::now_utc();
         // Validate retain_until_date is in the future (S3 requirement)
         // Only validate when both mode and date are provided (not clearing retention)
-        let retain_until_date = if let Some(date) = v.retain_until_date {
-            let retain_until = OffsetDateTime::from(date);
+        let retain_until_date = if let Some(retain_until) = v.retain_until {
             // Only validate future date when mode is set (not clearing retention)
             if !mode.is_empty() && retain_until <= now {
                 return Err(S3Error::with_message(
@@ -380,7 +465,12 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
                     "The retain until date must be in the future".to_string(),
                 ));
             }
-            retain_until.format(&Rfc3339).unwrap()
+            retain_until.format(&Rfc3339).map_err(|_| {
+                S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "The retain until date is not a supported RFC3339 timestamp".to_string(),
+                )
+            })?
         } else {
             String::default()
         };
@@ -398,9 +488,15 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
 }
 
 pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHold>) -> S3Result<HashMap<String, String>> {
+    parse_object_lock_legal_hold_native(legal_hold.as_ref().map(RequestedObjectLegalHold::from))
+}
+
+pub(crate) fn parse_object_lock_legal_hold_native(
+    legal_hold: Option<RequestedObjectLegalHold>,
+) -> S3Result<HashMap<String, String>> {
     let mut eval_metadata = HashMap::new();
     if let Some(v) = legal_hold {
-        let status = match v.status {
+        let status = match v.0 {
             Some(status) => match status.as_str() {
                 ObjectLockLegalHoldStatus::OFF | ObjectLockLegalHoldStatus::ON => status.as_str().to_string(),
                 _ => {
@@ -425,37 +521,35 @@ pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHol
 }
 
 pub(crate) async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Result<()> {
-    match metadata_sys::get_object_lock_config(bucket).await {
-        Ok((cfg, _created)) => {
-            if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidRequest,
-                    "Object Lock is not enabled for this bucket".to_string(),
-                ));
-            }
-        }
-        Err(err) => {
-            if err == StorageError::ConfigNotFound {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidRequest,
-                    "Bucket is missing ObjectLockConfiguration".to_string(),
-                ));
-            }
+    let state = load_bucket_object_lock_config_state(bucket).await?;
+    validate_bucket_object_lock_enabled_state(bucket, &state)
+}
+
+pub(crate) fn validate_bucket_object_lock_enabled_state(bucket: &str, state: &ObjectLockConfigState) -> S3Result<()> {
+    match state {
+        ObjectLockConfigState::Configured { config, .. } if config.object_lock_enabled.as_deref() == Some("Enabled") => Ok(()),
+        ObjectLockConfigState::Configured { .. } => Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "Object Lock is not enabled for this bucket".to_string(),
+        )),
+        ObjectLockConfigState::ConfirmedAbsent => Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "Bucket is missing ObjectLockConfiguration".to_string(),
+        )),
+        ObjectLockConfigState::Fabricated => {
             warn!(
                 component = LOG_COMPONENT_STORAGE,
                 subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
-                event = "object_lock_config_load_failed",
+                event = "object_lock_config_not_authoritative",
                 bucket = %bucket,
-                error = ?err,
-                "Failed to load bucket object lock configuration"
+                "Bucket Object Lock configuration is not authoritative"
             );
-            return Err(S3Error::with_message(
+            Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 "Failed to get bucket ObjectLockConfiguration".to_string(),
-            ));
+            ))
         }
     }
-    Ok(())
 }
 
 /// Validates HTTP conditional request headers for a single object according to
@@ -480,22 +574,29 @@ pub(crate) async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Resul
 /// has not changed), allowing the caller to translate this into the correct
 /// HTTP response.
 pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3Result<()> {
-    let mod_time = info.mod_time;
-    let etag = info.etag.as_deref();
+    match evaluate_read_preconditions(headers, info.etag.as_deref(), info.mod_time) {
+        Ok(()) => Ok(()),
+        Err(S3ErrorCode::NotModified) => Err(not_modified_error(info)?),
+        Err(code) => Err(S3Error::new(code)),
+    }
+}
+
+pub(crate) fn evaluate_read_preconditions(
+    headers: &HeaderMap,
+    etag: Option<&str>,
+    mod_time: Option<OffsetDateTime>,
+) -> Result<(), S3ErrorCode> {
     let if_match = non_empty_header_value(headers, IF_MATCH);
     let if_none_match = non_empty_header_value(headers, IF_NONE_MATCH);
     let if_modified_since = non_empty_header_value(headers, IF_MODIFIED_SINCE);
     let if_unmodified_since = non_empty_header_value(headers, IF_UNMODIFIED_SINCE);
 
-    if mod_time.is_none() && etag.is_none() {
-        return Ok(());
-    }
-
-    // If-Match: requires ETag to exist
+    // The caller has resolved an existing object, so '*' does not require an ETag.
     if let Some(if_match_val) = if_match {
         match etag {
-            Some(e) if is_etag_equal(e, if_match_val) => {}
-            _ => return Err(S3Error::new(S3ErrorCode::PreconditionFailed)),
+            _ if if_match_val == "*" => {}
+            Some(e) if read_etag_matches(e, if_match_val, false) => {}
+            _ => return Err(S3ErrorCode::PreconditionFailed),
         }
     }
 
@@ -504,32 +605,16 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
         && let Some(t) = mod_time
         && let Some(if_unmodified_since) = if_unmodified_since
         && let Ok(given_time) = time::PrimitiveDateTime::parse(if_unmodified_since, &RFC1123).map(|dt| dt.assume_utc())
-        && t > given_time.add(time::Duration::seconds(1))
+        && t.unix_timestamp() > given_time.unix_timestamp()
     {
-        return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+        return Err(S3ErrorCode::PreconditionFailed);
     }
 
     // If-None-Match
     if let Some(if_none_match) = if_none_match
-        && let Some(e) = etag
-        && is_etag_equal(e, if_none_match)
+        && (if_none_match == "*" || etag.is_some_and(|e| read_etag_matches(e, if_none_match, true)))
     {
-        let mut error_headers = HeaderMap::new();
-        if let Ok(etag_header) = parse_etag(e) {
-            error_headers.insert("etag", etag_header);
-        }
-        if let Some(t) = mod_time
-            && let Ok(last_modified_str) = t.format(&RFC1123)
-            && let Ok(last_modified_header) = HeaderValue::from_str(&last_modified_str)
-        {
-            error_headers.insert("last-modified", last_modified_header);
-        }
-
-        let mut s3_error = S3Error::new(S3ErrorCode::NotModified);
-        s3_error.set_message("Not Modified".to_string());
-        s3_error.set_status_code(StatusCode::NOT_MODIFIED);
-        s3_error.set_headers(error_headers);
-        return Err(s3_error);
+        return Err(S3ErrorCode::NotModified);
     }
 
     // If-Modified-Since (only when If-None-Match is absent — semantics per RFC 7232; dates use RFC 1123 format)
@@ -537,29 +622,92 @@ pub(crate) fn check_preconditions(headers: &HeaderMap, info: &ObjectInfo) -> S3R
         && let Some(t) = mod_time
         && let Some(if_modified_since) = if_modified_since
         && let Ok(given_time) = time::PrimitiveDateTime::parse(if_modified_since, &RFC1123).map(|dt| dt.assume_utc())
-        && t < given_time.add(time::Duration::seconds(1))
+        && t.unix_timestamp() <= given_time.unix_timestamp()
     {
-        let mut error_headers = HeaderMap::new();
-        if let Some(e) = etag
-            && let Ok(etag_header) = parse_etag(e)
-        {
-            error_headers.insert("etag", etag_header);
-        }
-        if let Ok(last_modified_str) = t.format(&RFC1123)
-            && let Ok(last_modified_header) = HeaderValue::from_str(&last_modified_str)
-        {
-            error_headers.insert("last-modified", last_modified_header);
-        }
-
-        let mut s3_error = S3Error::new(S3ErrorCode::NotModified);
-        s3_error.set_message("Not Modified".to_string());
-        s3_error.set_status_code(StatusCode::NOT_MODIFIED);
-        s3_error.set_headers(error_headers);
-
-        return Err(s3_error);
+        return Err(S3ErrorCode::NotModified);
     }
 
     Ok(())
+}
+
+fn not_modified_error(info: &ObjectInfo) -> S3Result<S3Error> {
+    let mut headers = HeaderMap::new();
+    if let Some(etag) = info.etag.as_deref() {
+        headers.insert(http::header::ETAG, parse_etag(etag).map_err(S3Error::internal_error)?);
+    }
+    if let Some(mod_time) = info.mod_time {
+        let value = mod_time.format(&RFC1123).map_err(S3Error::internal_error)?;
+        headers.insert(
+            http::header::LAST_MODIFIED,
+            HeaderValue::from_str(&value).map_err(S3Error::internal_error)?,
+        );
+    }
+    for name in ["cache-control", "content-location", "vary", "expires"] {
+        if let Some(value) = info.user_defined.get(name) {
+            headers.insert(name, HeaderValue::from_str(value).map_err(S3Error::internal_error)?);
+        }
+    }
+    if let Some(expires) = info.expires {
+        let value = expires.format(&RFC1123).map_err(S3Error::internal_error)?;
+        headers.insert(http::header::EXPIRES, HeaderValue::from_str(&value).map_err(S3Error::internal_error)?);
+    }
+    if let Some(version) = info.version_id {
+        let value = if version.is_nil() {
+            "null".to_owned()
+        } else {
+            version.to_string()
+        };
+        headers.insert("x-amz-version-id", HeaderValue::from_str(&value).map_err(S3Error::internal_error)?);
+    }
+    let mut error = S3Error::new(S3ErrorCode::NotModified);
+    error.set_status_code(StatusCode::NOT_MODIFIED);
+    error.set_message("Not Modified".to_owned());
+    error.set_headers(headers);
+    Ok(error)
+}
+
+/// GET/HEAD use weak comparison for If-None-Match and strong comparison for If-Match.
+fn read_etag_matches(object_etag: &str, condition: &str, allow_weak: bool) -> bool {
+    let object_etag = object_etag.trim();
+    let object_weak = object_etag.starts_with("W/");
+    let object_value = object_etag.strip_prefix("W/").unwrap_or(object_etag).trim_matches('"');
+    let mut remaining = condition.trim();
+    let mut matched = false;
+    while !remaining.is_empty() {
+        // Recipients ignore empty list members, but tags still need commas.
+        if let Some(rest) = remaining.strip_prefix(',') {
+            remaining = rest.trim();
+            continue;
+        }
+        let weak = remaining.starts_with("W/");
+        let value = remaining.strip_prefix("W/").unwrap_or(remaining);
+        let (value, rest) = if let Some(quoted) = value.strip_prefix('"') {
+            let Some(pair) = quoted.split_once('"') else { return false };
+            pair
+        } else {
+            // Preserve bare tags used by legacy internal callers.
+            if weak {
+                return false;
+            }
+            let (value, rest) = value.split_at(value.find(',').unwrap_or(value.len()));
+            let value = value.trim();
+            if value.is_empty() || value == "*" {
+                return false;
+            }
+            (value, rest)
+        };
+        if !value.bytes().all(|byte| byte == b'!' || (byte >= b'#' && byte != 0x7f)) {
+            return false;
+        }
+        matched |= value == object_value && (allow_weak || (!weak && !object_weak));
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return matched;
+        }
+        let Some(rest) = rest.strip_prefix(',') else { return false };
+        remaining = rest.trim();
+    }
+    matched
 }
 
 fn non_empty_header_value(headers: &HeaderMap, name: http::header::HeaderName) -> Option<&str> {
@@ -570,33 +718,10 @@ fn non_empty_header_value(headers: &HeaderMap, name: http::header::HeaderName) -
         .filter(|v| !v.is_empty())
 }
 
-/// Compares an object ETag with an ETag value from an HTTP header.
-///
-/// This helper implements HTTP ETag comparison semantics for headers such as
-/// `If-Match` and `If-None-Match`:
-/// - Supports the wildcard `*`, which matches any `object_etag`.
-/// - Supports comma-separated ETag lists (e.g., `"etag1", "etag2"`), returning
-///   `true` if any entry matches `object_etag`.
-/// - Automatically trims surrounding whitespace and double quotes from both the
-///   header entries and `object_etag` before comparison.
-///
-/// # Parameters
-/// - `object_etag`: The ETag associated with the stored object.
-/// - `header_etag`: The raw ETag header value received in the request, which may
-///   be a wildcard, a single ETag, or a comma-separated list of ETags.
-///
-/// # Returns
-/// `true` if the header value matches the object ETag according to the above
-/// HTTP ETag comparison rules, otherwise `false`.
-pub(crate) fn is_etag_equal(object_etag: &str, header_etag: &str) -> bool {
-    let header_etag = header_etag.trim();
-    if header_etag == "*" {
-        return true;
-    }
-    header_etag
-        .split(',')
-        .map(|s| s.trim().trim_matches('"'))
-        .any(|e| e == object_etag.trim_matches('"'))
+pub(crate) fn has_read_preconditions(headers: &HeaderMap) -> bool {
+    [IF_MATCH, IF_UNMODIFIED_SINCE, IF_NONE_MATCH, IF_MODIFIED_SINCE]
+        .into_iter()
+        .any(|name| non_empty_header_value(headers, name).is_some())
 }
 
 /// Converts an object ETag string into an HTTP `HeaderValue` for use in response headers.
@@ -721,42 +846,81 @@ where
     Ok(())
 }
 
-pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelete]) -> bool {
-    let (cfg, _created) = match get_replication_config(bucket).await {
-        Ok(replication_config) => replication_config,
-        Err(_err) => {
-            return false;
-        }
-    };
+/// Bucket validation cache to avoid repeated stat_volume() calls on every GET.
+///
+/// Backend: `RwLock<HashMap>`. A parallel opt-in starshard backend
+/// (`RUSTFS_BUCKET_CACHE_STARSHARD`) used to double-write every operation
+/// here; no deployment ever set the variable and the branch was removed in
+/// backlog#1832.
+///
+/// Entries expire after `BUCKET_VALIDATION_TTL` (checked on read).
+/// Write operations (delete/make bucket) invalidate the cache explicitly.
+const BUCKET_VALIDATION_TTL: Duration = Duration::from_secs(5);
 
-    for object in objects {
-        if cfg.has_active_rules(&object.object_name, true) {
-            return true;
-        }
-    }
-    false
+static BUCKET_CACHE_SMALL: OnceLock<RwLock<HashMap<String, Instant>>> = OnceLock::new();
+
+fn small_cache() -> &'static RwLock<HashMap<String, Instant>> {
+    BUCKET_CACHE_SMALL.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Helper function to get store and validate bucket exists
-pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<rustfs_ecstore::store::ECStore>> {
-    let Some(store) = resolve_object_store_handle() else {
+/// Get a value from the cache.
+fn cache_get(bucket: &str) -> Option<Instant> {
+    small_cache().read().ok()?.get(bucket).copied()
+}
+
+/// Insert a value into the cache.
+fn cache_insert(bucket: String, ts: Instant) {
+    if let Ok(mut map) = small_cache().write() {
+        map.insert(bucket, ts);
+    }
+}
+
+/// Remove a value from the cache.
+fn cache_remove(bucket: &str) {
+    if let Ok(mut map) = small_cache().write() {
+        map.remove(bucket);
+    }
+}
+/// Invalidate the validation cache for a specific bucket.
+pub fn invalidate_bucket_validation_cache(bucket: &str) {
+    cache_remove(bucket);
+}
+/// Helper function to get store and validate bucket exists.
+///
+/// Uses adaptive cache with 5s TTL to avoid repeated stat_volume() calls.
+/// Returns store directly on cache hit without calling get_bucket_info().
+pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::ECStore>> {
+    let Some(store) = runtime_sources::current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
-    // Validate bucket exists
+    validate_bucket_exists(&store, bucket).await?;
+
+    Ok(store)
+}
+
+/// Validate that `bucket` exists on `store`, using the same adaptive 5s-TTL
+/// positive cache as [`get_validated_store`]. Handlers that resolve their
+/// store through the request-bound server context (backlog#1052 S6) use this
+/// to keep bucket validation on that store instead of the process-global one.
+pub(crate) async fn validate_bucket_exists(store: &super::ECStore, bucket: &str) -> S3Result<()> {
+    // Check cache — TTL is checked manually.
+    if let Some(inserted_at) = cache_get(bucket)
+        && inserted_at.elapsed() < BUCKET_VALIDATION_TTL
+    {
+        return Ok(()); // Cache hit, skip validation
+    }
+
+    // Cache miss or expired, perform validation
     store
         .get_bucket_info(bucket, &BucketOptions::default())
         .await
         .map_err(ApiError::from)?;
 
-    Ok(store)
-}
+    // Update cache
+    cache_insert(bucket.to_string(), Instant::now());
 
-/// Quick check if CORS processing is needed (lightweight check for Origin header)
-/// This avoids unnecessary function calls for non-CORS requests
-#[inline]
-pub(crate) fn needs_cors_processing(headers: &HeaderMap) -> bool {
-    headers.contains_key(cors::standard::ORIGIN)
+    Ok(())
 }
 
 /// Apply CORS headers to response based on bucket CORS configuration and request origin
@@ -770,24 +934,15 @@ pub(crate) fn needs_cors_processing(headers: &HeaderMap) -> bool {
 ///    - `None`: bucket has no CORS config (or request has no valid `Origin`)
 ///    - `Some(empty headers)`: bucket CORS exists but request is denied / no rule matched
 ///    - `Some(non-empty headers)`: bucket CORS exists and request matched
-///
-/// Note: This function should only be called if `needs_cors_processing()` returns true
-/// to avoid unnecessary overhead for non-CORS requests.
-pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, headers: &HeaderMap) -> Option<HeaderMap> {
+pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, request: &cors::CorsRequest) -> Option<HeaderMap> {
     use http::HeaderValue;
 
-    fn is_credentialed_request(headers: &HeaderMap) -> bool {
-        headers.contains_key(http::header::AUTHORIZATION)
-            || headers.contains_key(http::header::COOKIE)
-            || headers.contains_key("x-amz-security-token")
-            || headers.contains_key("x-amz-content-sha256")
-    }
-
-    // Get Origin header from request
-    let origin = headers.get(cors::standard::ORIGIN)?.to_str().ok()?;
+    // Invalid and absent origins do not require a bucket metadata lookup.
+    let origin_header = request.origin.as_ref()?;
+    let origin = origin_header.to_str().ok()?;
 
     // Get CORS configuration for the bucket
-    let cors_config = match metadata_sys::get_cors_config(bucket).await {
+    let cors_config = match get_bucket_cors_config(bucket).await {
         Ok((config, _)) => config,
         Err(_) => return None, // No CORS config, no headers to add
     };
@@ -807,15 +962,17 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
     // Use Access-Control-Request-Method if present (for preflight and non-preflight requests),
     // otherwise fall back to the actual HTTP method.
     let is_preflight = method == http::Method::OPTIONS;
-    let requested_method = headers
-        .get(cors::request::ACCESS_CONTROL_REQUEST_METHOD)
+    let requested_method = request
+        .requested_method
+        .as_ref()
         .and_then(|v| v.to_str().ok())
         .unwrap_or(method_str);
 
     // Get requested headers from preflight request
     let requested_headers = if is_preflight {
-        headers
-            .get(cors::request::ACCESS_CONTROL_REQUEST_HEADERS)
+        request
+            .requested_headers
+            .as_ref()
             .and_then(|v| v.to_str().ok())
             .map(|h| h.split(',').map(|s| s.trim().to_lowercase()).collect::<Vec<_>>())
     } else {
@@ -878,27 +1035,16 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         // Credentials mode + wildcard allow list requires echoing the request origin.
         // Browsers reject `Access-Control-Allow-Origin: *` with `credentials: include`.
         let has_wildcard_origin = rule.allowed_origins.iter().any(|o| o == "*");
-        let credentialed_request = is_credentialed_request(headers);
-        let mut origin_reflected = false;
+        let credentialed_request = request.credentialed;
 
         if has_wildcard_origin {
             if credentialed_request {
-                if let Ok(origin_value) = HeaderValue::from_str(origin) {
-                    response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
-                    origin_reflected = true;
-                }
+                response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_header.clone());
             } else {
                 response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
             }
-        } else if let Ok(origin_value) = HeaderValue::from_str(origin) {
-            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
-            origin_reflected = true;
-        }
-
-        // Vary: Origin whenever origin is reflected (non-"*" allow-origin).
-        // This prevents proxy/browser caches from reusing CORS headers across different origins.
-        if origin_reflected {
-            response_headers.insert(cors::standard::VARY, HeaderValue::from_static("Origin"));
+        } else {
+            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_header.clone());
         }
 
         // Credentials mode requires explicit allow-credentials.
@@ -915,13 +1061,14 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         }
 
         // Access-Control-Allow-Headers (required for preflight if headers were requested)
-        if is_preflight && let Some(ref allowed_headers) = rule.allowed_headers {
-            let headers_str = allowed_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
+        if is_preflight && let Some(ref requested_headers) = requested_headers {
+            // Every requested header matched this rule; do not expose its wildcard
+            // or grant headers that the preflight did not request.
+            let headers_str = requested_headers.join(",");
             if let Ok(headers_value) = HeaderValue::from_str(&headers_str) {
                 response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_HEADERS, headers_value);
             }
         }
-
         // Access-Control-Expose-Headers (for actual requests)
         if !is_preflight && let Some(ref expose_headers) = rule.expose_headers {
             let expose_headers_str = expose_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
@@ -958,29 +1105,6 @@ pub(crate) fn matches_origin_pattern(pattern: &str, origin: &str) -> bool {
     }
 }
 
-/// Wrap S3Response with CORS headers if needed
-/// This function performs a lightweight check first to avoid unnecessary CORS processing
-/// for non-CORS requests (requests without Origin header)
-pub(crate) async fn wrap_response_with_cors<T>(
-    bucket: &str,
-    method: &http::Method,
-    headers: &HeaderMap,
-    output: T,
-) -> S3Response<T> {
-    let mut response = S3Response::new(output);
-
-    // Quick check: only process CORS if Origin header is present
-    if needs_cors_processing(headers)
-        && let Some(cors_headers) = apply_cors_headers(bucket, method, headers).await
-    {
-        for (key, value) in cors_headers.iter() {
-            response.headers.insert(key, value.clone());
-        }
-    }
-
-    response
-}
-
 /// Parse part number from Option<i32> to Option<usize> with validation
 /// This function checks that the part number is greater than 0 and
 /// converts it to usize, returning an error if invalid
@@ -997,10 +1121,65 @@ pub(crate) async fn wrap_response_with_cors<T>(
 pub(crate) fn parse_part_number_i32_to_usize(part_number: Option<i32>, op: &'static str) -> S3Result<Option<usize>> {
     match part_number {
         None => Ok(None),
-        Some(n) if n <= 0 => Err(S3Error::with_message(
+        Some(n) if !(1..=MAX_MULTIPART_PART_NUMBER).contains(&n) => Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
-            format!("{op}: invalid partNumber {n}, must be a positive integer"),
+            format!("{op}: partNumber must be between 1 and {MAX_MULTIPART_PART_NUMBER}"),
         )),
         Some(n) => Ok(Some(n as usize)),
+    }
+}
+
+#[cfg(test)]
+mod object_key_admission_tests {
+    use super::{validate_new_object_key, validate_object_key};
+
+    #[test]
+    fn storage_sidecar_keys_are_rejected_only_for_new_writes() {
+        for reserved in ["xl.meta", "xl.meta.bkp", "delete-prepared", "delete-quorum-committed"] {
+            for key in [
+                reserved.to_string(),
+                format!("parent/uuid/{reserved}"),
+                format!("parent/{reserved}/child"),
+                reserved.to_uppercase(),
+            ] {
+                for operation in ["PutObject", "COPY (dest)", "CreateMultipartUpload", "CompleteMultipartUpload"] {
+                    assert!(validate_new_object_key(&key, operation).is_err(), "{operation}: {key}");
+                }
+                assert!(validate_object_key(&key, "GetObject").is_ok(), "legacy read: {key}");
+                assert!(validate_object_key(&key, "DeleteObject").is_ok(), "legacy cleanup: {key}");
+            }
+            assert!(validate_new_object_key(&format!("ordinary/{reserved}-report"), "PutObject").is_ok());
+        }
+    }
+
+    #[test]
+    fn xml_invalid_keys_are_rejected_only_for_new_writes() {
+        for byte in (1u8..32).filter(|byte| !matches!(byte, 9 | 10 | 13)) {
+            let key = format!("legacy-{}", char::from(byte));
+            assert!(validate_new_object_key(&key, "PutObject").is_err());
+            assert!(validate_object_key(&key, "GetObject").is_ok());
+            assert!(validate_object_key(&key, "DeleteObject").is_ok());
+        }
+        for key in ["ordinary/key", "tab\tkey", "unicode-中文", "directory/"] {
+            assert!(validate_new_object_key(key, "PutObject").is_ok());
+        }
+    }
+
+    #[test]
+    fn reserved_directory_marker_keys_are_rejected() {
+        for key in [
+            "__XLDIR__",
+            "__XLDIR__/",
+            "prefix__XLDIR__/object",
+            "object__XLDIR__",
+            "a/__XLDIR__/b",
+        ] {
+            for operation in ["PutObject", "COPY (dest)", "CreateMultipartUpload", "CompleteMultipartUpload"] {
+                assert!(validate_object_key(key, operation).is_err(), "{operation}: {key}");
+            }
+        }
+        for key in ["ordinary/key", "xldir", "__xldir__", "directory/", "unicode-中文"] {
+            assert!(validate_object_key(key, "PutObject").is_ok(), "{key}");
+        }
     }
 }

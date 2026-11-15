@@ -12,5 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod json_document_schema;
+mod json_document_table;
+mod json_lines_schema;
 pub mod manager;
 mod parquet_table;
+mod schema_inference;

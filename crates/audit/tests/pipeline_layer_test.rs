@@ -12,76 +12,88 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use async_trait::async_trait;
-use rustfs_audit::{AuditPipeline, AuditRegistry, AuditRuntimeFacade, AuditRuntimeView};
-use rustfs_targets::arn::TargetID;
-use rustfs_targets::store::{Key, Store};
-use rustfs_targets::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
-use rustfs_targets::{StoreError, Target, TargetError};
-use serde::{Serialize, de::DeserializeOwned};
+use rustfs_audit::{AuditEntry, AuditError, AuditPipeline, AuditRegistry, AuditRuntimeFacade, AuditRuntimeView};
+use rustfs_targets::SharedTarget;
+use rustfs_targets::testkit::MockTarget;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
-#[derive(Clone)]
-struct TestTarget {
-    close_calls: Arc<AtomicUsize>,
-    id: TargetID,
-    init_calls: Arc<AtomicUsize>,
+/// Builds a target whose `save()` always fails, used to exercise the dispatch
+/// failure-propagation paths.
+fn failing_target(id: &str, name: &str) -> MockTarget {
+    MockTarget::new(id, name).with_save_failures(usize::MAX)
 }
 
-impl TestTarget {
-    fn new(id: &str, name: &str) -> Self {
-        Self {
-            close_calls: Arc::new(AtomicUsize::new(0)),
-            id: TargetID::new(id.to_string(), name.to_string()),
-            init_calls: Arc::new(AtomicUsize::new(0)),
-        }
+fn pipeline_with_targets(targets: Vec<(&str, SharedTarget<AuditEntry>)>) -> AuditPipeline {
+    let mut registry = AuditRegistry::new();
+    for (id, target) in targets {
+        registry.add_shared_target(id.to_string(), target);
     }
+    AuditPipeline::new(Arc::new(Mutex::new(registry)))
 }
 
-#[async_trait]
-impl<E> Target<E> for TestTarget
-where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
-{
-    fn id(&self) -> TargetID {
-        self.id.clone()
-    }
+#[tokio::test]
+async fn audit_pipeline_dispatch_propagates_total_failure() {
+    let failing = failing_target("primary", "webhook");
+    let observer = failing.clone();
+    let pipeline = pipeline_with_targets(vec![("primary:webhook", Arc::new(failing))]);
 
-    async fn is_active(&self) -> Result<bool, TargetError> {
-        Ok(true)
-    }
+    let result = pipeline.dispatch(Arc::new(AuditEntry::default())).await;
 
-    async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-        Ok(())
-    }
+    assert!(
+        matches!(result, Err(AuditError::Target(_))),
+        "dispatch must surface an error when every target fails, got {result:?}"
+    );
+    assert_eq!(observer.save_call_count(), 1, "the failing target should have been invoked");
+}
 
-    async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-        Ok(())
-    }
+#[tokio::test]
+async fn audit_pipeline_dispatch_tolerates_partial_failure() {
+    let failing = failing_target("primary", "webhook");
+    let healthy = MockTarget::new("secondary", "webhook");
+    let pipeline = pipeline_with_targets(vec![
+        ("primary:webhook", Arc::new(failing)),
+        ("secondary:webhook", Arc::new(healthy)),
+    ]);
 
-    async fn close(&self) -> Result<(), TargetError> {
-        self.close_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
+    let result = pipeline.dispatch(Arc::new(AuditEntry::default())).await;
 
-    fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-        None
-    }
+    assert!(
+        result.is_ok(),
+        "dispatch should succeed when at least one target accepts the event, got {result:?}"
+    );
+}
 
-    fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
-        Box::new(self.clone())
-    }
+#[tokio::test]
+async fn audit_pipeline_dispatch_batch_propagates_total_failure() {
+    let failing = failing_target("primary", "webhook");
+    let pipeline = pipeline_with_targets(vec![("primary:webhook", Arc::new(failing))]);
 
-    async fn init(&self) -> Result<(), TargetError> {
-        self.init_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
+    let entries = vec![Arc::new(AuditEntry::default()), Arc::new(AuditEntry::default())];
+    let result = pipeline.dispatch_batch(entries).await;
 
-    fn is_enabled(&self) -> bool {
-        true
-    }
+    assert!(
+        matches!(result, Err(AuditError::Target(_))),
+        "dispatch_batch must surface an error when every delivery fails, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn audit_pipeline_dispatch_batch_tolerates_partial_failure() {
+    let failing = failing_target("primary", "webhook");
+    let healthy = MockTarget::new("secondary", "webhook");
+    let pipeline = pipeline_with_targets(vec![
+        ("primary:webhook", Arc::new(failing)),
+        ("secondary:webhook", Arc::new(healthy)),
+    ]);
+
+    let entries = vec![Arc::new(AuditEntry::default())];
+    let result = pipeline.dispatch_batch(entries).await;
+
+    assert!(
+        result.is_ok(),
+        "dispatch_batch should succeed when a healthy target accepts the batch, got {result:?}"
+    );
 }
 
 #[tokio::test]
@@ -104,12 +116,19 @@ async fn audit_pipeline_reports_empty_runtime_snapshots() {
 }
 
 #[tokio::test]
-async fn audit_runtime_facade_stops_empty_replay_workers() {
+async fn stopping_audit_replay_workers_is_a_no_op_when_there_are_none() {
     let registry = Arc::new(Mutex::new(AuditRegistry::new()));
     let replay_workers = Arc::new(RwLock::new(rustfs_targets::ReplayWorkerManager::new()));
-    let facade = AuditRuntimeFacade::new(registry, replay_workers);
+    let facade = AuditRuntimeFacade::new(registry, Arc::clone(&replay_workers));
 
     facade.stop_replay_workers().await;
+
+    // The stop path takes the manager's workers and hands them to the adapter,
+    // so an empty facade must leave it empty rather than wedge it, and a second
+    // call — which shutdown paths make — must stay harmless (rustfs/backlog#1836).
+    assert!(replay_workers.read().await.is_empty());
+    facade.stop_replay_workers().await;
+    assert!(replay_workers.read().await.is_empty());
 }
 
 #[tokio::test]
@@ -127,9 +146,8 @@ async fn audit_runtime_facade_activates_empty_target_list() {
 async fn audit_runtime_view_upsert_and_remove_target() {
     let registry = Arc::new(Mutex::new(AuditRegistry::new()));
     let runtime_view = AuditRuntimeView::new(registry.clone());
-    let target = TestTarget::new("primary", "webhook");
-    let init_calls = Arc::clone(&target.init_calls);
-    let close_calls = Arc::clone(&target.close_calls);
+    let target = MockTarget::new("primary", "webhook");
+    let observer = target.clone();
 
     runtime_view
         .upsert_target("primary:webhook".to_string(), Box::new(target))
@@ -137,7 +155,7 @@ async fn audit_runtime_view_upsert_and_remove_target() {
         .expect("upsert should succeed");
 
     assert_eq!(runtime_view.list_targets().await, vec!["primary:webhook".to_string()]);
-    assert_eq!(init_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(observer.init_call_count(), 1);
 
     runtime_view
         .remove_target("primary:webhook")
@@ -145,7 +163,7 @@ async fn audit_runtime_view_upsert_and_remove_target() {
         .expect("remove should succeed");
 
     assert!(runtime_view.list_targets().await.is_empty());
-    assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(observer.close_call_count(), 1);
 }
 
 #[tokio::test]
@@ -153,7 +171,7 @@ async fn audit_runtime_facade_replace_targets_commits_runtime_state() {
     let registry = Arc::new(Mutex::new(AuditRegistry::new()));
     let replay_workers = Arc::new(RwLock::new(rustfs_targets::ReplayWorkerManager::new()));
     let facade = AuditRuntimeFacade::new(registry.clone(), replay_workers.clone());
-    let target = TestTarget::new("primary", "webhook");
+    let target = MockTarget::new("primary", "webhook");
     let activation = rustfs_targets::RuntimeActivation {
         replay_workers: rustfs_targets::ReplayWorkerManager::new(),
         targets: vec![Arc::new(target) as rustfs_targets::SharedTarget<rustfs_audit::AuditEntry>],

@@ -13,19 +13,23 @@
 // limitations under the License.
 
 use crate::{
-    capacity::capacity_integration::init_capacity_management,
-    config::Config,
+    config::{Config, S3Stack},
     server::{ServiceState, ServiceStateManager, ShutdownHandle, start_http_server},
+    startup_runtime_sources,
+    storage_api::server::http::ServerContextSlot,
+    storage_api::startup::runtime_sources::InstanceContext,
 };
-use rustfs_common::{GlobalReadiness, set_global_addr};
-use rustfs_credentials::init_global_action_credentials;
-use rustfs_ecstore::global::set_global_rustfs_port;
+use rustfs_common::GlobalReadiness;
 use rustfs_utils::net::parse_and_resolve_address;
 use std::{
-    io::{Error, Result},
+    io::{Error, ErrorKind, Result},
     net::SocketAddr,
+    path::Path,
     sync::Arc,
+    thread,
+    time::Duration,
 };
+use tempfile::TempDir;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_MAIN: &str = "main";
@@ -37,31 +41,72 @@ const EVENT_SERVER_STARTING: &str = "server_starting";
 const EVENT_ACTION_CREDENTIALS_INITIALIZED: &str = "action_credentials_initialized";
 const EVENT_ACTION_CREDENTIALS_INITIALIZATION_FAILED: &str = "action_credentials_initialization_failed";
 const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str = "Detected default root credentials; set RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY to non-default values for production deployments";
+#[cfg(not(feature = "gateway-stack"))]
+const GATEWAY_STACK_NOT_BUILT: &str = "RUSTFS_S3_STACK=gateway needs a binary built with the `gateway-stack` feature, which no release build enables (rustfs/backlog#2734)";
 
-pub struct StartupListenContext {
-    pub readiness: Arc<GlobalReadiness>,
-    pub server_addr: SocketAddr,
-    pub server_address: String,
+pub(crate) struct StartupListenContext {
+    pub(crate) readiness: Arc<GlobalReadiness>,
+    pub(crate) server_addr: SocketAddr,
+    pub(crate) server_address: String,
 }
 
-pub struct StartupHttpServers {
-    pub state_manager: Arc<ServiceStateManager>,
-    pub s3_shutdown_tx: Option<ShutdownHandle>,
-    pub console_shutdown_tx: Option<ShutdownHandle>,
+pub(crate) struct EmbeddedStartupListenContext {
+    pub(crate) readiness: Arc<GlobalReadiness>,
+    pub(crate) server_addr: SocketAddr,
+    pub(crate) server_address: String,
 }
 
-pub async fn init_startup_listen_context(config: &Config) -> Result<StartupListenContext> {
+pub(crate) struct EmbeddedStartupConfig {
+    pub(crate) config: Config,
+    pub(crate) identity: EmbeddedServerIdentity,
+    pub(crate) temp_dir_guard: Option<TempDir>,
+}
+
+pub(crate) struct EmbeddedServerIdentity {
+    pub(crate) access_key: String,
+    pub(crate) secret_key: String,
+    pub(crate) region: String,
+}
+
+pub(crate) struct EmbeddedHttpServer {
+    pub(crate) shutdown_handle: ShutdownHandle,
+    pub(crate) bound_addr: SocketAddr,
+}
+
+pub(crate) struct StartupHttpServers {
+    pub(crate) state_manager: Arc<ServiceStateManager>,
+    pub(crate) s3_shutdown_tx: Option<ShutdownHandle>,
+    pub(crate) console_shutdown_tx: Option<ShutdownHandle>,
+}
+
+/// cuObject S3-over-RDMA servers live for the process lifetime; they stop with it.
+#[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
+async fn init_cuobject_servers() -> Result<()> {
+    crate::app::object::cuobject::init_cuobject_service().await?;
+    Ok(())
+}
+
+#[cfg(not(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux")))]
+async fn init_cuobject_servers() -> Result<()> {
+    Ok(())
+}
+
+pub(crate) async fn init_startup_listen_context(
+    config: &Config,
+    instance_ctx: &Arc<InstanceContext>,
+) -> Result<StartupListenContext> {
+    refuse_unbuilt_stack(config.s3_stack)?;
+    crate::server::init_console_prefix()?;
     log_sanitized_server_config(config);
     let readiness = Arc::new(GlobalReadiness::new());
 
     if let Some(region_str) = &config.region {
-        region_str
-            .parse::<s3s::region::Region>()
-            .map(rustfs_ecstore::global::set_global_region)
-            .map_err(|err| Error::other(format!("invalid region '{}': {}", region_str, err)))?;
+        let (region, additional_regions) = parse_region_list(region_str)?;
+        startup_runtime_sources::publish_region(instance_ctx, region, additional_regions);
     }
 
     let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
+    validate_console_listener_address(config, server_addr)?;
     let server_port = server_addr.port();
     let server_address = server_addr.to_string();
 
@@ -85,12 +130,13 @@ pub async fn init_startup_listen_context(config: &Config) -> Result<StartupListe
         ip = %server_addr.ip(),
         port = %server_port,
         version = %crate::version::get_version(),
+        s3_stack = ?config.s3_stack,
         "Starting RustFS server"
     );
 
     init_startup_action_credentials(config)?;
-    set_global_rustfs_port(server_port);
-    set_global_addr(&config.address).await;
+    startup_runtime_sources::publish_server_port(server_port);
+    startup_runtime_sources::publish_server_addr(&config.address).await;
 
     Ok(StartupListenContext {
         readiness,
@@ -99,18 +145,164 @@ pub async fn init_startup_listen_context(config: &Config) -> Result<StartupListe
     })
 }
 
-pub async fn init_startup_http_servers(config: &Config, readiness: Arc<GlobalReadiness>) -> Result<StartupHttpServers> {
-    init_capacity_management().await;
+/// Refuses a selected S3 stack this binary cannot serve, before any listener or storage exists.
+/// The selection is never replaced by another stack.
+fn refuse_unbuilt_stack(stack: S3Stack) -> Result<()> {
+    match stack {
+        S3Stack::Legacy => Ok(()),
+        #[cfg(feature = "gateway-stack")]
+        S3Stack::Gateway => Ok(()),
+        #[cfg(not(feature = "gateway-stack"))]
+        S3Stack::Gateway => Err(Error::new(ErrorKind::Unsupported, GATEWAY_STACK_NOT_BUILT)),
+    }
+}
+
+pub(crate) async fn prepare_embedded_startup_config(
+    address: String,
+    access_key: String,
+    secret_key: String,
+    mut volumes: Vec<String>,
+    region: String,
+) -> Result<EmbeddedStartupConfig> {
+    Config::validate_root_credentials(&access_key, &secret_key)?;
+    let mut temp_dir_guard = None;
+    if volumes.is_empty() {
+        let dir = tempfile::tempdir().map_err(|err| Error::other(format!("failed to create temp dir: {err}")))?;
+        volumes.push(dir.path().display().to_string());
+        temp_dir_guard = Some(dir);
+    }
+
+    for volume in &volumes {
+        let path = Path::new(volume);
+        if !path.exists() {
+            tokio::fs::create_dir_all(path)
+                .await
+                .map_err(|err| Error::other(format!("failed to create volume dir {volume}: {err}")))?;
+        }
+    }
+
+    let mut config = Config::new(&address, volumes);
+    config.access_key = access_key.clone();
+    config.secret_key = secret_key.clone();
+    config.region = Some(region.clone());
+    config.console_enable = false;
+    // The stack is selected for the whole process, so an embedded server reads the same variable
+    // the binary does.
+    config.s3_stack = S3Stack::from_env()?;
+    refuse_unbuilt_stack(config.s3_stack)?;
+
+    Ok(EmbeddedStartupConfig {
+        config,
+        identity: EmbeddedServerIdentity {
+            access_key,
+            secret_key,
+            region,
+        },
+        temp_dir_guard,
+    })
+}
+
+pub(crate) fn find_embedded_available_port() -> Result<u16> {
+    let mut last_err = None;
+
+    for _ in 0..8 {
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => {
+                let port = listener.local_addr()?.port();
+                drop(listener);
+                return Ok(port);
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::AddrInUse | ErrorKind::AddrNotAvailable | ErrorKind::Interrupted | ErrorKind::WouldBlock
+                ) =>
+            {
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| Error::other("failed to reserve an embedded TCP port")))
+}
+
+pub(crate) async fn init_embedded_startup_listen_context(
+    config: &Config,
+    instance_ctx: &Arc<InstanceContext>,
+) -> Result<EmbeddedStartupListenContext> {
+    let readiness = Arc::new(GlobalReadiness::new());
+
+    let server_addr =
+        parse_and_resolve_address(config.address.as_str()).map_err(|err| Error::other(format!("address: {err}")))?;
+    if server_addr.port() == 0 {
+        return Err(Error::other(
+            "port 0 is not supported in embedded mode because startup requires \
+             a stable listen address and port before endpoint/global initialization. \
+             Use `find_available_port()` to obtain a free port.",
+        ));
+    }
+
+    // Embedded startup tolerates already-initialized credentials so multiple
+    // servers can coexist (backlog#1052 S5). Per-server dispatch owns the
+    // real credentials via ActionCredentialHandle; the global only needs to
+    // remember the first server's identity for ambient readers.
+    startup_runtime_sources::publish_action_credentials_tolerant(config.access_key.clone(), config.secret_key.clone())
+        .map_err(|err| Error::other(format!("credentials: {err:?}")))?;
+
+    if let Some(region_str) = &config.region {
+        let (region, additional_regions) = parse_region_list(region_str)?;
+        // The instance context is per-server, so region publication cannot
+        // panic on a second embedded server; the process still has one region
+        // for legacy ambient readers.
+        instance_ctx.set_region(region.into());
+        instance_ctx.set_additional_regions(additional_regions.into_iter().map(Into::into).collect());
+    }
+
+    startup_runtime_sources::publish_server_port(server_addr.port());
+    startup_runtime_sources::publish_server_addr(&config.address).await;
+
+    Ok(EmbeddedStartupListenContext {
+        readiness,
+        server_addr,
+        server_address: server_addr.to_string(),
+    })
+}
+
+pub(crate) async fn start_embedded_http_server(
+    config: &Config,
+    readiness: Arc<GlobalReadiness>,
+    server_ctx: Arc<ServerContextSlot>,
+) -> Result<EmbeddedHttpServer> {
+    let s3_config = s3_http_server_config(config);
+    let (shutdown_handle, bound_addr) = start_http_server(&s3_config, readiness, server_ctx).await?;
+
+    Ok(EmbeddedHttpServer {
+        shutdown_handle,
+        bound_addr,
+    })
+}
+
+pub(crate) async fn init_startup_http_servers(
+    config: &Config,
+    readiness: Arc<GlobalReadiness>,
+    server_ctx: Arc<ServerContextSlot>,
+) -> Result<StartupHttpServers> {
     let state_manager = Arc::new(ServiceStateManager::new());
     state_manager.update(ServiceState::Starting);
 
     let s3_config = s3_http_server_config(config);
-    let (s3_shutdown_tx, _) = start_http_server(&s3_config, readiness.clone()).await?;
+    let (s3_shutdown_tx, _) = start_http_server(&s3_config, readiness.clone(), server_ctx.clone()).await?;
 
     let console_shutdown_tx = match console_http_server_config(config) {
-        Some(console_config) => Some(start_http_server(&console_config, readiness).await?.0),
+        // The console shares the S3 server's context slot: it is the same
+        // logical server on a second listener.
+        Some(console_config) => Some(start_http_server(&console_config, readiness, server_ctx).await?.0),
         None => None,
     };
+
+    init_cuobject_servers().await?;
 
     Ok(StartupHttpServers {
         state_manager,
@@ -140,7 +332,7 @@ fn log_sanitized_server_config(config: &Config) {
 }
 
 fn init_startup_action_credentials(config: &Config) -> Result<()> {
-    match init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone())) {
+    match startup_runtime_sources::init_action_credentials(config.access_key.clone(), config.secret_key.clone()) {
         Ok(_) => {
             debug!(
                 target: "rustfs::main::run",
@@ -174,19 +366,94 @@ fn s3_http_server_config(config: &Config) -> Config {
 }
 
 fn console_http_server_config(config: &Config) -> Option<Config> {
-    if config.console_enable && !config.console_address.is_empty() {
+    if let Some(console_address) = console_listener_address(config) {
         let mut console_config = config.clone();
-        console_config.address = console_config.console_address.clone();
+        console_config.address = console_address.to_string();
+        console_config.console_address = console_address.to_string();
         Some(console_config)
     } else {
         None
     }
 }
 
+fn console_listener_address(config: &Config) -> Option<&str> {
+    let console_address = config.console_address.trim();
+    (config.console_enable && !console_address.is_empty()).then_some(console_address)
+}
+
+fn validate_console_listener_address(config: &Config, s3_addr: SocketAddr) -> Result<()> {
+    let Some(console_address) = console_listener_address(config) else {
+        return Ok(());
+    };
+
+    let console_addr = parse_and_resolve_address(console_address)
+        .map_err(|err| Error::other(format!("console address '{}': {err}", config.console_address)))?;
+
+    if listener_addresses_overlap(s3_addr, console_addr) {
+        return Err(Error::new(
+            ErrorKind::AddrInUse,
+            format!(
+                "console address '{}' resolves to {console_addr} and conflicts with S3 address '{}' ({s3_addr}); \
+                 set RUSTFS_CONSOLE_ADDRESS to a different port or disable the console with RUSTFS_CONSOLE_ENABLE=false",
+                config.console_address, config.address
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Parse `RUSTFS_REGION` / `--region`: one region, or a comma-separated list
+/// whose first entry is the server's own region and whose rest are further
+/// regions `CreateBucket` accepts as a `LocationConstraint`. Whitespace around
+/// entries is ignored; an empty or invalid entry is an error, as an invalid
+/// single region always was.
+fn parse_region_list(region_str: &str) -> Result<(s3s::region::Region, Vec<s3s::region::Region>)> {
+    let mut regions = region_str.split(',').map(|entry| {
+        entry
+            .trim()
+            .parse::<s3s::region::Region>()
+            .map_err(|err| Error::other(format!("invalid region '{region_str}': {err}")))
+    });
+    let region = regions
+        .next()
+        .ok_or_else(|| Error::other(format!("invalid region '{region_str}'")))??;
+    Ok((region, regions.collect::<Result<_>>()?))
+}
+
+fn listener_addresses_overlap(left: SocketAddr, right: SocketAddr) -> bool {
+    left.port() == right.port() && (left.ip() == right.ip() || left.ip().is_unspecified() || right.ip().is_unspecified())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_CREDENTIALS_WARNING_MESSAGE, console_http_server_config, s3_http_server_config};
+    use super::{
+        DEFAULT_CREDENTIALS_WARNING_MESSAGE, console_http_server_config, find_embedded_available_port,
+        init_startup_listen_context, listener_addresses_overlap, parse_region_list, prepare_embedded_startup_config,
+        s3_http_server_config, validate_console_listener_address,
+    };
     use crate::config::Config;
+    use crate::storage_api::startup::runtime_sources::InstanceContext;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::sync::Arc;
+
+    #[test]
+    fn parse_region_list_takes_first_entry_as_server_region() {
+        let (region, additional) = parse_region_list("us-east-1").expect("single region");
+        assert_eq!(region.as_str(), "us-east-1");
+        assert!(additional.is_empty());
+
+        let (region, additional) = parse_region_list("ap-southeast-2, us-west-2").expect("region list");
+        assert_eq!(region.as_str(), "ap-southeast-2");
+        assert_eq!(additional.iter().map(|region| region.as_str()).collect::<Vec<_>>(), ["us-west-2"]);
+    }
+
+    #[test]
+    fn parse_region_list_rejects_empty_and_invalid_entries() {
+        for value in ["", "us-east-1,", "us-east-1,,us-west-2", "us-east-1,US_WEST"] {
+            assert!(parse_region_list(value).is_err(), "{value:?} must be rejected");
+        }
+    }
 
     #[test]
     fn s3_http_server_config_disables_console_without_changing_address() {
@@ -217,6 +484,20 @@ mod tests {
     }
 
     #[test]
+    fn console_http_server_config_trims_console_address() {
+        let mut config = Config::new("127.0.0.1:9000", vec!["/tmp/rustfs-data".to_string()]);
+        config.console_enable = true;
+        config.console_address = " 127.0.0.1:9001 ".to_string();
+
+        let Some(console_config) = console_http_server_config(&config) else {
+            panic!("enabled console should build config");
+        };
+
+        assert_eq!(console_config.address, "127.0.0.1:9001");
+        assert_eq!(console_config.console_address, "127.0.0.1:9001");
+    }
+
+    #[test]
     fn console_http_server_config_skips_disabled_or_empty_console() {
         let mut config = Config::new("127.0.0.1:9000", vec!["/tmp/rustfs-data".to_string()]);
         config.console_enable = false;
@@ -226,6 +507,112 @@ mod tests {
         config.console_enable = true;
         config.console_address.clear();
         assert!(console_http_server_config(&config).is_none());
+
+        config.console_address = "   ".to_string();
+        assert!(console_http_server_config(&config).is_none());
+    }
+
+    #[test]
+    fn validate_console_listener_address_rejects_same_endpoint() {
+        let mut config = Config::new("127.0.0.1:9001", vec!["/tmp/rustfs-data".to_string()]);
+        config.console_enable = true;
+        config.console_address = "127.0.0.1:9001".to_string();
+
+        let err = validate_console_listener_address(&config, "127.0.0.1:9001".parse().expect("valid socket address"))
+            .expect_err("console must not bind the S3 endpoint");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        let message = err.to_string();
+        assert!(message.contains("RUSTFS_CONSOLE_ADDRESS"));
+        assert!(message.contains("127.0.0.1:9001"));
+    }
+
+    #[test]
+    fn validate_console_listener_address_rejects_wildcard_same_port() {
+        let mut config = Config::new("127.0.0.1:9001", vec!["/tmp/rustfs-data".to_string()]);
+        config.console_enable = true;
+        config.console_address = " :9001 ".to_string();
+
+        let err = validate_console_listener_address(&config, "127.0.0.1:9001".parse().expect("valid socket address"))
+            .expect_err("wildcard console listener covers the S3 endpoint port");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    #[test]
+    fn validate_console_listener_address_allows_different_ports() {
+        let mut config = Config::new("127.0.0.1:9000", vec!["/tmp/rustfs-data".to_string()]);
+        config.console_enable = true;
+        config.console_address = ":9001".to_string();
+
+        validate_console_listener_address(&config, "127.0.0.1:9000".parse().expect("valid socket address"))
+            .expect("different listener ports should be allowed");
+    }
+
+    #[test]
+    fn validate_console_listener_address_skips_disabled_or_empty_console() {
+        let mut config = Config::new("127.0.0.1:9001", vec!["/tmp/rustfs-data".to_string()]);
+        config.console_enable = false;
+        config.console_address = "127.0.0.1:9001".to_string();
+        validate_console_listener_address(&config, "127.0.0.1:9001".parse().expect("valid socket address"))
+            .expect("disabled console should not reserve a listener");
+
+        config.console_enable = true;
+        config.console_address.clear();
+        validate_console_listener_address(&config, "127.0.0.1:9001".parse().expect("valid socket address"))
+            .expect("empty console address should skip console listener");
+
+        config.console_address = "   ".to_string();
+        validate_console_listener_address(&config, "127.0.0.1:9001".parse().expect("valid socket address"))
+            .expect("blank console address should skip console listener");
+    }
+
+    #[test]
+    fn listener_addresses_overlap_treats_unspecified_as_covering_the_port() {
+        assert!(listener_addresses_overlap(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 9001),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001),
+        ));
+        assert!(!listener_addresses_overlap(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 9001),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9002),
+        ));
+    }
+
+    #[cfg(not(feature = "gateway-stack"))]
+    #[test]
+    fn a_binary_without_the_gateway_stack_refuses_to_select_it() {
+        let err = super::refuse_unbuilt_stack(crate::config::S3Stack::Gateway).expect_err("the gateway stack is not built");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("gateway-stack"), "{err}");
+    }
+
+    #[cfg(feature = "gateway-stack")]
+    #[test]
+    fn a_binary_with_the_gateway_stack_accepts_its_selection() {
+        super::refuse_unbuilt_stack(crate::config::S3Stack::Gateway).expect("the gateway stack is built");
+    }
+
+    #[test]
+    fn the_legacy_stack_is_always_selectable() {
+        super::refuse_unbuilt_stack(crate::config::S3Stack::Legacy).expect("legacy is the default stack");
+    }
+
+    #[tokio::test]
+    async fn init_startup_listen_context_rejects_console_s3_port_conflict() {
+        let mut config = Config::new("127.0.0.1:9001", vec!["/tmp/rustfs-data".to_string()]);
+        config.console_enable = true;
+        config.console_address = ":9001".to_string();
+        let instance_ctx = Arc::new(InstanceContext::new());
+
+        let err = match init_startup_listen_context(&config, &instance_ctx).await {
+            Ok(_) => panic!("startup should reject overlapping S3 and console listeners before binding sockets"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(err.to_string().contains("RUSTFS_CONSOLE_ADDRESS"));
     }
 
     #[test]
@@ -252,5 +639,78 @@ mod tests {
         assert!(DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
         assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
         assert!(!DEFAULT_CREDENTIALS_WARNING_MESSAGE.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
+    }
+
+    #[test]
+    fn find_embedded_available_port_returns_tcp_port() {
+        let port = match find_embedded_available_port() {
+            Ok(port) => port,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("available port should be found: {err}"),
+        };
+
+        assert_ne!(port, 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_embedded_startup_config_creates_temp_volume_when_missing() {
+        let prepared = prepare_embedded_startup_config(
+            "127.0.0.1:9000".to_string(),
+            "access".to_string(),
+            "embedded-secret".to_string(),
+            Vec::new(),
+            "us-west-2".to_string(),
+        )
+        .await
+        .expect("embedded startup config should be prepared");
+
+        assert_eq!(prepared.config.address, "127.0.0.1:9000");
+        assert_eq!(prepared.config.access_key, "access");
+        assert_eq!(prepared.config.secret_key, "embedded-secret");
+        assert_eq!(prepared.config.region.as_deref(), Some("us-west-2"));
+        assert_eq!(prepared.identity.access_key, "access");
+        assert_eq!(prepared.identity.secret_key, "embedded-secret");
+        assert_eq!(prepared.identity.region, "us-west-2");
+        assert!(!prepared.config.console_enable);
+        assert_eq!(prepared.config.volumes.len(), 1);
+        assert!(std::path::Path::new(&prepared.config.volumes[0]).exists());
+        assert!(prepared.temp_dir_guard.is_some());
+    }
+
+    #[tokio::test]
+    async fn prepare_embedded_startup_config_rejects_short_keys_before_creating_volumes() {
+        let parent = tempfile::tempdir().expect("temp parent");
+        let volume = parent.path().join("data");
+        let result = prepare_embedded_startup_config(
+            "127.0.0.1:0".to_string(),
+            "root".to_string(),
+            "1234567".to_string(),
+            vec![volume.display().to_string()],
+            "us-east-1".to_string(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(err) if err.kind() == std::io::ErrorKind::InvalidInput));
+        assert!(!volume.exists());
+    }
+
+    #[tokio::test]
+    async fn prepare_embedded_startup_config_creates_missing_custom_volume() {
+        let parent = tempfile::tempdir().expect("temp parent");
+        let volume = parent.path().join("data");
+
+        let prepared = prepare_embedded_startup_config(
+            "127.0.0.1:9000".to_string(),
+            "access".to_string(),
+            "embedded-secret".to_string(),
+            vec![volume.display().to_string()],
+            "us-east-1".to_string(),
+        )
+        .await
+        .expect("embedded startup config should create custom volume");
+
+        assert_eq!(prepared.config.volumes, vec![volume.display().to_string()]);
+        assert!(volume.exists());
+        assert!(prepared.temp_dir_guard.is_none());
     }
 }

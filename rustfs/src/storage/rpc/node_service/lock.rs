@@ -1,0 +1,515 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::NodeService;
+use rustfs_lock::{BatchAcquireOutcome, LockRequest};
+use rustfs_protos::proto_gen::node_service::*;
+use tokio::time::Instant;
+use tonic::{Request, Response, Status};
+
+fn lock_result_from_acquire(outcome: BatchAcquireOutcome) -> GenerallyLockResult {
+    match outcome {
+        BatchAcquireOutcome::Granted { lock_info, .. } => GenerallyLockResult {
+            success: true,
+            lock_info: lock_info.and_then(|info| serde_json::to_string(&info).ok()),
+            ..Default::default()
+        },
+        BatchAcquireOutcome::RetryableNoGrant { error } => lock_result_from_no_grant(error, LockAcquireStatus::RetryableNoGrant),
+        BatchAcquireOutcome::TerminalNoGrant { error } => lock_result_from_no_grant(error, LockAcquireStatus::RejectedNoGrant),
+        BatchAcquireOutcome::Ambiguous { error, .. } => lock_result_from_error(error.to_string()),
+    }
+}
+
+fn lock_result_from_no_grant(error: rustfs_lock::LockError, status: LockAcquireStatus) -> GenerallyLockResult {
+    let message = match error {
+        rustfs_lock::LockError::Timeout { .. } => "Lock acquisition timeout".to_string(),
+        rustfs_lock::LockError::Internal { message } => message,
+        error => error.to_string(),
+    };
+    GenerallyLockResult {
+        acquire_status: status.into(),
+        ..lock_result_from_error(message)
+    }
+}
+
+fn lock_result_from_error(error: impl Into<String>) -> GenerallyLockResult {
+    GenerallyLockResult {
+        success: false,
+        error_info: Some(error.into()),
+        lock_info: None,
+        ..Default::default()
+    }
+}
+
+/// Delegate a refresh RPC to the node's lock backend (`LocalClient::refresh`).
+///
+/// Extracted as a free function (decoupled from the `current_lock_client()` OnceLock
+/// global) so it can be unit-tested against a real `LocalClient`, mirroring the existing
+/// `lock_result_from_release` free-function test style.
+///
+/// Contract (see backlog#899 design, open question on not-found signalling): a lock the
+/// backend no longer holds returns `success=false` with `error_info=None`, so
+/// `RemoteClient::refresh` keeps mapping it to `Ok(false)` (a real not_found signal for the
+/// coordinator heartbeat) rather than `Err`. `error_info` is reserved for genuine RPC/backend
+/// errors. TODO(backlog#899): maintainers to confirm whether not-found should instead carry a
+/// distinguishable error_info prefix that `RemoteClient::refresh` decodes explicitly.
+async fn refresh_lock(
+    lock_client: &std::sync::Arc<dyn rustfs_lock::client::LockClient>,
+    args: &LockRequest,
+) -> GenerallyLockResponse {
+    match lock_client.refresh(&args.lock_id).await {
+        Ok(true) => GenerallyLockResponse {
+            success: true,
+            error_info: None,
+            lock_info: None,
+            ..Default::default()
+        },
+        Ok(false) => GenerallyLockResponse {
+            success: false,
+            error_info: None,
+            lock_info: None,
+            ..Default::default()
+        },
+        Err(err) => GenerallyLockResponse {
+            success: false,
+            error_info: Some(format!("can not refresh, resource: {0}, err: {1}", args.resource, err)),
+            lock_info: None,
+            ..Default::default()
+        },
+    }
+}
+
+fn lock_result_from_release(lock_id: &rustfs_lock::LockId, success: bool) -> GenerallyLockResult {
+    GenerallyLockResult {
+        success,
+        error_info: (!success).then(|| format!("lock not found for release: {lock_id}")),
+        lock_info: None,
+        release_status: if success {
+            LockReleaseStatus::Released.into()
+        } else {
+            LockReleaseStatus::AlreadyAbsent.into()
+        },
+        ..Default::default()
+    }
+}
+
+async fn release_lock(
+    lock_client: &std::sync::Arc<dyn rustfs_lock::client::LockClient>,
+    args: &LockRequest,
+) -> GenerallyLockResponse {
+    match lock_client.release(&args.lock_id).await {
+        Ok(success) => {
+            let result = lock_result_from_release(&args.lock_id, success);
+            GenerallyLockResponse {
+                success: result.success,
+                error_info: result.error_info,
+                lock_info: None,
+                release_status: result.release_status,
+            }
+        }
+        Err(err) => GenerallyLockResponse {
+            success: false,
+            error_info: Some(format!(
+                "can not unlock, resource: {0}, owner: {1}, err: {2}",
+                args.resource, args.owner, err
+            )),
+            lock_info: None,
+            ..Default::default()
+        },
+    }
+}
+
+impl NodeService {
+    pub(super) async fn handle_refresh(
+        &self,
+        request: Request<GenerallyLockRequest>,
+    ) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
+                    ..Default::default()
+                }));
+            }
+        };
+
+        let lock_client = self.get_lock_client()?;
+        Ok(Response::new(refresh_lock(&lock_client, &args).await))
+    }
+
+    pub(super) async fn handle_force_un_lock(
+        &self,
+        request: Request<GenerallyLockRequest>,
+    ) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
+                    ..Default::default()
+                }));
+            }
+        };
+
+        let lock_client = self.get_lock_client()?;
+        match lock_client.force_release(&args.lock_id).await {
+            Ok(success) => {
+                let result = lock_result_from_release(&args.lock_id, success);
+                Ok(Response::new(GenerallyLockResponse {
+                    success: result.success,
+                    error_info: result.error_info,
+                    lock_info: None,
+                    release_status: result.release_status,
+                }))
+            }
+            Err(err) => Ok(Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!(
+                    "can not force_unlock, resource: {0}, owner: {1}, err: {2}",
+                    args.resource, args.owner, err
+                )),
+                lock_info: None,
+                ..Default::default()
+            })),
+        }
+    }
+
+    pub(super) async fn handle_un_lock(
+        &self,
+        request: Request<GenerallyLockRequest>,
+    ) -> Result<Response<GenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
+                    ..Default::default()
+                }));
+            }
+        };
+
+        let lock_client = self.get_lock_client()?;
+        Ok(Response::new(release_lock(&lock_client, &args).await))
+    }
+
+    pub(super) async fn handle_lock(
+        &self,
+        request: Request<GenerallyLockRequest>,
+    ) -> Result<Response<GenerallyLockResponse>, Status> {
+        #[cfg(feature = "e2e-test-hooks")]
+        let request_id = super::e2e_rpc_delay::request_id(&request);
+        let request = request.into_inner();
+        // Parse the request to extract resource and owner
+        let args: LockRequest = match serde_json::from_str(&request.args) {
+            Ok(args) => args,
+            Err(err) => {
+                return Ok(Response::new(GenerallyLockResponse {
+                    success: false,
+                    error_info: Some(format!("can not decode args, err: {err}")),
+                    lock_info: None,
+                    ..Default::default()
+                }));
+            }
+        };
+
+        #[cfg(feature = "e2e-test-hooks")]
+        super::e2e_rpc_delay::locks(super::e2e_rpc_delay::Method::Lock, std::slice::from_ref(&args), request_id.as_deref()).await;
+        let lock_client = self.get_lock_client()?;
+        match lock_client.acquire_lock(&args).await {
+            Ok(result) => {
+                // Serialize lock_info if available
+                let lock_info_json = result.lock_info.as_ref().and_then(|info| serde_json::to_string(info).ok());
+                Ok(Response::new(GenerallyLockResponse {
+                    success: result.success,
+                    error_info: result.error,
+                    lock_info: lock_info_json,
+                    ..Default::default()
+                }))
+            }
+            Err(err) => Ok(Response::new(GenerallyLockResponse {
+                success: false,
+                error_info: Some(format!(
+                    "can not lock, resource: {0}, owner: {1}, err: {2}",
+                    args.resource, args.owner, err
+                )),
+                lock_info: None,
+                ..Default::default()
+            })),
+        }
+    }
+
+    pub(super) async fn handle_lock_batch(
+        &self,
+        request: Request<BatchGenerallyLockRequest>,
+    ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        let entered = Instant::now();
+        #[cfg(feature = "e2e-test-hooks")]
+        let request_id = super::e2e_rpc_delay::request_id(&request);
+        let request = request.into_inner();
+        let mut results = vec![lock_result_from_error("request was not processed"); request.args.len()];
+        let mut valid_requests = Vec::with_capacity(request.args.len());
+        let mut valid_indices = Vec::with_capacity(request.args.len());
+
+        for (idx, arg) in request.args.iter().enumerate() {
+            match serde_json::from_str::<LockRequest>(arg) {
+                Ok(args) => {
+                    valid_requests.push(args);
+                    valid_indices.push(idx);
+                }
+                Err(err) => {
+                    results[idx] = GenerallyLockResult {
+                        acquire_status: LockAcquireStatus::RejectedNoGrant.into(),
+                        ..lock_result_from_error(format!("can not decode args, err: {err}"))
+                    };
+                }
+            }
+        }
+
+        if !valid_requests.is_empty() {
+            #[cfg(feature = "e2e-test-hooks")]
+            if valid_requests.len() == request.args.len() {
+                super::e2e_rpc_delay::locks(super::e2e_rpc_delay::Method::LockBatch, &valid_requests, request_id.as_deref())
+                    .await;
+            }
+            let lock_client = self.get_lock_client()?;
+            // The payload's wait budget also pays for decoding and handler admission.
+            let wait = valid_requests
+                .iter()
+                .map(|request| request.acquire_timeout)
+                .max()
+                .unwrap_or_default();
+            let deadline = entered.checked_add(wait).unwrap_or(entered);
+            let batch_results = lock_client.acquire_locks_batch_until(&valid_requests, deadline).await;
+            for (result_idx, outcome) in batch_results.into_iter().enumerate() {
+                if let Some(request_idx) = valid_indices.get(result_idx) {
+                    results[*request_idx] = lock_result_from_acquire(outcome);
+                }
+            }
+        }
+
+        Ok(Response::new(BatchGenerallyLockResponse { results }))
+    }
+
+    pub(super) async fn handle_un_lock_batch(
+        &self,
+        request: Request<BatchGenerallyLockRequest>,
+    ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        let request = request.into_inner();
+        let mut results = vec![lock_result_from_error("request was not processed"); request.args.len()];
+        let mut lock_ids = Vec::with_capacity(request.args.len());
+        let mut valid_indices = Vec::with_capacity(request.args.len());
+
+        for (idx, arg) in request.args.iter().enumerate() {
+            match serde_json::from_str::<LockRequest>(arg) {
+                Ok(args) => {
+                    lock_ids.push(args.lock_id);
+                    valid_indices.push(idx);
+                }
+                Err(err) => {
+                    results[idx] = lock_result_from_error(format!("can not decode args, err: {err}"));
+                }
+            }
+        }
+
+        if !lock_ids.is_empty() {
+            let lock_client = self.get_lock_client()?;
+            match lock_client.release_locks_batch(&lock_ids).await {
+                Ok(batch_results) => {
+                    for (result_idx, success) in batch_results.into_iter().enumerate() {
+                        if let Some(request_idx) = valid_indices.get(result_idx) {
+                            results[*request_idx] = match lock_ids.get(result_idx) {
+                                Some(lock_id) => lock_result_from_release(lock_id, success),
+                                None => lock_result_from_error(format!("unlock response index out of range: {result_idx}")),
+                            };
+                        }
+                    }
+                }
+                Err(err) => {
+                    for request_idx in valid_indices {
+                        results[request_idx] = lock_result_from_error(format!("can not batch unlock, err: {err}"));
+                    }
+                }
+            }
+        }
+
+        Ok(Response::new(BatchGenerallyLockResponse { results }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lock_result_from_acquire, lock_result_from_release};
+
+    fn test_lock_id() -> rustfs_lock::LockId {
+        rustfs_lock::LockRequest::new(rustfs_lock::ObjectKey::new("bucket", "object"), rustfs_lock::LockType::Exclusive, "owner")
+            .lock_id
+    }
+
+    #[test]
+    fn lock_result_from_release_reports_missing_lock() {
+        let lock_id = test_lock_id();
+        let result = lock_result_from_release(&lock_id, false);
+
+        assert!(!result.success);
+        assert_eq!(result.release_status, super::LockReleaseStatus::AlreadyAbsent as i32);
+        assert!(result.lock_info.is_none());
+        assert!(
+            result
+                .error_info
+                .expect("missing release should include error")
+                .contains("lock not found for release")
+        );
+    }
+
+    #[test]
+    fn batch_acquire_mapping_preserves_explicit_and_ambiguous_failures() {
+        for (outcome, status) in [
+            (
+                rustfs_lock::BatchAcquireOutcome::RetryableNoGrant {
+                    error: rustfs_lock::LockError::internal("lock conflict"),
+                },
+                super::LockAcquireStatus::RetryableNoGrant,
+            ),
+            (
+                rustfs_lock::BatchAcquireOutcome::TerminalNoGrant {
+                    error: rustfs_lock::LockError::internal("invalid request"),
+                },
+                super::LockAcquireStatus::RejectedNoGrant,
+            ),
+            (
+                rustfs_lock::BatchAcquireOutcome::Ambiguous {
+                    error: rustfs_lock::LockError::internal("legacy batch failed"),
+                    cleanup_owned_by_client: false,
+                },
+                super::LockAcquireStatus::Unspecified,
+            ),
+        ] {
+            let result = lock_result_from_acquire(outcome);
+            assert!(!result.success);
+            assert!(result.error_info.is_some());
+            assert!(result.lock_info.is_none());
+            assert_eq!(result.acquire_status, status as i32);
+            assert_eq!(result.release_status, super::LockReleaseStatus::Unspecified as i32);
+        }
+    }
+
+    #[test]
+    fn batch_acquire_timeout_preserves_legacy_business_error_text() {
+        let result = lock_result_from_acquire(rustfs_lock::BatchAcquireOutcome::RetryableNoGrant {
+            error: rustfs_lock::LockError::timeout("bucket/object", std::time::Duration::from_millis(50)),
+        });
+        assert_eq!(result.error_info.as_deref(), Some("Lock acquisition timeout"));
+        assert_eq!(result.acquire_status, super::LockAcquireStatus::RetryableNoGrant as i32);
+    }
+
+    #[test]
+    fn batch_acquire_mapping_preserves_legacy_success() {
+        let result = lock_result_from_acquire(rustfs_lock::BatchAcquireOutcome::Granted {
+            lock_info: None,
+            wait_time: std::time::Duration::ZERO,
+        });
+        assert!(result.success);
+        assert!(result.error_info.is_none());
+        assert_eq!(result.acquire_status, super::LockAcquireStatus::Unspecified as i32);
+    }
+
+    #[tokio::test]
+    async fn release_lock_preserves_strict_failure_and_reports_authoritative_absence() {
+        use rustfs_lock::{GlobalLockManager, LocalClient, LockClient, LockRequest, LockType, ObjectKey};
+        use std::sync::Arc;
+
+        let client: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
+        let request = LockRequest::new(ObjectKey::new("bucket", "release-result"), LockType::Exclusive, "owner");
+        assert!(client.acquire_lock(&request).await.expect("acquire grant").success);
+
+        let released = super::release_lock(&client, &request).await;
+        assert!(released.success);
+        assert!(released.error_info.is_none());
+        assert_eq!(released.release_status, super::LockReleaseStatus::Released as i32);
+        let absent = super::release_lock(&client, &request).await;
+        assert!(!absent.success, "ordinary release remains strict");
+        assert!(absent.error_info.is_some());
+        assert_eq!(absent.release_status, super::LockReleaseStatus::AlreadyAbsent as i32);
+
+        let successor = LockRequest::new(request.resource.clone(), LockType::Exclusive, "successor");
+        assert!(client.acquire_lock(&successor).await.expect("acquire successor").success);
+        let absent = super::release_lock(&client, &request).await;
+        assert!(!absent.success);
+        assert_eq!(absent.release_status, super::LockReleaseStatus::AlreadyAbsent as i32);
+        assert!(
+            client
+                .check_status(&successor.lock_id)
+                .await
+                .expect("check successor")
+                .is_some()
+        );
+        assert!(client.release(&successor.lock_id).await.expect("release successor"));
+    }
+
+    // B1 -- refresh_lock delegates to LocalClient::refresh for a held lock, returns
+    //        success=true, and actually extends expires_at (inverts the "parse then drop" stub).
+    #[tokio::test]
+    async fn refresh_lock_delegates_to_lock_client_and_extends_entry() {
+        use super::refresh_lock;
+        use rustfs_lock::client::LockClient;
+        use rustfs_lock::{LocalClient, LockRequest, LockStatus, LockType, ObjectKey};
+        use std::sync::Arc;
+
+        let client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let req = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_ttl(std::time::Duration::from_secs(30));
+        let acquired = client.acquire_lock(&req).await.expect("acquire");
+        assert!(acquired.success, "precondition: lock acquired");
+
+        let resp = refresh_lock(&client, &req).await;
+        assert!(
+            resp.success,
+            "handle_refresh must delegate to lock_client.refresh and succeed for a held lock"
+        );
+        assert!(resp.error_info.is_none());
+
+        let status = client.check_status(&req.lock_id).await.unwrap().expect("entry present");
+        assert_eq!(status.status, LockStatus::Acquired, "refresh must extend the entry, keeping it Acquired");
+    }
+
+    // B2 -- refresh_lock reports a non-existent lock_id as success=false
+    //        (feeds broadcast_refresh a real not_found signal; the stub's unconditional
+    //         true would permanently mask lock loss).
+    #[tokio::test]
+    async fn refresh_lock_reports_missing_lock_as_failure() {
+        use super::refresh_lock;
+        use rustfs_lock::client::LockClient;
+        use rustfs_lock::{LocalClient, LockRequest, LockType, ObjectKey};
+        use std::sync::Arc;
+
+        let client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let req = LockRequest::new(ObjectKey::new("bucket", "ghost"), LockType::Exclusive, "owner");
+
+        let resp = refresh_lock(&client, &req).await;
+        assert!(
+            !resp.success,
+            "refresh of a non-existent lock must return success=false (not the stub's unconditional true)"
+        );
+    }
+}

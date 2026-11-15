@@ -24,14 +24,15 @@ mod unix;
 mod windows;
 
 #[cfg(target_os = "linux")]
-pub use linux::{check_cross_device_mounts, get_drive_stats, get_info, get_physical_device_ids, same_disk};
+pub use linux::{check_cross_device_mounts, get_drive_stats, get_info, get_physical_device_ids, is_mount_point, same_disk};
 
 #[cfg(all(unix, not(target_os = "linux")))]
-pub use unix::{check_cross_device_mounts, get_drive_stats, get_info, get_physical_device_ids, same_disk};
+pub use unix::{check_cross_device_mounts, get_drive_stats, get_info, get_physical_device_ids, is_mount_point, same_disk};
 
 #[cfg(target_os = "windows")]
 pub use windows::{
-    check_cross_device_mounts, get_drive_stats, get_info, get_physical_device_ids, get_volume_serial_number, same_disk,
+    check_cross_device_mounts, get_drive_stats, get_info, get_physical_device_ids, get_volume_serial_number, is_mount_point,
+    same_disk,
 };
 
 #[derive(Debug, Default, PartialEq)]
@@ -63,6 +64,13 @@ pub struct DiskInfo {
     pub files: u64,
     pub ffree: u64,
     pub fstype: String,
+    /// The volume is reached through a network redirector.
+    ///
+    /// Windows names the server's filesystem (usually `NTFS`) in `fstype` for
+    /// SMB shares, so remote volumes are reported here instead. On Unix the
+    /// client filesystem type (`nfs`, `cifs`, `smb2`, ...) already identifies
+    /// network mounts and this stays `false`.
+    pub remote: bool,
     pub major: u64,
     pub minor: u64,
     pub name: String,
@@ -125,12 +133,17 @@ mod tests {
         // Test passes if the function doesn't panic - the actual result depends on test environment
     }
 
-    #[ignore] // FIXME: failed in github actions
     #[test]
-    fn test_get_drive_stats_default() {
+    fn test_get_drive_stats_missing_device_or_default() {
+        #[cfg(target_os = "linux")]
+        {
+            let err = get_drive_stats(0, 0).expect_err("linux block device 0:0 should not exist");
+            assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        }
+
         #[cfg(not(target_os = "linux"))]
         {
-            let stats = get_drive_stats(0, 0).unwrap();
+            let stats = get_drive_stats(0, 0).expect("non-linux drive stats fallback should return defaults");
             assert_eq!(stats, IOStats::default());
         }
     }

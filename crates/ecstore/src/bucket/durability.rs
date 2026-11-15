@@ -1,0 +1,262 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Per-bucket durability tier configuration (HP-5 phase 2).
+//!
+//! A bucket can override the process-wide durability mode
+//! (`RUSTFS_DURABILITY_MODE`) with its own tier. The override is stored as a
+//! RustFS extension entry (`durability.json`) in the bucket metadata file and
+//! is resolved by the disk layer at commit points via
+//! `effective_durability(volume)`. System buckets (`.rustfs.sys`,
+//! `.minio.sys`) can never carry an override; they stay pinned to `strict`.
+//! See docs/operations/durability-modes.md for the semantics.
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// Valid per-bucket durability tier names. `legacy-off` is deliberately not
+/// representable per bucket: it exists only for the process-wide legacy
+/// switch (`RUSTFS_DRIVE_SYNC_ENABLE=false`).
+pub const BUCKET_DURABILITY_MODE_STRICT: &str = "strict";
+pub const BUCKET_DURABILITY_MODE_FILE_SYNC: &str = "file-sync";
+pub const BUCKET_DURABILITY_MODE_RELAXED: &str = "relaxed";
+pub const BUCKET_DURABILITY_MODE_NONE: &str = "none";
+
+/// JSON payload stored under the `durability.json` bucket metadata entry.
+///
+/// An absent entry, an empty payload, or an empty `mode` string all mean
+/// "no override": the bucket follows the process-wide durability mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BucketDurabilityConfig {
+    /// Requested tier: `strict` | `file-sync` | `relaxed` | `none` (case-insensitive,
+    /// whitespace-tolerant). Empty means "inherit the global mode".
+    pub mode: String,
+}
+
+#[derive(Serialize)]
+struct BucketDurabilityConfigWireRef<'a> {
+    mode: &'a str,
+    #[serde(skip_serializing_if = "is_false")]
+    file_sync: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Deserialize)]
+struct BucketDurabilityConfigWire {
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    file_sync: bool,
+}
+
+impl Serialize for BucketDurabilityConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let file_sync = self.mode.trim().eq_ignore_ascii_case(BUCKET_DURABILITY_MODE_FILE_SYNC);
+        BucketDurabilityConfigWireRef {
+            mode: if file_sync {
+                BUCKET_DURABILITY_MODE_STRICT
+            } else {
+                &self.mode
+            },
+            file_sync,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for BucketDurabilityConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = BucketDurabilityConfigWire::deserialize(deserializer)?;
+        let mode = if wire.file_sync {
+            if wire.mode.trim().eq_ignore_ascii_case(BUCKET_DURABILITY_MODE_STRICT) {
+                BUCKET_DURABILITY_MODE_FILE_SYNC.to_string()
+            } else {
+                BUCKET_DURABILITY_MODE_STRICT.to_string()
+            }
+        } else {
+            wire.mode
+        };
+        Ok(Self { mode })
+    }
+}
+
+impl BucketDurabilityConfig {
+    pub fn new(mode: &str) -> Self {
+        Self { mode: mode.to_string() }
+    }
+
+    /// Whether `mode` names a valid per-bucket tier.
+    pub fn is_valid_mode(mode: &str) -> bool {
+        matches!(
+            mode.trim().to_ascii_lowercase().as_str(),
+            BUCKET_DURABILITY_MODE_STRICT
+                | BUCKET_DURABILITY_MODE_FILE_SYNC
+                | BUCKET_DURABILITY_MODE_RELAXED
+                | BUCKET_DURABILITY_MODE_NONE
+        )
+    }
+
+    /// The canonical (trimmed, lowercase) tier name, or `None` when the
+    /// config does not carry a valid override.
+    pub fn normalized_mode(&self) -> Option<String> {
+        let mode = self.mode.trim().to_ascii_lowercase();
+        if Self::is_valid_mode(&mode) { Some(mode) } else { None }
+    }
+}
+
+/// Default durability policy for newly created buckets. An unset value must
+/// inherit the process-wide mode so a default single-node deployment remains
+/// strict. Relaxed and none remain explicit operator choices.
+pub const ENV_NEW_BUCKET_DURABILITY_MODE: &str = "RUSTFS_NEW_BUCKET_DURABILITY_MODE";
+pub const DEFAULT_NEW_BUCKET_DURABILITY_MODE: &str = "inherit";
+
+const EVENT_NEW_BUCKET_DURABILITY_MODE: &str = "new_bucket_durability_mode";
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_BUCKET_DURABILITY: &str = "bucket_durability";
+
+/// The `durability.json` bytes to seed into a freshly created bucket's metadata.
+/// Empty means "no override" (the bucket then follows the global
+/// `RUSTFS_DURABILITY_MODE`); otherwise the serialized chosen tier. Invalid
+/// values also fail closed to inherit the global mode instead of seeding a
+/// surprising tier.
+pub fn new_bucket_durability_config_json(bucket: &str) -> Vec<u8> {
+    let raw = std::env::var(ENV_NEW_BUCKET_DURABILITY_MODE).unwrap_or_else(|_| DEFAULT_NEW_BUCKET_DURABILITY_MODE.to_string());
+    let mode = raw.trim();
+    if mode.eq_ignore_ascii_case("inherit") || mode.is_empty() || !BucketDurabilityConfig::is_valid_mode(mode) {
+        return Vec::new();
+    }
+    let config = BucketDurabilityConfig::new(mode);
+    if let Some(mode) = config.normalized_mode().filter(|mode| mode != BUCKET_DURABILITY_MODE_STRICT) {
+        tracing::warn!(
+            event = EVENT_NEW_BUCKET_DURABILITY_MODE,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_BUCKET_DURABILITY,
+            state = "non_strict_new_bucket_override",
+            bucket = %bucket,
+            mode = %mode,
+            "New bucket durability is explicitly configured below strict"
+        );
+    }
+    serde_json::to_vec(&config).expect("BucketDurabilityConfig serialization cannot fail")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_bucket_seeded_mode() -> Option<String> {
+        let json = new_bucket_durability_config_json("test-bucket");
+        if json.is_empty() {
+            return None;
+        }
+        serde_json::from_slice::<BucketDurabilityConfig>(&json)
+            .expect("new-bucket durability config must serialize")
+            .normalized_mode()
+    }
+
+    #[test]
+    fn valid_modes_are_recognized() {
+        assert!(BucketDurabilityConfig::is_valid_mode("strict"));
+        assert!(BucketDurabilityConfig::is_valid_mode("file-sync"));
+        assert!(BucketDurabilityConfig::is_valid_mode("relaxed"));
+        assert!(BucketDurabilityConfig::is_valid_mode("none"));
+        assert!(BucketDurabilityConfig::is_valid_mode(" RELAXED "));
+        assert!(!BucketDurabilityConfig::is_valid_mode(""));
+        assert!(!BucketDurabilityConfig::is_valid_mode("bogus"));
+        // The legacy full-off switch is process-wide only.
+        assert!(!BucketDurabilityConfig::is_valid_mode("legacy-off"));
+    }
+
+    #[test]
+    fn normalized_mode_canonicalizes_or_rejects() {
+        assert_eq!(BucketDurabilityConfig::new(" Relaxed ").normalized_mode().as_deref(), Some("relaxed"));
+        assert_eq!(BucketDurabilityConfig::new("strict").normalized_mode().as_deref(), Some("strict"));
+        assert_eq!(BucketDurabilityConfig::new(" FILE-SYNC ").normalized_mode().as_deref(), Some("file-sync"));
+        assert_eq!(BucketDurabilityConfig::default().normalized_mode(), None);
+        assert_eq!(BucketDurabilityConfig::new("bogus").normalized_mode(), None);
+    }
+
+    #[test]
+    fn json_round_trip() {
+        let cfg = BucketDurabilityConfig::new("relaxed");
+        let json = serde_json::to_vec(&cfg).expect("serialize");
+        let back: BucketDurabilityConfig = serde_json::from_slice(&json).expect("deserialize");
+        assert_eq!(back, cfg);
+
+        let file_sync = BucketDurabilityConfig::new("file-sync");
+        let json = serde_json::to_vec(&file_sync).expect("serialize file-sync");
+        assert_eq!(json, br#"{"mode":"strict","file_sync":true}"#);
+        let back: BucketDurabilityConfig = serde_json::from_slice(&json).expect("deserialize file-sync");
+        assert_eq!(back.normalized_mode().as_deref(), Some("file-sync"));
+
+        let malformed = serde_json::from_slice::<BucketDurabilityConfig>(br#"{"mode":"none","file_sync":true}"#)
+            .expect("deserialize malformed file-sync");
+        assert_eq!(malformed.normalized_mode().as_deref(), Some("strict"));
+
+        // Empty object deserializes to the "inherit" default.
+        let empty: BucketDurabilityConfig = serde_json::from_slice(b"{}").expect("deserialize empty");
+        assert_eq!(empty.normalized_mode(), None);
+    }
+
+    #[test]
+    fn file_sync_encoding_fails_closed_on_legacy_readers() {
+        #[derive(Deserialize)]
+        struct LegacyConfig {
+            #[serde(default)]
+            mode: String,
+        }
+
+        let json = serde_json::to_vec(&BucketDurabilityConfig::new("file-sync")).expect("serialize file-sync");
+        let legacy: LegacyConfig = serde_json::from_slice(&json).expect("legacy reader should ignore the marker");
+        assert_eq!(legacy.mode, "strict", "legacy readers must apply the stronger strict fallback");
+    }
+
+    #[test]
+    fn new_bucket_default_inherits_when_unset() {
+        temp_env::with_var_unset(ENV_NEW_BUCKET_DURABILITY_MODE, || {
+            assert_eq!(new_bucket_seeded_mode(), None);
+        });
+    }
+
+    #[test]
+    fn new_bucket_default_honors_explicit_tiers() {
+        for mode in [
+            BUCKET_DURABILITY_MODE_STRICT,
+            BUCKET_DURABILITY_MODE_FILE_SYNC,
+            BUCKET_DURABILITY_MODE_RELAXED,
+            BUCKET_DURABILITY_MODE_NONE,
+        ] {
+            temp_env::with_var(ENV_NEW_BUCKET_DURABILITY_MODE, Some(mode), || {
+                assert_eq!(new_bucket_seeded_mode().as_deref(), Some(mode));
+            });
+        }
+    }
+
+    #[test]
+    fn new_bucket_default_can_inherit_global_mode() {
+        for mode in ["inherit", "", "bogus"] {
+            temp_env::with_var(ENV_NEW_BUCKET_DURABILITY_MODE, Some(mode), || {
+                assert_eq!(new_bucket_seeded_mode(), None);
+            });
+        }
+    }
+}

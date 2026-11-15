@@ -22,6 +22,58 @@ pub const DEFAULT_HEALTH_ENDPOINT_ENABLE: bool = true;
 pub const ENV_HEALTH_READINESS_CACHE_TTL_MS: &str = "RUSTFS_HEALTH_READINESS_CACHE_TTL_MS";
 pub const DEFAULT_HEALTH_READINESS_CACHE_TTL_MS: u64 = 1000;
 
+/// Enable readiness withdrawal when bounded object read/write stages stop
+/// completing while requests remain active.
+pub const ENV_HEALTH_OBJECT_PROGRESS_ENABLE: &str = "RUSTFS_HEALTH_OBJECT_PROGRESS_ENABLE";
+pub const DEFAULT_HEALTH_OBJECT_PROGRESS_ENABLE: bool = true;
+
+/// Requested time without completion in a bounded object stage before local
+/// readiness is withdrawn (milliseconds). A value of `0` uses the default;
+/// runtime adds a safety floor based on the object-lock acquisition timeout.
+pub const ENV_HEALTH_OBJECT_PROGRESS_TIMEOUT_MS: &str = "RUSTFS_HEALTH_OBJECT_PROGRESS_TIMEOUT_MS";
+pub const DEFAULT_HEALTH_OBJECT_PROGRESS_TIMEOUT_MS: u64 = 30_000;
+/// Additional time beyond the configured object-lock acquisition deadline.
+pub const HEALTH_OBJECT_PROGRESS_LOCK_MARGIN_MS: u64 = 5_000;
+
+/// End-to-end budget for cluster health readiness probes (milliseconds).
+/// Includes cache/singleflight waiting, storage observations, and lock checks.
+pub const ENV_HEALTH_CLUSTER_TIMEOUT_MS: &str = "RUSTFS_HEALTH_CLUSTER_TIMEOUT_MS";
+pub const DEFAULT_HEALTH_CLUSTER_TIMEOUT_MS: u64 = 2000;
+
+/// Timeout for one remote lock-client online check used by readiness (milliseconds).
+///
+/// This is intentionally shorter than the generic lock RPC timeout so
+/// `/health/ready` can report degradation instead of riding a dead peer's
+/// connect or HTTP/2 keepalive budget.
+pub const ENV_HEALTH_LOCK_ONLINE_TIMEOUT_MS: &str = "RUSTFS_HEALTH_LOCK_ONLINE_TIMEOUT_MS";
+pub const DEFAULT_HEALTH_LOCK_ONLINE_TIMEOUT_MS: u64 = 1000;
+
+/// Maximum time to wait for local node runtime readiness (storage / IAM / lock
+/// quorum) during startup before failing fast (seconds).
+///
+/// On slow or multi-node cold starts — e.g. Docker/Kubernetes/NAS deployments
+/// where peer DNS records and erasure-format quorum take time to converge — this
+/// budget must be large enough to outlast the internal startup DNS-retry window
+/// and the format-load retry loop. Increase it for slow NAS/edge clusters; lower
+/// it for fast single-node setups that should fail fast. A value of `0` is
+/// treated as the default rather than an instant timeout.
+pub const ENV_STARTUP_READINESS_MAX_WAIT_SECS: &str = "RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS";
+pub const DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS: u64 = 120;
+
+/// Wait for peer re-admission before a distributed node publishes startup
+/// readiness.
+///
+/// After this node reaches local readiness it asks the peers in each erasure
+/// set it serves, over the internode RPC channel, whether they count its
+/// drives as online. Startup readiness is published once a strict majority of
+/// each set's peers do, or when the startup budget
+/// ([`ENV_STARTUP_READINESS_MAX_WAIT_SECS`]) elapses, or when unreachable or
+/// older peers make that majority impossible. The gate always fails open; it
+/// never affects steady-state `/health/ready` or request handling. Disable it
+/// to restore the local-view-only startup readiness.
+pub const ENV_STARTUP_PEER_READMISSION_ENABLE: &str = "RUSTFS_STARTUP_PEER_READMISSION_ENABLE";
+pub const DEFAULT_STARTUP_PEER_READMISSION_ENABLE: bool = true;
+
 /// Enable minimal health payload mode for GET `/health*` responses.
 /// When enabled, only `status` and `ready` fields are returned.
 pub const ENV_HEALTH_MINIMAL_RESPONSE_ENABLE: &str = "RUSTFS_HEALTH_MINIMAL_RESPONSE_ENABLE";
@@ -43,3 +95,8 @@ pub const DEFAULT_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS: usize = 0;
 /// in running state if a global KMS manager exists.
 pub const ENV_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE: &str = "RUSTFS_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE";
 pub const DEFAULT_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE: bool = false;
+
+/// Enable peer-health readiness impact.
+/// When disabled, peer-health state is reported but does not affect readiness.
+pub const ENV_HEALTH_PEER_READY_CHECK_ENABLE: &str = "RUSTFS_HEALTH_PEER_READY_CHECK_ENABLE";
+pub const DEFAULT_HEALTH_PEER_READY_CHECK_ENABLE: bool = false;

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::Tag;
+use rustfs_gateway_types::cors_tagging::PersistedTag as Tag;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use url::form_urlencoded;
@@ -61,7 +61,7 @@ pub fn encode_tags(tags: Vec<Tag>) -> String {
 
     for tag in tags.iter() {
         if let (Some(k), Some(v)) = (tag.key.as_ref(), tag.value.as_ref()) {
-            //encoded.append_pair(k.as_ref().unwrap().as_str(), v.as_ref().unwrap().as_str());
+            //encoded.append_pair(k.as_ref().expect("operation should succeed").as_str(), v.as_ref().expect("operation should succeed").as_str());
             encoded.append_pair(k.as_str(), v.as_str());
         }
     }

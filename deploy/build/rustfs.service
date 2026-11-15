@@ -20,12 +20,12 @@ WorkingDirectory=/opt/rustfs
 # rustfs reads address, volumes, console, credentials, and other runtime settings
 # from RUSTFS_* variables. See `../config/rustfs.env` for an example template.
 EnvironmentFile=/etc/default/rustfs
-ExecStart=/usr/local/bin/rustfs server
+ExecStart=/usr/bin/rustfs server
 
 # service log configuration
 LogsDirectory=rustfs
-StandardOutput=append:/var/log/rustfs/rustfs.log
-StandardError=append:/var/log/rustfs/rustfs-err.log
+StandardOutput=journal
+StandardError=journal
 
 # resource constraints
 LimitNOFILE=1048576

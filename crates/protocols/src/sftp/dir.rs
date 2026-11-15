@@ -25,10 +25,13 @@ use super::state::{DirCursor, HandleState, ListingContinuation};
 use crate::common::client::s3::StorageBackend;
 use crate::common::gateway::S3Action;
 use bytes::Bytes;
-use futures_util::stream;
 use russh_sftp::protocol::{File, Handle, Name, StatusCode};
+use rustfs_gateway_stream::ByteStream;
+use rustfs_gateway_types::{
+    BucketName, ObjectKey, OpaqueString,
+    dto::{ListObjectsV2Input, PutObjectInput},
+};
 use rustfs_utils::path;
-use s3s::dto::{ListObjectsV2Input, PutObjectInput, StreamingBlob};
 
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_SFTP_DIR: &str = "sftp_dir";
@@ -54,6 +57,33 @@ pub(super) fn dot_entries() -> Vec<File> {
             attrs,
         },
     ]
+}
+
+/// Client-visible S3 key for an SFTP sub-directory.
+///
+/// `object_key` is the parsed prefix without a trailing slash. The
+/// returned key ends in `/` so the storage layer can encode it to the
+/// reserved directory marker. Callers must not encode the key first:
+/// `validate_object_key` rejects any client key that already contains
+/// the marker suffix.
+fn directory_client_key(object_key: &str) -> String {
+    format!("{object_key}/")
+}
+
+fn directory_listing_input(
+    bucket: &str,
+    prefix: &str,
+    continuation: &ListingContinuation,
+) -> Result<ListObjectsV2Input, SftpError> {
+    let mut builder = ListObjectsV2Input::builder()
+        .bucket(BucketName::new(bucket.to_owned()).map_err(|e| s3_error_to_sftp("build_list_objects", e))?)
+        .prefix(prefix.to_owned())
+        .delimiter("/".to_owned())
+        .max_keys(READDIR_PAGE_MAX_KEYS);
+    if let ListingContinuation::Next(token) = continuation {
+        builder = builder.continuation_token(OpaqueString::from(token.clone()));
+    }
+    Ok(builder.build())
 }
 
 impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
@@ -89,23 +119,11 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // list_objects_v2 wire call. Matching that means a policy
         // revoked mid-iteration takes effect on the next page rather
         // than at session end.
-        self.authorize(&S3Action::ListBucket, bucket, None).await?;
-
-        let mut builder = ListObjectsV2Input::builder()
-            .bucket(bucket.clone())
-            .prefix(Some(prefix.clone()))
-            .delimiter(Some("/".to_string()))
-            .max_keys(Some(READDIR_PAGE_MAX_KEYS));
-        if let ListingContinuation::Next(token) = continuation {
-            builder = builder.continuation_token(Some(token.clone()));
-        }
-        let input = builder.build().map_err(|e| s3_error_to_sftp("build_list_objects", e))?;
+        let input = directory_listing_input(bucket, prefix, continuation)?;
+        self.authorize_list_objects(&input).await?;
 
         let out = self
-            .run_backend(
-                "list_objects_v2",
-                self.storage.list_objects_v2(input, self.access_key(), self.secret_key()),
-            )
+            .run_backend("list_objects_v2", self.storage.list_objects_v2(input, self.credentials()))
             .await?;
 
         let mut entries = Vec::new();
@@ -114,17 +132,15 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // delimiter="/" split. Each prefix ends with "/".
         // last_path_component returns the final component, or None if
         // the prefix has no component (e.g. "/" on its own).
-        if let Some(common) = out.common_prefixes {
-            for cp in common {
-                let Some(p) = cp.prefix else { continue };
-                let Some(name) = last_path_component(&p) else { continue };
-                let attrs = s3_attrs_to_sftp(0, None, true);
-                entries.push(File {
-                    filename: name.to_string(),
-                    longname: generate_longname(name, &attrs),
-                    attrs,
-                });
-            }
+        for cp in out.common_prefixes {
+            let p = cp.prefix;
+            let Some(name) = last_path_component(&p) else { continue };
+            let attrs = s3_attrs_to_sftp(0, None, true);
+            entries.push(File {
+                filename: name.to_string(),
+                longname: generate_longname(name, &attrs),
+                attrs,
+            });
         }
 
         // contents holds object entries at the current level. __XLDIR__
@@ -132,29 +148,27 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // for entries whose key contains a "/" after the prefix (those
         // belong under a sub-prefix and would have appeared via
         // common_prefixes).
-        if let Some(contents) = out.contents {
-            for obj in contents {
-                let Some(full_key) = obj.key else { continue };
-                if full_key.ends_with(path::GLOBAL_DIR_SUFFIX) {
-                    continue;
-                }
-                let Some(name) = relative_filename(&full_key, prefix.as_str()) else { continue };
-                let size = obj.size.unwrap_or(0).max(0) as u64;
-                let mtime = timestamp_to_mtime(obj.last_modified);
-                let attrs = s3_attrs_to_sftp(size, mtime, false);
-                entries.push(File {
-                    filename: name.to_string(),
-                    longname: generate_longname(name, &attrs),
-                    attrs,
-                });
+        for obj in out.contents {
+            let full_key = obj.key;
+            if full_key.as_str().ends_with(path::GLOBAL_DIR_SUFFIX) {
+                continue;
             }
+            let Some(name) = relative_filename(full_key.as_str(), prefix.as_str()) else { continue };
+            let size = obj.size.max(0) as u64;
+            let mtime = timestamp_to_mtime(Some(obj.last_modified));
+            let attrs = s3_attrs_to_sftp(size, mtime, false);
+            entries.push(File {
+                filename: name.to_string(),
+                longname: generate_longname(name, &attrs),
+                attrs,
+            });
         }
 
         // Advance the continuation cursor. is_truncated without a token is
         // a backend inconsistency. Handle as Done rather than risk looping
         // forever on an absent token.
-        *continuation = match (out.is_truncated.unwrap_or(false), out.next_continuation_token) {
-            (true, Some(token)) => ListingContinuation::Next(token),
+        *continuation = match (out.is_truncated, out.next_continuation_token) {
+            (true, Some(token)) => ListingContinuation::Next(token.into_string()),
             _ => ListingContinuation::Done,
         };
 
@@ -172,10 +186,6 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     /// must not fall through to a destructive call when this returns
     /// Err.
     pub(super) async fn validate_directory_empty(&self, bucket: &str, prefix: &str) -> Result<(), SftpError> {
-        let prefix_for_authorization = if prefix.is_empty() { None } else { Some(prefix) };
-        self.authorize(&S3Action::ListBucket, bucket, prefix_for_authorization)
-            .await?;
-
         // For sub-directory prefixes, max_keys=2 because the backend
         // may return the directory's own __XLDIR__ marker (decoded to
         // the prefix itself, e.g. "subdir/") as a content entry.
@@ -185,21 +195,20 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // marker to filter.
         let max_keys = if prefix.is_empty() { 1 } else { 2 };
         let mut builder = ListObjectsV2Input::builder()
-            .bucket(bucket.to_string())
-            .delimiter(Some("/".to_string()))
-            .max_keys(Some(max_keys));
+            .bucket(BucketName::new(bucket.to_string()).map_err(|e| s3_error_to_sftp("build_list_objects", e))?)
+            .delimiter("/".to_string())
+            .max_keys(max_keys);
         if !prefix.is_empty() {
-            builder = builder.prefix(Some(prefix.to_string()));
+            builder = builder.prefix(prefix.to_string());
         }
-        let input = builder.build().map_err(|e| s3_error_to_sftp("build_list_objects", e))?;
+        let input = builder.build();
+
+        self.authorize_list_objects(&input).await?;
 
         // Issue list_objects_v2. On Err the destructive caller never
         // runs because validate_directory_empty returns the Err.
         let out = self
-            .run_backend(
-                "list_objects_v2",
-                self.storage.list_objects_v2(input, self.access_key(), self.secret_key()),
-            )
+            .run_backend("list_objects_v2", self.storage.list_objects_v2(input, self.credentials()))
             .await?;
 
         // Count content entries that are not the directory's own marker.
@@ -207,12 +216,8 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // trailing-slash keys in list responses, so the marker for
         // "subdir/" appears as a content entry with key "subdir/". That
         // entry must not count as content when checking emptiness.
-        let real_content_count = out
-            .contents
-            .as_ref()
-            .map(|c| c.iter().filter(|obj| obj.key.as_deref() != Some(prefix)).count())
-            .unwrap_or(0);
-        let has_prefixes = out.common_prefixes.map(|c| !c.is_empty()).unwrap_or(false);
+        let real_content_count = out.contents.iter().filter(|obj| obj.key.as_str() != prefix).count();
+        let has_prefixes = !out.common_prefixes.is_empty();
         if real_content_count > 0 || has_prefixes {
             return Err(SftpError::code(StatusCode::Failure));
         }
@@ -226,41 +231,49 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     /// OPENDIR so a client without ListAllMyBuckets can still open the
     /// root directory handle.
     ///
+    /// A principal without ListAllMyBuckets (a bucket-scoped user) gets
+    /// the session-aware ListBuckets instead, which IAM filters to the
+    /// buckets the principal may ListBucket or GetBucketLocation, the
+    /// same as S3 ListBuckets and the WebDAV root. It carries the
+    /// session's request headers and transport security, like every
+    /// other SFTP authorization.
+    ///
     /// ListBuckets is not batched in the S3 API. A single response
     /// carries the full set. Truncate at ROOT_LISTING_MAX_ENTRIES so a
     /// principal with many visible buckets produces a bounded Vec and
     /// does not exceed the SSH channel window with a single response.
     pub(super) async fn fetch_bucket_list(&self) -> Result<Vec<File>, SftpError> {
-        self.authorize(&S3Action::ListBuckets, "", None).await?;
-
-        let out = self
-            .run_backend("list_buckets", self.storage.list_buckets(self.access_key(), self.secret_key()))
-            .await?;
+        let out = if self.is_authorized(&S3Action::ListBuckets, "", None).await? {
+            self.run_backend("list_buckets", self.storage.list_buckets(self.credentials()))
+                .await?
+        } else {
+            self.run_backend(
+                "list_buckets",
+                self.storage.list_buckets_for_session(
+                    &self.session_context,
+                    &self.session_context.request_headers,
+                    self.session_context.secure_transport,
+                ),
+            )
+            .await?
+        };
 
         let mut entries = Vec::new();
         let mut truncated_at: Option<usize> = None;
-        // buckets is Option at the SDK level. None means no content
-        // (distinct from Some(empty Vec)). Both cases produce an empty
-        // result here.
-        if let Some(buckets) = out.buckets {
-            let total = buckets.len();
-            for bucket in buckets {
-                if entries.len() >= ROOT_LISTING_MAX_ENTRIES {
-                    truncated_at = Some(total);
-                    break;
-                }
-                // Bucket.name is Option in the SDK type. Skip entries
-                // where the name is None since there is no SFTP path
-                // that maps to an unnamed bucket.
-                let Some(name) = bucket.name else { continue };
-                let mtime = timestamp_to_mtime(bucket.creation_date);
-                let attrs = s3_attrs_to_sftp(0, mtime, true);
-                entries.push(File {
-                    filename: name.clone(),
-                    longname: generate_longname(&name, &attrs),
-                    attrs,
-                });
+        let total = out.buckets.len();
+        for bucket in out.buckets {
+            if entries.len() >= ROOT_LISTING_MAX_ENTRIES {
+                truncated_at = Some(total);
+                break;
             }
+            let name = bucket.name;
+            let mtime = timestamp_to_mtime(Some(bucket.creation_date));
+            let attrs = s3_attrs_to_sftp(0, mtime, true);
+            entries.push(File {
+                filename: name.as_str().to_owned(),
+                longname: generate_longname(name.as_str(), &attrs),
+                attrs,
+            });
         }
         if let Some(total) = truncated_at {
             tracing::warn!(
@@ -280,29 +293,27 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     /// MKDIR for a bucket-level path: authorise and issue CreateBucket.
     pub(super) async fn mkdir_bucket(&self, bucket: &str) -> Result<(), SftpError> {
         self.authorize(&S3Action::CreateBucket, bucket, None).await?;
-        self.run_backend("create_bucket", self.storage.create_bucket(bucket, self.access_key(), self.secret_key()))
+        self.run_backend("create_bucket", self.storage.create_bucket(bucket, self.credentials()))
             .await?;
         Ok(())
     }
 
-    /// MKDIR for a sub-directory path: write a zero-byte object at
-    /// encode_dir_object(prefix + "/"). The encoding maps "foo/" to
-    /// "foo__XLDIR__", which matches the RustFS marker convention used
-    /// by the S3, Swift, and WebDAV backends.
+    /// MKDIR for a sub-directory path: write a zero-byte object at the
+    /// client-visible directory key (`foo/`). Storage encodes that key to
+    /// the on-disk marker `foo__XLDIR__` after the S3 client-key boundary.
+    /// The encoded suffix is reserved, so PutObject must not be given it.
     pub(super) async fn mkdir_subdir_marker(&self, bucket: &str, object_key: &str) -> Result<(), SftpError> {
-        let marker_key = path::encode_dir_object(&format!("{object_key}/"));
-        self.authorize(&S3Action::PutObject, bucket, Some(&marker_key)).await?;
+        let dir_key = directory_client_key(object_key);
+        self.authorize(&S3Action::PutObject, bucket, Some(&dir_key)).await?;
 
-        let body = stream::once(async { Ok::<Bytes, std::io::Error>(Bytes::new()) });
-        let streaming = StreamingBlob::wrap(body);
+        let streaming = ByteStream::from_bytes(Bytes::new());
         let input = PutObjectInput::builder()
-            .bucket(bucket.to_string())
-            .key(marker_key.clone())
-            .content_length(Some(0))
-            .body(Some(streaming))
-            .build()
-            .map_err(|e| s3_error_to_sftp("build_put_object", e))?;
-        self.run_backend("put_object", self.storage.put_object(input, self.access_key(), self.secret_key()))
+            .bucket(BucketName::new(bucket.to_owned()).map_err(|e| s3_error_to_sftp("build_put_object", e))?)
+            .key(ObjectKey::new(dir_key).map_err(|e| s3_error_to_sftp("build_put_object", e))?)
+            .content_length(0)
+            .body(streaming)
+            .build();
+        self.run_backend("put_object", self.storage.put_object(input, self.credentials()))
             .await?;
         Ok(())
     }
@@ -312,26 +323,21 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     pub(super) async fn rmdir_bucket(&self, bucket: &str) -> Result<(), SftpError> {
         self.validate_directory_empty(bucket, "").await?;
         self.authorize(&S3Action::DeleteBucket, bucket, None).await?;
-        self.run_backend("delete_bucket", self.storage.delete_bucket(bucket, self.access_key(), self.secret_key()))
+        self.run_backend("delete_bucket", self.storage.delete_bucket(bucket, self.credentials()))
             .await?;
         Ok(())
     }
 
     /// RMDIR for a sub-directory path: validate no objects under the
-    /// prefix, then authorise and delete the __XLDIR__ marker that
-    /// represents the directory.
+    /// prefix, then authorise and delete the trailing-slash directory key.
+    /// Storage encodes that key to the on-disk marker.
     pub(super) async fn rmdir_subdir_marker(&self, bucket: &str, object_key: &str) -> Result<(), SftpError> {
-        let prefix = format!("{object_key}/");
-        self.validate_directory_empty(bucket, &prefix).await?;
+        let dir_key = directory_client_key(object_key);
+        self.validate_directory_empty(bucket, &dir_key).await?;
 
-        let marker_key = path::encode_dir_object(&prefix);
-        self.authorize(&S3Action::DeleteObject, bucket, Some(&marker_key)).await?;
-        self.run_backend(
-            "delete_object",
-            self.storage
-                .delete_object(bucket, &marker_key, self.access_key(), self.secret_key()),
-        )
-        .await?;
+        self.authorize(&S3Action::DeleteObject, bucket, Some(&dir_key)).await?;
+        self.run_backend("delete_object", self.storage.delete_object(bucket, &dir_key, self.credentials()))
+            .await?;
         Ok(())
     }
 
@@ -392,13 +398,9 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 Some(k) if k.ends_with('/') => k.clone(),
                 Some(k) => format!("{k}/"),
             };
-            self.authorize(
-                &S3Action::ListBucket,
-                &bucket,
-                if prefix.is_empty() { None } else { Some(prefix.as_str()) },
-            )
-            .await?;
-            self.run_backend("head_bucket", self.storage.head_bucket(&bucket, self.access_key(), self.secret_key()))
+            let input = directory_listing_input(&bucket, &prefix, &ListingContinuation::Initial)?;
+            self.authorize_list_objects(&input).await?;
+            self.run_backend("head_bucket", self.storage.head_bucket(&bucket, self.credentials()))
                 .await?;
             DirCursor::Listing {
                 bucket,
@@ -453,14 +455,222 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
 #[cfg(test)]
 mod tests {
     use super::super::state::{DirCursor, HandleState, ListingContinuation};
-    use super::super::test_support::{TEST_PART_SIZE, build_driver, capture_tracing_at};
+    use super::super::test_support::{TEST_PART_SIZE, build_driver, build_driver_with_timeout, capture_tracing_at};
     use crate::common::dummy_storage::{DummyBackend, DummyError};
-    use crate::common::gateway::with_test_auth_override;
+    use crate::common::gateway::{with_test_auth_override, with_test_iam_unavailable};
     use russh_sftp::protocol::StatusCode;
     use russh_sftp::server::Handler;
     use std::sync::Arc;
     use tokio::sync::Notify;
     use tracing::Level;
+
+    fn buckets(names: &[&str]) -> rustfs_gateway_types::dto::ListBucketsOutput {
+        rustfs_gateway_types::dto::ListBucketsOutput {
+            buckets: names
+                .iter()
+                .map(|n| rustfs_gateway_types::dto::Bucket {
+                    name: rustfs_gateway_types::BucketName::new((*n).to_owned()).expect("bucket name"),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn names(files: &[russh_sftp::protocol::File]) -> Vec<&str> {
+        files.iter().map(|f| f.filename.as_str()).collect()
+    }
+
+    fn deny_list_all_my_buckets(action: &crate::common::gateway::S3Action, _: &str, _: Option<&str>) -> bool {
+        !matches!(action, crate::common::gateway::S3Action::ListBuckets)
+    }
+
+    #[tokio::test]
+    async fn root_listing_with_list_all_my_buckets_lists_every_bucket() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_list_buckets_ok(buckets(&["alpha", "beta"]));
+        backend.queue_session_list_buckets_ok(buckets(&["beta"]));
+        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        let files = with_test_auth_override(|_, _, _| true, driver.fetch_bucket_list())
+            .await
+            .expect("global listing");
+
+        assert_eq!(names(&files), ["alpha", "beta"]);
+        assert!(backend.last_session_list_context().is_none(), "session listing must not run");
+    }
+
+    #[tokio::test]
+    async fn root_listing_without_list_all_my_buckets_lists_only_visible_buckets() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_list_buckets_ok(buckets(&["alpha", "beta"]));
+        backend.queue_session_list_buckets_ok(buckets(&["beta"]));
+        let mut driver = build_driver(backend.clone(), TEST_PART_SIZE);
+        driver
+            .session_context
+            .request_headers
+            .insert("user-agent", http::HeaderValue::from_static("sftp-listing-test"));
+        driver.session_context.secure_transport = false;
+
+        let files = with_test_auth_override(deny_list_all_my_buckets, driver.fetch_bucket_list())
+            .await
+            .expect("bucket-scoped listing");
+
+        assert_eq!(names(&files), ["beta"]);
+        let (headers, secure) = backend.last_session_list_context().expect("session listing ran");
+        assert_eq!(headers, driver.session_context.request_headers, "same headers as every other SFTP check");
+        assert_eq!(
+            secure, driver.session_context.secure_transport,
+            "same transport as every other SFTP check"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_listing_without_any_visible_bucket_is_permission_denied() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_session_list_buckets_err(rustfs_s3_types::S3Error::new(rustfs_s3_types::S3ErrorCode::AccessDenied));
+        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        let err = with_test_auth_override(deny_list_all_my_buckets, driver.fetch_bucket_list())
+            .await
+            .expect_err("no visible bucket");
+
+        assert_eq!(err.0, StatusCode::PermissionDenied);
+        assert!(backend.last_session_list_context().is_some(), "the session listing ran");
+    }
+
+    #[tokio::test]
+    async fn root_listing_fails_without_fallback_when_iam_is_unavailable() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_session_list_buckets_ok(buckets(&["beta"]));
+        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        let err = with_test_iam_unavailable(driver.fetch_bucket_list())
+            .await
+            .expect_err("IAM outage");
+
+        assert_eq!(err.0, StatusCode::Failure);
+        assert!(backend.last_session_list_context().is_none(), "an IAM outage is not a policy deny");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn root_listing_fails_without_fallback_when_the_global_check_times_out() {
+        let backend = Arc::new(DummyBackend::new().stall_authorization());
+        backend.queue_session_list_buckets_ok(buckets(&["beta"]));
+        let driver = build_driver_with_timeout(backend.clone(), TEST_PART_SIZE, 1);
+
+        let err = driver.fetch_bucket_list().await.expect_err("authorization deadline");
+
+        assert_eq!(err.0, StatusCode::Failure);
+        assert!(backend.last_session_list_context().is_none(), "a timeout is not a policy deny");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn root_listing_fallback_respects_the_backend_deadline() {
+        let backend = Arc::new(DummyBackend::new().stall_session_listing());
+        let driver = build_driver_with_timeout(backend, TEST_PART_SIZE, 1);
+
+        let err = with_test_auth_override(deny_list_all_my_buckets, driver.fetch_bucket_list())
+            .await
+            .expect_err("session listing deadline");
+
+        assert_eq!(err.0, StatusCode::Failure);
+    }
+
+    #[tokio::test]
+    async fn root_listing_session_error_other_than_access_denied_is_failure() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_session_list_buckets_err(rustfs_s3_types::S3Error::with_message(
+            rustfs_s3_types::S3ErrorCode::InternalError,
+            "AccessDenied in the message is not an access denial",
+        ));
+        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        let err = with_test_auth_override(deny_list_all_my_buckets, driver.fetch_bucket_list())
+            .await
+            .expect_err("backend failure");
+
+        assert_eq!(err.0, StatusCode::Failure);
+    }
+
+    #[tokio::test]
+    async fn root_listing_fallback_is_truncated_at_the_root_listing_limit() {
+        for count in [super::ROOT_LISTING_MAX_ENTRIES, super::ROOT_LISTING_MAX_ENTRIES + 1] {
+            let backend = Arc::new(DummyBackend::new());
+            let many: Vec<String> = (0..count).map(|i| format!("bucket-{i:05}")).collect();
+            backend.queue_session_list_buckets_ok(buckets(&many.iter().map(String::as_str).collect::<Vec<_>>()));
+            let driver = build_driver(backend, TEST_PART_SIZE);
+
+            let files = with_test_auth_override(deny_list_all_my_buckets, driver.fetch_bucket_list())
+                .await
+                .expect("bucket-scoped listing");
+
+            assert_eq!(files.len(), super::ROOT_LISTING_MAX_ENTRIES, "bucket count {count}");
+        }
+    }
+
+    #[tokio::test]
+    async fn root_listing_fails_closed_when_the_backend_has_no_session_listing() {
+        let backend = Arc::new(DummyBackend::new());
+        let driver = build_driver(backend.clone(), TEST_PART_SIZE);
+
+        let err = with_test_auth_override(deny_list_all_my_buckets, driver.fetch_bucket_list())
+            .await
+            .expect_err("no session-aware listing");
+
+        assert_eq!(err.0, StatusCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn opendir_and_readdir_authorize_the_same_listing_parameters() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_head_bucket_ok();
+        let mut driver = build_driver(backend.clone(), TEST_PART_SIZE);
+        let handle = with_test_auth_override(
+            |_, bucket, prefix| bucket == "bucket" && prefix == Some("private/"),
+            driver.opendir_inner(1, "/bucket/private"),
+        )
+        .await
+        .expect("OPENDIR conditional allow");
+        let mut cursor = DirCursor::Listing {
+            bucket: "bucket".into(),
+            prefix: "private/".into(),
+            continuation: ListingContinuation::Initial,
+            dots_emitted: true,
+        };
+        with_test_auth_override(|_, _, prefix| prefix == Some("private/"), driver.next_listing_page(&mut cursor))
+            .await
+            .expect("READDIR conditional allow");
+        cursor = DirCursor::Listing {
+            bucket: "bucket".into(),
+            prefix: "private/".into(),
+            continuation: ListingContinuation::Next("next-page".into()),
+            dots_emitted: true,
+        };
+        with_test_auth_override(|_, _, prefix| prefix == Some("private/"), driver.next_listing_page(&mut cursor))
+            .await
+            .expect("continued READDIR conditional allow");
+        let authorized = backend.list_authorizations();
+        let executed = backend.list_objects_calls();
+        assert_eq!(authorized.len(), 3);
+        assert_eq!(executed.len(), 2);
+        for input in &authorized {
+            assert_eq!(input.prefix.as_deref(), Some("private/"));
+            assert_eq!(input.delimiter.as_deref(), Some("/"));
+            assert_eq!(input.max_keys, Some(super::READDIR_PAGE_MAX_KEYS));
+        }
+        for (auth, call) in authorized[1..].iter().zip(&executed) {
+            assert_eq!(auth.prefix, call.prefix);
+            assert_eq!(auth.delimiter, call.delimiter);
+            assert_eq!(auth.max_keys, call.max_keys);
+            assert_eq!(auth.continuation_token, call.continuation_token);
+        }
+        assert_eq!(authorized[2].continuation_token.as_ref().map(|value| value.as_str()), Some("next-page"));
+        let denied =
+            with_test_auth_override(|_, _, prefix| prefix != Some("private/"), driver.readdir_inner(2, handle.handle)).await;
+        assert!(denied.is_err(), "policy change must deny the next READDIR");
+        assert_eq!(backend.list_objects_calls().len(), 2, "denied READDIR cannot reach storage");
+    }
 
     #[tokio::test]
     async fn validate_directory_empty_propagates_list_error() {
@@ -471,7 +681,7 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         backend.queue_list_objects_v2_err(DummyError::Injected("list_objects_v2 transient failure".into()));
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
-        let result = with_test_auth_override(|_, _, _| true, driver.validate_directory_empty("b", "")).await;
+        let result = with_test_auth_override(|_, _, _| true, driver.validate_directory_empty("bucket", "")).await;
         assert!(result.is_err(), "list_objects_v2 error must propagate as Err");
     }
 
@@ -480,7 +690,7 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         backend.queue_list_objects_v2_ok_empty();
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
-        let result = with_test_auth_override(|_, _, _| true, driver.validate_directory_empty("b", "")).await;
+        let result = with_test_auth_override(|_, _, _| true, driver.validate_directory_empty("bucket", "")).await;
         assert!(result.is_ok(), "empty listing must return Ok");
     }
 
@@ -499,7 +709,7 @@ mod tests {
 
         let mut driver = build_driver(backend.clone(), TEST_PART_SIZE);
         let cursor = DirCursor::Listing {
-            bucket: "b".to_string(),
+            bucket: "bucket".to_string(),
             prefix: String::new(),
             continuation: ListingContinuation::Initial,
             dots_emitted: true,
@@ -567,7 +777,7 @@ mod tests {
         backend.queue_list_objects_v2_ok_empty();
         let mut driver = build_driver(Arc::clone(&backend), TEST_PART_SIZE);
         let cursor = DirCursor::Listing {
-            bucket: "b".to_string(),
+            bucket: "bucket".to_string(),
             prefix: String::new(),
             continuation: ListingContinuation::Initial,
             dots_emitted: true,
@@ -600,7 +810,7 @@ mod tests {
         backend.queue_list_objects_v2_err(DummyError::Injected("backend exploded".into()));
         let mut driver = build_driver(Arc::clone(&backend), TEST_PART_SIZE);
         let cursor = DirCursor::Listing {
-            bucket: "b".to_string(),
+            bucket: "bucket".to_string(),
             prefix: String::new(),
             continuation: ListingContinuation::Initial,
             dots_emitted: true,
@@ -619,5 +829,96 @@ mod tests {
             captured.contains("SFTP READDIR failed"),
             "error-level event must carry the SFTP READDIR failed message, captured: {captured}"
         );
+    }
+
+    #[tokio::test]
+    async fn mkdir_subdir_puts_trailing_slash_client_key() {
+        let backend = Arc::new(DummyBackend::new());
+        let mut driver = build_driver(Arc::clone(&backend), TEST_PART_SIZE);
+        let authorized = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&authorized);
+
+        let status = with_test_auth_override(
+            move |action, bucket, key| {
+                record
+                    .lock()
+                    .expect("auth log")
+                    .push((action.as_str(), bucket.to_string(), key.map(str::to_string)));
+                true
+            },
+            driver.mkdir(1, "/bucket/photos/2024".to_string(), russh_sftp::protocol::FileAttributes::default()),
+        )
+        .await
+        .expect("mkdir of an ordinary directory");
+
+        assert!(matches!(status.status_code, StatusCode::Ok));
+        let calls = backend.put_object_calls();
+        assert_eq!(calls.len(), 1, "mkdir must issue one PutObject");
+        assert_eq!(calls[0].bucket, "bucket");
+        assert_eq!(calls[0].key, "photos/2024/");
+        assert!(
+            !calls[0].key.contains(rustfs_utils::path::GLOBAL_DIR_SUFFIX),
+            "the client key must not carry the reserved directory-marker suffix"
+        );
+        let auth = authorized.lock().expect("auth log");
+        assert_eq!(
+            auth.as_slice(),
+            [("s3:PutObject", "bucket".to_string(), Some("photos/2024/".to_string()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn rmdir_subdir_deletes_trailing_slash_client_key() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_delete_object_ok();
+        let mut driver = build_driver(Arc::clone(&backend), TEST_PART_SIZE);
+        let authorized = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&authorized);
+
+        let status = with_test_auth_override(
+            move |action, bucket, key| {
+                record
+                    .lock()
+                    .expect("auth log")
+                    .push((action.as_str(), bucket.to_string(), key.map(str::to_string)));
+                true
+            },
+            driver.rmdir(2, "/bucket/photos/2024".to_string()),
+        )
+        .await
+        .expect("rmdir of an empty directory");
+
+        assert!(matches!(status.status_code, StatusCode::Ok));
+        let calls = backend.delete_object_calls();
+        assert_eq!(calls.len(), 1, "rmdir must issue one DeleteObject");
+        assert_eq!(calls[0].bucket, "bucket");
+        assert_eq!(calls[0].key, "photos/2024/");
+        assert!(
+            !calls[0].key.contains(rustfs_utils::path::GLOBAL_DIR_SUFFIX),
+            "the client key must not carry the reserved directory-marker suffix"
+        );
+        let auth = authorized.lock().expect("auth log");
+        assert_eq!(
+            auth.as_slice(),
+            [
+                ("s3:ListBucket", "bucket".to_string(), Some("photos/2024/".to_string())),
+                ("s3:DeleteObject", "bucket".to_string(), Some("photos/2024/".to_string())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mkdir_rejects_reserved_directory_marker_before_put() {
+        let backend = Arc::new(DummyBackend::new());
+        let mut driver = build_driver(Arc::clone(&backend), TEST_PART_SIZE);
+        let path = format!("/bucket/sub{}", rustfs_utils::path::GLOBAL_DIR_SUFFIX);
+
+        let err = driver
+            .mkdir(3, path, russh_sftp::protocol::FileAttributes::default())
+            .await
+            .expect_err("a client path containing the reserved marker must be rejected");
+
+        assert_eq!(StatusCode::from(err), StatusCode::BadMessage);
+        assert!(backend.put_object_calls().is_empty(), "rejection must happen before PutObject");
     }
 }

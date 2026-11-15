@@ -25,12 +25,314 @@ pub const ENV_INTERNODE_HTTP2_KEEPALIVE_INTERVAL_SECS: &str = "RUSTFS_INTERNODE_
 pub const DEFAULT_INTERNODE_HTTP2_KEEPALIVE_INTERVAL_SECS: u64 = 5;
 
 /// HTTP/2 keepalive timeout for internode gRPC channels.
+///
+/// This is the time a peer has to ACK a keepalive PING before the whole channel
+/// (and every RPC/stream multiplexed on it) is torn down. A very aggressive value
+/// misfires under load: on a saturated node the PING ACK is legitimately delayed,
+/// the channel is wrongly declared dead, in-flight peer reads fail, and large-object
+/// GETs truncate mid-stream (client "unexpected EOF"). See backlog#832. Keep this
+/// generous enough to tolerate transient load while still detecting truly dead peers.
 pub const ENV_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS: &str = "RUSTFS_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS";
-pub const DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 3;
+pub const DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 20;
 
 /// Overall timeout for a single internode gRPC request.
 pub const ENV_INTERNODE_RPC_TIMEOUT_SECS: &str = "RUSTFS_INTERNODE_RPC_TIMEOUT_SECS";
-pub const DEFAULT_INTERNODE_RPC_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_INTERNODE_RPC_TIMEOUT_SECS: u64 = 30;
+
+/// Total budget for one admin peer probe round, including any reconnect retry.
+///
+/// This is intentionally separate from the transport-level RPC timeout: admin
+/// probes may retry once, but the retry must consume the same round budget.
+pub const ENV_ADMIN_PEER_PROBE_TIMEOUT_SECS: &str = "RUSTFS_ADMIN_PEER_PROBE_TIMEOUT_SECS";
+pub const DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS: u64 = 10;
+pub const MAX_ADMIN_PEER_PROBE_TIMEOUT_SECS: u64 = 60;
+const _: () = assert!(DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS <= MAX_ADMIN_PEER_PROBE_TIMEOUT_SECS);
+
+// ── Client-side internode gRPC channel tuning (P0) ──
+// These mirror the server-side HTTP/2 transport tuning in `rustfs/src/server/http.rs`
+// on the *client* `tonic` `Endpoint` used for internode RPCs. Explicit values make
+// the operator's receive-credit policy independent of changes to library defaults.
+
+/// Disable Nagle's algorithm on internode gRPC client sockets.
+///
+/// Latency-sensitive control-plane RPCs (locks, health, small metadata) send tiny
+/// frames; Nagle batching adds avoidable delay. Defaults to `true` (nodelay on),
+/// matching the server socket configuration.
+pub const ENV_INTERNODE_RPC_TCP_NODELAY: &str = "RUSTFS_INTERNODE_RPC_TCP_NODELAY";
+pub const DEFAULT_INTERNODE_RPC_TCP_NODELAY: bool = true;
+
+// Compile-time invariant: nodelay defaults on so latency-sensitive control-plane RPCs are not
+// batched by Nagle, matching the server socket configuration.
+const _: () = assert!(DEFAULT_INTERNODE_RPC_TCP_NODELAY);
+
+/// HTTP/2 initial stream window size (bytes) for internode gRPC client channels.
+///
+/// Size this for the bandwidth-delay product and concurrent response budget of
+/// unary responses such as `ReadMultiple` and `BatchReadVersion`. Set to 0 to use the
+/// `tonic`/`hyper` default. Defaults to 1MiB.
+pub const ENV_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE";
+pub const DEFAULT_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE: u32 = 1024 * 1024;
+
+/// HTTP/2 initial connection window size (bytes) for internode gRPC client channels.
+///
+/// Should be >= the stream window so multiple concurrent streams are not starved by the
+/// connection-level flow-control window. Set to 0 to fall back to the library default.
+/// Defaults to 2MiB.
+pub const ENV_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE";
+pub const DEFAULT_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
+
+// Compile-time invariant: the connection-level window must be >= the per-stream window, or
+// concurrent streams would be starved by the connection-level flow-control budget.
+const _: () = assert!(DEFAULT_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE >= DEFAULT_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE);
+
+/// Maximum encoded message size (bytes) for internode gRPC, applied to both the client
+/// `NodeServiceClient` and the server `NodeServiceServer`.
+///
+/// Without this, `tonic`'s default 4MiB decode limit silently caps `bytes`-carrying
+/// unary RPCs (`ReadAll`/`WriteAll`/`ReadMultiple`/`BatchReadVersion`); a large multi-version
+/// `xl.meta` or an aggregated response then fails with `out_of_range`. The default comes
+/// from `rustfs_protos::DEFAULT_GRPC_SERVER_MESSAGE_LEN` (100MiB) at the call sites.
+pub const ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE: &str = "RUSTFS_INTERNODE_RPC_MAX_MESSAGE_SIZE";
+
+/// Payload-size threshold (bytes) above which a unary internode gRPC response counts as a
+/// "large payload" for alerting.
+///
+/// Large `ReadAll`/`ReadMultiple` responses share the control-plane channel with
+/// latency-sensitive lock/health RPCs and can head-of-line block them (see grpc-optimization
+/// G2). This threshold drives the `rustfs_system_network_internode_operation_large_payloads_total`
+/// counter so operators can size which paths need channel isolation in P1. Defaults to 8MiB.
+pub const ENV_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES: &str = "RUSTFS_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES";
+pub const DEFAULT_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES: usize = 8 * 1024 * 1024;
+
+/// Request stopping the JSON compatibility strings on internode metadata RPCs and sending only the
+/// msgpack `_bin` payloads (grpc-optimization P2-1).
+///
+/// Defaults to `false` (dual-write, byte-for-byte legacy behavior). This is only a request; RustFS
+/// keeps JSON compatibility fields unless [`ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED`] is also
+/// true after the release-window convergence and rollback gates pass. See
+/// `docs/operations/internode-msgpack-json-convergence-runbook.md`.
+pub const ENV_INTERNODE_RPC_MSGPACK_ONLY: &str = "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY";
+pub const DEFAULT_INTERNODE_RPC_MSGPACK_ONLY: bool = false;
+
+/// Explicit fleet-wide confirmation gate for [`ENV_INTERNODE_RPC_MSGPACK_ONLY`].
+///
+/// This separate default-off guard prevents a single legacy flag from accidentally emptying JSON
+/// fields in a mixed-version fleet where an older peer still reads the JSON field.
+pub const ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED: &str = "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED";
+pub const DEFAULT_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED: bool = false;
+
+// Compile-time invariants: dual-write by default so the base build is byte-for-byte legacy behavior.
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_ONLY);
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED);
+
+/// Require target-bound v2 signatures on every internode gRPC request, rejecting the legacy
+/// constant-target fallback instead of accepting it (<https://github.com/rustfs/backlog/issues/1327>).
+///
+/// Defaults to `false` (fail-open): a request without any v2 auth headers keeps authenticating
+/// through the legacy signature, so legacy-only peers survive rolling upgrades with byte-for-byte
+/// the pre-gate acceptance behavior. This is a rollout lever, not a wire-format change: it may only
+/// be enabled **after** the v1-fallback counter
+/// (`rustfs_system_network_internode_signature_v1_fallback_total`) has read zero across a release
+/// window fleet-wide, confirming every peer already sends v2 authentication on every internode gRPC
+/// request. Single-env rollback. Requests that do carry v2 headers are unaffected by this switch:
+/// they are always verified as v2 with no downgrade, strict or not.
+pub const ENV_INTERNODE_RPC_SIGNATURE_STRICT: &str = "RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT";
+pub const DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT: bool = false;
+
+// Compile-time invariant: fail-open by default so legacy-only peers keep authenticating during
+// rolling upgrades until the fleet-wide v1-fallback counter reads zero.
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_SIGNATURE_STRICT);
+
+/// Require a signature-bound canonical body digest on every mutating internode disk RPC
+/// (RenameData, DeleteVersion, DeleteVersions, WriteMetadata, UpdateMetadata, WriteAll, Delete,
+/// DeletePaths, RenameFile, RenamePart, DeleteVolume, MakeVolume, MakeVolumes), rejecting requests
+/// that authenticate without one (<https://github.com/rustfs/backlog/issues/1327>).
+///
+/// Defaults to `false` (fail-open): a mutating request without a body digest keeps authenticating
+/// through the method-bound v2 (or legacy) signature, so peers from releases that predate
+/// body-digest signing survive rolling upgrades unchanged. Requests that do carry a digest are
+/// always verified with no downgrade, strict or not — the digest value is part of the signed v2
+/// scope, so an on-path attacker cannot strip it without invalidating the signature. This is a
+/// rollout lever gated on the body-digest fallback counter
+/// (`rustfs_system_network_internode_body_digest_fallback_total`) reading zero across a release
+/// window fleet-wide. Single-env rollback. It is deliberately separate from
+/// [`ENV_INTERNODE_RPC_SIGNATURE_STRICT`]: the two enforcement flips converge on different
+/// counters and must not gate each other.
+pub const ENV_INTERNODE_RPC_BODY_DIGEST_STRICT: &str = "RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT";
+pub const DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT: bool = false;
+
+// Compile-time invariant: fail-open by default so digestless peers keep authenticating during
+// rolling upgrades until the fleet-wide body-digest fallback counter reads zero.
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT);
+
+/// Require the replay-scoped internode RPC signature after the fleet has converged on it.
+///
+/// The default keeps v1/v2 peers available during a rolling upgrade. Operators may set this only
+/// after `rustfs_system_network_internode_replay_scope_fallback_total` remains zero for a full
+/// release window. The node still accepts a v2-authenticated `Ping` carrying an epoch challenge:
+/// that narrowly scoped bootstrap lets an upgraded client learn the receiving process epoch and
+/// immediately retry with the replay-scoped signature after a peer restart.
+pub const ENV_INTERNODE_RPC_REPLAY_SCOPE_STRICT: &str = "RUSTFS_INTERNODE_RPC_REPLAY_SCOPE_STRICT";
+pub const DEFAULT_INTERNODE_RPC_REPLAY_SCOPE_STRICT: bool = false;
+
+// Compile-time invariant: mixed-version clusters must remain available until operators make the
+// observed fallback counter an explicit strictness decision.
+const _: () = assert!(!DEFAULT_INTERNODE_RPC_REPLAY_SCOPE_STRICT);
+
+/// Capacity (distinct nonces) of the process-local internode RPC replay cache that enforces
+/// one-time consumption of authenticated RPC signatures.
+///
+/// Nonces remain protected until their signed timestamp is outside the observed wall-clock
+/// validity window, including after clock rollback. Current-time signatures live about five
+/// minutes; the maximum accepted forward clock skew can extend that to ten minutes. A body-bound
+/// v3 request consumes both its v3 and compatibility-v2 nonces, so size for receiver nonce intake,
+/// not S3 request rate or CPU count.
+///
+/// Automatic admission budgets 13% of effective process memory for signed-time
+/// hash tables, allocator overhead and simultaneous old/new tables during growth.
+/// The reported count is an absolute UUID payload ceiling, not guaranteed throughput:
+/// actual byte admission can reject earlier depending on timestamp distribution.
+/// Tables grow with demand and are released together when their signed time expires.
+/// CPU count, a historical minimum, and a fixed 32M ceiling do not constrain this budget.
+/// If memory detection fails, the historical default remains a bounded count fallback.
+///
+/// Explicit values remain count ceilings with the historical minimum of 1,048,576
+/// for configuration compatibility, and bypass automatic byte admission. That
+/// compatibility floor does not apply to the automatically detected memory budget.
+/// Zero never disables replay protection.
+/// Overflow rejects the request without evicting a still-valid identity, increments
+/// `rustfs_system_network_internode_replay_cache_overflow_total`, and returns resource
+/// exhaustion rather than invalid credentials. Measure headroom before overriding.
+pub const ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY: &str = "RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY";
+pub const DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY: usize = 1_048_576;
+
+/// Consecutive-failure threshold after which an internode peer is marked offline (grpc-optimization
+/// P3 observability).
+///
+/// A peer accrues a failure on each dial failure or RPC-triggered connection eviction, and flips
+/// back online on the next successful dial. Drives the `rustfs_cluster_servers_offline_total` gauge
+/// (parity with MinIO's `minio_cluster_servers_offline_total`). Clamped to at least 1. Defaults to 3.
+pub const ENV_INTERNODE_OFFLINE_FAILURE_THRESHOLD: &str = "RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD";
+pub const DEFAULT_INTERNODE_OFFLINE_FAILURE_THRESHOLD: u32 = 3;
+
+/// Prewarm internode control channels in the background at remote-disk construction, moving the
+/// connect cost off the first RPC (grpc-optimization P3-1).
+///
+/// Best-effort and deduped per peer; failures fall through to the existing lazy connect + recovery
+/// monitor. Defaults to `false` (opt-in): enabling it dials every peer at startup, and it is not yet
+/// validated against a cold-start baseline.
+pub const ENV_INTERNODE_PREWARM: &str = "RUSTFS_INTERNODE_PREWARM";
+pub const DEFAULT_INTERNODE_PREWARM: bool = false;
+
+/// Fast-fail (bypass) internode RPCs to a peer already marked offline, instead of paying the connect
+/// timeout, letting quorum proceed sooner (grpc-optimization P3-2).
+///
+/// Defaults to `false` (opt-in): this touches peer routing (consistency-sensitive) and must be
+/// validated with the failover bench before rollout. It does NOT change quorum. The bypass is
+/// self-healing — one request per [`ENV_INTERNODE_OFFLINE_REPROBE_SECS`] is let through to recover a
+/// peer even without a background monitor. Single-env rollback.
+pub const ENV_INTERNODE_OFFLINE_BYPASS: &str = "RUSTFS_INTERNODE_OFFLINE_BYPASS";
+pub const DEFAULT_INTERNODE_OFFLINE_BYPASS: bool = false;
+
+/// Re-probe interval (seconds) for the offline bypass: while a peer is offline, one request is let
+/// through this often to attempt recovery. Clamped to a small minimum by callers. Defaults to 5s.
+pub const ENV_INTERNODE_OFFLINE_REPROBE_SECS: &str = "RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS";
+pub const DEFAULT_INTERNODE_OFFLINE_REPROBE_SECS: u64 = 5;
+
+// Compile-time invariant: prewarm and offline-bypass are opt-in so the base build is unchanged.
+const _: () = assert!(!DEFAULT_INTERNODE_PREWARM);
+const _: () = assert!(!DEFAULT_INTERNODE_OFFLINE_BYPASS);
+
+/// Extra attempts for idempotent, read-only/reentrant control-plane and object-read RPCs
+/// (`DiskInfo`, `ReadAll`, `ReadMetadata`, `ReadVersion`) on transient network failures, with
+/// exponential backoff (grpc-optimization P3-3).
+///
+/// Defaults to `1`: a freshly-committed object lives on only `write_quorum` disks until heal
+/// reconstructs the rest, so a single reset-by-peer on a metadata read during that
+/// read-after-write window can erode the read quorum and surface as a spurious
+/// `InsufficientReadQuorum` (issue #2761). One bounded retry absorbs that transient failure.
+/// **Only** idempotent reads use this; write/lock RPCs (`WriteAll`/`RenameData`/`Delete*`/`Lock`
+/// /`UnLock`) must never auto-retry, to preserve quorum and idempotency semantics (see `AGENTS.md`).
+pub const ENV_INTERNODE_IDEMPOTENT_READ_RETRIES: &str = "RUSTFS_INTERNODE_IDEMPOTENT_READ_RETRIES";
+pub const DEFAULT_INTERNODE_IDEMPOTENT_READ_RETRIES: usize = 1;
+
+// ── Control/bulk channel isolation (P1) ──
+// Large `bytes`-carrying unary RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion) otherwise
+// share the control-plane HTTP/2 connection with latency-sensitive lock/health RPCs; a large
+// transfer can head-of-line block a lock RPC (G2/G5). When isolation is enabled these bulk RPCs
+// are routed onto a separate per-peer channel pool. See grpc-optimization P1.
+
+/// Enable control/bulk internode gRPC channel isolation.
+///
+/// Defaults to `false`: this touches lock-RPC transport routing (consistency-sensitive), so it
+/// is opt-in and validated against a baseline before rollout. When `false`, bulk RPCs reuse the
+/// control channel exactly as before, so the switch is a single-env rollback.
+pub const ENV_INTERNODE_CHANNEL_ISOLATION: &str = "RUSTFS_INTERNODE_CHANNEL_ISOLATION";
+pub const DEFAULT_INTERNODE_CHANNEL_ISOLATION: bool = false;
+
+// Compile-time invariant: isolation is opt-in so the default build behaves exactly as before P1.
+const _: () = assert!(!DEFAULT_INTERNODE_CHANNEL_ISOLATION);
+
+/// Number of bulk channels maintained per peer when channel isolation is enabled.
+///
+/// A tonic `Channel` is a single TCP/HTTP2 connection; multiple bulk channels are round-robined
+/// to relieve the single-connection throughput ceiling for large transfers. Kept small (default
+/// 2) to avoid a connection storm; clamped to at least 1. Set to 1 to isolate bulk onto a single
+/// dedicated connection (still separate from control).
+pub const ENV_INTERNODE_BULK_CHANNELS: &str = "RUSTFS_INTERNODE_BULK_CHANNELS";
+pub const DEFAULT_INTERNODE_BULK_CHANNELS: usize = 2;
+
+/// Optional receive-window overrides for isolated bulk channels. When unset, inherit the
+/// corresponding `RUSTFS_INTERNODE_RPC_HTTP2_*` setting. Zero selects the library default.
+pub const ENV_INTERNODE_BULK_HTTP2_STREAM_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_BULK_HTTP2_STREAM_WINDOW_SIZE";
+pub const ENV_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE";
+
+/// Transport admission and pending-buffer limits for isolated bulk channels. These limits
+/// apply to the tonic service; complete unary bodies are observed separately by RPC metrics.
+pub const ENV_INTERNODE_BULK_CONCURRENCY_LIMIT: &str = "RUSTFS_INTERNODE_BULK_CONCURRENCY_LIMIT";
+pub const DEFAULT_INTERNODE_BULK_CONCURRENCY_LIMIT: usize = 64;
+pub const ENV_INTERNODE_BULK_BUFFER_SIZE: &str = "RUSTFS_INTERNODE_BULK_BUFFER_SIZE";
+pub const DEFAULT_INTERNODE_BULK_BUFFER_SIZE: usize = 1024;
+
+/// Per-peer limit held through complete bulk-unary response decoding and validation. Zero keeps
+/// the compatibility behavior with no additional admission gate.
+pub const ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT: &str = "RUSTFS_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT";
+pub const DEFAULT_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT: usize = 0;
+pub const ENV_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS: &str = "RUSTFS_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS";
+pub const DEFAULT_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS: u64 = 1_000;
+const _: () = assert!(DEFAULT_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT == 0);
+
+/// Profile selector for conservative internode HTTP data-plane client tuning.
+pub const ENV_INTERNODE_HTTP_TUNING_PROFILE: &str = "RUSTFS_INTERNODE_HTTP_TUNING_PROFILE";
+pub const DEFAULT_INTERNODE_HTTP_TUNING_PROFILE: &str = "legacy";
+
+/// Internode HTTP data-plane protocol: `http1` (default) or `auto` (TLS ALPN).
+pub const ENV_INTERNODE_HTTP_PROTOCOL: &str = "RUSTFS_INTERNODE_HTTP_PROTOCOL";
+
+/// Internode HTTP connection pool maximum idle connections per host.
+pub const ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST: &str = "RUSTFS_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST";
+
+/// Internode HTTP connection pool idle timeout in seconds.
+pub const ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS: &str = "RUSTFS_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS";
+
+/// Internode HTTP/2 initial stream window size in bytes.
+///
+/// NOTE (backlog#805-C3): all `RUSTFS_INTERNODE_HTTP2_*` tuning (window sizes,
+/// adaptive window, keepalive timeout) only takes effect when the internode
+/// connection actually negotiates HTTP/2, which happens via TLS-ALPN. Over
+/// plaintext internode transport or with the default `http1` protocol policy,
+/// these settings are inert. Select `RUSTFS_INTERNODE_HTTP_PROTOCOL=auto` and
+/// enable internode TLS to use them.
+pub const ENV_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE";
+
+/// Internode HTTP/2 initial connection window size in bytes.
+pub const ENV_INTERNODE_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE";
+
+/// Whether internode HTTP/2 adaptive window sizing is enabled.
+pub const ENV_INTERNODE_HTTP2_ADAPTIVE_WINDOW: &str = "RUSTFS_INTERNODE_HTTP2_ADAPTIVE_WINDOW";
+
+/// Internode HTTP proxy mode: legacy, off, or system.
+pub const ENV_INTERNODE_HTTP_PROXY: &str = "RUSTFS_INTERNODE_HTTP_PROXY";
 
 /// Environment variable for selecting the internode data-plane transport backend.
 pub const ENV_RUSTFS_INTERNODE_DATA_TRANSPORT: &str = "RUSTFS_INTERNODE_DATA_TRANSPORT";
@@ -39,8 +341,130 @@ pub const DEFAULT_INTERNODE_DATA_TRANSPORT: &str = "tcp-http";
 /// Legacy alias for "tcp-http". Both values select the TCP/HTTP transport backend.
 pub const INTERNODE_DATA_TRANSPORT_TCP: &str = "tcp";
 
+/// Internode reads whose data moves over NIXL/UCX (InfiniBand rails or RoCE by
+/// LID/GID, no IP needed); requests, writes and walks stay on TCP/HTTP. Requires
+/// a binary built with the `nixl` feature and `RUSTFS_NIXL_ENABLE`; until the
+/// NIXL agent is up, and for any read it cannot serve, it uses TCP/HTTP.
+pub const INTERNODE_DATA_TRANSPORT_NIXL: &str = "nixl";
+
 /// Known internode transport backend names accepted by the config parser.
-pub const KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS: &[&str] = &[DEFAULT_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP];
+pub const KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS: &[&str] = &[
+    DEFAULT_INTERNODE_DATA_TRANSPORT,
+    INTERNODE_DATA_TRANSPORT_TCP,
+    INTERNODE_DATA_TRANSPORT_NIXL,
+];
+
+/// Check the configured RDMA devices at startup and leave out any that is down,
+/// slower than its peers, or loses its link during a short watch.
+pub const ENV_RUSTFS_NIXL_DEVICE_CHECK: &str = "RUSTFS_NIXL_DEVICE_CHECK";
+pub const DEFAULT_RUSTFS_NIXL_DEVICE_CHECK: bool = true;
+/// Leave out a device whose link dropped this many times more since boot than
+/// the quietest device of its link layer; 0 skips this test.
+pub const ENV_RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS: &str = "RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS";
+pub const DEFAULT_RUSTFS_NIXL_DEVICE_MAX_LINK_DROPS: u64 = 16;
+/// How long the startup device check watches the link counters; 0 skips the watch.
+pub const ENV_RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS: &str = "RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS";
+pub const DEFAULT_RUSTFS_NIXL_DEVICE_FLAP_WINDOW_MS: u64 = 3_000;
+
+/// NIXL internode reads in flight per remote shard stream.
+pub const ENV_RUSTFS_NIXL_INTERNODE_DEPTH: &str = "RUSTFS_NIXL_INTERNODE_DEPTH";
+pub const DEFAULT_RUSTFS_NIXL_INTERNODE_DEPTH: usize = 4;
+
+/// Whether S3 GETs and PUTs carrying the NIXL headers are served over NIXL/UCX
+/// S3-over-RDMA (requires a build with the `nixl` feature and libnixl). The
+/// pipeline settings below (`RUSTFS_CUOBJECT_GET_FANOUT*`, `_INFLIGHT_WRITES`,
+/// `_SHARD_ARENA_BYTES`) apply to this transport as well.
+pub const ENV_RUSTFS_NIXL_ENABLE: &str = "RUSTFS_NIXL_ENABLE";
+pub const DEFAULT_RUSTFS_NIXL_ENABLE: bool = false;
+/// This node's NIXL agent name; defaults to `rustfs-<first local endpoint host>`.
+pub const ENV_RUSTFS_NIXL_AGENT_NAME: &str = "RUSTFS_NIXL_AGENT_NAME";
+/// Comma-separated UCX device names (`mlx5_9,mlx5_10`; NIXL adds the port); empty lets UCX use every device.
+pub const ENV_RUSTFS_NIXL_UCX_DEVICES: &str = "RUSTFS_NIXL_UCX_DEVICES";
+/// UCX progress workers of the agent.
+pub const ENV_RUSTFS_NIXL_NUM_WORKERS: &str = "RUSTFS_NIXL_NUM_WORKERS";
+pub const DEFAULT_RUSTFS_NIXL_NUM_WORKERS: u32 = 1;
+/// Staging chunk size per transfer descriptor to a client.
+pub const ENV_RUSTFS_NIXL_CHUNK_BYTES: &str = "RUSTFS_NIXL_CHUNK_BYTES";
+pub const DEFAULT_RUSTFS_NIXL_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+/// Registered staging memory of the agent.
+pub const ENV_RUSTFS_NIXL_POOL_BYTES: &str = "RUSTFS_NIXL_POOL_BYTES";
+pub const DEFAULT_RUSTFS_NIXL_POOL_BYTES: usize = 1024 * 1024 * 1024;
+/// Transfers in flight per node at most.
+pub const ENV_RUSTFS_NIXL_MAX_INFLIGHT: &str = "RUSTFS_NIXL_MAX_INFLIGHT";
+pub const DEFAULT_RUSTFS_NIXL_MAX_INFLIGHT: usize = 256;
+/// A transfer that has not completed after this many seconds fails the request.
+pub const ENV_RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS: &str = "RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS";
+pub const DEFAULT_RUSTFS_NIXL_TRANSFER_TIMEOUT_SECS: u64 = 60;
+
+/// Whether S3 GETs carrying an `x-amz-rdma-token` are served over cuObject S3-over-RDMA
+/// (requires a build with the `cuobject` feature and libcuobjserver).
+pub const ENV_RUSTFS_CUOBJECT_ENABLE: &str = "RUSTFS_CUOBJECT_ENABLE";
+pub const DEFAULT_RUSTFS_CUOBJECT_ENABLE: bool = false;
+
+/// Comma-separated RDMA-capable IP addresses that get a cuObject server each.
+/// Defaults to the hosts of this node's own endpoints.
+pub const ENV_RUSTFS_CUOBJECT_ADDRS: &str = "RUSTFS_CUOBJECT_ADDRS";
+
+/// UDP/RDMA control port of the cuObject servers.
+pub const ENV_RUSTFS_CUOBJECT_PORT: &str = "RUSTFS_CUOBJECT_PORT";
+pub const DEFAULT_RUSTFS_CUOBJECT_PORT: u16 = 18515;
+
+/// Staging chunk size per RDMA write to a client.
+pub const ENV_RUSTFS_CUOBJECT_CHUNK_BYTES: &str = "RUSTFS_CUOBJECT_CHUNK_BYTES";
+pub const DEFAULT_RUSTFS_CUOBJECT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Registered staging memory per cuObject server.
+pub const ENV_RUSTFS_CUOBJECT_POOL_BYTES: &str = "RUSTFS_CUOBJECT_POOL_BYTES";
+pub const DEFAULT_RUSTFS_CUOBJECT_POOL_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Dynamically connected initiators per cuObject server (concurrent client connections).
+/// Staging chunks (RDMA writes) kept in flight per GET, so decoding never waits
+/// for the write of the previous chunk; each costs one chunk of the pool.
+pub const ENV_RUSTFS_CUOBJECT_INFLIGHT_WRITES: &str = "RUSTFS_CUOBJECT_INFLIGHT_WRITES";
+pub const DEFAULT_RUSTFS_CUOBJECT_INFLIGHT_WRITES: usize = 3;
+
+/// Staging chunks (RDMA reads from the client buffer) kept in flight per
+/// RDMA PUT body, so ingest never waits on one chunk's round trip at a time;
+/// each costs one chunk of the pool.
+pub const ENV_RUSTFS_CUOBJECT_PUT_READ_AHEAD: &str = "RUSTFS_CUOBJECT_PUT_READ_AHEAD";
+pub const DEFAULT_RUSTFS_CUOBJECT_PUT_READ_AHEAD: usize = 4;
+
+/// Concurrent erasure-block-aligned segments one cuObject GET is split into
+/// on the server (each segment decodes and RDMA-writes its own stripes), so a
+/// single stream keeps several stripes in flight. 1 disables the fan-out.
+pub const ENV_RUSTFS_CUOBJECT_GET_FANOUT: &str = "RUSTFS_CUOBJECT_GET_FANOUT";
+pub const DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT: usize = 8;
+
+/// Smallest segment worth its own producer (rounded up to whole erasure
+/// blocks): each segment pays a reader setup per part it touches, so short
+/// requests stay sequential.
+pub const ENV_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES: &str = "RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES";
+pub const DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_MIN_BYTES: u64 = 192 * 1024 * 1024;
+
+/// Segment producers a node runs across all its cuObject GETs: each new GET
+/// gets a fair share (budget / open GETs, at least 1, at most the fan-out)
+/// and never waits for one, so many-stream load degrades to sequential GETs
+/// instead of a reader-setup storm.
+pub const ENV_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET: &str = "RUSTFS_CUOBJECT_GET_FANOUT_BUDGET";
+pub const DEFAULT_RUSTFS_CUOBJECT_GET_FANOUT_BUDGET: usize = 16;
+
+/// Registered host memory the erasure decoder reads shards into so a
+/// cuObject GET can RDMA-write data shards straight from those buffers
+/// (zero-copy emit); 0 keeps the staging copy. Blocks are
+/// `RUSTFS_ERASURE_SHARD_BYTES` (4 MiB when unset); objects with larger
+/// shards fall back to heap buffers and the staging copy.
+pub const ENV_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES: &str = "RUSTFS_CUOBJECT_SHARD_ARENA_BYTES";
+pub const DEFAULT_RUSTFS_CUOBJECT_SHARD_ARENA_BYTES: usize = 0;
+
+pub const ENV_RUSTFS_CUOBJECT_NUM_DCIS: &str = "RUSTFS_CUOBJECT_NUM_DCIS";
+pub const DEFAULT_RUSTFS_CUOBJECT_NUM_DCIS: u32 = 128;
+
+/// Complete cuObject transfers through the library's asynchronous mode: the
+/// write is submitted with a handle and the task waits on the channel's
+/// completion descriptor instead of holding a blocking thread for the whole
+/// transfer. `false` keeps one blocking library call per transfer.
+pub const ENV_RUSTFS_CUOBJECT_ASYNC_TRANSFERS: &str = "RUSTFS_CUOBJECT_ASYNC_TRANSFERS";
+pub const DEFAULT_RUSTFS_CUOBJECT_ASYNC_TRANSFERS: bool = true;
 
 #[cfg(test)]
 mod tests {
@@ -51,8 +475,98 @@ mod tests {
         assert_eq!(DEFAULT_INTERNODE_CONNECT_TIMEOUT_SECS, 3);
         assert_eq!(DEFAULT_INTERNODE_TCP_KEEPALIVE_SECS, 10);
         assert_eq!(DEFAULT_INTERNODE_HTTP2_KEEPALIVE_INTERVAL_SECS, 5);
-        assert_eq!(DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS, 3);
-        assert_eq!(DEFAULT_INTERNODE_RPC_TIMEOUT_SECS, 10);
+        assert_eq!(DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS, 20);
+        assert_eq!(DEFAULT_INTERNODE_RPC_TIMEOUT_SECS, 30);
+        assert_eq!(DEFAULT_ADMIN_PEER_PROBE_TIMEOUT_SECS, 10);
+        assert_eq!(DEFAULT_INTERNODE_HTTP_TUNING_PROFILE, "legacy");
+    }
+
+    #[test]
+    fn internode_rpc_channel_tuning_defaults() {
+        assert_eq!(DEFAULT_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE, 1024 * 1024);
+        assert_eq!(DEFAULT_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE, 2 * 1024 * 1024);
+        // The nodelay-on and connection-window >= stream-window invariants are enforced at
+        // compile time next to the constant definitions.
+    }
+
+    #[test]
+    fn internode_rpc_channel_tuning_env_names_are_stable() {
+        assert_eq!(ENV_INTERNODE_RPC_TCP_NODELAY, "RUSTFS_INTERNODE_RPC_TCP_NODELAY");
+        assert_eq!(
+            ENV_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE,
+            "RUSTFS_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE"
+        );
+        assert_eq!(ENV_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE, "RUSTFS_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE");
+        assert_eq!(ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE, "RUSTFS_INTERNODE_RPC_MAX_MESSAGE_SIZE");
+        assert_eq!(
+            ENV_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES,
+            "RUSTFS_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES"
+        );
+        assert_eq!(DEFAULT_INTERNODE_RPC_LARGE_PAYLOAD_WARN_BYTES, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn internode_channel_isolation_defaults_and_env_names() {
+        // The isolation-off default is asserted at compile time next to the constant definition.
+        assert_eq!(DEFAULT_INTERNODE_BULK_CHANNELS, 2);
+        assert_eq!(DEFAULT_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT, 0);
+        assert_eq!(DEFAULT_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS, 1_000);
+        assert_eq!(ENV_INTERNODE_CHANNEL_ISOLATION, "RUSTFS_INTERNODE_CHANNEL_ISOLATION");
+        assert_eq!(ENV_INTERNODE_BULK_CHANNELS, "RUSTFS_INTERNODE_BULK_CHANNELS");
+        assert_eq!(ENV_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT, "RUSTFS_INTERNODE_BULK_BODY_CONCURRENCY_LIMIT");
+        assert_eq!(ENV_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS, "RUSTFS_INTERNODE_BULK_BODY_WAIT_TIMEOUT_MS");
+    }
+
+    #[test]
+    fn internode_msgpack_only_env_name_is_stable() {
+        // The dual-write-by-default invariants are asserted at compile time next to the definitions.
+        assert_eq!(ENV_INTERNODE_RPC_MSGPACK_ONLY, "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY");
+        assert_eq!(
+            ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED,
+            "RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED"
+        );
+    }
+
+    #[test]
+    fn internode_signature_strict_env_name_is_stable() {
+        // The fail-open default invariant is asserted at compile time next to the definition.
+        assert_eq!(ENV_INTERNODE_RPC_SIGNATURE_STRICT, "RUSTFS_INTERNODE_RPC_SIGNATURE_STRICT");
+    }
+
+    #[test]
+    fn internode_body_digest_strict_env_name_is_stable() {
+        // The fail-open default invariant is asserted at compile time next to the definition.
+        assert_eq!(ENV_INTERNODE_RPC_BODY_DIGEST_STRICT, "RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT");
+    }
+
+    #[test]
+    fn internode_replay_scope_strict_env_name_is_stable() {
+        // The fail-open default invariant is asserted at compile time next to the definition.
+        assert_eq!(ENV_INTERNODE_RPC_REPLAY_SCOPE_STRICT, "RUSTFS_INTERNODE_RPC_REPLAY_SCOPE_STRICT");
+    }
+
+    #[test]
+    fn internode_replay_cache_capacity_defaults_and_env_name() {
+        assert_eq!(ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY, "RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY");
+        assert_eq!(DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY, 1_048_576);
+    }
+
+    #[test]
+    fn internode_offline_failure_threshold_defaults_and_env_name() {
+        assert_eq!(DEFAULT_INTERNODE_OFFLINE_FAILURE_THRESHOLD, 3);
+        assert_eq!(ENV_INTERNODE_OFFLINE_FAILURE_THRESHOLD, "RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD");
+    }
+
+    #[test]
+    fn internode_p3_lifecycle_defaults_are_opt_in() {
+        // The opt-in (default-off) invariants are asserted at compile time next to the definitions.
+        assert_eq!(DEFAULT_INTERNODE_OFFLINE_REPROBE_SECS, 5);
+        // One bounded retry for idempotent reads to absorb read-after-write transient failures (#2761).
+        assert_eq!(DEFAULT_INTERNODE_IDEMPOTENT_READ_RETRIES, 1);
+        assert_eq!(ENV_INTERNODE_PREWARM, "RUSTFS_INTERNODE_PREWARM");
+        assert_eq!(ENV_INTERNODE_OFFLINE_BYPASS, "RUSTFS_INTERNODE_OFFLINE_BYPASS");
+        assert_eq!(ENV_INTERNODE_OFFLINE_REPROBE_SECS, "RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS");
+        assert_eq!(ENV_INTERNODE_IDEMPOTENT_READ_RETRIES, "RUSTFS_INTERNODE_IDEMPOTENT_READ_RETRIES");
     }
 
     #[test]
@@ -68,9 +582,23 @@ mod tests {
             "RUSTFS_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS"
         );
         assert_eq!(ENV_INTERNODE_RPC_TIMEOUT_SECS, "RUSTFS_INTERNODE_RPC_TIMEOUT_SECS");
+        assert_eq!(ENV_ADMIN_PEER_PROBE_TIMEOUT_SECS, "RUSTFS_ADMIN_PEER_PROBE_TIMEOUT_SECS");
+        assert_eq!(ENV_INTERNODE_HTTP_TUNING_PROFILE, "RUSTFS_INTERNODE_HTTP_TUNING_PROFILE");
+        assert_eq!(ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST, "RUSTFS_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST");
+        assert_eq!(ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS, "RUSTFS_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS");
+        assert_eq!(
+            ENV_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE,
+            "RUSTFS_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE"
+        );
+        assert_eq!(
+            ENV_INTERNODE_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE,
+            "RUSTFS_INTERNODE_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE"
+        );
+        assert_eq!(ENV_INTERNODE_HTTP2_ADAPTIVE_WINDOW, "RUSTFS_INTERNODE_HTTP2_ADAPTIVE_WINDOW");
+        assert_eq!(ENV_INTERNODE_HTTP_PROXY, "RUSTFS_INTERNODE_HTTP_PROXY");
         assert_eq!(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, "RUSTFS_INTERNODE_DATA_TRANSPORT");
         assert_eq!(DEFAULT_INTERNODE_DATA_TRANSPORT, "tcp-http");
         assert_eq!(INTERNODE_DATA_TRANSPORT_TCP, "tcp");
-        assert_eq!(KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS, &["tcp-http", "tcp"]);
+        assert_eq!(KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS, &["tcp-http", "tcp", "nixl"]);
     }
 }

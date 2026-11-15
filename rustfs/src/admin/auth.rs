@@ -12,14 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::{RequestCredentials, RequestEnvelope};
 use crate::auth::get_condition_values;
 use http::HeaderMap;
-use http::Uri;
 use rustfs_credentials::Credentials;
-use rustfs_iam::store::object::ObjectStore;
+use rustfs_iam::store::Store;
 use rustfs_iam::sys::IamSys;
 use rustfs_policy::policy::{Args, action::Action};
-use s3s::{S3Result, s3_error};
+use rustfs_s3_types::{S3Result, s3_error};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -46,6 +46,20 @@ impl<'a> AdminResourceScope<'a> {
     pub fn bucket_object(bucket: &'a str, object: &'a str) -> Self {
         Self { bucket, object }
     }
+
+    /// Scope an admin request to a single KMS key.
+    ///
+    /// The policy crate carries the requested key identifier in the object slot
+    /// with an empty bucket (see `Statement::kms_key_scope_matches`); `Args` has
+    /// no dedicated field for it. An empty `key_id` means the caller could not
+    /// name a target key, which keeps the pre-resource-scoping behaviour where a
+    /// KMS statement matches every key.
+    pub fn kms_key(key_id: &'a str) -> Self {
+        Self {
+            bucket: "",
+            object: key_id,
+        }
+    }
 }
 
 pub async fn validate_admin_request(
@@ -56,7 +70,7 @@ pub async fn validate_admin_request(
     actions: Vec<Action>,
     remote_addr: Option<std::net::SocketAddr>,
 ) -> S3Result<()> {
-    let Ok(iam_store) = rustfs_iam::get() else {
+    let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
     let ctx = AuthContext {
@@ -67,8 +81,22 @@ pub async fn validate_admin_request(
         remote_addr,
     };
 
-    for action in &actions {
-        if check_admin_request_auth(iam_store.clone(), &ctx, *action, "", "")
+    evaluate_admin_actions(iam_store, &ctx, &actions, "", "").await
+}
+
+/// Return `Ok(())` as soon as any of the candidate `actions` is allowed for the
+/// request context, otherwise `AccessDenied`. This is the single decision core
+/// shared by every admin-gate entry point; unit tests exercise it directly so
+/// the allow/deny contract does not silently drift.
+async fn evaluate_admin_actions<S: Store>(
+    iam_store: Arc<IamSys<S>>,
+    ctx: &AuthContext<'_>,
+    actions: &[Action],
+    bucket: &str,
+    object: &str,
+) -> S3Result<()> {
+    for action in actions {
+        if check_admin_request_auth(iam_store.clone(), ctx, *action, bucket, object)
             .await
             .is_ok()
         {
@@ -78,8 +106,8 @@ pub async fn validate_admin_request(
     Err(s3_error!(AccessDenied, "Access Denied"))
 }
 
-async fn check_admin_request_auth(
-    iam_store: Arc<IamSys<ObjectStore>>,
+async fn check_admin_request_auth<S: Store>(
+    iam_store: Arc<IamSys<S>>,
     ctx: &AuthContext<'_>,
     action: Action,
     bucket: &str,
@@ -146,7 +174,7 @@ pub async fn validate_admin_request_with_bucket_object(
     remote_addr: Option<std::net::SocketAddr>,
     resource: AdminResourceScope<'_>,
 ) -> S3Result<()> {
-    let Ok(iam_store) = rustfs_iam::get() else {
+    let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
     let ctx = AuthContext {
@@ -157,54 +185,75 @@ pub async fn validate_admin_request_with_bucket_object(
         remote_addr,
     };
 
-    for action in &actions {
-        if check_admin_request_auth(iam_store.clone(), &ctx, *action, resource.bucket, resource.object)
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-    }
-    Err(s3_error!(AccessDenied, "Access Denied"))
+    evaluate_admin_actions(iam_store, &ctx, &actions, resource.bucket, resource.object).await
 }
 
-/// Unified authentication request handler for both UI and CLI
-///
-/// This function provides a single entry point for authentication,
-/// ensuring consistent behavior between UI and CLI authentication flows.
-///
-/// # Arguments
-/// * `headers` - HTTP request headers
-/// * `uri` - Request URI
-/// * `credentials` - User credentials from request (Credentials)
-///
-/// # Returns
-/// * `Ok((Credentials, bool))` - Authentication successful, returns user credentials and is_owner flag
-/// * `Err(S3Error)` - Authentication failed with error details
-///
-/// # Example
-/// ```ignore
-/// let (cred, is_owner) = authenticate_request(&req.headers, &req.uri, &input_cred).await?;
-/// ```
-pub async fn authenticate_request(
+pub(crate) async fn validate_admin_action_with_bucket_object_for_iam<S: Store>(
+    iam_store: Arc<IamSys<S>>,
     headers: &HeaderMap,
-    uri: &Uri,
-    credentials: &s3s::auth::Credentials,
-) -> S3Result<(Credentials, bool)> {
-    use crate::auth::{check_key_valid, get_session_token};
+    cred: &Credentials,
+    is_owner: bool,
+    action: Action,
+    remote_addr: Option<std::net::SocketAddr>,
+    resource: AdminResourceScope<'_>,
+) -> S3Result<()> {
+    let ctx = AuthContext {
+        headers,
+        cred,
+        is_owner,
+        deny_only: false,
+        remote_addr,
+    };
+    evaluate_admin_actions(iam_store, &ctx, &[action], resource.bucket, resource.object).await
+}
 
-    // Extract session token from request
-    let session_token = get_session_token(uri, headers).unwrap_or_default();
+/// Admin gate for KMS endpoints that act on one key.
+///
+/// `key_id` is the identifier as requested (before any alias resolution), so a
+/// policy scoped to `arn:aws:kms:::key/<id>` only authorizes that key. Endpoints
+/// without a target key pass `""` and stay unscoped, which is also what a
+/// malformed request resolves to: the request is rejected on its own parse error
+/// right after the gate, so no key is ever touched under an unscoped decision.
+pub async fn validate_admin_request_with_kms_key(
+    headers: &HeaderMap,
+    cred: &Credentials,
+    is_owner: bool,
+    deny_only: bool,
+    actions: Vec<Action>,
+    remote_addr: Option<std::net::SocketAddr>,
+    key_id: &str,
+) -> S3Result<()> {
+    validate_admin_request_with_bucket_object(
+        headers,
+        cred,
+        is_owner,
+        deny_only,
+        actions,
+        remote_addr,
+        AdminResourceScope::kms_key(key_id),
+    )
+    .await
+}
+
+/// Authenticate the caller of an owned admin request from the facts its
+/// envelope carries: the presented access key and the session token the edge
+/// decoded.
+pub(crate) async fn authenticate_envelope_credentials(credentials: &RequestCredentials) -> S3Result<(Credentials, bool)> {
+    authenticate_request_facts(credentials.access_key(), credentials.session_token().unwrap_or_default()).await
+}
+
+async fn authenticate_request_facts(access_key: &str, session_token: &str) -> S3Result<(Credentials, bool)> {
+    use crate::auth::check_key_valid;
 
     // Log authentication attempt for debugging
     debug!(
         "authenticate_request: processing authentication - access_key={}, has_session_token={}",
-        credentials.access_key,
+        access_key,
         !session_token.is_empty()
     );
 
     // Validate credentials using the core authentication function
-    let result = check_key_valid(session_token, &credentials.access_key).await;
+    let result = check_key_valid(session_token, access_key).await;
 
     match &result {
         Ok((cred, is_owner)) => {
@@ -214,13 +263,594 @@ pub async fn authenticate_request(
             );
         }
         Err(e) => {
-            tracing::warn!(
-                "authenticate_request: authentication failed - access_key={}, error={}",
-                credentials.access_key,
-                e
-            );
+            tracing::warn!("authenticate_request: authentication failed - access_key={}, error={}", access_key, e);
         }
     }
 
-    result
+    result.map_err(Into::into)
+}
+
+/// Full admin gate over RustFS-owned request facts: authenticate the
+/// presented credentials, then authorize the caller for `actions`
+/// ([`validate_admin_request`], allowing on the first permitted action).
+/// Returns the authenticated credentials for handlers that need the caller
+/// identity. `deny_only` stays `false`: every caller performs a full allow
+/// check.
+pub async fn authorize_admin_envelope(req: &RequestEnvelope, actions: Vec<Action>) -> S3Result<Credentials> {
+    let Some(input_cred) = req.credentials() else {
+        return Err(s3_error!(InvalidRequest, "get cred failed"));
+    };
+
+    let (cred, owner) = authenticate_envelope_credentials(input_cred).await?;
+    // Policy conditions see the verified proxy client, never the raw peer.
+    validate_admin_request(req.headers(), &cred, owner, false, actions, req.policy_source_addr()).await?;
+
+    Ok(cred)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit coverage for the central admin authorization gate (rustfs/backlog#1151 sec-4).
+    //!
+    //! These tests pin the allow/deny contract of the gate decision core without a
+    //! running cluster. The gate delegates the actual policy evaluation to
+    //! `IamSys::is_allowed`; the behavior owned *here* is: owner/root short-circuits
+    //! to allow, any other principal with no matching policy is denied with
+    //! `AccessDenied`, and `evaluate_admin_actions` grants access as soon as any one
+    //! candidate action is permitted. We drive that with an `IamSys` backed by an
+    //! empty in-memory cache so `is_owner=true` returns allow (owner short-circuit)
+    //! and every non-owner principal resolves to deny.
+    use super::*;
+    use http::Uri;
+    use rustfs_iam::cache::Cache;
+    use rustfs_iam::manager::IamCache;
+    use rustfs_iam::store::{GroupInfo, MappedPolicy, UserType};
+    use rustfs_policy::auth::UserIdentity;
+    use rustfs_policy::policy::action::{AdminAction, KmsAction};
+    use rustfs_policy::policy::{Policy, PolicyDoc};
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64};
+    use time::OffsetDateTime;
+
+    /// A `Store` whose methods are never invoked by these tests: the gate only
+    /// reaches the persistence layer for non-owner principals, and the
+    /// `IamCache` we build starts with an empty in-memory snapshot, so
+    /// `get_user` resolves to `None` (unknown user) before any `api` call.
+    #[derive(Clone)]
+    struct EmptyStore;
+
+    #[async_trait::async_trait]
+    impl Store for EmptyStore {
+        fn has_watcher(&self) -> bool {
+            false
+        }
+        async fn save_iam_config<Item: Serialize + Send>(
+            &self,
+            _item: Item,
+            _path: impl AsRef<str> + Send,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_iam_config<Item: DeserializeOwned>(
+            &self,
+            _path: impl AsRef<str> + Send,
+        ) -> rustfs_iam::error::Result<Item> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn delete_iam_config(&self, _path: impl AsRef<str> + Send) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn save_user_identity(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _item: UserIdentity,
+            _ttl: Option<usize>,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn delete_user_identity(&self, _name: &str, _user_type: UserType) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_user_identity(&self, _name: &str, _user_type: UserType) -> rustfs_iam::error::Result<UserIdentity> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_user(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _m: &mut HashMap<String, UserIdentity>,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_users(
+            &self,
+            _user_type: UserType,
+            _m: &mut HashMap<String, UserIdentity>,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_secret_key(&self, _name: &str, _user_type: UserType) -> rustfs_iam::error::Result<String> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn save_group_info(&self, _name: &str, _item: GroupInfo) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn delete_group_info(&self, _name: &str) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_group(&self, _name: &str, _m: &mut HashMap<String, GroupInfo>) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_groups(&self, _m: &mut HashMap<String, GroupInfo>) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn save_policy_doc(&self, _name: &str, _item: PolicyDoc) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn delete_policy_doc(&self, _name: &str) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_policy(&self, _name: &str) -> rustfs_iam::error::Result<PolicyDoc> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_policy_doc(&self, _name: &str, _m: &mut HashMap<String, PolicyDoc>) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_policy_docs(&self, _m: &mut HashMap<String, PolicyDoc>) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn save_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _item: MappedPolicy,
+            _ttl: Option<usize>,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn delete_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_mapped_policies(
+            &self,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+        async fn load_all(&self, _cache: &Cache) -> rustfs_iam::error::Result<()> {
+            unimplemented!("EmptyStore is not exercised by the admin-auth gate tests")
+        }
+    }
+
+    /// An `IamCache` over an empty in-memory snapshot. It is constructed
+    /// directly (all fields are public, mirroring the iam crate's own
+    /// `build_test_iam_cache`) so no cluster-backed `ObjectStore` or disk load is
+    /// required. Readiness state is irrelevant: the gate calls `is_allowed`
+    /// directly, which does not gate on `is_ready`.
+    fn iam_cache_with_empty_store() -> IamCache<EmptyStore> {
+        let (send_chan, _rx) = tokio::sync::mpsc::channel::<i64>(1);
+        IamCache {
+            cache: Cache::default(),
+            api: EmptyStore,
+            state: Arc::new(AtomicU8::new(0)),
+            loading: Arc::new(AtomicBool::new(false)),
+            roles: HashMap::new(),
+            send_chan,
+            last_timestamp: AtomicI64::new(0),
+            sync_failures: AtomicU64::new(0),
+            sync_successes: AtomicU64::new(0),
+            last_sync_duration_millis: AtomicU64::new(0),
+        }
+    }
+
+    fn iam_sys_with_empty_store() -> Arc<IamSys<EmptyStore>> {
+        Arc::new(IamSys::new(Arc::new(iam_cache_with_empty_store())))
+    }
+
+    /// Same in-memory `IamSys`, with one regular (non-owner, non-temp,
+    /// non-service) account carrying `document` as its only attached policy. All
+    /// three cache entries the evaluation path consults are pre-seeded, so no
+    /// `EmptyStore` method is ever reached.
+    fn iam_sys_with_policy(account: &str, document: &str) -> Arc<IamSys<EmptyStore>> {
+        let store = iam_cache_with_empty_store();
+        let now = OffsetDateTime::now_utc();
+        let cache = &store.cache;
+
+        cache.add_or_update_user(
+            account,
+            &UserIdentity::new(Credentials {
+                access_key: account.to_string(),
+                secret_key: "kms-operator-secret".to_string(),
+                status: "on".to_string(),
+                ..Default::default()
+            }),
+            now,
+        );
+        cache.add_or_update_policy_doc(
+            KMS_TEST_POLICY_NAME,
+            &PolicyDoc {
+                policy: Policy::parse_config(document.as_bytes()).expect("test policy should parse"),
+                ..Default::default()
+            },
+            now,
+        );
+        cache.add_or_update_user_policy(account, &MappedPolicy::new(KMS_TEST_POLICY_NAME), now);
+
+        Arc::new(IamSys::new(Arc::new(store)))
+    }
+
+    const KMS_TEST_POLICY_NAME: &str = "kms-key-a-only";
+
+    fn ctx_for<'a>(headers: &'a HeaderMap, cred: &'a Credentials, is_owner: bool) -> AuthContext<'a> {
+        AuthContext {
+            headers,
+            cred,
+            is_owner,
+            deny_only: false,
+            remote_addr: None,
+        }
+    }
+
+    fn admin_action() -> Action {
+        Action::AdminAction(AdminAction::ServerInfoAdminAction)
+    }
+
+    fn assert_access_denied(res: S3Result<()>) {
+        let err = res.expect_err("gate should reject the request");
+        assert_eq!(
+            err.code(),
+            &rustfs_s3_types::S3ErrorCode::AccessDenied,
+            "admin gate rejection must map to the AccessDenied S3 error code"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn admin_and_sts_handlers_use_verified_client_ip_and_bucket_scope() {
+        crate::app::gating_test_env::run_large_stack_test("admin-client-conditions", || async {
+            use crate::admin::operation::Operation;
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use crate::shared_types::RemoteAddr;
+            use rustfs_iam::store::object::ObjectStore;
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use std::sync::Arc;
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<ObjectStore>> {
+                    self.0.clone()
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+            let previous = crate::runtime_sources::current_app_context();
+            let (_directory, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            ObjectStore::new(store.clone())
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .unwrap();
+            let iam = rustfs_iam::build_iam_sys(store.clone()).await.unwrap();
+            for (key, document) in [
+                (
+                    "proxy-admin",
+                    serde_json::json!({"Version":"2012-10-17","Statement":[
+                        {"Effect":"Allow","Action":"admin:*"},
+                        {"Effect":"Allow","Action":"sts:AssumeRole"},
+                        {"Effect":"Deny","Action":"admin:*","Condition":{"NotIpAddress":{"aws:SourceIp":"10.0.0.0/8"}}},
+                        {"Effect":"Deny","Action":"sts:AssumeRole","Condition":{"NotIpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}
+                    ]}),
+                ),
+                (
+                    "scoped-usage",
+                    serde_json::json!({"Version":"2012-10-17","Statement":[
+                        {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::usage-allowed"},
+                        {"Effect":"Deny","Action":"s3:ListBucket","NotResource":"arn:aws:s3:::usage-allowed"}
+                    ]}),
+                ),
+            ] {
+                iam.create_user(
+                    key,
+                    &AddOrUpdateUserReq {
+                        secret_key: "test-user-secret".to_owned(),
+                        policy: None,
+                        status: AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .unwrap();
+                iam.set_policy(key, Policy::parse_config(&serde_json::to_vec(&document).unwrap()).unwrap())
+                    .await
+                    .unwrap();
+                iam.policy_db_set(key, UserType::Reg, false, key).await.unwrap();
+            }
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: "proxy-test-root".to_owned(),
+                secret_key: "proxy-root-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+            let request = |key: &str, client_ip: Option<&str>, method: http::Method, uri: &str, body: &str| {
+                let mut builder = TestRequest::new(method, uri)
+                    .extension(Some(RemoteAddr("10.1.2.3:4567".parse().unwrap())))
+                    .header("x-forwarded-for", "10.1.2.3")
+                    .header("x-real-ip", "10.1.2.3")
+                    .credentials(key, "test-user-secret", None)
+                    .body(body.to_owned());
+                if let Some(ip) = client_ip {
+                    builder =
+                        builder.extension(rustfs_trusted_proxies::ClientInfo::direct(format!("{ip}:7890").parse().unwrap()));
+                }
+                builder.build()
+            };
+            for (client, allowed) in [(Some("203.0.113.17"), false), (Some("10.8.7.6"), true), (None, true)] {
+                let req = request("proxy-admin", client, http::Method::GET, "/", "");
+                assert_eq!(req.policy_source_addr().unwrap().port(), 4567);
+                let result = authorize_admin_envelope(req.envelope(), vec![admin_action()]).await;
+                if allowed {
+                    result.expect("verified private client is allowed");
+                } else {
+                    assert_eq!(result.unwrap_err().code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+                }
+                let req = request(
+                    "proxy-admin",
+                    client,
+                    http::Method::POST,
+                    "/",
+                    "Action=AssumeRole&Version=invalid-version",
+                );
+                let error = crate::admin::handlers::sts::AssumeRoleHandle {}
+                    .call(req, matchit::Params::new())
+                    .await
+                    .unwrap_err();
+                if allowed {
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
+                    assert_eq!(
+                        error.message(),
+                        Some("not support version"),
+                        "only an authorized caller reaches version validation"
+                    );
+                } else {
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+                }
+                let response = crate::admin::handlers::is_admin::IsAdminHandler {}
+                    .call(request("proxy-admin", client, http::Method::GET, "/", ""), matchit::Params::new())
+                    .await
+                    .unwrap();
+                let (_status, _headers, mut body) = response.into_parts();
+                let json: serde_json::Value = serde_json::from_slice(&body.store_all_limited(4096).await.unwrap()).unwrap();
+                assert_eq!(json["is_admin"], allowed);
+            }
+            let mut routes = matchit::Router::new();
+            routes.insert("/usage/{bucket}", ()).unwrap();
+            for (bucket, allowed) in [("usage-allowed", true), ("usage-secret", false)] {
+                let path = format!("/usage/{bucket}");
+                let matched = routes.at(&path).unwrap();
+                let req = request("scoped-usage", None, http::Method::GET, &format!("{path}?unexpected=1"), "");
+                let error = crate::admin::handlers::usage_prefix::BucketPrefixUsageHandler {}
+                    .call(req, matched.params)
+                    .await
+                    .unwrap_err();
+                if allowed {
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
+                    assert_eq!(error.message(), Some("unknown query parameter: unexpected"));
+                } else {
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+                }
+            }
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
+    }
+
+    /// Owner (root/admin) credential is authorized for an admin action.
+    #[tokio::test]
+    async fn admin_owner_credential_is_allowed() {
+        let iam = iam_sys_with_empty_store();
+        let headers = HeaderMap::new();
+        let cred = Credentials {
+            access_key: "rustfsadmin".to_string(),
+            ..Default::default()
+        };
+        let ctx = ctx_for(&headers, &cred, true);
+
+        let res = check_admin_request_auth(iam, &ctx, admin_action(), "", "").await;
+        assert!(res.is_ok(), "owner credential must pass the admin auth gate");
+    }
+
+    /// A known-shaped but non-owner principal with no matching policy is denied.
+    #[tokio::test]
+    async fn non_admin_credential_is_denied() {
+        let iam = iam_sys_with_empty_store();
+        let headers = HeaderMap::new();
+        let cred = Credentials {
+            access_key: "limiteduser".to_string(),
+            secret_key: "limitedsecret".to_string(),
+            ..Default::default()
+        };
+        let ctx = ctx_for(&headers, &cred, false);
+
+        let res = check_admin_request_auth(iam, &ctx, admin_action(), "", "").await;
+        assert_access_denied(res);
+    }
+
+    /// A request carrying an empty (missing) access key is denied.
+    #[tokio::test]
+    async fn missing_credential_is_denied() {
+        let iam = iam_sys_with_empty_store();
+        let headers = HeaderMap::new();
+        let cred = Credentials::default();
+        let ctx = ctx_for(&headers, &cred, false);
+
+        let res = check_admin_request_auth(iam, &ctx, admin_action(), "", "").await;
+        assert_access_denied(res);
+    }
+
+    /// The shared admin gate rejects a request carrying no credentials before
+    /// authentication or IAM is consulted, with the exact error the folded
+    /// per-handler wrappers produced (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn authorize_admin_envelope_without_credentials_is_rejected() {
+        let envelope = crate::app::RequestEnvelope::from_parts(
+            crate::app::RequestHead {
+                method: http::Method::GET,
+                uri: Uri::from_static("/rustfs/admin/v3/usage/bucket"),
+                headers: HeaderMap::new(),
+                credentials: None,
+                region: None,
+                service: None,
+            },
+            http::Extensions::new(),
+        );
+
+        let err = authorize_admin_envelope(&envelope, vec![admin_action()])
+            .await
+            .expect_err("an envelope without credentials must be rejected");
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("get cred failed"));
+    }
+
+    /// KMS scoping rides the object slot with an empty bucket, matching the
+    /// contract the policy crate evaluates KMS statements against.
+    #[test]
+    fn kms_scope_carries_the_key_id_in_the_object_slot() {
+        let scope = AdminResourceScope::kms_key("key-a");
+        assert_eq!(scope.bucket, "");
+        assert_eq!(scope.object, "key-a");
+
+        let unscoped = AdminResourceScope::kms_key("");
+        assert_eq!(unscoped.object, "", "an absent key id must stay unscoped");
+    }
+
+    const KMS_OPERATOR: &str = "kms-operator";
+
+    fn kms_disable_key_actions() -> Vec<Action> {
+        vec![Action::KmsAction(KmsAction::DisableKeyAction)]
+    }
+
+    async fn gate_for_key(iam: Arc<IamSys<EmptyStore>>, key_id: &str, is_owner: bool) -> S3Result<()> {
+        let headers = HeaderMap::new();
+        let cred = Credentials {
+            access_key: KMS_OPERATOR.to_string(),
+            secret_key: "kms-operator-secret".to_string(),
+            status: "on".to_string(),
+            ..Default::default()
+        };
+        let ctx = ctx_for(&headers, &cred, is_owner);
+        let scope = AdminResourceScope::kms_key(key_id);
+
+        evaluate_admin_actions(iam, &ctx, &kms_disable_key_actions(), scope.bucket, scope.object).await
+    }
+
+    /// End-to-end through the gate: a `kms:DisableKey` grant limited to `key/A`
+    /// authorizes key A and denies key B with `AccessDenied`. This is the seam the
+    /// per-handler tests cannot reach — it pins that the scope actually travels
+    /// into the policy verdict rather than being dropped on the way
+    /// (rustfs/backlog#1582).
+    #[tokio::test]
+    async fn kms_scoped_gate_denies_a_key_outside_the_policy_scope() {
+        let document = r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["kms:DisableKey"],"Resource":["arn:aws:kms:::key/key-a"]}
+        ]}"#;
+
+        let allowed = gate_for_key(iam_sys_with_policy(KMS_OPERATOR, document), "key-a", false).await;
+        assert!(allowed.is_ok(), "the key the policy names must pass the gate");
+
+        assert_access_denied(gate_for_key(iam_sys_with_policy(KMS_OPERATOR, document), "key-b", false).await);
+    }
+
+    /// Compatibility pins for the same gate: a resource-less KMS statement keeps
+    /// authorizing every key, and the owner short-circuit is unaffected by scoping.
+    #[tokio::test]
+    async fn kms_scoped_gate_keeps_unscoped_policies_and_owners_unrestricted() {
+        let unscoped = r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["kms:DisableKey"]}
+        ]}"#;
+        let scoped = r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["kms:DisableKey"],"Resource":["arn:aws:kms:::key/key-a"]}
+        ]}"#;
+
+        for key in ["key-a", "key-b"] {
+            let res = gate_for_key(iam_sys_with_policy(KMS_OPERATOR, unscoped), key, false).await;
+            assert!(res.is_ok(), "a resource-less KMS statement must keep authorizing {key}");
+
+            let res = gate_for_key(iam_sys_with_policy(KMS_OPERATOR, scoped), key, true).await;
+            assert!(res.is_ok(), "the owner short-circuit must still authorize {key}");
+        }
+    }
+
+    /// An endpoint with no target key passes an empty scope, which must behave
+    /// exactly like the unscoped gate it replaced.
+    #[tokio::test]
+    async fn kms_gate_without_a_target_key_matches_every_key() {
+        let scoped = r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["kms:DisableKey"],"Resource":["arn:aws:kms:::key/key-a"]}
+        ]}"#;
+
+        let res = gate_for_key(iam_sys_with_policy(KMS_OPERATOR, scoped), "", false).await;
+        assert!(res.is_ok(), "an absent key id must keep the pre-resource-scoping verdict");
+    }
+
+    /// The multi-action loop authorizes as soon as one candidate action passes
+    /// (owner short-circuits every action), and denies when none pass.
+    #[tokio::test]
+    async fn evaluate_admin_actions_grants_when_any_action_allowed() {
+        let headers = HeaderMap::new();
+        let actions = vec![
+            Action::AdminAction(AdminAction::ServerInfoAdminAction),
+            Action::AdminAction(AdminAction::ConfigUpdateAdminAction),
+        ];
+
+        // Owner: allowed on the first candidate action.
+        let owner_cred = Credentials {
+            access_key: "rustfsadmin".to_string(),
+            ..Default::default()
+        };
+        let owner_ctx = ctx_for(&headers, &owner_cred, true);
+        let iam = iam_sys_with_empty_store();
+        let res = evaluate_admin_actions(iam, &owner_ctx, &actions, "", "").await;
+        assert!(res.is_ok(), "owner must be granted when at least one action is permitted");
+
+        // Non-owner with no policy: none of the candidate actions pass.
+        let user_cred = Credentials {
+            access_key: "limiteduser".to_string(),
+            ..Default::default()
+        };
+        let user_ctx = ctx_for(&headers, &user_cred, false);
+        let iam = iam_sys_with_empty_store();
+        let res = evaluate_admin_actions(iam, &user_ctx, &actions, "", "").await;
+        assert_access_denied(res);
+    }
 }

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! ILM (Information Lifecycle Management) metrics collector.
 //!
 //! Collects ILM metrics including pending tasks, active tasks,
@@ -48,6 +46,51 @@ pub struct IlmStats {
     pub versions_scanned: u64,
 }
 
+/// ILM task metrics by action and state.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IlmActionTaskStats {
+    pub(crate) action: String,
+    pub(crate) state: String,
+    pub(crate) value: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IlmQueueTaskStats {
+    pub(crate) action: String,
+    pub(crate) state: String,
+    pub(crate) value: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IlmTaskEventStats {
+    pub(crate) action: String,
+    pub(crate) result: String,
+    pub(crate) value: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IlmBackpressureStats {
+    pub(crate) action: String,
+    pub(crate) reason: String,
+    pub(crate) value: u64,
+}
+
+/// ILM statistics with runtime-local node identity and bounded action/state details.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IlmRuntimeStats {
+    pub(crate) server: String,
+    pub(crate) stats: IlmStats,
+    pub(crate) action_tasks: Vec<IlmActionTaskStats>,
+    pub(crate) queue_tasks: Vec<IlmQueueTaskStats>,
+    pub(crate) task_events: Vec<IlmTaskEventStats>,
+    pub(crate) backpressure: Vec<IlmBackpressureStats>,
+    pub(crate) versions_scanned: u64,
+}
+
+fn is_live_action_task_state(state: &str) -> bool {
+    matches!(state, "pending" | "active" | "compensation_running")
+}
+
 /// Collects ILM metrics from the given stats.
 ///
 /// Uses the metric descriptors from `metrics_type::ilm` module.
@@ -78,6 +121,49 @@ pub fn collect_ilm_metrics(stats: &IlmStats) -> Vec<PrometheusMetric> {
     ]
 }
 
+pub(crate) fn collect_ilm_runtime_metrics(stats: &IlmRuntimeStats) -> Vec<PrometheusMetric> {
+    let mut metrics = collect_ilm_metrics(&stats.stats);
+
+    metrics.extend(
+        stats
+            .action_tasks
+            .iter()
+            .filter(|task| is_live_action_task_state(&task.state))
+            .map(|task| {
+                PrometheusMetric::from_descriptor(&ILM_ACTION_TASKS_MD, task.value as f64)
+                    .with_label_owned(SERVER_LABEL, stats.server.clone())
+                    .with_label_owned(ACTION_LABEL, task.action.clone())
+                    .with_label_owned(STATE_LABEL, task.state.clone())
+            }),
+    );
+
+    metrics.extend(stats.queue_tasks.iter().map(|task| {
+        PrometheusMetric::from_descriptor(&ILM_TASKS_MD, task.value as f64)
+            .with_label_owned(SERVER_LABEL, stats.server.clone())
+            .with_label_owned(ACTION_LABEL, task.action.clone())
+            .with_label_owned(QUEUE_STATE_LABEL, task.state.clone())
+    }));
+    metrics.extend(stats.task_events.iter().map(|event| {
+        PrometheusMetric::from_descriptor(&ILM_TASK_EVENTS_MD, event.value as f64)
+            .with_label_owned(SERVER_LABEL, stats.server.clone())
+            .with_label_owned(ACTION_LABEL, event.action.clone())
+            .with_label_owned(RESULT_LABEL, event.result.clone())
+    }));
+    metrics.extend(stats.backpressure.iter().map(|event| {
+        PrometheusMetric::from_descriptor(&ILM_QUEUE_BACKPRESSURE_MD, event.value as f64)
+            .with_label_owned(SERVER_LABEL, stats.server.clone())
+            .with_label_owned(ACTION_LABEL, event.action.clone())
+            .with_label_owned(REASON_LABEL, event.reason.clone())
+    }));
+    metrics.push(
+        PrometheusMetric::from_descriptor(&ILM_VERSIONS_SCANNED_BY_SERVER_MD, stats.versions_scanned as f64)
+            .with_label_owned(SERVER_LABEL, stats.server.clone())
+            .with_label_owned(SOURCE_LABEL, "lifecycle".to_string()),
+    );
+
+    metrics
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,16 +181,116 @@ mod tests {
             transition_compensation_running_tasks: 1,
             versions_scanned: 1000000,
         };
+        let runtime_stats = IlmRuntimeStats {
+            server: "node1:9000".to_string(),
+            stats,
+            queue_tasks: vec![IlmQueueTaskStats {
+                action: "transition".to_string(),
+                state: "pending".to_string(),
+                value: 8,
+            }],
+            task_events: vec![IlmTaskEventStats {
+                action: "transition".to_string(),
+                result: "completed".to_string(),
+                value: 7,
+            }],
+            backpressure: vec![IlmBackpressureStats {
+                action: "transition".to_string(),
+                reason: "queue_full".to_string(),
+                value: 2,
+            }],
+            versions_scanned: 1000000,
+            action_tasks: vec![
+                IlmActionTaskStats {
+                    action: "expiry".to_string(),
+                    state: "pending".to_string(),
+                    value: 100,
+                },
+                IlmActionTaskStats {
+                    action: "transition".to_string(),
+                    state: "queue_send_timeout".to_string(),
+                    value: 3,
+                },
+                IlmActionTaskStats {
+                    action: "transition".to_string(),
+                    state: "active".to_string(),
+                    value: 5,
+                },
+            ],
+        };
 
-        let metrics = collect_ilm_metrics(&stats);
+        let metrics = collect_ilm_runtime_metrics(&runtime_stats);
 
-        assert_eq!(metrics.len(), 9);
+        assert_eq!(metrics.len(), 15);
 
         let pending = metrics.iter().find(|m| m.value == 100.0);
         assert!(pending.is_some());
 
         let scanned = metrics.iter().find(|m| m.value == 1000000.0);
         assert!(scanned.is_some());
+
+        let transition_timeout = metrics.iter().find(|m| {
+            m.name == ILM_ACTION_TASKS_MD.get_full_metric_name()
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == SERVER_LABEL && value.as_ref() == "node1:9000")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == ACTION_LABEL && value.as_ref() == "transition")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "queue_send_timeout")
+        });
+        assert!(transition_timeout.is_none());
+
+        let transition_queue = metrics.iter().find(|m| {
+            m.name == ILM_TASKS_MD.get_full_metric_name()
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == ACTION_LABEL && value.as_ref() == "transition")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == QUEUE_STATE_LABEL && value.as_ref() == "pending")
+        });
+        assert_eq!(transition_queue.map(|metric| metric.value), Some(8.0));
+
+        let completed = metrics.iter().find(|m| {
+            m.name == ILM_TASK_EVENTS_MD.get_full_metric_name()
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == RESULT_LABEL && value.as_ref() == "completed")
+        });
+        assert_eq!(completed.map(|metric| metric.value), Some(7.0));
+
+        let backpressure = metrics.iter().find(|m| {
+            m.name == ILM_QUEUE_BACKPRESSURE_MD.get_full_metric_name()
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == REASON_LABEL && value.as_ref() == "queue_full")
+        });
+        assert_eq!(backpressure.map(|metric| metric.value), Some(2.0));
+
+        let version_detail = metrics.iter().find(|m| {
+            m.name == ILM_VERSIONS_SCANNED_BY_SERVER_MD.get_full_metric_name()
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == SERVER_LABEL && value.as_ref() == "node1:9000")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == SOURCE_LABEL && value.as_ref() == "lifecycle")
+        });
+        assert_eq!(version_detail.map(|metric| metric.value), Some(1000000.0));
+
+        let transition_active = metrics.iter().find(|m| {
+            m.name == ILM_ACTION_TASKS_MD.get_full_metric_name()
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == ACTION_LABEL && value.as_ref() == "transition")
+                && m.labels
+                    .iter()
+                    .any(|(name, value)| *name == STATE_LABEL && value.as_ref() == "active")
+        });
+        assert_eq!(transition_active.map(|m| m.value), Some(5.0));
     }
 
     #[test]

@@ -27,15 +27,17 @@ use super::attrs;
 use super::constants::limits::S3_COPY_OBJECT_MAX_SIZE;
 use super::errors::{SftpError, auth_err, auth_err_unreachable, is_no_such_upload_error, ok_status, s3_error_to_sftp};
 use super::lifecycle::SessionDiag;
-use super::paths::{parse_s3_path, sanitise_control_bytes};
+use super::paths::{copy_source_value, parse_s3_path, sanitise_control_bytes};
 use super::state::{HandleState, WritePhase};
 use super::write::{build_write_tombstone, fstat_reported_size, rejects_excl_or_trunc_without_create, should_abort_on_drop};
 use crate::common::client::s3::StorageBackend;
-use crate::common::gateway::{AuthorizationError, S3Action, authorize_operation};
+use crate::common::gateway::{AuthorizationError, S3Action};
 use crate::common::session::SessionContext;
 use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode, Version};
+use rustfs_credentials::Credentials;
+use rustfs_gateway_types::dto::{AbortMultipartUploadInput, CopyObjectInput, ListObjectsV2Input};
+use rustfs_gateway_types::{BucketName, ObjectKey, UploadIdClaim};
 use rustfs_utils::MaskedAccessKey;
-use s3s::dto::{AbortMultipartUploadInput, CopyObjectInput, CopySource};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, LazyLock};
@@ -165,16 +167,14 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         super::read_cache::ReadCache::new(Arc::clone(&self.read_cache_in_use))
     }
 
-    /// Borrow the authenticated principal's S3 access key. Each StorageBackend
-    /// call needs this alongside the secret key for signing.
+    /// Borrow the authenticated principal's S3 access key for diagnostics.
     pub(super) fn access_key(&self) -> &str {
-        &self.session_context.principal.user_identity.credentials.access_key
+        &self.credentials().access_key
     }
 
-    /// Borrow the authenticated principal's S3 secret key. Used together with
-    /// access_key for signing every backend call.
-    pub(super) fn secret_key(&self) -> &str {
-        &self.session_context.principal.user_identity.credentials.secret_key
+    /// Borrow the authenticated principal credentials for backend calls.
+    pub(super) fn credentials(&self) -> &Credentials {
+        self.session_context.credentials()
     }
 
     /// Returns Err(PermissionDenied) when the driver is read-only,
@@ -298,7 +298,45 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     /// the SSH keepalive closed the transport (~45 s). The deadline
     /// closes that gap and returns IamUnavailable to the client.
     pub(super) async fn authorize(&self, action: &S3Action, bucket: &str, key: Option<&str>) -> Result<(), SftpError> {
-        let auth_fut = authorize_operation(&self.session_context, action, bucket, key);
+        let auth_fut = self.storage.authorize_operation(&self.session_context, action, bucket, key);
+        self.await_authorization(action, bucket, key, auth_fut).await
+    }
+
+    /// Like authorize, but a policy deny returns Ok(false) instead of
+    /// PermissionDenied, without the SFTP driver's access_denied warn,
+    /// for callers that fall back to a narrower operation when the
+    /// action is denied. The storage layer may still log the denial.
+    /// IamUnavailable and the deadline are handled exactly as in
+    /// authorize.
+    pub(super) async fn is_authorized(&self, action: &S3Action, bucket: &str, key: Option<&str>) -> Result<bool, SftpError> {
+        let auth_fut = self.storage.authorize_operation(&self.session_context, action, bucket, key);
+        let mut denied = false;
+        let deny_as_ok = async {
+            match auth_fut.await {
+                Err(AuthorizationError::AccessDenied) => {
+                    denied = true;
+                    Ok(())
+                }
+                other => other,
+            }
+        };
+        self.await_authorization(action, bucket, key, deny_as_ok).await?;
+        Ok(!denied)
+    }
+
+    pub(super) async fn authorize_list_objects(&self, input: &ListObjectsV2Input) -> Result<(), SftpError> {
+        let auth_fut = self.storage.authorize_list_objects(&self.session_context, input);
+        self.await_authorization(&S3Action::ListBucket, input.bucket.as_str(), input.prefix.as_deref(), auth_fut)
+            .await
+    }
+
+    async fn await_authorization(
+        &self,
+        action: &S3Action,
+        bucket: &str,
+        key: Option<&str>,
+        auth_fut: impl std::future::Future<Output = Result<(), AuthorizationError>>,
+    ) -> Result<(), SftpError> {
         let outcome = match tokio::time::timeout(std::time::Duration::from_secs(self.backend_op_timeout_secs), auth_fut).await {
             Ok(inner) => inner,
             Err(_elapsed) => {
@@ -787,25 +825,17 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
 
         self.authorize(&S3Action::DeleteObject, &bucket, Some(&object_key)).await?;
 
-        self.run_backend(
-            "delete_object",
-            self.storage
-                .delete_object(&bucket, &object_key, self.access_key(), self.secret_key()),
-        )
-        .await?;
+        self.run_backend("delete_object", self.storage.delete_object(&bucket, &object_key, self.credentials()))
+            .await?;
         Ok(ok_status(id))
     }
 
     /// SSH_FXP_MKDIR, SFTP Internet Draft section 6.6. Bucket-level path
     /// (only the bucket component is set) issues CreateBucket. Sub-bucket
-    /// path issues PutObject of a zero-byte object at the encoded
-    /// directory marker key. MKDIR at the SFTP root returns Failure
-    /// because there is no parent into which a new top-level entity could
-    /// be added.
-    ///
-    /// The directory-marker key is built with rustfs_utils::path::
-    /// encode_dir_object so the key format matches the convention used
-    /// by the rest of RustFS (S3, Swift, WebDAV).
+    /// path issues PutObject of a zero-byte object at the logical prefix
+    /// plus a trailing slash. Storage encodes that client key into the
+    /// directory marker. MKDIR at the SFTP root returns Failure because
+    /// there is no parent into which a new top-level entity could be added.
     #[tracing::instrument(level = "info", skip(self, _attrs), fields(id, path = %sanitise_control_bytes(&path)), err(Debug))]
     async fn mkdir(&mut self, id: u32, path: String, _attrs: FileAttributes) -> Result<Status, Self::Error> {
         self.enforce_server_readonly()?;
@@ -825,8 +855,9 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
     /// SSH_FXP_RMDIR, SFTP Internet Draft section 6.6. Empty check then
     /// delete. Bucket-level path lists the bucket with max_keys=1 and,
     /// on an empty result, calls DeleteBucket. Sub-bucket path lists the
-    /// prefix and, on an empty result, calls DeleteObject on the encoded
-    /// directory marker.
+    /// prefix and, on an empty result, calls DeleteObject on the
+    /// trailing-slash directory key. Storage encodes that key to the
+    /// on-disk marker.
     ///
     /// validate_directory_empty propagates the list error rather than
     /// swallowing it. Without that, a transient backend error during
@@ -898,11 +929,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
         // single-shot vs multipart-copy branch below.
         self.authorize(&S3Action::HeadObject, &src_bucket, Some(&src_object)).await?;
         let head = self
-            .run_backend(
-                "head_object",
-                self.storage
-                    .head_object(&src_bucket, &src_object, self.access_key(), self.secret_key()),
-            )
+            .run_backend("head_object", self.storage.head_object(&src_bucket, &src_object, self.credentials()))
             .await?;
         let content_length = head.content_length.unwrap_or(0).max(0) as u64;
 
@@ -910,17 +937,11 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
         // Multipart UploadPartCopy above that.
         if content_length <= S3_COPY_OBJECT_MAX_SIZE {
             self.authorize(&S3Action::CopyObject, &dst_bucket, Some(&dst_object)).await?;
-            let input = CopyObjectInput::builder()
-                .copy_source(CopySource::Bucket {
-                    bucket: src_bucket.clone().into(),
-                    key: src_object.clone().into(),
-                    version_id: None,
-                })
-                .bucket(dst_bucket.clone())
-                .key(dst_object.clone())
-                .build()
-                .map_err(|e| s3_error_to_sftp("build_copy_object", e))?;
-            self.run_backend("copy_object", self.storage.copy_object(input, self.access_key(), self.secret_key()))
+            let input = CopyObjectInput::builder(copy_source_value(&src_bucket, &src_object))
+                .bucket(BucketName::new(dst_bucket.clone()).map_err(|e| s3_error_to_sftp("build_copy_object", e))?)
+                .key(ObjectKey::new(dst_object.clone()).map_err(|e| s3_error_to_sftp("build_copy_object", e))?)
+                .build();
+            self.run_backend("copy_object", self.storage.copy_object(input, self.credentials()))
                 .await?;
         } else {
             self.multipart_copy(&src_bucket, &src_object, &dst_bucket, &dst_object, content_length)
@@ -932,12 +953,8 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
         // delete separately.
         self.authorize(&S3Action::DeleteObject, &src_bucket, Some(&src_object))
             .await?;
-        self.run_backend(
-            "delete_object",
-            self.storage
-                .delete_object(&src_bucket, &src_object, self.access_key(), self.secret_key()),
-        )
-        .await?;
+        self.run_backend("delete_object", self.storage.delete_object(&src_bucket, &src_object, self.credentials()))
+            .await?;
 
         Ok(ok_status(id))
     }
@@ -1029,14 +1046,12 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
 impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
     fn drop(&mut self) {
         // Snapshot credentials, peer IP, and the per-call backend
-        // timeout before draining the handle table. self.access_key()
-        // and self.secret_key() borrow self.session_context immutably,
-        // which conflicts with the mutable borrow of self.handles
-        // inside the loop. The timeout is copied into each spawned
-        // abort task so the deadline applies uniformly to inline calls
-        // and Drop-time aborts.
-        let access_key = self.session_context.principal.user_identity.credentials.access_key.clone();
-        let secret_key = self.session_context.principal.user_identity.credentials.secret_key.clone();
+        // timeout before draining the handle table. Borrowing
+        // self.session_context inside the loop would conflict with the
+        // mutable borrow of self.handles. The timeout is copied into each
+        // spawned abort task so the deadline applies uniformly to inline
+        // calls and Drop-time aborts.
+        let credentials = self.session_context.credentials().clone();
         let peer = self.session_context.source_ip;
         let backend_op_timeout_secs = self.backend_op_timeout_secs;
 
@@ -1056,7 +1071,7 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
                             key = %key,
                             upload_id = %upload_id,
                             peer = %peer,
-                            access_key = %access_key,
+                            access_key = %MaskedAccessKey(&credentials.access_key),
                             "skipped abort of orphaned multipart upload on session drop, principal lacks s3:AbortMultipartUpload, bucket lifecycle rules must reclaim parts",
                         );
                     }
@@ -1065,8 +1080,7 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
             };
 
             let storage = Arc::clone(&self.storage);
-            let access_key = access_key.clone();
-            let secret_key = secret_key.clone();
+            let credentials = credentials.clone();
             let upload_id = upload_id_owned;
 
             // Cap the global abort fan-out so a burst of session
@@ -1097,32 +1111,14 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
                         peer = %peer,
                         "aborting orphaned multipart upload on session drop"
                     );
-                    // Build AbortMultipartUploadInput inside the spawned
-                    // task so the builder Result is handled in async
-                    // context. The builder only fails on missing required
-                    // fields. bucket, key, and upload_id are all set, so
-                    // log and return on any unexpected failure.
-                    let input = match AbortMultipartUploadInput::builder()
-                        .bucket(bucket.clone())
-                        .key(key.clone())
-                        .upload_id(upload_id.clone())
-                        .build()
-                    {
-                        Ok(input) => input,
-                        Err(e) => {
-                            tracing::error!(
-                                bucket = %bucket,
-                                key = %key,
-                                upload_id = %upload_id,
-                                err = %e,
-                                "failed to build AbortMultipartUploadInput on session drop"
-                            );
-                            return;
-                        }
-                    };
+                    let input = AbortMultipartUploadInput::builder()
+                        .bucket(BucketName::new(bucket.clone()).expect("validated bucket name"))
+                        .key(ObjectKey::new(key.clone()).expect("validated object key"))
+                        .upload_id(UploadIdClaim::from_wire(upload_id.clone()))
+                        .build();
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(backend_op_timeout_secs),
-                        storage.abort_multipart_upload(input, &access_key, &secret_key),
+                        storage.abort_multipart_upload(input, &credentials),
                     )
                     .await
                     {
@@ -1256,7 +1252,7 @@ mod tests {
             ..Default::default()
         };
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", 1234, attrs.clone()))
+            .allocate_handle(file_handle("bucket", "k", 1234, attrs.clone()))
             .expect("allocate");
         let out = driver.fstat(4, handle_id).await.expect("fstat on File must succeed");
         assert_eq!(out.attrs.size, Some(1234));
@@ -1270,7 +1266,7 @@ mod tests {
         let phase = WritePhase::Buffering {
             part_buffer: vec![0u8; 4096],
         };
-        let handle_id = driver.allocate_handle(write_handle("b", "k", phase)).expect("allocate");
+        let handle_id = driver.allocate_handle(write_handle("bucket", "k", phase)).expect("allocate");
         let out = driver.fstat(5, handle_id).await.expect("fstat on Write must succeed");
         assert_eq!(
             out.attrs.size,
@@ -1284,7 +1280,7 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         let mut driver = build_driver(backend, TEST_PART_SIZE);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", 0, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", 0, FileAttributes::default()))
             .expect("allocate");
         let status = driver
             .fsetstat(6, handle_id, FileAttributes::default())
@@ -1401,7 +1397,7 @@ mod tests {
             "list_objects_v2 transient failure".into(),
         ));
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
-        let result = with_test_auth_override(|_, _, _| true, driver.validate_directory_empty("b", "")).await;
+        let result = with_test_auth_override(|_, _, _| true, driver.validate_directory_empty("bucket", "")).await;
         assert!(result.is_err(), "list_objects_v2 error must propagate as Err");
     }
 
@@ -1410,7 +1406,7 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         backend.queue_list_objects_v2_ok_empty();
         let driver = build_driver(backend.clone(), TEST_PART_SIZE);
-        let result = with_test_auth_override(|_, _, _| true, driver.validate_directory_empty("b", "")).await;
+        let result = with_test_auth_override(|_, _, _| true, driver.validate_directory_empty("bucket", "")).await;
         assert!(result.is_ok(), "empty listing must return Ok");
     }
 
@@ -1419,7 +1415,7 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         let mut driver = build_readonly_driver(backend, TEST_PART_SIZE);
         let handle_id = driver
-            .allocate_handle(file_handle("b", "k", 0, FileAttributes::default()))
+            .allocate_handle(file_handle("bucket", "k", 0, FileAttributes::default()))
             .expect("allocate");
         let result = driver.fsetstat(10, handle_id, FileAttributes::default()).await;
         match result {
@@ -1436,7 +1432,7 @@ mod tests {
     async fn authorize_maps_iam_unavailable_to_failure() {
         let backend = Arc::new(DummyBackend::new());
         let driver = build_driver(backend, TEST_PART_SIZE);
-        let result = with_test_iam_unavailable(driver.authorize(&S3Action::PutObject, "b", Some("k"))).await;
+        let result = with_test_iam_unavailable(driver.authorize(&S3Action::PutObject, "bucket", Some("k"))).await;
         let err = result.expect_err("IAM unavailable must surface as Err");
         assert!(
             matches!(err.0, StatusCode::Failure),
@@ -1451,7 +1447,7 @@ mod tests {
     async fn authorize_maps_access_denied_to_permission_denied() {
         let backend = Arc::new(DummyBackend::new());
         let driver = build_driver(backend, TEST_PART_SIZE);
-        let result = with_test_auth_override(|_, _, _| false, driver.authorize(&S3Action::PutObject, "b", Some("k"))).await;
+        let result = with_test_auth_override(|_, _, _| false, driver.authorize(&S3Action::PutObject, "bucket", Some("k"))).await;
         let err = result.expect_err("Deny must surface as Err");
         assert!(matches!(err.0, StatusCode::PermissionDenied), "AccessDenied must map to PermissionDenied");
     }

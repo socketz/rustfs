@@ -13,19 +13,36 @@
 // limitations under the License.
 
 //! Core WebDAV tests
+//!
+//! # Security regression coverage
+//!
+//! GHSA-3p3x-734c-h5vx (constant-time secret comparison on the WebDAV/FTPS
+//! password login path, fixed in rustfs/rustfs#4403) is anchored end-to-end by
+//! the authentication-failure block in [`test_webdav_core_operations`], marked
+//! with a `GHSA-3p3x` comment. It drives the `ct_eq` rejection branch in
+//! `WebDavAuth::authenticate` (`crates/protocols/src/webdav/server.rs`): a
+//! valid access key with a wrong secret is rejected (the exact branch the
+//! advisory hardened), and an unknown user is rejected with the same status so
+//! the two failures are indistinguishable. The sibling FTPS assertion lives in
+//! `ftps_core.rs`; the internode RPC fail-closed advisory
+//! (GHSA-r5qv-rc46-hv8q, rustfs/rustfs#4402) is anchored by the `ghsa_r5qv_*`
+//! unit tests in `crates/ecstore/src/cluster/rpc/http_auth.rs`. See
+//! `docs/testing/security-regressions.md` for the full advisory -> test map.
+//!
+//! Advisory: <https://github.com/rustfs/rustfs/security/advisories/GHSA-3p3x-734c-h5vx>
 
-use crate::common::local_http_client;
 use crate::common::rustfs_binary_path_with_features;
+use crate::common::{
+    AdminTransport, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via, signed_s3_request,
+};
+use crate::common::{FAST_DATA_USAGE_SCANNER_ENV, admin_request};
 use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
-use base64::Engine;
-use http::header::{CONTENT_TYPE, HOST};
+use http::Method;
 use reqwest::Client;
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::sign_v4;
-use s3s::Body;
-use serial_test::serial;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
+use tokio::time::sleep;
 use tracing::info;
 
 // Fixed WebDAV port for testing
@@ -48,96 +65,47 @@ fn basic_auth_header() -> String {
 
 fn basic_auth_header_for(access_key: &str, secret_key: &str) -> String {
     let credentials = format!("{}:{}", access_key, secret_key);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
+    let encoded = base64_simd::STANDARD.encode_to_string(credentials);
     format!("Basic {}", encoded)
 }
 
-async fn signed_admin_request(
-    method: http::Method,
-    url: &str,
-    body: Option<Vec<u8>>,
-    content_type: Option<&str>,
-) -> Result<reqwest::Response> {
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri
-        .authority()
-        .ok_or_else(|| anyhow::anyhow!("request URL missing authority"))?
-        .to_string();
-    let mut request = http::Request::builder().method(method.clone()).uri(uri);
-    request = request.header(HOST, authority);
-    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if let Some(content_type) = content_type {
-        request = request.header(CONTENT_TYPE, content_type);
-    }
-
-    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
-    let signed = sign_v4(
-        request.body(Body::empty())?,
-        content_len,
+async fn admin_create_user(base_url: &str, username: &str, secret_key: &str) -> Result<()> {
+    admin_create_user_via(
+        AdminTransport::Signed,
+        base_url,
         DEFAULT_ACCESS_KEY,
         DEFAULT_SECRET_KEY,
-        "",
-        "us-east-1",
-    );
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let mut request_builder = local_http_client().request(reqwest_method, url);
-    for (name, value) in signed.headers() {
-        request_builder = request_builder.header(name, value);
-    }
-    if let Some(body) = body {
-        request_builder = request_builder.body(body);
-    }
-
-    Ok(request_builder.send().await?)
-}
-
-async fn admin_create_user(base_url: &str, username: &str, secret_key: &str) -> Result<()> {
-    let url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", base_url, username);
-    let body = serde_json::json!({
-        "secretKey": secret_key,
-        "status": "enabled"
-    });
-    let response =
-        signed_admin_request(http::Method::PUT, &url, Some(body.to_string().into_bytes()), Some("application/json")).await?;
-
-    if response.status() != reqwest::StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("create user failed: {status} {body}");
-    }
-
-    Ok(())
+        username,
+        secret_key,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))
 }
 
 async fn admin_add_canned_policy(base_url: &str, policy_name: &str, policy: &serde_json::Value) -> Result<()> {
-    let url = format!("{}/rustfs/admin/v3/add-canned-policy?name={}", base_url, policy_name);
-    let response =
-        signed_admin_request(http::Method::PUT, &url, Some(policy.to_string().into_bytes()), Some("application/json")).await?;
-
-    if response.status() != reqwest::StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("add canned policy failed: {status} {body}");
-    }
-
-    Ok(())
+    admin_add_canned_policy_via(
+        AdminTransport::Signed,
+        base_url,
+        DEFAULT_ACCESS_KEY,
+        DEFAULT_SECRET_KEY,
+        policy_name,
+        &policy.to_string(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))
 }
 
 async fn admin_attach_policy_to_user(base_url: &str, policy_name: &str, username: &str) -> Result<()> {
-    let url = format!(
-        "{}/rustfs/admin/v3/set-user-or-group-policy?policyName={}&userOrGroup={}&isGroup=false",
-        base_url, policy_name, username
-    );
-    let response = signed_admin_request(http::Method::PUT, &url, Some(Vec::new()), None).await?;
-
-    if response.status() != reqwest::StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("attach policy failed: {status} {body}");
-    }
-
-    Ok(())
+    admin_attach_user_policy_via(
+        AdminTransport::Signed,
+        base_url,
+        DEFAULT_ACCESS_KEY,
+        DEFAULT_SECRET_KEY,
+        policy_name,
+        username,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Test WebDAV: MKCOL (create bucket), PUT, GET, DELETE, PROPFIND operations
@@ -151,6 +119,7 @@ pub async fn test_webdav_core_operations() -> Result<()> {
     let mut server_process = Command::new(&binary_path)
         .arg("--address")
         .arg(S3_TEST_ADDRESS)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
         .env("RUSTFS_WEBDAV_ENABLE", "true")
         .env("RUSTFS_WEBDAV_ADDRESS", WEBDAV_ADDRESS)
         .env("RUSTFS_WEBDAV_TLS_ENABLED", "false") // No TLS for testing
@@ -214,6 +183,111 @@ pub async fn test_webdav_core_operations() -> Result<()> {
             resp.status()
         );
         info!("PASS: PUT file '{}' successful", filename);
+
+        // Regression for #6260: a bucket-scoped policy must be able to discover its bucket at the
+        // WebDAV root without the unrelated global ListAllMyBuckets permission.
+        let scoped_bucket = "webdav-scoped-bucket";
+        let scoped_file = "visible.txt";
+        let scoped_user = "webdav-scoped-user";
+        let scoped_secret = "webdav-scoped-secret";
+        let scoped_policy_name = "webdav-scoped-policy";
+
+        let resp = client
+            .request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), format!("{}/{}", base_url, scoped_bucket))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert_eq!(resp.status().as_u16(), 201, "scoped test bucket should be created");
+
+        let resp = client
+            .put(format!("{}/{}/{}", base_url, scoped_bucket, scoped_file))
+            .header("Authorization", &auth_header)
+            .body("visible to the scoped principal")
+            .send()
+            .await?;
+        assert_eq!(resp.status().as_u16(), 201, "scoped test object should be created");
+
+        admin_create_user(&admin_base_url, scoped_user, scoped_secret).await?;
+        admin_add_canned_policy(
+            &admin_base_url,
+            scoped_policy_name,
+            &serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:*"],
+                        "Resource": [
+                            format!("arn:aws:s3:::{}", scoped_bucket),
+                            format!("arn:aws:s3:::{}/*", scoped_bucket)
+                        ]
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Action": ["s3:*"],
+                        "Resource": [
+                            format!("arn:aws:s3:::{}", scoped_bucket),
+                            format!("arn:aws:s3:::{}/*", scoped_bucket)
+                        ],
+                        "Condition": { "Bool": { "aws:SecureTransport": "true" } }
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Action": ["s3:*"],
+                        "Resource": [
+                            format!("arn:aws:s3:::{}", scoped_bucket),
+                            format!("arn:aws:s3:::{}/*", scoped_bucket)
+                        ],
+                        "Condition": { "StringEquals": { "s3:signatureversion": "AWS4-HMAC-SHA256" } }
+                    }
+                ]
+            }),
+        )
+        .await?;
+        admin_attach_policy_to_user(&admin_base_url, scoped_policy_name, scoped_user).await?;
+
+        let scoped_auth = basic_auth_header_for(scoped_user, scoped_secret);
+        let resp = client
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &base_url)
+            .header("Authorization", &scoped_auth)
+            .header("Depth", "1")
+            .header("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+            .send()
+            .await?;
+        assert_eq!(resp.status().as_u16(), 207, "bucket-scoped root PROPFIND should succeed");
+        let root_listing = resp.text().await?;
+        assert!(root_listing.contains(scoped_bucket), "the authorized bucket should be listed");
+        assert!(!root_listing.contains(bucket_name), "an unauthorized bucket must not be listed");
+
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                format!("{}/{}", base_url, scoped_bucket),
+            )
+            .header("Authorization", &scoped_auth)
+            .header("Depth", "1")
+            .send()
+            .await?;
+        assert_eq!(resp.status().as_u16(), 207, "authorized bucket PROPFIND should succeed");
+        assert!(resp.text().await?.contains(scoped_file), "the authorized object should be listed");
+
+        let denied_user = "webdav-no-buckets-user";
+        let denied_secret = "webdav-no-buckets-secret";
+        admin_create_user(&admin_base_url, denied_user, denied_secret).await?;
+        let resp = client
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &base_url)
+            .header("Authorization", basic_auth_header_for(denied_user, denied_secret))
+            .header("Depth", "1")
+            .send()
+            .await?;
+        assert_eq!(
+            resp.status().as_u16(),
+            207,
+            "PROPFIND keeps the root resource visible when the directory listing is forbidden"
+        );
+        let denied_body = resp.text().await?;
+        assert!(!denied_body.contains(scoped_bucket), "a denied response must not leak the scoped bucket");
+        assert!(!denied_body.contains(bucket_name), "a denied response must not leak the admin bucket");
 
         // Test GET (download file)
         info!("Testing WebDAV: GET (download file '{}')", filename);
@@ -652,15 +726,38 @@ pub async fn test_webdav_core_operations() -> Result<()> {
         );
         info!("PASS: DELETE bucket '{}' successful", bucket_name);
 
-        // Test authentication failure
-        info!("Testing WebDAV: Authentication failure");
-        let resp = client
+        // Security regression (GHSA-3p3x-734c-h5vx): constant-time secret
+        // comparison on the WebDAV password login path (fixed in
+        // rustfs/rustfs#4403). A valid access key with a wrong secret must be
+        // rejected via the `ct_eq` branch in `WebDavAuth::authenticate`, and an
+        // unknown user must be rejected with the same status so the two are
+        // indistinguishable. Behavior-only assertion (no timing checks).
+        info!("Testing WebDAV (GHSA-3p3x): valid access key + wrong secret is rejected");
+        let wrong_secret_resp = client
             .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &base_url)
-            .header("Authorization", "Basic aW52YWxpZDppbnZhbGlk") // invalid:invalid
+            .header("Authorization", basic_auth_header_for(DEFAULT_ACCESS_KEY, "definitely-not-the-secret"))
             .send()
             .await?;
-        assert_eq!(resp.status().as_u16(), 401, "Invalid auth should return 401, got: {}", resp.status());
-        info!("PASS: Authentication failure test successful");
+        let wrong_secret_status = wrong_secret_resp.status().as_u16();
+        assert_eq!(
+            wrong_secret_status, 401,
+            "valid access key + wrong secret should return 401, got: {wrong_secret_status}"
+        );
+        info!("PASS: WebDAV wrong secret rejected with 401");
+
+        info!("Testing WebDAV (GHSA-3p3x): unknown user is rejected");
+        let unknown_user_resp = client
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &base_url)
+            .header("Authorization", basic_auth_header_for("no-such-access-key", "definitely-not-the-secret"))
+            .send()
+            .await?;
+        let unknown_user_status = unknown_user_resp.status().as_u16();
+        assert_eq!(unknown_user_status, 401, "unknown user should return 401, got: {unknown_user_status}");
+        assert_eq!(
+            wrong_secret_status, unknown_user_status,
+            "invalid-user and invalid-secret failures must be indistinguishable at the protocol layer"
+        );
+        info!("PASS: WebDAV authentication failure (GHSA-3p3x) test successful");
 
         info!("WebDAV core tests passed");
         Ok(())
@@ -675,7 +772,339 @@ pub async fn test_webdav_core_operations() -> Result<()> {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_webdav_core_operations_direct() -> Result<()> {
     test_webdav_core_operations().await
+}
+
+#[tokio::test]
+async fn test_webdav_content_type_directory_marker() -> Result<()> {
+    let env = ProtocolTestEnvironment::new().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let admin_base_url = format!("http://{}", S3_TEST_ADDRESS);
+    let binary_path = rustfs_binary_path_with_features(Some("webdav"));
+    let mut server_process = Command::new(&binary_path)
+        .arg("--address")
+        .arg(S3_TEST_ADDRESS)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
+        .env("RUSTFS_WEBDAV_ENABLE", "true")
+        .env("RUSTFS_WEBDAV_ADDRESS", WEBDAV_ADDRESS)
+        .env("RUSTFS_WEBDAV_TLS_ENABLED", "false")
+        .arg(&env.temp_dir)
+        .spawn()?;
+
+    let result = async {
+        ProtocolTestEnvironment::wait_for_port_ready(WEBDAV_PORT, 30)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        let client = create_client();
+        let bucket_name = "webdav-content-type-bucket";
+        let directory_name = "content-type-directory";
+        let webdav_base_url = format!("http://{}", WEBDAV_ADDRESS);
+        let mkcol_bucket = client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL").expect("MKCOL is a valid HTTP method"),
+                format!("{}/{}", webdav_base_url, bucket_name),
+            )
+            .header("Authorization", basic_auth_header())
+            .send()
+            .await?;
+        anyhow::ensure!(
+            mkcol_bucket.status().is_success() || mkcol_bucket.status().as_u16() == 201,
+            "MKCOL bucket should succeed, got: {}",
+            mkcol_bucket.status()
+        );
+
+        let mkcol_directory = client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL").expect("MKCOL is a valid HTTP method"),
+                format!("{}/{}/{}", webdav_base_url, bucket_name, directory_name),
+            )
+            .header("Authorization", basic_auth_header())
+            .send()
+            .await?;
+        anyhow::ensure!(
+            mkcol_directory.status().is_success() || mkcol_directory.status().as_u16() == 201,
+            "MKCOL directory should succeed, got: {}",
+            mkcol_directory.status()
+        );
+
+        let head_url = format!("{}/{}/{}/", admin_base_url, bucket_name, directory_name);
+        let head = signed_s3_request(http::Method::HEAD, &head_url, None, None, DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        anyhow::ensure!(head.status().is_success(), "HEAD directory marker should succeed, got: {}", head.status());
+        let content_type = head
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        anyhow::ensure!(
+            content_type == "application/x-directory",
+            "WebDAV directory marker must preserve its content type, got: {content_type}"
+        );
+        Ok(())
+    }
+    .await;
+
+    let _ = server_process.kill().await;
+    let _ = server_process.wait().await;
+    result
+}
+
+/// Extract the numeric value of the first occurrence of a DAV property in a
+/// PROPFIND multistatus body. Namespace-prefix agnostic; a self-closing
+/// (unreported) property yields None.
+fn quota_prop_value(body: &str, prop: &str) -> Option<u64> {
+    let prop_start = body.find(prop)?;
+    let after_name = &body[prop_start + prop.len()..];
+    let value_start = after_name.find('>')? + 1;
+    let value_end = after_name[value_start..].find('<')? + value_start;
+    after_name[value_start..value_end].trim().parse().ok()
+}
+
+/// PROPFIND `/` at Depth 0 requesting the two quota properties, returning
+/// (quota-available-bytes, quota-used-bytes).
+async fn propfind_root_quota(client: &Client, base_url: &str, auth_header: &str) -> Result<(u64, u64)> {
+    let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<D:propfind xmlns:D="DAV:"><D:prop><D:quota-available-bytes/><D:quota-used-bytes/></D:prop></D:propfind>"#;
+    let resp = client
+        .request(
+            reqwest::Method::from_bytes(b"PROPFIND").expect("PROPFIND is a valid HTTP method"),
+            base_url,
+        )
+        .header("Authorization", auth_header)
+        .header("Depth", "0")
+        .header("Content-Type", "application/xml")
+        .body(body)
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    anyhow::ensure!(status.as_u16() == 207, "PROPFIND / should return 207, got: {status} body: {text}");
+    let available = quota_prop_value(&text, "quota-available-bytes")
+        .ok_or_else(|| anyhow::anyhow!("quota-available-bytes missing from PROPFIND response: {text}"))?;
+    let used = quota_prop_value(&text, "quota-used-bytes")
+        .ok_or_else(|| anyhow::anyhow!("quota-used-bytes missing from PROPFIND response: {text}"))?;
+    Ok((available, used))
+}
+
+/// Set a HARD bucket quota, retrying while the admin API reports the quota
+/// subsystem as not yet ready (503), mirroring quota_test.rs readiness.
+async fn set_bucket_quota_with_retry(admin_base_url: &str, bucket: &str, quota_bytes: u64) -> Result<()> {
+    let quota_path = format!("/rustfs/admin/v3/quota/{bucket}");
+    let quota_config = serde_json::json!({
+        "quota": quota_bytes,
+        "quota_type": "HARD"
+    })
+    .to_string();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, response) = admin_request(
+            admin_base_url,
+            Method::PUT,
+            &quota_path,
+            Some(quota_config.clone()),
+            DEFAULT_ACCESS_KEY,
+            DEFAULT_SECRET_KEY,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if status.is_success() {
+            return Ok(());
+        }
+        if status != http::StatusCode::SERVICE_UNAVAILABLE {
+            anyhow::bail!("failed to set quota for {bucket}: {status} {response}");
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("quota readiness did not converge for {bucket} within 30 seconds");
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Test WebDAV: PROPFIND quota properties (quota-available-bytes /
+/// quota-used-bytes).
+///
+/// dav-server queries quota once per PROPFIND without a path argument, so the
+/// reported pair is session-scoped:
+///
+/// - Phase A: a visible bucket without quota (or no buckets at all) falls back
+///   to the cluster's usable physical capacity, the console dashboard numbers.
+/// - Phase B: once every visible bucket carries a HARD quota, the pair is the
+///   summed cached bucket usage against the summed quota limits.
+pub async fn test_webdav_quota_reporting() -> Result<()> {
+    // Dedicated ports: the core WebDAV test owns 9010/9080.
+    const QUOTA_S3_ADDRESS: &str = "127.0.0.1:9011";
+    const QUOTA_WEBDAV_PORT: u16 = 9081;
+    const QUOTA_WEBDAV_ADDRESS: &str = "127.0.0.1:9081";
+    const QUOTA_LIMIT: u64 = 1_073_741_824; // 1 GiB
+    const OBJECT_CONTENT: &[u8] = b"Hello, WebDAV!";
+
+    let env = ProtocolTestEnvironment::new().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let admin_base_url = format!("http://{QUOTA_S3_ADDRESS}");
+
+    info!("Starting WebDAV server on {}", QUOTA_WEBDAV_ADDRESS);
+    let binary_path = rustfs_binary_path_with_features(Some("webdav"));
+    let mut server_command = Command::new(&binary_path);
+    server_command
+        .arg("--address")
+        .arg(QUOTA_S3_ADDRESS)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
+        .env("RUSTFS_WEBDAV_ENABLE", "true")
+        .env("RUSTFS_WEBDAV_ADDRESS", QUOTA_WEBDAV_ADDRESS)
+        .env("RUSTFS_WEBDAV_TLS_ENABLED", "false") // No TLS for testing
+        .arg(&env.temp_dir);
+    // Quota-mode reporting reads the data-usage scanner cache; run the scanner
+    // on a fast cycle so the uploaded object converges quickly.
+    for (key, value) in FAST_DATA_USAGE_SCANNER_ENV {
+        server_command.env(key, value);
+    }
+    let mut server_process = server_command.spawn()?;
+
+    // Ensure server is cleaned up even on failure
+    let result = async {
+        ProtocolTestEnvironment::wait_for_port_ready(QUOTA_WEBDAV_PORT, 30)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        let client = create_client();
+        let auth_header = basic_auth_header();
+        let base_url = format!("http://{QUOTA_WEBDAV_ADDRESS}");
+
+        // Phase A: physical-capacity fallback (a visible bucket has no quota)
+        info!("Testing WebDAV quota: fallback to physical capacity without bucket quotas");
+        let phase_a_bucket = "quota-fallback-probe";
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL").expect("MKCOL is a valid HTTP method"),
+                format!("{base_url}/{phase_a_bucket}"),
+            )
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success(),
+            "MKCOL '{phase_a_bucket}' should succeed, got: {}",
+            resp.status()
+        );
+
+        // Storage info may briefly report zero capacity right after startup
+        // (disks still initializing), which omits the quota properties; poll
+        // until they appear.
+        let phase_a_deadline = Instant::now() + Duration::from_secs(30);
+        let (available, _used) = loop {
+            match propfind_root_quota(&client, &base_url, &auth_header).await {
+                Ok(quota) => break quota,
+                Err(e) if Instant::now() < phase_a_deadline => {
+                    info!("quota properties not reported yet, retrying: {e}");
+                    sleep(Duration::from_secs(1)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        assert!(
+            available > 0,
+            "physical-capacity fallback should report positive quota-available-bytes, got: {available}"
+        );
+        info!("PASS: quota fallback reports physical capacity (available={available})");
+
+        let resp = client
+            .delete(format!("{base_url}/{phase_a_bucket}"))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 204,
+            "DELETE bucket '{phase_a_bucket}' should succeed, got: {}",
+            resp.status()
+        );
+
+        // Phase B: every visible bucket has a HARD quota -> summed usage/quota
+        info!("Testing WebDAV quota: summed bucket quota reporting");
+        let bucket = "quota-probe";
+        let object = "hello.txt";
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"MKCOL").expect("MKCOL is a valid HTTP method"),
+                format!("{base_url}/{bucket}"),
+            )
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(resp.status().is_success(), "MKCOL '{bucket}' should succeed, got: {}", resp.status());
+
+        let resp = client
+            .put(format!("{base_url}/{bucket}/{object}"))
+            .header("Authorization", &auth_header)
+            .body(OBJECT_CONTENT)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 201,
+            "PUT '{bucket}/{object}' should succeed, got: {}",
+            resp.status()
+        );
+
+        set_bucket_quota_with_retry(&admin_base_url, bucket, QUOTA_LIMIT).await?;
+
+        // The usage cache trails the scanner; poll PROPFIND until the uploaded
+        // object is reflected (before convergence the missing usage counts as 0).
+        let expected_used = OBJECT_CONTENT.len() as u64;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (available, used) = loop {
+            let (available, used) = propfind_root_quota(&client, &base_url, &auth_header).await?;
+            if used == expected_used {
+                break (available, used);
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "quota-used-bytes did not converge to {expected_used} within 60 seconds (last: used={used} available={available})"
+                );
+            }
+            sleep(Duration::from_secs(2)).await;
+        };
+        assert_eq!(
+            available,
+            QUOTA_LIMIT - expected_used,
+            "quota-available-bytes should be the remaining quota"
+        );
+        info!("PASS: summed quota reporting converged (used={used}, available={available})");
+
+        // Cleanup
+        let resp = client
+            .delete(format!("{base_url}/{bucket}/{object}"))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 204,
+            "DELETE '{bucket}/{object}' should succeed, got: {}",
+            resp.status()
+        );
+        let resp = client
+            .delete(format!("{base_url}/{bucket}"))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert!(
+            resp.status().is_success() || resp.status().as_u16() == 204,
+            "DELETE bucket '{bucket}' should succeed, got: {}",
+            resp.status()
+        );
+
+        info!("WebDAV quota reporting tests passed");
+        Ok(())
+    }
+    .await;
+
+    // Always cleanup server process
+    let _ = server_process.kill().await;
+    let _ = server_process.wait().await;
+
+    result
+}
+
+#[tokio::test]
+async fn test_webdav_quota_reporting_direct() -> Result<()> {
+    test_webdav_quota_reporting().await
 }

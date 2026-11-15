@@ -62,6 +62,51 @@ Current guidance:
 - `RUSTFS_CORS_ALLOWED_ORIGINS` defaults to empty, so the S3 endpoint emits no generic CORS headers unless configured. Set `*` for wildcard origins without credentials, or a comma-separated allow-list for credentialed explicit origins.
 - `RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS` defaults to `*` for the console service.
 
+## Console URL prefix
+
+`RUSTFS_CONSOLE_PREFIX` changes the embedded console URL prefix. The default is
+`/rustfs/console`. For example, `RUSTFS_CONSOLE_PREFIX=/console` serves the UI at
+`http://localhost:9001/console/`. Nested prefixes such as `/management/console`
+are supported; one trailing slash is removed. Restart the server after changing it.
+
+The prefix must be a non-root absolute path of at most 256 bytes, with nonempty
+segments containing only ASCII letters, digits, `-`, `_`, `.`, or `~`. Dot
+segments, encoded characters, and overlaps with reserved admin, RPC, health,
+profiling, browser entry, and icon routes are rejected at startup. `/` is not supported.
+Choose a prefix that does not collide with S3 bucket paths.
+
+The console routes, embedded frontend asset URLs, browser redirects, and OIDC
+console redirects use this prefix. Admin API paths and the identity provider's
+`/rustfs/admin/v3/oidc/callback/...` URL remain unchanged. `RUSTFS_CONSOLE_ADDRESS`
+continues to control only the listening address and port. The server adapts bundled
+console asset references from their build-time base path to the runtime prefix.
+
+OEM builds can set `RUSTFS_CONSOLE_BASE_PATH` when compiling RustFS to embed a
+different default, such as `/nuofans/console`. Build the bundled console with the
+same `NEXT_PUBLIC_BASE_PATH`. An unset or empty build variable retains
+`/rustfs/console`. The build path must satisfy the validation rules above and must
+not have a trailing slash.
+
+At startup, `RUSTFS_CONSOLE_PREFIX` takes precedence over the compiled default.
+Changing `RUSTFS_CONSOLE_BASE_PATH` when starting an existing binary has no effect;
+rebuild both components to change the embedded default. If a runtime prefix is
+configured, asset adaptation uses the compiled base path as its source, including
+when restoring `/rustfs/console` for a custom OEM build.
+
+## Browser redirect environment variables
+
+- `RUSTFS_BROWSER_REDIRECT_URL` sets the externally reachable browser origin used for OIDC callback, console success redirect, and logout fallback URLs. Configure it to the public scheme and authority without a path, for example `https://console.example.com`. In load-balancer deployments, keep OIDC authorize and callback requests on the same backend node because the in-flight OIDC `state` is local to the RustFS node.
+
+## S3 API environment variables
+
+- `RUSTFS_API_OBJECT_MAX_VERSIONS` caps the number of retained versions for a single object. It defaults to `9223372036854775807`, matching MinIO's practical-unlimited default. Set a positive integer to enforce a lower per-object metadata bound.
+- `RUSTFS_VEEAM_SOSAPI_ENABLE` serves Veeam SOSAPI `system.xml` and `capacity.xml` for an authenticated GET or HEAD of those exact bucket-root keys. It defaults to `true`. Explicit version reads use the normal object path. Capacity requests return `ServiceUnavailable` until the scanner publishes a complete snapshot certified for the current bucket incarnation and authoritative quota metadata can be read. Legacy or mixed-version snapshots without an incarnation proof cannot serve capacity until a compatible scanner publishes a certified snapshot. Capacity also returns `ServiceUnavailable` when cluster or disk observations are missing, stale, or degraded. Retry after scanner convergence and storage or metadata recovery. Capacity assumes shard paths have independent backing space; shared physical storage can make the estimate optimistic. Set the flag to `false` to restore the normal object path, including deletion of a real object previously stored at that key.
+- `MINIO_API_OBJECT_MAX_VERSIONS` is accepted as a compatibility alias when the canonical RustFS variable is not set.
+
+## Distributed endpoint locality
+
+- `RUSTFS_LOCAL_ENDPOINT_HOST` identifies this server's host in a distributed `RUSTFS_VOLUMES` topology without resolving every peer during startup. Set it to exactly one host, without a scheme, port, or path. It is accepted only for orchestrated URL topologies and must match at least one endpoint on the RustFS server port; invalid or unmatched values fail startup. Leave it unset to retain DNS-based locality discovery.
+
 ## Scanner environment aliases
 
 - `RUSTFS_SCANNER_SPEED` (canonical, also accepts `MINIO_SCANNER_SPEED`)
@@ -72,9 +117,46 @@ Current guidance:
 - `RUSTFS_DATA_SCANNER_START_DELAY_SECS` (deprecated alias for compatibility)
 - `RUSTFS_SCANNER_IDLE_MODE` (canonical)
 - `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` (canonical)
+- `RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_DURATION_SECS` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_OBJECTS` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_DIRECTORIES` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_ENTRIES` (canonical)
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_NAME_BYTES` (canonical)
+- `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` (canonical)
+- `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` (canonical)
+- `RUSTFS_SCANNER_WALKERS_PER_DISK` (canonical)
+
+Scanner cycle budget controls:
+
+- When `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` is unset, the finite default is 1800 seconds (30 minutes), matching the scanner benchmark guidance.
+- An explicit `0` preserves the compatibility behavior of an unbounded runtime budget. Object and directory budgets likewise remain unbounded when explicitly set to `0`.
+
+Scanner bucket quantum controls:
+
+- `RUSTFS_SCANNER_BUCKET_QUANTUM_DURATION_SECS`, `RUSTFS_SCANNER_BUCKET_QUANTUM_OBJECTS`, `RUSTFS_SCANNER_BUCKET_QUANTUM_DIRECTORIES`, `RUSTFS_SCANNER_BUCKET_QUANTUM_ENTRIES`, and `RUSTFS_SCANNER_BUCKET_QUANTUM_NAME_BYTES` cap one bucket admission. Their persistent keys are `scanner.bucket_quantum_duration`, `scanner.bucket_quantum_objects`, `scanner.bucket_quantum_directories`, `scanner.bucket_quantum_entries`, and `scanner.bucket_quantum_name_bytes`; duration is in whole seconds and the remaining keys are work counts or bytes.
+- All five defaults are `0` for controlled rollout. A positive value enables that dimension; `0` disables that dimension, and all five zero values disable the bucket quantum. Parent cycle limits remain in force. Invalid unsigned integers and durations outside the platform timer range are rejected; environment overrides take precedence but cannot hide invalid persisted values. Admin scanner status reports each effective value and source under `runtime_config.bucket_quantum_*`, using `bucket_quantum_duration_seconds` for duration.
+- Disabled defaults are an initial rollout state, not completion of usage-convergence acceptance. Production defaults require matched-topology A/B measurements and the remote progress/fairness checks in [Scanner runtime controls](../../docs/operations/scanner-runtime-controls.md#bucket-quantum-rollout-and-acceptance). These controls do not certify partial usage or acknowledge pending dirty work.
+
+Scanner recovery retry controls:
+
+- `RUSTFS_SCANNER_RECOVERY_BACKOFF_CAP_SECS` caps the wait between automatic startup recovery retries. The persistent admin key is `scanner.recovery_backoff_cap`; the environment takes precedence over the persistent value, and the unset default remains 600 seconds (10 minutes). Values must be positive integer seconds within the platform timer range; `0`, malformed values, and overflow are rejected. A valid environment override does not hide an invalid persistent value from `admin config set` validation.
+- The cap bounds the existing exponential retry schedule. Updating the persistent value applies to the next computed retry; it does not reschedule a wait already in progress. Retryable observations continue retrying after the short retry budget. Admin scanner status reports the effective value and source at `runtime_config.recovery_backoff_cap_seconds`.
+
+Scanner walker controls:
+
+- `RUSTFS_SCANNER_WALKERS_PER_DISK` sets how many bucket walkers each local disk of an erasure set runs; the default `1` walks one bucket per disk at a time, which is the right value for rotational media. On flash, `2` to `4` lets one disk walk several buckets concurrently, which matters most for single-disk deployments with many buckets, where the walk is otherwise fully serial. Values outside `1` through `16` are rejected by `admin config set`; an out-of-range or non-numeric environment value is logged as a scanner runtime config error (`state = "startup_apply_failed"`) and the scanner keeps the default. The walkers of one disk share that disk's scanner admission, so peers still see one scan session per physical disk, and `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` still caps the total.
+- The same value is available as the persistent `scanner.walkers_per_disk` key and is reported under `runtime_config.walkers_per_disk` in the admin scanner status; see [Scanner Runtime Controls](../../docs/operations/scanner-runtime-controls.md).
+
+- A timed-out cycle cancels cooperative scanner work, then fences its leader epoch before releasing the lease. An uncooperative I/O operation is dropped after the bounded shutdown window; its cursor is not claimed to be durable and the scanner reports `recovery-required` when the worker cannot stop cooperatively, the cycle state was not confirmed durable, or epoch fencing cannot be persisted.
+
+## Mmap read environment aliases
+
+- `RUSTFS_OBJECT_MMAP_READ_ENABLE` (canonical)
+- `RUSTFS_OBJECT_ZERO_COPY_ENABLE` (deprecated alias for compatibility)
 
 ## Health compatibility switches
 
@@ -84,6 +166,14 @@ Current guidance:
   - enables minimal payload mode for GET health responses (`status`, `ready` only).
 - `RUSTFS_HEALTH_READINESS_CACHE_TTL_MS`
   - TTL for readiness cache evaluation.
+- `RUSTFS_HEALTH_OBJECT_PROGRESS_ENABLE`
+  - withdraws readiness when bounded object read/write stages stop completing while requests remain active.
+  - default is `true`.
+- `RUSTFS_HEALTH_OBJECT_PROGRESS_TIMEOUT_MS`
+  - maximum time without completion in a bounded object stage before readiness is withdrawn.
+  - default is `30000`; `0` uses the default.
+  - the effective value is at least 5 seconds longer than `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT`.
+  - this readiness SLO is independent of disk read/write failure deadlines and may withdraw traffic before those deadlines expire.
 - `RUSTFS_HEALTH_COMPAT_BUSY_CHECK_ENABLE`
   - enables busy protection behavior for health probes.
   - default is `false`.
@@ -93,6 +183,74 @@ Current guidance:
 - `RUSTFS_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE`
   - enables KMS readiness enforcement for `/health/ready`.
   - default is `false`.
+
+## Object lock admission environment variables
+
+- `RUSTFS_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS`
+  - experimental same-object PUT commit namespace-lock admission budget.
+  - default is `0`, which disables this override and keeps `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT` behavior.
+  - when set, only `put_object_commit` write-lock acquisition is bounded by this millisecond budget; other namespace lock users keep the global object-lock timeout.
+  - timeout returns S3 `SlowDown`, so clients should use normal SDK retry handling.
+  - this is not a fdatasync or group-commit switch. Track fdatasync batching separately with `rustfs_s3_put_object_rename_fdatasync_batch_files`.
+
+## Foreground write admission environment variables
+
+Large direct `PutObject` requests, multipart `UploadPart` requests, and
+server-side multipart `UploadPartCopy` requests share one per-process permit
+pool that bounds concurrent body ingest and storage writes. Small direct PUTs
+stay on the legacy path.
+
+- `RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE`
+  - enables the default-on pool; `false` keeps only the soft request counter.
+  - default is `true`.
+- `RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT`
+  - a positive value is an exact request-count limit shared by all gated writes.
+  - default is `0`: derive half of `RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS`, clamped to `32`, as large-write slots. Each slot has eight units. A gated direct PUT or unknown-size multipart part uses eight units; known-size parts use one unit per 8 MiB, rounded up, with a minimum of one and maximum of eight.
+  - stock settings therefore share 256 units across at most 32 large/unknown writes or 256 parts of up to 8 MiB. Mixed sizes consume the same budget. Admitted known parts of up to 64 MiB total at most 2 GiB of declared payload; larger streaming writes and queued bodies are separate. This is not a bound on total process or kernel memory.
+  - admission snapshots report allocated or reserved units in `active` and the unit budget in `limit` under automatic sizing. Explicit and strict limits still report request-count permits.
+- `RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES`
+  - smallest direct `PutObject` that takes a permit; unknown-size requests always do.
+  - default is `33554432` (32 MiB).
+- `RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS`
+  - how long a direct `PutObject` waits for a permit before returning S3 `SlowDown`.
+  - default is `250`.
+- `RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES`
+  - smallest `UploadPart` that takes a permit; `0` gates every part.
+  - default is `0`.
+- `RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS`
+  - how long an `UploadPart` or `UploadPartCopy` waits in the bounded queue for a permit before returning S3 `SlowDown`; `0` rejects immediately when the pool is full.
+  - default is `10000`. Parts wait before body ingest or source-object reads, so SDK-default clients that send every part of an upload concurrently drain through the pool instead of failing on a full pool.
+  - RustFS does not read the request body while a part is queued, so the client's socket write stalls for the whole wait and whatever timeout the client or an intermediary has configured competes with this value. `UploadPartCopy` waits before taking bucket lifecycle locks or opening source readers, and uses the unknown-size weight because the authoritative copy length is available only after source metadata and range validation. Keep the wait with margin below the shortest client/proxy timeout in use (botocore applies its 60 s `connect_timeout` to the body write; the AWS SDK for Java v2 has a 30 s socket write timeout; reverse proxies add their own body timeouts); a wait that outlives the client timeout surfaces as a dropped connection instead of `SlowDown`.
+- `RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING`
+  - maximum `UploadPart` and `UploadPartCopy` requests waiting for a permit at once; parts beyond it return `SlowDown` without waiting.
+  - default is `0`, which derives 16 times the large-write slot count, or the explicit request-count limit (512 at stock settings). Automatic subdivision does not enlarge this queue.
+  - each queued HTTP/1 part holds whatever unread body the client already pushed into the connection's kernel receive buffer (an HTTP/2 part holds up to its flow-control window in process memory). Autotuned receive buffers can remain large on reused connections; queue depth does not imply a fixed per-connection memory cost.
+- `RUSTFS_PUT_FOREGROUND_ADMISSION_ENABLE`, `RUSTFS_PUT_FOREGROUND_ADMISSION_LIMIT`, `RUSTFS_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS`
+  - experimental strict gate that applies to every foreground write regardless of size and replaces the pool above when enabled.
+  - default is disabled; enabling it with limit `0` disables foreground write admission entirely.
+
+## HTTP listener socket environment variables
+
+- `RUSTFS_HTTP_SOCKET_RECV_BUFFER_BYTES`
+  - fixed `SO_RCVBUF` for the API listener, inherited by every accepted socket; `0` leaves the receive buffer to kernel autotuning.
+  - default is `0`. A fixed buffer disables receive autotuning. Linux doubles the requested value for socket-memory accounting, subject to kernel limits; that capacity is not a measurement of queued payload or allocated memory.
+  - with autotuning the receive ceiling is controlled by the kernel (`net.ipv4.tcp_rmem` on Linux); its defaults vary with kernel version and memory. A connection can retain a buffer enlarged by previous requests while its next request is queued. Tune the kernel ceiling first, and set this variable only on kernels without receive-buffer autotuning (illumos/Solaris) or where the sysctl cannot be changed.
+  - the send buffer remains fixed at 4 MiB; this setting only controls the receive side.
+
+## Remote tier timeout environment variables
+
+- `RUSTFS_TIER_REMOTE_CONNECT_TIMEOUT_SECS`
+  - remote tier TCP connect timeout.
+  - default is `10`.
+  - must be positive; zero fails tier client initialization, while an invalid integer is logged and falls back to the default.
+- `RUSTFS_TIER_REMOTE_REQUEST_TIMEOUT_SECS`
+  - remote tier request timeout through response headers.
+  - default is `86400` so large transition uploads keep a production-safe budget.
+  - must be positive; zero fails tier client initialization, while an invalid integer is logged and falls back to the default. Very large values are accepted and act as a correspondingly long budget.
+- `RUSTFS_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS`
+  - maximum idle time between remote tier response-body chunks.
+  - default is `60`; the timer resets only when non-empty body data keeps progressing.
+  - must be positive; zero fails tier client initialization, while an invalid integer is logged and falls back to the default.
 
 ## Drive timeout environment variables
 
@@ -114,11 +272,27 @@ Drive timeout health-action policy:
 Drive timeout profile preset:
 - `RUSTFS_DRIVE_TIMEOUT_PROFILE`
   - `default` (default): keep current timeout defaults.
-  - `high_latency`: use 60s default timeout for scanner-sensitive operations when no per-operation timeout override is set (`read_metadata`, `disk_info`, `list_dir`, `walk_dir`, `walk_dir_stall`).
+  - `high_latency`: use 60s default timeout for scanner-sensitive operations when no operation-specific override is set (`read_metadata`, `disk_info`, `list_dir`, `walk_dir`, `walk_dir_stall`, and object-capacity scan base/maximum budgets).
 - Precedence:
   - Explicit per-operation timeout env (`RUSTFS_DRIVE_*_TIMEOUT_SECS`) takes highest precedence.
+  - Explicit object-capacity timeout env (`RUSTFS_CAPACITY_STAT_TIMEOUT`, `RUSTFS_CAPACITY_MAX_TIMEOUT`) takes precedence for capacity scans.
   - Then `RUSTFS_DRIVE_MAX_TIMEOUT_DURATION` legacy fallback.
   - Then the profile-derived default (`default` or `high_latency`).
+
+## Admin peer probe timeout
+
+- `RUSTFS_ADMIN_PEER_PROBE_TIMEOUT_SECS`
+  - total per-peer budget for the `server_info`/`storage_info` admin probe round; `server_info` may reconnect once and `storage_info` remains a single attempt.
+  - default is `10` seconds, preserving the previous two-attempt worst-case budget.
+  - values must be positive; `0` or an invalid value falls back to the default, and values above `60` are clamped to `60`.
+  - the setting is read by the aggregating node only; it does not change the internode RPC wire contract. Any retry shares one round deadline rather than receiving a fresh timeout.
+
+## Target queue directory
+
+- `RUSTFS_TARGET_STORE_DIR`
+  - absolute root for notify and audit target queues whose `queue_dir` is the default `/opt/rustfs/events` or `/opt/rustfs/audit`; they open `<root>/events` and `<root>/audit` on this node.
+  - unset keeps those paths on Linux and macOS; native Windows uses `%ProgramData%\RustFS\events` and `%ProgramData%\RustFS\audit`.
+  - explicit `queue_dir` values are never relocated, and the persisted target configuration is unchanged. Changing the root does not migrate pending entries. See `docs/operations/target-queue-storage.md`.
 
 ## Startup filesystem boundary policy
 
@@ -126,7 +300,9 @@ Drive timeout profile preset:
   - `warn` (default): log warning and continue startup.
   - `fail`: abort startup with an error.
 
-RustFS production guidance remains direct-attached local POSIX filesystems. Network-mounted filesystems (for example `nfs`, `cifs`, `smb2`, and `fuse.*`) are treated as unsupported by this startup guard.
+RustFS production guidance remains direct-attached local POSIX filesystems. Network-mounted filesystems (for example `nfs`, `cifs`, `smb2`, and `fuse.*`) are treated as unsupported by this startup guard. On Windows, endpoints on network drives (UNC shares such as `\\server\share` and mapped drive letters) are treated the same way, even though Windows reports the server's filesystem (usually `NTFS`) for them.
+
+A local POSIX filesystem bind-mounted into a gVisor sandbox with directfs is a supported storage path. gVisor presents that bind mount as `9p`/`V9FS`, so the host filesystem type is not visible; the startup guard recognizes mountinfo options `trans=fd` and `directfs` and does not treat the mount as unsupported. Genuine 9p, virtio, and NFS shares remain unsupported.
 
 ## 📄 License
 

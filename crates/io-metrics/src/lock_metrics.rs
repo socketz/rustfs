@@ -62,6 +62,79 @@ pub fn record_contention_event() {
     counter!("rustfs_lock_contentions").increment(1);
 }
 
+/// Record a failed object namespace lock acquisition with bounded labels.
+#[inline(always)]
+pub fn record_object_lock_acquire_failure(
+    op: &'static str,
+    mode: &'static str,
+    resource_class: &'static str,
+    reason: &'static str,
+) {
+    use metrics::counter;
+    counter!(
+        "rustfs_object_lock_acquire_failures_total",
+        "op" => op,
+        "mode" => mode,
+        "resource_class" => resource_class,
+        "reason" => reason
+    )
+    .increment(1);
+}
+
+/// Record a remote lock RPC that exceeded its caller's deadline.
+#[inline(always)]
+pub fn record_remote_lock_rpc_timeout(peer: &str, op: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_rpc_timeouts_total", "peer" => peer.to_string(), "op" => op).increment(1);
+}
+
+/// Record a lock acquisition rejected by the per-peer request breaker or
+/// in-flight admission limit.
+#[inline(always)]
+pub fn record_remote_lock_request_suppressed(peer: &str, op: &'static str, reason: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_request_suppressed_total", "peer" => peer.to_string(), "op" => op, "reason" => reason)
+        .increment(1);
+}
+
+/// Record the cached lock channel to `peer` being evicted after an RPC failure.
+#[inline(always)]
+pub fn record_remote_lock_channel_eviction(peer: &str, trigger: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_channel_evictions_total", "peer" => peer.to_string(), "trigger" => trigger).increment(1);
+}
+
+/// Record an RPC failure that did not evict the cached lock channel to `peer`
+/// because the peer recently served a request or was re-dialed too recently.
+#[inline(always)]
+pub fn record_remote_lock_channel_eviction_suppressed(peer: &str, verdict: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_channel_evictions_suppressed_total", "peer" => peer.to_string(), "verdict" => verdict)
+        .increment(1);
+}
+
+/// Record a timed-out lock RPC that was left running (`detached`) or cancelled
+/// because the per-peer detached budget was exhausted (`aborted`).
+#[inline(always)]
+pub fn record_remote_lock_rpc_detached(op: &'static str, outcome: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_rpc_detached_total", "op" => op, "outcome" => outcome).increment(1);
+}
+
+/// Record how a detached lock RPC eventually ended.
+#[inline(always)]
+pub fn record_remote_lock_rpc_late_completion(op: &'static str, outcome: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_rpc_late_completions_total", "op" => op, "outcome" => outcome).increment(1);
+}
+
+/// Record the release of a lock that was granted after its caller timed out.
+#[inline(always)]
+pub fn record_remote_lock_late_release(outcome: &'static str) {
+    use metrics::counter;
+    counter!("rustfs_remote_lock_late_releases_total", "outcome" => outcome).increment(1);
+}
+
 /// Record object namespace lock diagnostics being enabled.
 #[inline(always)]
 pub fn record_object_lock_diag_enabled(enabled: bool) {
@@ -163,6 +236,86 @@ impl LockMetricsSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replaces the per-helper smoke tests that called the record_* helpers
+    /// and asserted nothing: the calls (same literals) now run against a local
+    /// DebuggingRecorder and every metric name the helpers own must actually
+    /// be emitted (rustfs/backlog#1836 PR3).
+    #[test]
+    fn record_helpers_emit_their_metrics() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            record_lock_optimization_enabled(true);
+            record_lock_optimization_enabled(false);
+            record_spin_attempt(true);
+            record_spin_attempt(false);
+            record_spin_count_change(100);
+            record_spin_count_change(200);
+            record_lock_hold_time(Duration::from_millis(10));
+            record_lock_hold_time(Duration::from_millis(100));
+            record_early_release();
+            record_contention_event();
+            record_remote_lock_rpc_timeout("http://peer:9000", "lock");
+            record_remote_lock_request_suppressed("http://peer:9000", "lock", "breaker_open");
+            record_remote_lock_channel_eviction("http://peer:9000", "timeout");
+            record_remote_lock_channel_eviction_suppressed("http://peer:9000", "peer_recently_served");
+            record_remote_lock_rpc_detached("lock", "detached");
+            record_remote_lock_rpc_late_completion("lock", "success");
+            record_remote_lock_late_release("released");
+            record_object_lock_acquire_failure("put_object_commit", "write", "system_metadata", "timeout");
+        });
+
+        let emitted: std::collections::HashSet<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite, _, _, _)| composite.key().name().to_string())
+            .collect();
+        for expected in [
+            "rustfs_lock_optimization_enabled",
+            "rustfs_lock_spin_successes",
+            "rustfs_lock_spin_failures",
+            "rustfs_lock_spin_count",
+            "rustfs_lock_hold_time_secs",
+            "rustfs_lock_early_releases",
+            "rustfs_lock_contentions",
+            "rustfs_remote_lock_rpc_timeouts_total",
+            "rustfs_remote_lock_request_suppressed_total",
+            "rustfs_remote_lock_channel_evictions_total",
+            "rustfs_remote_lock_channel_evictions_suppressed_total",
+            "rustfs_remote_lock_rpc_detached_total",
+            "rustfs_remote_lock_rpc_late_completions_total",
+            "rustfs_remote_lock_late_releases_total",
+            "rustfs_object_lock_acquire_failures_total",
+        ] {
+            assert!(emitted.contains(expected), "{expected} must be emitted by its record helper");
+        }
+    }
+
+    #[test]
+    fn object_lock_acquire_failure_metric_is_recorded_without_resource_labels() {
+        let recorder = SeenMetricsRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_object_lock_acquire_failure("put_object_commit", "write", "system_metadata", "timeout");
+        });
+
+        let keys = recorder.counters.lock().expect("counter keys should be lockable");
+        let key = keys
+            .iter()
+            .find(|key| key.name() == "rustfs_object_lock_acquire_failures_total")
+            .expect("object lock failure counter should be emitted");
+        let labels = key.labels().map(|label| (label.key(), label.value())).collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                ("op", "put_object_commit"),
+                ("mode", "write"),
+                ("resource_class", "system_metadata"),
+                ("reason", "timeout"),
+            ]
+        );
+    }
     use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
     use std::sync::{Arc, Mutex};
 
@@ -253,40 +406,6 @@ mod tests {
 
     impl HistogramFn for NoopHistogram {
         fn record(&self, _value: f64) {}
-    }
-
-    #[test]
-    fn test_record_lock_optimization_enabled() {
-        record_lock_optimization_enabled(true);
-        record_lock_optimization_enabled(false);
-    }
-
-    #[test]
-    fn test_record_spin_attempt() {
-        record_spin_attempt(true);
-        record_spin_attempt(false);
-    }
-
-    #[test]
-    fn test_record_spin_count_change() {
-        record_spin_count_change(100);
-        record_spin_count_change(200);
-    }
-
-    #[test]
-    fn test_record_lock_hold_time() {
-        record_lock_hold_time(Duration::from_millis(10));
-        record_lock_hold_time(Duration::from_millis(100));
-    }
-
-    #[test]
-    fn test_record_early_release() {
-        record_early_release();
-    }
-
-    #[test]
-    fn test_record_contention_event() {
-        record_contention_event();
     }
 
     #[test]

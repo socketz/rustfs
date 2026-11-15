@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::target::REDACTED_SECRET;
 use hashbrown::HashMap;
 use hyper::HeaderMap;
 use regex::Regex;
-use s3s::{S3Request, S3Response};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::Path;
@@ -23,7 +23,31 @@ use std::sync::LazyLock;
 use thiserror::Error;
 use url::Url;
 
-static HOST_LABEL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$").unwrap());
+/// Request headers whose values carry credentials or session tokens and must
+/// never be serialized verbatim into audit/notification entries, which are
+/// forwarded to external sinks (webhook/kafka/file/...). Matched
+/// case-insensitively; hyper lowercases header names, but we normalize
+/// defensively so this stays correct for any caller.
+const SENSITIVE_HEADERS: &[&str] = &[
+    "authorization",
+    "x-amz-security-token",
+    "x-amz-content-sha256",
+    "x-amz-server-side-encryption-customer-key",
+    "x-amz-server-side-encryption-customer-key-md5",
+    "x-amz-copy-source-server-side-encryption-customer-key",
+    "x-amz-copy-source-server-side-encryption-customer-key-md5",
+    "cookie",
+    "set-cookie",
+];
+
+/// Returns true when the header name is credential-bearing and its value must
+/// be redacted before leaving the process.
+fn is_sensitive_header(name: &str) -> bool {
+    SENSITIVE_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
+
+static HOST_LABEL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$").expect("operation should succeed"));
 
 /// NetError represents errors that can occur in network operations.
 #[derive(Error, Debug)]
@@ -68,11 +92,6 @@ impl std::fmt::Display for Host {
     }
 }
 
-/// Extract request parameters from S3Request, mainly header information.
-pub fn extract_req_params<T>(req: &S3Request<T>) -> HashMap<String, String> {
-    extract_params_header(&req.headers)
-}
-
 /// Extract request parameters from hyper::HeaderMap, mainly header information.
 /// This function is useful when you have a raw HTTP request and need to extract parameters.
 #[deprecated(since = "0.1.0", note = "Use extract_params_header instead")]
@@ -81,19 +100,22 @@ pub fn extract_req_params_header(head: &HeaderMap) -> HashMap<String, String> {
 }
 
 /// Extract parameters from hyper::HeaderMap, mainly header information.
+///
+/// Credential-bearing headers (see [`SENSITIVE_HEADERS`]) are redacted: the
+/// header name is preserved for correlation, but its value is replaced with
+/// [`REDACTED_SECRET`] so secrets never reach downstream audit/notification
+/// sinks. Non-sensitive headers keep their existing behavior.
 pub fn extract_params_header(head: &HeaderMap) -> HashMap<String, String> {
     let mut params = HashMap::new();
     for (key, value) in head.iter() {
-        if let Ok(val_str) = value.to_str() {
-            params.insert(key.as_str().to_string(), val_str.to_string());
+        let name = key.as_str();
+        if is_sensitive_header(name) {
+            params.insert(name.to_string(), REDACTED_SECRET.to_string());
+        } else if let Ok(val_str) = value.to_str() {
+            params.insert(name.to_string(), val_str.to_string());
         }
     }
     params
-}
-
-/// Extract response elements from S3Response, mainly header information.
-pub fn extract_resp_elements<T>(resp: &S3Response<T>) -> HashMap<String, String> {
-    extract_params_header(&resp.headers)
 }
 
 /// Get host from header information.
@@ -332,7 +354,7 @@ impl<'de> serde::Deserialize<'de> for ParsedURL {
     {
         let s: String = serde::Deserialize::deserialize(deserializer)?;
         if s.is_empty() {
-            Ok(ParsedURL(Url::parse("about:blank").unwrap()))
+            Ok(ParsedURL(Url::parse("about:blank").expect("operation should succeed")))
         } else {
             parse_url(&s).map_err(serde::de::Error::custom)
         }
@@ -363,7 +385,7 @@ pub fn parse_url(s: &str) -> Result<ParsedURL, NetError> {
         });
 
         if !port_str.is_empty() {
-            let host_port = format!("{}:{}", uu.host_str().unwrap(), port_str);
+            let host_port = format!("{}:{}", uu.host_str().expect("operation should succeed"), port_str);
             parse_host(&host_port)?;
         }
     }
@@ -395,7 +417,6 @@ pub fn parse_url(s: &str) -> Result<ParsedURL, NetError> {
     Ok(ParsedURL(uu))
 }
 
-#[allow(dead_code)]
 pub fn parse_http_url(s: &str) -> Result<ParsedURL, NetError> {
     let u = parse_url(s)?;
     match u.0.scheme() {
@@ -404,7 +425,6 @@ pub fn parse_http_url(s: &str) -> Result<ParsedURL, NetError> {
     }
 }
 
-#[allow(dead_code)]
 pub fn is_network_or_host_down(err: &std::io::Error, expect_timeouts: bool) -> bool {
     if err.kind() == std::io::ErrorKind::TimedOut {
         return !expect_timeouts;
@@ -416,12 +436,10 @@ pub fn is_network_or_host_down(err: &std::io::Error, expect_timeouts: bool) -> b
         || err_str.contains("use of closed network connection")
 }
 
-#[allow(dead_code)]
 pub fn is_conn_reset_err(err: &std::io::Error) -> bool {
     err.to_string().contains("connection reset by peer") || matches!(err.raw_os_error(), Some(libc::ECONNRESET))
 }
 
-#[allow(dead_code)]
 pub fn is_conn_refused_err(err: &std::io::Error) -> bool {
     err.to_string().contains("connection refused") || matches!(err.raw_os_error(), Some(libc::ECONNREFUSED))
 }
@@ -430,6 +448,62 @@ pub fn is_conn_refused_err(err: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use hyper::header::HeaderValue;
+
+    #[test]
+    fn extract_params_header_redacts_credential_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("AWS4-HMAC-SHA256 Credential=AKIA.../secret"));
+        headers.insert("x-amz-security-token", HeaderValue::from_static("FQoGZXIvYXdzE.../session-token"));
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static("e3b0c44298fc1c149afbf4c8996fb924"));
+        headers.insert("x-amz-server-side-encryption-customer-key", HeaderValue::from_static("destination-key"));
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            HeaderValue::from_static("destination-key-md5"),
+        );
+        headers.insert(
+            "x-amz-copy-source-server-side-encryption-customer-key",
+            HeaderValue::from_static("source-key"),
+        );
+        headers.insert(
+            "x-amz-copy-source-server-side-encryption-customer-key-md5",
+            HeaderValue::from_static("source-key-md5"),
+        );
+        headers.insert("cookie", HeaderValue::from_static("session=abc123"));
+        headers.insert("content-type", HeaderValue::from_static("application/octet-stream"));
+        headers.insert("user-agent", HeaderValue::from_static("aws-cli/2.0"));
+
+        let params = extract_params_header(&headers);
+
+        // Sensitive headers keep their name for correlation but never leak the value.
+        for name in [
+            "authorization",
+            "x-amz-security-token",
+            "x-amz-content-sha256",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+            "x-amz-copy-source-server-side-encryption-customer-key",
+            "x-amz-copy-source-server-side-encryption-customer-key-md5",
+            "cookie",
+        ] {
+            assert_eq!(params.get(name).map(String::as_str), Some(REDACTED_SECRET), "{name} must be redacted");
+        }
+        // Non-sensitive headers are preserved verbatim.
+        assert_eq!(params.get("content-type").map(String::as_str), Some("application/octet-stream"));
+        assert_eq!(params.get("user-agent").map(String::as_str), Some("aws-cli/2.0"));
+    }
+
+    #[test]
+    fn is_sensitive_header_matches_case_insensitively() {
+        assert!(is_sensitive_header("Authorization"));
+        assert!(is_sensitive_header("X-Amz-Security-Token"));
+        assert!(is_sensitive_header("X-AMZ-CONTENT-SHA256"));
+        assert!(is_sensitive_header("X-Amz-Server-Side-Encryption-Customer-Key"));
+        assert!(is_sensitive_header("X-Amz-Server-Side-Encryption-Customer-Key-MD5"));
+        assert!(is_sensitive_header("X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key"));
+        assert!(is_sensitive_header("X-Amz-Copy-Source-Server-Side-Encryption-Customer-Key-MD5"));
+        assert!(!is_sensitive_header("content-type"));
+        assert!(!is_sensitive_header("x-amz-request-id"));
+    }
 
     #[test]
     fn test_get_request_port() {
@@ -485,7 +559,7 @@ mod tests {
     fn parse_host_with_valid_ipv4() {
         let result = parse_host("192.168.1.1:8080");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "192.168.1.1");
         assert_eq!(host.port, Some(8080));
     }
@@ -494,7 +568,7 @@ mod tests {
     fn parse_host_with_valid_hostname() {
         let result = parse_host("example.com:443");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "example.com");
         assert_eq!(host.port, Some(443));
     }
@@ -503,7 +577,7 @@ mod tests {
     fn parse_host_with_ipv6_brackets() {
         let result = parse_host("[::1]:8080");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "::1");
         assert_eq!(host.port, Some(8080));
     }
@@ -512,7 +586,7 @@ mod tests {
     fn parse_host_with_bare_ipv6_without_port() {
         let result = parse_host("::1");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "::1");
         assert_eq!(host.port, None);
     }
@@ -521,7 +595,7 @@ mod tests {
     fn parse_host_with_ipv6_zone_without_port() {
         let result = parse_host("fe80::1%eth0");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "fe80::1%eth0");
         assert_eq!(host.port, None);
     }
@@ -530,7 +604,7 @@ mod tests {
     fn parse_host_with_bracketed_ipv6_zone_and_port() {
         let result = parse_host("[fe80::1%eth0]:9000");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "fe80::1%eth0");
         assert_eq!(host.port, Some(9000));
     }
@@ -539,7 +613,7 @@ mod tests {
     fn parse_host_with_bracketed_ipv6_without_port() {
         let result = parse_host("[::1]");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "::1");
         assert_eq!(host.port, None);
     }
@@ -560,7 +634,7 @@ mod tests {
     fn parse_host_without_port() {
         let result = parse_host("example.com");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "example.com");
         assert_eq!(host.port, None);
     }
@@ -605,7 +679,7 @@ mod tests {
     fn parse_url_with_valid_http_url() {
         let result = parse_url("http://example.com/path");
         assert!(result.is_ok());
-        let parsed = result.unwrap();
+        let parsed = result.expect("operation should succeed");
         assert_eq!(parsed.hostname(), "example.com");
         assert_eq!(parsed.port(), "80");
         assert_eq!(parsed.scheme(), "http");
@@ -616,7 +690,7 @@ mod tests {
     fn parse_url_with_explicit_default_https_port() {
         let result = parse_url("https://example.com:443/path");
         assert!(result.is_ok());
-        let parsed = result.unwrap();
+        let parsed = result.expect("operation should succeed");
         assert_eq!(parsed.to_string(), "https://example.com/path");
     }
 
@@ -636,7 +710,7 @@ mod tests {
     fn parse_url_normalizes_path() {
         let result = parse_url("http://example.com//path/../path/");
         assert!(result.is_ok());
-        let parsed = result.unwrap();
+        let parsed = result.expect("operation should succeed");
         assert_eq!(parsed.to_string(), "http://example.com/path/");
     }
 }

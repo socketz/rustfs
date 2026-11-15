@@ -22,5 +22,4 @@ Applies to `crates/policy/`.
 
 ## Suggested Validation
 
-- `cargo test -p rustfs-policy`
-- Full gate before commit: `make pre-commit`
+- `cargo nextest run -p rustfs-policy --no-tests fail`, narrowed to the affected tests.

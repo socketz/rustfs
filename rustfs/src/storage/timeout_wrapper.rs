@@ -53,6 +53,8 @@
 //! }
 //! ```
 
+#[cfg(not(test))]
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -116,6 +118,19 @@ impl GetObjectTimeoutPolicy {
             min_timeout: Duration::from_secs(min_timeout_secs),
             max_timeout: Duration::from_secs(max_timeout_secs),
         }
+    }
+
+    /// Load the process-wide GetObject timeout policy once for hot request paths.
+    #[cfg(not(test))]
+    pub fn cached_from_env() -> Self {
+        static POLICY: OnceLock<GetObjectTimeoutPolicy> = OnceLock::new();
+        POLICY.get_or_init(Self::from_env).clone()
+    }
+
+    /// Load the GetObject timeout policy from the current test environment.
+    #[cfg(test)]
+    pub fn cached_from_env() -> Self {
+        Self::from_env()
     }
 
     /// Check if timeout is enabled (timeout > 0).
@@ -397,21 +412,21 @@ impl RequestTimeoutWrapper {
 
         debug!(timeout_secs = timeout_duration.as_secs(), "Starting timed operation");
 
-        rustfs_io_metrics::record_get_object_request_started();
+        rustfs_io_metrics::record_get_object_timeout_operation_start();
 
         let cancel_token_for_op = self.cancel_token.clone();
 
         match tokio::time::timeout(timeout_duration, operation(cancel_token_for_op)).await {
             Ok(Ok(result)) => {
                 let elapsed = self.elapsed();
-                rustfs_io_metrics::record_get_object_request_result("success", elapsed.as_secs_f64());
+                rustfs_io_metrics::record_get_object_timeout_operation_result("success", elapsed.as_secs_f64());
                 debug!(elapsed_ms = elapsed.as_millis(), "Operation completed successfully");
 
                 TimedGetObjectResult::Success(result)
             }
             Ok(Err(e)) => {
                 let elapsed = self.elapsed();
-                rustfs_io_metrics::record_get_object_request_result("error", elapsed.as_secs_f64());
+                rustfs_io_metrics::record_get_object_timeout_operation_result("error", elapsed.as_secs_f64());
                 debug!(elapsed_ms = elapsed.as_millis(), "Operation failed with error");
 
                 TimedGetObjectResult::Error(e)
@@ -421,7 +436,7 @@ impl RequestTimeoutWrapper {
                 self.cancel_token.cancel();
 
                 rustfs_io_metrics::record_get_object_timeout(None, Some(elapsed.as_secs_f64()));
-                rustfs_io_metrics::record_get_object_request_result("timeout", elapsed.as_secs_f64());
+                rustfs_io_metrics::record_get_object_timeout_operation_result("timeout", elapsed.as_secs_f64());
 
                 warn!(
                     timeout_secs = timeout_duration.as_secs(),
@@ -462,14 +477,39 @@ pub fn get_io_buffer_size() -> usize {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::{
+        GetObjectTimeoutPolicy, RequestTimeoutWrapper, TimedGetObjectResult, get_duplex_buffer_size, get_io_buffer_size,
+    };
     use std::time::Duration;
 
     #[test]
     fn test_timeout_config_default() {
         let config = GetObjectTimeoutPolicy::default();
         assert_eq!(config.get_object_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_cached_timeout_config_is_stable() {
+        let first = GetObjectTimeoutPolicy::cached_from_env();
+        let second = GetObjectTimeoutPolicy::cached_from_env();
+
+        assert_eq!(first.get_object_timeout, second.get_object_timeout);
+        assert_eq!(first.enable_dynamic_timeout, second.enable_dynamic_timeout);
+        assert_eq!(first.bytes_per_second, second.bytes_per_second);
+        assert_eq!(first.min_timeout, second.min_timeout);
+        assert_eq!(first.max_timeout, second.max_timeout);
+    }
+
+    #[test]
+    fn test_cached_timeout_config_honors_test_env_overrides() {
+        temp_env::with_var(rustfs_config::ENV_OBJECT_GET_TIMEOUT, Some("7"), || {
+            assert_eq!(GetObjectTimeoutPolicy::cached_from_env().get_object_timeout, Duration::from_secs(7));
+        });
+        temp_env::with_var(rustfs_config::ENV_OBJECT_GET_TIMEOUT, Some("11"), || {
+            assert_eq!(GetObjectTimeoutPolicy::cached_from_env().get_object_timeout, Duration::from_secs(11));
+        });
     }
 
     #[test]

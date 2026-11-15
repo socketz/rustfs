@@ -1,0 +1,1243 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use crate::{Error, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncReadExt as _;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tracing::{debug, info, warn};
+
+mod integrity;
+mod validation;
+use integrity::CheckpointJson;
+
+use super::super::storage_api::owner::{EcstoreConditionalFileUpdate, EcstoreDiskAPI, EcstoreDiskBytes};
+use super::super::{BUCKET_META_PREFIX, DiskStore, HealDiskExt, RUSTFS_META_BUCKET};
+use super::{
+    LOG_COMPONENT_HEAL, LOG_SUBSYSTEM_RESUME, PersistThrottle, RESUME_CHECKPOINT_BLOCKED_FILE, RESUME_CHECKPOINT_FILE,
+    dangling_delete_deadline_is_representable, delete_resume_file, path_to_str, validate_resume_task_id,
+};
+
+const EVENT_HEAL_CHECKPOINT_STATE: &str = "heal_checkpoint_state";
+const RESUME_CHECKPOINT_DIGEST_FILE: &str = "ahm_checkpoint.sha256";
+const BLOCKED_CHECKPOINT_MARKER_SCHEMA: u32 = 1;
+/// A blocked snapshot is re-read with the current reader at most this often.
+const BLOCKED_CHECKPOINT_REVALIDATION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const BLOCKED_CHECKPOINT_MARKER_MAX_BYTES: usize = 4 * 1024;
+
+/// Content of `<task>_ahm_checkpoint.blocked`. Older binaries wrote the
+/// literal `blocked` and treat any content as blocked, so this record only
+/// adds the revalidation schedule for the current reader.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BlockedCheckpointMarker {
+    schema: u32,
+    blocked_at: u64,
+    revalidate_after: u64,
+    reason: String,
+}
+
+impl BlockedCheckpointMarker {
+    fn new(now: u64, reason: &str) -> Self {
+        Self {
+            schema: BLOCKED_CHECKPOINT_MARKER_SCHEMA,
+            blocked_at: now,
+            revalidate_after: now.saturating_add(BLOCKED_CHECKPOINT_REVALIDATION_INTERVAL.as_secs()),
+            reason: reason.chars().take(512).collect(),
+        }
+    }
+
+    /// A legacy or unreadable marker is due immediately; it was written by a
+    /// reader that could not schedule its own revalidation.
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > BLOCKED_CHECKPOINT_MARKER_MAX_BYTES {
+            return None;
+        }
+        serde_json::from_slice::<Self>(bytes)
+            .ok()
+            .filter(|marker| marker.schema == BLOCKED_CHECKPOINT_MARKER_SCHEMA)
+    }
+
+    fn encode(&self) -> Result<EcstoreDiskBytes> {
+        serde_json::to_vec(self)
+            .map(EcstoreDiskBytes::from)
+            .map_err(|error| Error::Serialization(format!("Serialize blocked checkpoint marker: {error}")))
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+const CHECKPOINT_PER_VERSION_SCHEMA: u32 = 7;
+
+/// Current on-disk schema version for `ResumeCheckpoint`. Schema 5 could
+/// persist incomplete counters; schema 6 could acknowledge null as latest.
+/// Discard those positions and dedup identities and replay the scan.
+pub(super) const CURRENT_CHECKPOINT_SCHEMA: u32 = 7;
+const ADMIN_CHECKPOINT_SCHEMA: u32 = 8;
+
+#[derive(Debug, Clone, Copy)]
+pub enum CheckpointObjectOutcome {
+    Processed,
+    Failed,
+    Skipped,
+    DeferredDanglingDelete { retry_not_before: u64 },
+}
+
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Debug)]
+pub struct CheckpointObjectOutcomeRecord {
+    pub object: String,
+    pub outcome: CheckpointObjectOutcome,
+    pub successful: u64,
+    pub failed: u64,
+    pub skipped: u64,
+    pub bytes: u64,
+    pub skipped_new_versions: u64,
+    pub skipped_ilm_expired: u64,
+    pub counter_unknown: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdminErasureCheckpoint {
+    pub set_disk_id: String,
+    pub options: rustfs_heal_contracts::heal_channel::HealOpts,
+    pub buckets: std::collections::BTreeMap<String, Option<uuid::Uuid>>,
+    pub outcome: crate::heal::outcome::HealTaskOutcome,
+    pub completed: bool,
+}
+
+impl AdminErasureCheckpoint {
+    pub(crate) fn validate_scope(
+        &self,
+        set_disk_id: &str,
+        options: &rustfs_heal_contracts::heal_channel::HealOpts,
+    ) -> Result<()> {
+        let current = serde_json::to_value(options).map_err(|e| Error::InvalidCheckpoint(e.to_string()))?;
+        let saved = serde_json::to_value(self.options).map_err(|e| Error::InvalidCheckpoint(e.to_string()))?;
+        if self.set_disk_id != set_disk_id || current != saved {
+            return Err(Error::InvalidCheckpoint("Administrator checkpoint scope changed".to_string()));
+        }
+        if self.buckets.values().any(|id| {
+            if options.dry_run {
+                id.is_some()
+            } else {
+                id.is_none_or(|id| id.is_nil())
+            }
+        }) {
+            return Err(Error::InvalidCheckpoint(
+                "Administrator checkpoint lacks a bucket incarnation".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Lightweight progress view for resume decisions. Omits the per-page object
+/// ledgers so callers do not clone a million-object checkpoint just to read
+/// counters and positions.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointProgressSnapshot {
+    pub current_bucket_index: usize,
+    pub current_object_index: usize,
+    pub successful_objects: u64,
+    pub failed_object_count: u64,
+    pub skipped_object_count: u64,
+    pub skipped_new_versions: u64,
+    pub skipped_ilm_expired: u64,
+    pub processed_bytes: u64,
+    pub total_objects: u64,
+    pub total_bytes: u64,
+    pub baseline_generation: Option<u64>,
+    pub baseline_known: bool,
+    pub counter_unknown: bool,
+}
+
+impl CheckpointProgressSnapshot {
+    pub fn has_progress(&self) -> bool {
+        self.baseline_known
+            || self.successful_objects > 0
+            || self.failed_object_count > 0
+            || self.skipped_object_count > 0
+            || self.skipped_new_versions > 0
+            || self.skipped_ilm_expired > 0
+            || self.processed_bytes > 0
+            || self.total_objects > 0
+            || self.total_bytes > 0
+            || self.baseline_generation.is_some()
+            || self.counter_unknown
+    }
+}
+
+/// resume checkpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeCheckpoint {
+    /// on-disk schema version; absent in legacy snapshots (defaults to 0)
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) admin: Option<AdminErasureCheckpoint>,
+    /// task id
+    pub task_id: String,
+    /// checkpoint time
+    pub checkpoint_time: u64,
+    /// current bucket index
+    pub current_bucket_index: usize,
+    /// current object index
+    pub current_object_index: usize,
+    /// Objects healed since the last completed page. HashSet: with the
+    /// previous Vec the per-object `contains` was O(n) and made large-bucket
+    /// heals O(N²). Only spans the in-flight page — completed pages are
+    /// covered by `current_object_index`, so `complete_page` prunes the sets.
+    pub processed_objects: HashSet<String>,
+    /// failed objects
+    pub failed_objects: HashSet<String>,
+    /// skipped objects
+    pub skipped_objects: HashSet<String>,
+    /// Aggregate object ledger counters restored alongside the dedup sets.
+    #[serde(default)]
+    pub successful_objects: u64,
+    #[serde(default)]
+    pub failed_object_count: u64,
+    #[serde(default)]
+    pub skipped_object_count: u64,
+    // Omit defaults to preserve the integrity digest of older checkpoints.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub dangling_delete_grace_objects: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dangling_delete_retry_not_before: Option<u64>,
+    #[serde(default)]
+    pub skipped_new_versions: u64,
+    #[serde(default)]
+    pub skipped_ilm_expired: u64,
+    #[serde(default)]
+    pub processed_bytes: u64,
+    #[serde(default)]
+    pub total_objects: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
+    pub baseline_generation: Option<u64>,
+    #[serde(default)]
+    pub baseline_known: bool,
+    /// Persistent telemetry fence for counter/byte overflow or corruption.
+    #[serde(default)]
+    pub counter_unknown: bool,
+    /// Integrity digest over the checkpoint with this field set to `None`.
+    /// Keeping it in the checkpoint makes the payload and its authentication
+    /// record one CAS generation instead of two independently-written files.
+    #[serde(default)]
+    pub integrity_digest: Option<String>,
+}
+
+impl ResumeCheckpoint {
+    pub fn new(task_id: String) -> Self {
+        Self {
+            schema_version: CURRENT_CHECKPOINT_SCHEMA,
+            admin: None,
+            task_id,
+            checkpoint_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            current_bucket_index: 0,
+            current_object_index: 0,
+            processed_objects: HashSet::new(),
+            failed_objects: HashSet::new(),
+            skipped_objects: HashSet::new(),
+            successful_objects: 0,
+            failed_object_count: 0,
+            skipped_object_count: 0,
+            dangling_delete_grace_objects: 0,
+            dangling_delete_retry_not_before: None,
+            skipped_new_versions: 0,
+            skipped_ilm_expired: 0,
+            processed_bytes: 0,
+            total_objects: 0,
+            total_bytes: 0,
+            baseline_generation: None,
+            baseline_known: false,
+            counter_unknown: false,
+            integrity_digest: None,
+        }
+    }
+
+    pub fn update_position(&mut self, bucket_index: usize, object_index: usize) {
+        self.current_bucket_index = bucket_index;
+        self.current_object_index = object_index;
+        self.checkpoint_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
+    pub fn add_processed_object(&mut self, object: String) {
+        self.processed_objects.insert(object);
+    }
+
+    pub fn add_failed_object(&mut self, object: String) {
+        self.failed_objects.insert(object);
+    }
+
+    pub fn add_skipped_object(&mut self, object: String) {
+        self.skipped_objects.insert(object);
+    }
+
+    pub fn update_progress(&mut self, successful: u64, failed: u64, skipped: u64, bytes: u64) {
+        self.successful_objects = successful;
+        self.failed_object_count = failed;
+        self.skipped_object_count = skipped;
+        self.processed_bytes = bytes;
+    }
+
+    pub fn set_progress_baseline(&mut self, total_objects: u64, total_bytes: u64, generation: Option<u64>) {
+        self.total_objects = total_objects;
+        self.total_bytes = total_bytes;
+        self.baseline_generation = generation;
+        // The caller has already validated that this is a complete snapshot;
+        // preserve the distinction between a known empty scope and an old
+        // checkpoint that omitted all baseline fields.
+        self.baseline_known = true;
+    }
+
+    pub fn mark_counter_unknown(&mut self) {
+        self.counter_unknown = true;
+        self.checkpoint_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
+    pub fn set_skipped_version_counts(&mut self, new_versions: u64, ilm_expired: u64) {
+        self.skipped_new_versions = new_versions;
+        self.skipped_ilm_expired = ilm_expired;
+        self.checkpoint_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    }
+
+    /// Advance past a fully-processed page: objects below `object_index` are
+    /// skipped by position on resume, so the per-object sets no longer need
+    /// their entries and would otherwise grow with the whole bucket.
+    pub fn complete_page(&mut self, bucket_index: usize, object_index: usize) {
+        self.update_position(bucket_index, object_index);
+        self.processed_objects.clear();
+        self.skipped_objects.clear();
+        self.failed_objects.clear();
+    }
+
+    /// Reset the scan to the start and clear the per-object sets so a retry
+    /// re-scans the whole set.
+    pub fn reset_for_retry(&mut self) {
+        self.update_position(0, 0);
+        self.processed_objects.clear();
+        self.skipped_objects.clear();
+        self.successful_objects = 0;
+        self.failed_object_count = 0;
+        self.skipped_object_count = 0;
+        self.dangling_delete_grace_objects = 0;
+        self.dangling_delete_retry_not_before = None;
+        self.skipped_new_versions = 0;
+        self.skipped_ilm_expired = 0;
+        self.processed_bytes = 0;
+        self.total_objects = 0;
+        self.total_bytes = 0;
+        self.baseline_generation = None;
+        self.baseline_known = false;
+        self.counter_unknown = false;
+        self.failed_objects.clear();
+    }
+}
+
+/// resume checkpoint manager
+pub struct CheckpointManager {
+    disk: DiskStore,
+    checkpoint: Arc<RwLock<ResumeCheckpoint>>,
+    throttle: Mutex<PersistThrottle>,
+    save_lock: AsyncMutex<()>,
+    last_saved: Mutex<Option<EcstoreDiskBytes>>,
+}
+
+impl CheckpointManager {
+    fn blocked_path(task_id: &str) -> std::path::PathBuf {
+        Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_BLOCKED_FILE}"))
+    }
+
+    /// Inspect markers only. In particular, listing cannot invoke
+    /// `is_blocked`, whose scheduled revalidation can remove the marker.
+    pub(crate) async fn blocked_records(disk: &DiskStore) -> Result<Vec<crate::BlockedCheckpointRecord>> {
+        let entries = match EcstoreDiskAPI::list_dir(disk.as_ref(), "", RUSTFS_META_BUCKET, BUCKET_META_PREFIX, -1).await {
+            Ok(entries) => entries,
+            Err(crate::heal::DiskError::FileNotFound) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let disk_id = match EcstoreDiskAPI::get_disk_id(disk.as_ref()).await {
+            Ok(id) => id.filter(|id| !id.is_nil()),
+            // Recovery evidence can survive on a not-yet-formatted local root.
+            Err(crate::heal::DiskError::UnformattedDisk) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let suffix = format!("_{RESUME_CHECKPOINT_BLOCKED_FILE}");
+        let mut records = Vec::new();
+        let mut budget = validation::DiagnosticBudget::default();
+        for entry in entries {
+            let Some(task_id) = entry.strip_suffix(&suffix) else {
+                continue;
+            };
+            if validate_resume_task_id(task_id).is_err() {
+                records.push(crate::BlockedCheckpointRecord {
+                    task_id: task_id.to_owned(),
+                    disk_id,
+                    reason: "invalid_checkpoint_task_id".to_owned(),
+                    blocked_at: None,
+                    revalidate_after: None,
+                    validation: validation::inspect(disk, task_id, &mut budget).await,
+                });
+                continue;
+            }
+            let path = Self::blocked_path(task_id);
+            let reader = match EcstoreDiskAPI::read_file(disk.as_ref(), RUSTFS_META_BUCKET, path_to_str(&path)?).await {
+                Ok(reader) => reader,
+                // A concurrent recovery may have removed a listed marker.
+                Err(crate::heal::DiskError::FileNotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let mut bytes = Vec::new();
+            reader
+                .take(u64::try_from(BLOCKED_CHECKPOINT_MARKER_MAX_BYTES + 1).map_err(Error::other)?)
+                .read_to_end(&mut bytes)
+                .await?;
+            let marker = BlockedCheckpointMarker::decode(&bytes);
+            records.push(crate::BlockedCheckpointRecord {
+                task_id: task_id.to_owned(),
+                disk_id,
+                reason: marker
+                    .as_ref()
+                    .map(|marker| marker.reason.clone())
+                    .unwrap_or_else(|| "legacy_or_unreadable_blocked_marker".to_owned()),
+                blocked_at: marker.as_ref().map(|marker| marker.blocked_at),
+                revalidate_after: marker.as_ref().map(|marker| marker.revalidate_after),
+                validation: validation::inspect(disk, task_id, &mut budget).await,
+            });
+        }
+        records.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+        Ok(records)
+    }
+
+    /// Return whether a checkpoint is isolated after a malformed or
+    /// unsupported snapshot was observed. A due marker is revalidated with the
+    /// current reader first, so a snapshot that only an older reader rejected
+    /// unblocks here instead of staying blocked forever.
+    pub(crate) async fn is_blocked(disk: &DiskStore, task_id: &str) -> bool {
+        if validate_resume_task_id(task_id).is_err() {
+            return false;
+        }
+        let blocked_path = Self::blocked_path(task_id);
+        let Ok(path) = path_to_str(&blocked_path) else {
+            return false;
+        };
+        match HealDiskExt::read_all(disk.as_ref(), RUSTFS_META_BUCKET, path).await {
+            Ok(marker) => Self::revalidate_blocked_snapshot(disk, task_id, marker).await,
+            Err(crate::heal::DiskError::FileNotFound) => false,
+            Err(_) => true,
+        }
+    }
+
+    /// Re-read a blocked snapshot with the current reader once its marker is
+    /// due. Returns whether the task is still blocked. Verification clears the
+    /// marker; a tampered or corrupt snapshot keeps it and advances the next
+    /// revalidation time. Both outcomes retain the snapshot bytes.
+    async fn revalidate_blocked_snapshot(disk: &DiskStore, task_id: &str, marker_bytes: EcstoreDiskBytes) -> bool {
+        let now = unix_now();
+        let marker = BlockedCheckpointMarker::decode(&marker_bytes);
+        if marker.as_ref().is_some_and(|marker| marker.revalidate_after > now) {
+            return true;
+        }
+        let checkpoint_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
+        let Ok(path) = path_to_str(&checkpoint_path) else {
+            return true;
+        };
+        let verification = match HealDiskExt::read_all(disk.as_ref(), RUSTFS_META_BUCKET, path).await {
+            // No snapshot remains to isolate; an operator already replaced or
+            // removed it and a fresh scan is the safe continuation.
+            Ok(bytes) if bytes.is_empty() => Ok(()),
+            Err(crate::heal::DiskError::FileNotFound) => Ok(()),
+            Ok(bytes) => Self::load_from_data(disk.clone(), task_id, bytes.to_vec()).await.map(|_| ()),
+            Err(error) => Err(Error::TaskExecutionFailed {
+                message: format!("Failed to read blocked checkpoint: {error}"),
+            }),
+        };
+        let reason = match verification {
+            Ok(()) => {
+                if let Err(error) = delete_resume_file(disk, &Self::blocked_path(task_id)).await {
+                    warn!(
+                        target: "rustfs::heal::resume",
+                        event = EVENT_HEAL_CHECKPOINT_STATE,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_RESUME,
+                        task_id,
+                        state = "unblock_marker_delete_failed",
+                        error = %error,
+                        "Heal checkpoint verified but its blocked marker could not be removed"
+                    );
+                    return true;
+                }
+                info!(
+                    target: "rustfs::heal::resume",
+                    event = EVENT_HEAL_CHECKPOINT_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_RESUME,
+                    task_id,
+                    blocked_at = marker.as_ref().map(|marker| marker.blocked_at).unwrap_or_default(),
+                    state = "unblocked_by_revalidation",
+                    "Heal checkpoint verified by the current reader; blocked marker cleared"
+                );
+                return false;
+            }
+            Err(error) => error.to_string(),
+        };
+        let mut refreshed = BlockedCheckpointMarker::new(now, &reason);
+        if let Some(previous) = &marker {
+            refreshed.blocked_at = previous.blocked_at;
+        }
+        let update = match refreshed.encode() {
+            Ok(bytes) => {
+                EcstoreDiskAPI::compare_and_update_file(
+                    disk.as_ref(),
+                    RUSTFS_META_BUCKET,
+                    Self::blocked_path(task_id).to_string_lossy().as_ref(),
+                    Some(marker_bytes),
+                    Some(bytes),
+                )
+                .await
+            }
+            Err(error) => Err(crate::heal::DiskError::other(error)),
+        };
+        warn!(
+            target: "rustfs::heal::resume",
+            event = EVENT_HEAL_CHECKPOINT_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_RESUME,
+            task_id,
+            revalidate_after = refreshed.revalidate_after,
+            marker_refreshed = matches!(update, Ok(EcstoreConditionalFileUpdate::Updated)),
+            state = "revalidation_failed",
+            reason,
+            "Heal checkpoint remains blocked after revalidation"
+        );
+        true
+    }
+
+    /// Validate the checkpoint while enumerating resumable state. This reads
+    /// the checkpoint once and also isolates malformed or unsupported data.
+    pub(crate) async fn is_resumable(disk: &DiskStore, task_id: &str) -> Result<bool> {
+        validate_resume_task_id(task_id)?;
+        if Self::is_blocked(disk, task_id).await {
+            return Err(Error::InvalidCheckpoint(format!("Resume task {task_id} has a blocked checkpoint")));
+        }
+        let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
+        let Ok(path) = path_to_str(&file_path) else {
+            return Err(Error::InvalidCheckpoint("Resume checkpoint path is not valid UTF-8".to_string()));
+        };
+        match HealDiskExt::read_all(disk.as_ref(), RUSTFS_META_BUCKET, path).await {
+            Ok(bytes) if bytes.is_empty() => Ok(true),
+            Ok(bytes) => Self::load_from_data(disk.clone(), task_id, bytes.to_vec())
+                .await
+                .map(|_| true),
+            Err(crate::heal::DiskError::FileNotFound) => Ok(true),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn block_invalid_snapshot(disk: &DiskStore, task_id: &str, reason: &str) {
+        // Any marker content blocks older readers. The current reader keeps
+        // the reason and revalidates the snapshot once the schedule is due;
+        // an existing marker keeps its own schedule.
+        let blocked_path = Self::blocked_path(task_id);
+        let Ok(path) = path_to_str(&blocked_path) else {
+            return;
+        };
+        let marker = match BlockedCheckpointMarker::new(unix_now(), reason).encode() {
+            Ok(marker) => marker,
+            Err(error) => {
+                warn!(
+                    target: "rustfs::heal::resume",
+                    event = EVENT_HEAL_CHECKPOINT_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_RESUME,
+                    task_id,
+                    state = "blocked_marker_write_failed",
+                    error = %error,
+                    "Heal checkpoint could not persist its blocked marker"
+                );
+                return;
+            }
+        };
+        let result = EcstoreDiskAPI::compare_and_update_file(disk.as_ref(), RUSTFS_META_BUCKET, path, None, Some(marker)).await;
+        match result {
+            Ok(EcstoreConditionalFileUpdate::Updated | EcstoreConditionalFileUpdate::Mismatch) => {}
+            Ok(EcstoreConditionalFileUpdate::Missing) => warn!(
+                target: "rustfs::heal::resume",
+                event = EVENT_HEAL_CHECKPOINT_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_RESUME,
+                task_id,
+                state = "blocked_marker_write_failed",
+                error = "marker target disappeared",
+                "Heal checkpoint could not persist its blocked marker"
+            ),
+            Err(error) => warn!(
+                target: "rustfs::heal::resume",
+                event = EVENT_HEAL_CHECKPOINT_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_RESUME,
+                task_id,
+                state = "blocked_marker_write_failed",
+                error = %error,
+                "Heal checkpoint could not persist its blocked marker"
+            ),
+        }
+    }
+
+    /// create new checkpoint manager
+    pub async fn new(disk: DiskStore, task_id: String) -> Result<Self> {
+        validate_resume_task_id(&task_id)?;
+        let checkpoint_volume = format!("{RUSTFS_META_BUCKET}/{BUCKET_META_PREFIX}");
+        if let Err(error) = EcstoreDiskAPI::make_volume(disk.as_ref(), &checkpoint_volume).await
+            && error != crate::heal::DiskError::VolumeExists
+        {
+            return Err(Error::TaskExecutionFailed {
+                message: format!("Failed to create checkpoint volume: {error}"),
+            });
+        }
+        let checkpoint = ResumeCheckpoint::new(task_id);
+        let manager = Self {
+            disk,
+            checkpoint: Arc::new(RwLock::new(checkpoint)),
+            throttle: Mutex::new(PersistThrottle::new()),
+            save_lock: AsyncMutex::new(()),
+            last_saved: Mutex::new(None),
+        };
+
+        // save initial checkpoint
+        if let Err(e) = manager.save_checkpoint().await {
+            warn!(
+                target: "rustfs::heal::resume",
+                event = EVENT_HEAL_CHECKPOINT_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_RESUME,
+                state = "initial_save_failed",
+                error = %e,
+                "Heal checkpoint persistence failed"
+            );
+            return Err(e);
+        }
+        Ok(manager)
+    }
+
+    /// load checkpoint from disk
+    pub async fn load_from_disk(disk: DiskStore, task_id: &str) -> Result<Self> {
+        validate_resume_task_id(task_id)?;
+        let checkpoint_data = Self::read_checkpoint_file(&disk, task_id).await?;
+        Self::load_from_data(disk, task_id, checkpoint_data).await
+    }
+
+    async fn load_from_data(disk: DiskStore, task_id: &str, checkpoint_data: Vec<u8>) -> Result<Self> {
+        validate_resume_task_id(task_id)?;
+        let prepared = match validation::PreparedCheckpoint::decode(task_id, &checkpoint_data) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                if failure.block_snapshot {
+                    Self::block_invalid_snapshot(&disk, task_id, &failure.error.to_string()).await;
+                }
+                return Err(failure.error);
+            }
+        };
+        let legacy_digest = if prepared.needs_legacy_digest() {
+            let digest_path = Self::digest_path(task_id);
+            let digest_path = path_to_str(&digest_path)?;
+            match HealDiskExt::read_all(disk.as_ref(), RUSTFS_META_BUCKET, digest_path).await {
+                Ok(bytes) => Some(bytes),
+                Err(crate::heal::DiskError::FileNotFound) => None,
+                Err(error) => {
+                    return Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to read checkpoint digest: {error}"),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        let validated = match prepared.verify(task_id, &checkpoint_data, legacy_digest.as_deref()) {
+            Ok(validated) => validated,
+            Err(failure) => {
+                if failure.block_snapshot {
+                    Self::block_invalid_snapshot(&disk, task_id, &failure.error.to_string()).await;
+                }
+                return Err(failure.error);
+            }
+        };
+        let mut checkpoint = validated.checkpoint;
+        let supported_schema = validated.supported_schema;
+        let integrity_verified = validated.summary.signature_valid == Some(true);
+
+        if checkpoint.schema_version < CHECKPOINT_PER_VERSION_SCHEMA || !integrity_verified {
+            warn!(
+                target: "rustfs::heal::resume",
+                event = EVENT_HEAL_CHECKPOINT_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_RESUME,
+                task_id,
+                found_schema = checkpoint.schema_version,
+                current_schema = CURRENT_CHECKPOINT_SCHEMA,
+                state = "schema_discarded",
+                "Heal checkpoint schema is stale; discarding dedup sets and position"
+            );
+            checkpoint.processed_objects.clear();
+            checkpoint.failed_objects.clear();
+            checkpoint.skipped_objects.clear();
+            checkpoint.successful_objects = 0;
+            checkpoint.failed_object_count = 0;
+            checkpoint.skipped_object_count = 0;
+            checkpoint.dangling_delete_grace_objects = 0;
+            checkpoint.dangling_delete_retry_not_before = None;
+            checkpoint.skipped_new_versions = 0;
+            checkpoint.skipped_ilm_expired = 0;
+            checkpoint.processed_bytes = 0;
+            checkpoint.total_objects = 0;
+            checkpoint.total_bytes = 0;
+            checkpoint.baseline_generation = None;
+            checkpoint.baseline_known = false;
+            checkpoint.counter_unknown = false;
+            checkpoint.current_bucket_index = 0;
+            checkpoint.current_object_index = 0;
+        }
+        checkpoint.schema_version = supported_schema;
+
+        Ok(Self {
+            disk,
+            checkpoint: Arc::new(RwLock::new(checkpoint)),
+            throttle: Mutex::new(PersistThrottle::new()),
+            save_lock: AsyncMutex::new(()),
+            last_saved: Mutex::new(Some(EcstoreDiskBytes::from(checkpoint_data))),
+        })
+    }
+
+    /// check if checkpoint exists
+    pub async fn has_checkpoint(disk: &DiskStore, task_id: &str) -> bool {
+        if validate_resume_task_id(task_id).is_err() {
+            return false;
+        }
+        let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
+        match path_to_str(&file_path) {
+            Ok(path_str) => match HealDiskExt::read_all(disk.as_ref(), RUSTFS_META_BUCKET, path_str).await {
+                Ok(data) => !data.is_empty(),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        }
+    }
+
+    /// get current checkpoint
+    pub async fn get_checkpoint(&self) -> ResumeCheckpoint {
+        self.checkpoint.read().await.clone()
+    }
+
+    /// True when a page object is already settled in the current ledger.
+    /// Membership is checked under the lock without cloning the checkpoint,
+    /// which used to copy every page's dedup sets on the small-object path.
+    pub async fn is_object_settled(&self, key: &str) -> bool {
+        let checkpoint = self.checkpoint.read().await;
+        checkpoint.processed_objects.contains(key)
+            || checkpoint.failed_objects.contains(key)
+            || checkpoint.skipped_objects.contains(key)
+    }
+
+    /// True when the administrator checkpoint already finished.
+    pub async fn admin_completed(&self) -> bool {
+        self.checkpoint
+            .read()
+            .await
+            .admin
+            .as_ref()
+            .is_some_and(|admin| admin.completed)
+    }
+
+    /// Current resume position without cloning the object ledgers.
+    pub async fn resume_position(&self) -> (usize, usize) {
+        let checkpoint = self.checkpoint.read().await;
+        (checkpoint.current_bucket_index, checkpoint.current_object_index)
+    }
+
+    /// Dangling-delete grace summary without cloning the object ledgers.
+    pub async fn dangling_delete_grace(&self) -> (u64, Option<u64>, bool) {
+        let checkpoint = self.checkpoint.read().await;
+        (
+            checkpoint.dangling_delete_grace_objects,
+            checkpoint.dangling_delete_retry_not_before,
+            checkpoint.counter_unknown,
+        )
+    }
+
+    /// Aggregate progress counters without cloning the page dedup sets.
+    pub async fn progress_snapshot(&self) -> CheckpointProgressSnapshot {
+        let checkpoint = self.checkpoint.read().await;
+        CheckpointProgressSnapshot {
+            current_bucket_index: checkpoint.current_bucket_index,
+            current_object_index: checkpoint.current_object_index,
+            successful_objects: checkpoint.successful_objects,
+            failed_object_count: checkpoint.failed_object_count,
+            skipped_object_count: checkpoint.skipped_object_count,
+            skipped_new_versions: checkpoint.skipped_new_versions,
+            skipped_ilm_expired: checkpoint.skipped_ilm_expired,
+            processed_bytes: checkpoint.processed_bytes,
+            total_objects: checkpoint.total_objects,
+            total_bytes: checkpoint.total_bytes,
+            baseline_generation: checkpoint.baseline_generation,
+            baseline_known: checkpoint.baseline_known,
+            counter_unknown: checkpoint.counter_unknown,
+        }
+    }
+
+    /// Finish the administrator outcome in place and persist it.
+    pub async fn complete_admin(&self) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        let admin = checkpoint
+            .admin
+            .as_mut()
+            .ok_or_else(|| Error::InvalidCheckpoint("Missing administrator outcome at completion".to_string()))?;
+        admin.completed = true;
+        admin.outcome.finish(None);
+        drop(checkpoint);
+        self.save_checkpoint().await
+    }
+
+    /// update position
+    pub async fn update_position(&self, bucket_index: usize, object_index: usize) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.update_position(bucket_index, object_index);
+        drop(checkpoint);
+        self.save_checkpoint_throttled().await
+    }
+
+    /// Persist a completed page position while retaining its identities.
+    pub async fn complete_page(&self, bucket_index: usize, object_index: usize) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.complete_page(bucket_index, object_index);
+        drop(checkpoint);
+        self.save_checkpoint_throttled().await
+    }
+
+    /// Persist the page position while retaining identities until the resume
+    /// cursor is durable.
+    pub async fn advance_page(&self, bucket_index: usize, object_index: usize) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.update_position(bucket_index, object_index);
+        drop(checkpoint);
+        self.save_checkpoint().await
+    }
+
+    /// Remove the previous page's dedup identities only after its resume cursor
+    /// has been durably exposed.
+    pub async fn prune_completed_page(&self) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.processed_objects.clear();
+        checkpoint.skipped_objects.clear();
+        checkpoint.failed_objects.clear();
+        drop(checkpoint);
+        self.save_checkpoint().await
+    }
+
+    /// Advance to the next bucket and clear the final page identities after the
+    /// resume state has durably recorded the completed bucket.
+    pub async fn complete_bucket(&self, next_bucket_index: usize) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.complete_page(next_bucket_index, 0);
+        drop(checkpoint);
+        self.save_checkpoint().await
+    }
+
+    /// Reset the checkpoint to the start of the scan for a retry, then persist.
+    pub async fn reset_for_retry(&self) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.reset_for_retry();
+        drop(checkpoint);
+        self.save_checkpoint_throttled().await
+    }
+
+    pub(crate) async fn reset_after_delete_recovery(&self) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.reset_for_retry();
+        if let Some(admin) = checkpoint.admin.as_mut() {
+            admin.completed = false;
+            admin.outcome = Default::default();
+            admin.outcome.start();
+        }
+        drop(checkpoint);
+        self.save_checkpoint().await
+    }
+
+    /// Add a processed object. Called once per healed object, so persistence
+    /// is batched (`PERSIST_EVERY_MUTATIONS` / `PERSIST_INTERVAL`); positions
+    /// and page boundaries still persist unconditionally.
+    pub async fn add_processed_object(&self, object: String) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.add_processed_object(object);
+        drop(checkpoint);
+        self.save_checkpoint_if_due().await
+    }
+
+    /// add failed object (batched, see `add_processed_object`)
+    pub async fn add_failed_object(&self, object: String) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.add_failed_object(object);
+        drop(checkpoint);
+        self.save_checkpoint_if_due().await
+    }
+
+    /// add skipped object (batched, see `add_processed_object`)
+    pub async fn add_skipped_object(&self, object: String) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.add_skipped_object(object);
+        drop(checkpoint);
+        self.save_checkpoint_if_due().await
+    }
+
+    /// Atomically persist an object's dedup identity with its aggregate result.
+    pub async fn record_object_outcome(&self, record: CheckpointObjectOutcomeRecord) -> Result<()> {
+        self.record_outcome(record, None, 0).await.map(|_| ())
+    }
+
+    pub(crate) async fn set_admin(&self, admin: AdminErasureCheckpoint) -> Result<()> {
+        {
+            let mut checkpoint = self.checkpoint.write().await;
+            checkpoint.schema_version = ADMIN_CHECKPOINT_SCHEMA;
+            checkpoint.admin = Some(admin);
+        }
+        self.save_checkpoint().await
+    }
+
+    pub(crate) async fn record_outcome(
+        &self,
+        record: CheckpointObjectOutcomeRecord,
+        canonical: Option<crate::heal::outcome::HealObjectOutcome>,
+        attempt_failures: u32,
+    ) -> Result<Option<crate::heal::outcome::HealTaskOutcome>> {
+        let CheckpointObjectOutcomeRecord {
+            object,
+            outcome,
+            successful,
+            failed,
+            skipped,
+            bytes,
+            skipped_new_versions,
+            skipped_ilm_expired,
+            counter_unknown,
+        } = record;
+        let mut checkpoint = self.checkpoint.write().await;
+        let durable_admin = canonical.is_some();
+        if let Some(canonical) = canonical {
+            let already_recorded = checkpoint.processed_objects.contains(&object)
+                || checkpoint.failed_objects.contains(&object)
+                || checkpoint.skipped_objects.contains(&object);
+            if already_recorded {
+                return Err(Error::InvalidCheckpoint("Administrator object was accounted twice".to_string()));
+            }
+            let admin = checkpoint
+                .admin
+                .as_mut()
+                .ok_or_else(|| Error::InvalidCheckpoint("Missing administrator outcome".to_string()))?;
+            for _ in 0..attempt_failures {
+                admin.outcome.attempt_failed();
+            }
+            admin.outcome.record(canonical);
+        }
+        match outcome {
+            CheckpointObjectOutcome::Processed => checkpoint.add_processed_object(object),
+            CheckpointObjectOutcome::Failed => checkpoint.add_failed_object(object),
+            CheckpointObjectOutcome::Skipped => checkpoint.add_skipped_object(object),
+            CheckpointObjectOutcome::DeferredDanglingDelete { retry_not_before } => {
+                if !dangling_delete_deadline_is_representable(retry_not_before) {
+                    return Err(Error::InvalidCheckpoint("Unrepresentable dangling-delete grace deadline".to_string()));
+                }
+                if checkpoint.skipped_objects.insert(object) {
+                    checkpoint.dangling_delete_grace_objects = checkpoint
+                        .dangling_delete_grace_objects
+                        .checked_add(1)
+                        .ok_or_else(|| Error::InvalidCheckpoint("Dangling-delete grace counter overflow".to_string()))?;
+                    checkpoint.dangling_delete_retry_not_before = Some(
+                        checkpoint
+                            .dangling_delete_retry_not_before
+                            .map_or(retry_not_before, |deadline| deadline.max(retry_not_before)),
+                    );
+                }
+            }
+        }
+        checkpoint.update_progress(successful, failed, skipped, bytes);
+        checkpoint.set_skipped_version_counts(skipped_new_versions, skipped_ilm_expired);
+        if counter_unknown {
+            checkpoint.mark_counter_unknown();
+        }
+        let canonical_snapshot = checkpoint
+            .admin
+            .as_ref()
+            .filter(|_| durable_admin)
+            .map(|admin| admin.outcome.clone());
+        drop(checkpoint);
+        if durable_admin {
+            self.save_checkpoint().await?;
+        } else {
+            self.save_checkpoint_if_due().await?;
+        }
+        Ok(canonical_snapshot)
+    }
+
+    pub async fn update_progress(&self, successful: u64, failed: u64, skipped: u64, bytes: u64) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.update_progress(successful, failed, skipped, bytes);
+        drop(checkpoint);
+        self.save_checkpoint_if_due().await
+    }
+
+    pub async fn set_progress_baseline(&self, total_objects: u64, total_bytes: u64, generation: Option<u64>) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.set_progress_baseline(total_objects, total_bytes, generation);
+        drop(checkpoint);
+        self.save_checkpoint_throttled().await
+    }
+
+    pub async fn mark_counter_unknown(&self) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.mark_counter_unknown();
+        drop(checkpoint);
+        self.save_checkpoint().await
+    }
+
+    pub async fn set_skipped_version_counts(&self, new_versions: u64, ilm_expired: u64) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.set_skipped_version_counts(new_versions, ilm_expired);
+        drop(checkpoint);
+        self.save_checkpoint_throttled().await
+    }
+
+    async fn save_checkpoint_if_due(&self) -> Result<()> {
+        let should_save = self.throttle.lock().map(|mut throttle| throttle.record()).unwrap_or(true);
+        if !should_save {
+            return Ok(());
+        }
+        self.save_checkpoint_throttled().await
+    }
+
+    async fn save_checkpoint_throttled(&self) -> Result<()> {
+        let result = self.save_checkpoint().await;
+        if result.is_ok()
+            && let Ok(mut throttle) = self.throttle.lock()
+        {
+            throttle.mark_saved();
+        }
+        result
+    }
+
+    /// cleanup checkpoint
+    pub async fn cleanup(&self) -> Result<()> {
+        let task_id = self.checkpoint.read().await.task_id.clone();
+        validate_resume_task_id(&task_id)?;
+
+        let checkpoint_file = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
+        delete_resume_file(&self.disk, &checkpoint_file).await?;
+        delete_resume_file(&self.disk, &Self::digest_path(&task_id)).await?;
+        delete_resume_file(&self.disk, &Self::blocked_path(&task_id)).await?;
+
+        debug!(
+            target: "rustfs::heal::resume",
+            event = EVENT_HEAL_CHECKPOINT_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_RESUME,
+            task_id,
+            state = "cleaned",
+            "Heal checkpoint cleaned"
+        );
+        Ok(())
+    }
+
+    /// save checkpoint to disk
+    async fn save_checkpoint(&self) -> Result<()> {
+        // Serialize saves and take the snapshot only after acquiring the lock:
+        // a slower writer must not publish a snapshot taken before a newer one.
+        let _save_guard = self.save_lock.lock().await;
+        let checkpoint = self.checkpoint.read().await.clone();
+        validate_resume_task_id(&checkpoint.task_id)?;
+        let checkpoint_value = serde_json::to_value(&checkpoint).map_err(|e| Error::TaskExecutionFailed {
+            message: format!("Failed to serialize checkpoint: {e}"),
+        })?;
+        let mut persisted_checkpoint = CheckpointJson::from_value(checkpoint_value)?;
+        persisted_checkpoint.sort_all_objects();
+        let unsigned_checkpoint_data = persisted_checkpoint.unsigned_bytes()?;
+        let digest = Self::checkpoint_digest(&unsigned_checkpoint_data);
+        persisted_checkpoint.set_digest(Some(digest))?;
+        let checkpoint_data =
+            EcstoreDiskBytes::from(serde_json::to_vec(&persisted_checkpoint).map_err(|e| Error::TaskExecutionFailed {
+                message: format!("Failed to serialize checkpoint: {e}"),
+            })?);
+
+        let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{}_{}", checkpoint.task_id, RESUME_CHECKPOINT_FILE));
+
+        let path_str = path_to_str(&file_path)?;
+        let last_saved = self
+            .last_saved
+            .lock()
+            .map_err(|_| Error::TaskExecutionFailed {
+                message: "Checkpoint save state lock is poisoned; refusing to save".to_string(),
+            })?
+            .clone();
+        let update = EcstoreDiskAPI::compare_and_update_file(
+            self.disk.as_ref(),
+            RUSTFS_META_BUCKET,
+            path_str,
+            last_saved.clone(),
+            Some(checkpoint_data.clone()),
+        )
+        .await
+        .map_err(|e| Error::TaskExecutionFailed {
+            message: format!("Failed to save checkpoint: {e}"),
+        })?;
+
+        let expected = match update {
+            EcstoreConditionalFileUpdate::Updated => None,
+            EcstoreConditionalFileUpdate::Missing => {
+                return Err(Error::TaskExecutionFailed {
+                    message: "Checkpoint was removed after this manager saved it; refusing to recreate it".to_string(),
+                });
+            }
+            EcstoreConditionalFileUpdate::Mismatch => {
+                // A healthy manager normally completes the CAS above without
+                // another read or JSON parse. Inspect only after a mismatch so
+                // corruption and future schemas cannot be overwritten blindly.
+                let existing = match HealDiskExt::read_all(self.disk.as_ref(), RUSTFS_META_BUCKET, path_str).await {
+                    Ok(existing) => existing,
+                    Err(crate::heal::DiskError::FileNotFound) => {
+                        return Err(Error::TaskExecutionFailed {
+                            message: "Checkpoint was removed after this manager saved it; refusing to recreate it".to_string(),
+                        });
+                    }
+                    Err(error) => {
+                        return Err(Error::TaskExecutionFailed {
+                            message: format!("Failed to inspect checkpoint after CAS mismatch: {error}"),
+                        });
+                    }
+                };
+
+                if existing.is_empty() && last_saved.is_none() {
+                    Some(existing)
+                } else {
+                    let current: ResumeCheckpoint = match serde_json::from_slice(&existing) {
+                        Ok(current) => current,
+                        Err(error) => {
+                            let error = Error::TaskExecutionFailed {
+                                message: format!("Existing checkpoint is corrupt: {error}"),
+                            };
+                            Self::block_invalid_snapshot(&self.disk, &checkpoint.task_id, &error.to_string()).await;
+                            return Err(error);
+                        }
+                    };
+                    if current.task_id != checkpoint.task_id {
+                        let error = Error::TaskExecutionFailed {
+                            message: "Existing checkpoint task id does not match filename".to_string(),
+                        };
+                        Self::block_invalid_snapshot(&self.disk, &checkpoint.task_id, &error.to_string()).await;
+                        return Err(error);
+                    }
+                    let supported_schema = if current.admin.is_some() {
+                        ADMIN_CHECKPOINT_SCHEMA
+                    } else {
+                        CURRENT_CHECKPOINT_SCHEMA
+                    };
+                    if current.schema_version > supported_schema {
+                        let error = Error::TaskExecutionFailed {
+                            message: format!(
+                                "Existing checkpoint schema {} is newer than supported schema {supported_schema}",
+                                current.schema_version
+                            ),
+                        };
+                        Self::block_invalid_snapshot(&self.disk, &checkpoint.task_id, &error.to_string()).await;
+                        return Err(error);
+                    }
+                    if last_saved.as_ref().is_none_or(|saved| saved.as_ref() != existing.as_ref()) {
+                        return Err(Error::TaskExecutionFailed {
+                            message: "Checkpoint changed since this manager loaded it; refusing to overwrite newer progress"
+                                .to_string(),
+                        });
+                    }
+                    Some(existing)
+                }
+            }
+        };
+
+        if let Some(expected) = expected {
+            match EcstoreDiskAPI::compare_and_update_file(
+                self.disk.as_ref(),
+                RUSTFS_META_BUCKET,
+                path_str,
+                Some(expected),
+                Some(checkpoint_data.clone()),
+            )
+            .await
+            .map_err(|e| Error::TaskExecutionFailed {
+                message: format!("Failed to save checkpoint after CAS mismatch: {e}"),
+            })? {
+                EcstoreConditionalFileUpdate::Updated => {}
+                EcstoreConditionalFileUpdate::Missing | EcstoreConditionalFileUpdate::Mismatch => {
+                    return Err(Error::TaskExecutionFailed {
+                        message: "Checkpoint changed while saving; refusing to overwrite newer progress".to_string(),
+                    });
+                }
+            }
+        }
+
+        let mut last_saved = self.last_saved.lock().map_err(|_| Error::TaskExecutionFailed {
+            message: "Checkpoint save state lock is poisoned after save".to_string(),
+        })?;
+        *last_saved = Some(checkpoint_data);
+
+        debug!(
+            target: "rustfs::heal::resume",
+            event = EVENT_HEAL_CHECKPOINT_STATE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_RESUME,
+            task_id = %checkpoint.task_id,
+            state = "saved",
+            "Heal checkpoint persisted"
+        );
+        Ok(())
+    }
+
+    /// read checkpoint file from disk
+    async fn read_checkpoint_file(disk: &DiskStore, task_id: &str) -> Result<Vec<u8>> {
+        validate_resume_task_id(task_id)?;
+        let file_path = Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_FILE}"));
+
+        let path_str = path_to_str(&file_path)?;
+        HealDiskExt::read_all(disk.as_ref(), RUSTFS_META_BUCKET, path_str)
+            .await
+            .map(|bytes| bytes.to_vec())
+            .map_err(|e| Error::TaskExecutionFailed {
+                message: format!("Failed to read checkpoint file: {e}"),
+            })
+    }
+
+    fn checkpoint_digest(checkpoint_data: &[u8]) -> String {
+        base64_simd::STANDARD.encode_to_string(Sha256::digest(checkpoint_data))
+    }
+
+    fn digest_path(task_id: &str) -> std::path::PathBuf {
+        Path::new(BUCKET_META_PREFIX).join(format!("{task_id}_{RESUME_CHECKPOINT_DIGEST_FILE}"))
+    }
+}

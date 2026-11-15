@@ -13,23 +13,65 @@
 // limitations under the License.
 
 use rustfs_io_metrics::{
-    record_cgroup_memory_split, record_cpu_usage, record_memory_usage, record_process_memory_split,
-    snapshot_process_resource_and_system,
+    AllocatorMemoryObservation, ProcessSampler, record_allocator_memory_observation, record_cgroup_memory_split,
+    record_cpu_usage, record_memory_usage, record_process_memory_split,
 };
 use serde::Serialize;
-use std::collections::HashMap;
+#[cfg(any(not(target_os = "windows"), test))]
+use serde_json::Value;
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+#[cfg(all(
+    feature = "diagnostic-allocator-live",
+    not(target_os = "windows"),
+    not(all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use sysinfo::System;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
-
-static MEMORY_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
 
 const ENV_MEMORY_OBSERVABILITY_INTERVAL_SECS: &str = "RUSTFS_MEMORY_OBSERVABILITY_INTERVAL_SECS";
 const DEFAULT_MEMORY_OBSERVABILITY_INTERVAL_SECS: u64 = 15;
 const MEMORY_OBSERVABILITY_SERVICE_NAME: &str = "memory_observability";
+const CGROUP_V2_MEMORY_STAT_PATH: &str = "/sys/fs/cgroup/memory.stat";
+const CGROUP_V2_MEMORY_CURRENT_PATH: &str = "/sys/fs/cgroup/memory.current";
+const CGROUP_V2_MEMORY_MAX_PATH: &str = "/sys/fs/cgroup/memory.max";
+const CGROUP_V1_MEMORY_STAT_PATH: &str = "/sys/fs/cgroup/memory/memory.stat";
+const CGROUP_V1_MEMORY_USAGE_PATH: &str = "/sys/fs/cgroup/memory/memory.usage_in_bytes";
+const CGROUP_V1_MEMORY_LIMIT_PATH: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
+
+#[cfg(all(
+    feature = "diagnostic-allocator-live",
+    not(target_os = "windows"),
+    not(all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+static DIAGNOSTIC_GLOBAL_ALLOCATOR_LIVE_REQUESTED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(all(
+    feature = "diagnostic-allocator-live",
+    not(target_os = "windows"),
+    not(all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+fn adjust_diagnostic_global_allocator_live_bytes(counter: &AtomicUsize, old_size: usize, new_size: usize) {
+    if new_size > old_size {
+        counter.fetch_add(new_size - old_size, Ordering::Relaxed);
+    } else if old_size > new_size {
+        counter.fetch_sub(old_size - new_size, Ordering::Relaxed);
+    }
+}
+
+/// Update the diagnostic-only live requested-byte counter for Rust allocations
+/// routed through the binary's `GlobalAlloc` wrapper.
+#[cfg(all(
+    feature = "diagnostic-allocator-live",
+    not(target_os = "windows"),
+    not(all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+#[doc(hidden)]
+pub fn record_diagnostic_global_allocator_resize(old_size: usize, new_size: usize) {
+    adjust_diagnostic_global_allocator_live_bytes(&DIAGNOSTIC_GLOBAL_ALLOCATOR_LIVE_REQUESTED_BYTES, old_size, new_size);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -127,14 +169,31 @@ struct CgroupMemorySnapshot {
     inactive_file_bytes: Option<u64>,
 }
 
-fn memory_system() -> &'static Mutex<System> {
-    MEMORY_SYSTEM.get_or_init(|| Mutex::new(System::new()))
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CgroupMemoryStatFields {
+    anon: Option<u64>,
+    file: Option<u64>,
+    active_file: Option<u64>,
+    inactive_file: Option<u64>,
+    rss: Option<u64>,
+    cache: Option<u64>,
+    total_rss: Option<u64>,
+    total_cache: Option<u64>,
+    total_active_file: Option<u64>,
+    total_inactive_file: Option<u64>,
 }
 
-fn refresh_total_memory() -> u64 {
-    let mut system = memory_system().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    system.refresh_memory();
-    system.total_memory()
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AllocatorMemorySnapshot {
+    backend: &'static str,
+    observation: AllocatorMemoryObservation,
+}
+
+/// Get effective total memory from container resources.
+///
+/// Returns the effective memory (considering cgroup limits and overrides).
+fn refresh_effective_memory() -> u64 {
+    crate::cgroup_resources::container_resources().memory_bytes
 }
 
 fn read_optional_u64(path: &Path) -> Option<u64> {
@@ -146,62 +205,160 @@ fn read_optional_u64(path: &Path) -> Option<u64> {
     trimmed.parse::<u64>().ok()
 }
 
-fn parse_kv_stats(content: &str) -> HashMap<String, u64> {
-    content
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let key = parts.next()?;
-            let value = parts.next()?.parse::<u64>().ok()?;
-            Some((key.to_string(), value))
-        })
-        .collect()
+fn parse_cgroup_memory_stat(content: &str) -> CgroupMemoryStatFields {
+    let mut fields = CgroupMemoryStatFields::default();
+    for line in content.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let Some(value) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+            continue;
+        };
+
+        match key {
+            "anon" => fields.anon = Some(value),
+            "file" => fields.file = Some(value),
+            "active_file" => fields.active_file = Some(value),
+            "inactive_file" => fields.inactive_file = Some(value),
+            "rss" => fields.rss = Some(value),
+            "cache" => fields.cache = Some(value),
+            "total_rss" => fields.total_rss = Some(value),
+            "total_cache" => fields.total_cache = Some(value),
+            "total_active_file" => fields.total_active_file = Some(value),
+            "total_inactive_file" => fields.total_inactive_file = Some(value),
+            _ => {}
+        }
+    }
+    fields
 }
 
 fn read_cgroup_v2() -> Option<CgroupMemorySnapshot> {
-    let root = Path::new("/sys/fs/cgroup");
-    let stat_path = root.join("memory.stat");
-    if !stat_path.exists() {
-        return None;
-    }
-
-    let stats = parse_kv_stats(&std::fs::read_to_string(&stat_path).ok()?);
+    let stats = parse_cgroup_memory_stat(&std::fs::read_to_string(CGROUP_V2_MEMORY_STAT_PATH).ok()?);
     Some(CgroupMemorySnapshot {
-        current_bytes: read_optional_u64(&root.join("memory.current")),
-        limit_bytes: read_optional_u64(&root.join("memory.max")),
-        anon_bytes: stats.get("anon").copied(),
-        file_bytes: stats.get("file").copied(),
-        active_file_bytes: stats.get("active_file").copied(),
-        inactive_file_bytes: stats.get("inactive_file").copied(),
+        current_bytes: read_optional_u64(Path::new(CGROUP_V2_MEMORY_CURRENT_PATH)),
+        limit_bytes: read_optional_u64(Path::new(CGROUP_V2_MEMORY_MAX_PATH)),
+        anon_bytes: stats.anon,
+        file_bytes: stats.file,
+        active_file_bytes: stats.active_file,
+        inactive_file_bytes: stats.inactive_file,
     })
 }
 
 fn read_cgroup_v1() -> Option<CgroupMemorySnapshot> {
-    let root = Path::new("/sys/fs/cgroup/memory");
-    let stat_path = root.join("memory.stat");
-    if !stat_path.exists() {
-        return None;
-    }
-
-    let stats = parse_kv_stats(&std::fs::read_to_string(&stat_path).ok()?);
+    let stats = parse_cgroup_memory_stat(&std::fs::read_to_string(CGROUP_V1_MEMORY_STAT_PATH).ok()?);
     Some(CgroupMemorySnapshot {
-        current_bytes: read_optional_u64(&root.join("memory.usage_in_bytes")),
-        limit_bytes: read_optional_u64(&root.join("memory.limit_in_bytes")),
-        anon_bytes: stats.get("total_rss").copied().or_else(|| stats.get("rss").copied()),
-        file_bytes: stats.get("total_cache").copied().or_else(|| stats.get("cache").copied()),
-        active_file_bytes: stats
-            .get("total_active_file")
-            .copied()
-            .or_else(|| stats.get("active_file").copied()),
-        inactive_file_bytes: stats
-            .get("total_inactive_file")
-            .copied()
-            .or_else(|| stats.get("inactive_file").copied()),
+        current_bytes: read_optional_u64(Path::new(CGROUP_V1_MEMORY_USAGE_PATH)),
+        limit_bytes: read_optional_u64(Path::new(CGROUP_V1_MEMORY_LIMIT_PATH)),
+        anon_bytes: stats.total_rss.or(stats.rss),
+        file_bytes: stats.total_cache.or(stats.cache),
+        active_file_bytes: stats.total_active_file.or(stats.active_file),
+        inactive_file_bytes: stats.total_inactive_file.or(stats.inactive_file),
     })
 }
 
 fn read_cgroup_memory_snapshot() -> Option<CgroupMemorySnapshot> {
     read_cgroup_v2().or_else(read_cgroup_v1)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
+    let json = rustfs_mimalloc::MiMalloc::stats_json();
+    if json.is_empty() {
+        return None;
+    }
+    let observation = parse_mimalloc_stats_json(&json)?;
+    Some(AllocatorMemorySnapshot {
+        backend: crate::allocator_reclaim::allocator_backend(),
+        observation,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn read_allocator_memory_snapshot() -> Option<AllocatorMemorySnapshot> {
+    None
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
+fn numeric_json_value(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_i64().and_then(|value| u64::try_from(value).ok())),
+        Value::String(value) => value.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
+fn find_mimalloc_stat<'a>(value: &'a Value, metric: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(fields) => fields
+            .get(metric)
+            .or_else(|| fields.values().find_map(|value| find_mimalloc_stat(value, metric))),
+        Value::Array(values) => values.iter().find_map(|value| find_mimalloc_stat(value, metric)),
+        _ => None,
+    }
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
+fn mimalloc_stat_current(value: &Value, metric: &str) -> Option<u64> {
+    find_mimalloc_stat(value, metric)?
+        .as_object()?
+        .get("current")
+        .and_then(numeric_json_value)
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
+fn mimalloc_stat_total(value: &Value, metric: &str) -> Option<u64> {
+    match find_mimalloc_stat(value, metric)? {
+        Value::Object(fields) => fields.get("total").and_then(numeric_json_value),
+        value => numeric_json_value(value),
+    }
+}
+
+#[cfg(any(not(target_os = "windows"), test))]
+fn parse_mimalloc_stats_json(stats_json: &str) -> Option<AllocatorMemoryObservation> {
+    let value = serde_json::from_str::<Value>(stats_json).ok()?;
+    let mut observation = AllocatorMemoryObservation {
+        reserved_bytes: mimalloc_stat_current(&value, "reserved"),
+        committed_bytes: mimalloc_stat_current(&value, "committed"),
+        page_committed_bytes: mimalloc_stat_current(&value, "page_committed"),
+        heap_count: mimalloc_stat_current(&value, "heaps").or_else(|| mimalloc_stat_current(&value, "heap_count")),
+        // Mimalloc statistics schema 6 emits scalar totals; older schemas can use an
+        // object with a total. Neither representation reports live memory.
+        reset_bytes_total: mimalloc_stat_total(&value, "reset"),
+        purged_bytes_total: mimalloc_stat_total(&value, "purged"),
+        commit_calls_total: mimalloc_stat_total(&value, "commit_calls"),
+        reset_calls_total: mimalloc_stat_total(&value, "reset_calls"),
+        purge_calls_total: mimalloc_stat_total(&value, "purge_calls"),
+        arena_purge_passes_total: mimalloc_stat_total(&value, "arena_purges"),
+        ..AllocatorMemoryObservation::default()
+    };
+    if let Some(requested) = find_mimalloc_stat(&value, "malloc_requested") {
+        // Count fields belong to one statistic; scalar counters only have a total.
+        let (current, peak, total) = match requested {
+            Value::Object(fields) => (
+                fields.get("current").and_then(numeric_json_value),
+                fields.get("peak").and_then(numeric_json_value),
+                fields.get("total").and_then(numeric_json_value),
+            ),
+            _ => (None, None, numeric_json_value(requested)),
+        };
+        // All-zero stats can mean accounting was compiled out. Normal/huge
+        // allocation stats are not a substitute for live requested bytes.
+        if [current, peak, total].into_iter().flatten().any(|value| value > 0) {
+            observation.malloc_requested_bytes = current;
+            observation.malloc_requested_peak_bytes = peak;
+            observation.malloc_requested_total_bytes = total;
+        }
+    }
+
+    if observation == AllocatorMemoryObservation::default() {
+        None
+    } else {
+        Some(observation)
+    }
 }
 
 fn configured_memory_observability_interval_secs() -> u64 {
@@ -271,17 +428,137 @@ pub fn memory_observability_controller_snapshot(ctx: &CancellationToken) -> Memo
     )
 }
 
-async fn record_memory_snapshot() {
-    match tokio::task::spawn_blocking(|| {
-        let (resource, process) = snapshot_process_resource_and_system();
-        let total_memory = refresh_total_memory();
+/// Record the effective memory total and its basis (host or cgroup).
+fn record_effective_memory(total_bytes: u64) {
+    let basis = crate::cgroup_resources::container_resources().basis;
+    metrics::gauge!("rustfs_memory_effective_total_bytes", "basis" => basis).set(total_bytes as f64);
+}
+
+/// These are live process-cgroup observations, separate from the startup-only
+/// container gauges. Consumers must require availability and a fresh timestamp;
+/// a failed sample does not overwrite an unknown resource with zero.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn record_background_resource_sample(sample: Option<crate::cgroup_resources::live::ResourceSample>, observed_at: u64) {
+    let Some(sample) = sample else {
+        metrics::gauge!("rustfs_background_resource_sample_available").set(0.0);
+        return;
+    };
+    metrics::gauge!("rustfs_background_resource_cpu_millis").set(sample.cpu_millis as f64);
+    metrics::gauge!("rustfs_background_resource_memory_limit_bytes").set(sample.memory_limit as f64);
+    metrics::gauge!("rustfs_background_resource_memory_headroom_bytes").set(sample.memory_headroom as f64);
+    // Two exact 32-bit values preserve the generation identity in floating-point
+    // metrics without introducing a new label for every cgroup replacement.
+    metrics::gauge!("rustfs_background_resource_identity_high").set((sample.identity >> 32) as f64);
+    metrics::gauge!("rustfs_background_resource_identity_low").set((sample.identity & u64::from(u32::MAX)) as f64);
+    for (name, resource, value) in [
+        ("rustfs_background_resource_cpu_usage_microseconds", "cpu_usage", sample.cpu_usage_usec),
+        (
+            "rustfs_background_resource_cpu_throttled_microseconds",
+            "cpu_throttled",
+            sample.cpu_throttled_usec,
+        ),
+        ("rustfs_background_resource_cpu_stall_microseconds", "cpu_stall", sample.cpu_stall_usec),
+        (
+            "rustfs_background_resource_memory_stall_microseconds",
+            "memory_stall",
+            sample.memory_stall_usec,
+        ),
+        ("rustfs_background_resource_io_stall_microseconds", "io_stall", sample.io_stall_usec),
+    ] {
+        metrics::gauge!("rustfs_background_resource_counter_available", "resource" => resource).set(if value.is_some() {
+            1.0
+        } else {
+            0.0
+        });
+        if let Some(value) = value {
+            metrics::gauge!(name).set(value as f64);
+        }
+    }
+    metrics::gauge!("rustfs_background_resource_observed_timestamp_seconds").set(observed_at as f64);
+    metrics::gauge!("rustfs_background_resource_sample_available").set(1.0);
+}
+
+/// Record container resource detection results.
+fn record_container_resource_detection() {
+    let res = crate::cgroup_resources::container_resources();
+
+    metrics::gauge!("rustfs_container_cpu_cores").set(res.cpu_cores as f64);
+    metrics::gauge!("rustfs_container_memory_bytes").set(res.memory_bytes as f64);
+    metrics::gauge!("rustfs_container_cgroup_detected").set(if res.cgroup_detected { 1.0 } else { 0.0 });
+    metrics::gauge!("rustfs_container_overridden").set(if res.overridden { 1.0 } else { 0.0 });
+}
+
+fn allocator_snapshot_or_unavailable(snapshot: Option<AllocatorMemorySnapshot>) -> AllocatorMemorySnapshot {
+    snapshot.unwrap_or_else(|| AllocatorMemorySnapshot {
+        backend: crate::allocator_reclaim::allocator_backend(),
+        observation: AllocatorMemoryObservation::default(),
+    })
+}
+
+/// Record the serving Tokio runtime's worker and blocking-pool thread counts.
+/// Blocking-pool counts require a diagnostic build with `tokio_unstable`.
+fn record_tokio_runtime_metrics() {
+    let runtime = tokio::runtime::Handle::current().metrics();
+    metrics::gauge!("rustfs_runtime_worker_threads").set(runtime.num_workers() as f64);
+
+    #[cfg(tokio_unstable)]
+    {
+        let total = runtime.num_blocking_threads();
+        let idle = runtime.num_idle_blocking_threads().min(total);
+        metrics::gauge!("rustfs_runtime_blocking_pool_metrics_available").set(1.0);
+        metrics::gauge!("rustfs_runtime_blocking_threads_total").set(total as f64);
+        metrics::gauge!("rustfs_runtime_blocking_threads_idle").set(idle as f64);
+        metrics::gauge!("rustfs_runtime_blocking_threads_active").set(total.saturating_sub(idle) as f64);
+    }
+
+    #[cfg(not(tokio_unstable))]
+    metrics::gauge!("rustfs_runtime_blocking_pool_metrics_available").set(0.0);
+
+    #[cfg(all(
+        feature = "diagnostic-allocator-live",
+        not(target_os = "windows"),
+        not(all(feature = "hotpath", feature = "hotpath-alloc"))
+    ))]
+    {
+        metrics::gauge!("rustfs_memory_allocator_rust_global_requested_live_bytes_available").set(1.0);
+        metrics::gauge!("rustfs_memory_allocator_rust_global_requested_live_bytes")
+            .set(DIAGNOSTIC_GLOBAL_ALLOCATOR_LIVE_REQUESTED_BYTES.load(Ordering::Relaxed) as f64);
+    }
+
+    #[cfg(not(all(
+        feature = "diagnostic-allocator-live",
+        not(target_os = "windows"),
+        not(all(feature = "hotpath", feature = "hotpath-alloc"))
+    )))]
+    metrics::gauge!("rustfs_memory_allocator_rust_global_requested_live_bytes_available").set(0.0);
+}
+
+async fn record_memory_snapshot(process_sampler: Arc<Mutex<ProcessSampler>>) {
+    record_tokio_runtime_metrics();
+    match tokio::task::spawn_blocking(move || {
+        let mut sampler = process_sampler.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (resource, process) = sampler.snapshot_resource_and_system();
+        #[cfg(any(target_os = "linux", all(test, unix)))]
+        {
+            // Reuse the existing blocking sampling worker. No filesystem reads
+            // or new tasks are added to object, scanner or heal execution paths.
+            let sample = crate::cgroup_resources::live::sample().ok();
+            if let Ok(observed_at) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                record_background_resource_sample(sample, observed_at.as_secs());
+            } else {
+                record_background_resource_sample(None, 0);
+            }
+        }
+        let effective_memory = refresh_effective_memory();
         let cgroup = read_cgroup_memory_snapshot();
-        (resource, process, total_memory, cgroup)
+        let allocator = read_allocator_memory_snapshot();
+        (resource, process, effective_memory, cgroup, allocator)
     })
     .await
     {
-        Ok((resource, process, total_memory, cgroup)) => {
-            record_memory_usage(process.resident_memory_bytes, total_memory);
+        Ok((resource, process, effective_memory, cgroup, allocator)) => {
+            record_memory_usage(process.resident_memory_bytes, effective_memory);
+            record_effective_memory(effective_memory);
             record_cpu_usage(resource.cpu_percent);
             record_process_memory_split(process.resident_memory_bytes, process.virtual_memory_bytes);
 
@@ -295,8 +572,13 @@ async fn record_memory_snapshot() {
                     cgroup.inactive_file_bytes,
                 );
             }
+
+            let allocator = allocator_snapshot_or_unavailable(allocator);
+            record_allocator_memory_observation(allocator.backend, allocator.observation);
         }
         Err(err) => {
+            let allocator = allocator_snapshot_or_unavailable(None);
+            record_allocator_memory_observation(allocator.backend, allocator.observation);
             debug!(error = ?err, "memory observability sampler task failed");
         }
     }
@@ -305,6 +587,10 @@ async fn record_memory_snapshot() {
 pub fn init_memory_observability(ctx: CancellationToken) {
     let interval_secs = configured_memory_observability_interval_secs();
     let interval = Duration::from_secs(interval_secs.max(1));
+    let process_sampler = Arc::new(Mutex::new(ProcessSampler::new()));
+
+    // Record container resource detection results at startup
+    record_container_resource_detection();
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -317,7 +603,7 @@ pub fn init_memory_observability(ctx: CancellationToken) {
                     break;
                 }
                 _ = ticker.tick() => {
-                    record_memory_snapshot().await;
+                    record_memory_snapshot(Arc::clone(&process_sampler)).await;
                 }
             }
         }
@@ -326,21 +612,172 @@ pub fn init_memory_observability(ctx: CancellationToken) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(
+        feature = "diagnostic-allocator-live",
+        not(target_os = "windows"),
+        not(all(feature = "hotpath", feature = "hotpath-alloc"))
+    ))]
+    use std::sync::atomic::AtomicUsize;
+
+    #[cfg(all(
+        feature = "diagnostic-allocator-live",
+        not(target_os = "windows"),
+        not(all(feature = "hotpath", feature = "hotpath-alloc"))
+    ))]
+    #[test]
+    fn diagnostic_global_allocator_counter_tracks_alloc_realloc_and_free() {
+        let counter = AtomicUsize::new(0);
+
+        super::adjust_diagnostic_global_allocator_live_bytes(&counter, 0, 32);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 32);
+
+        super::adjust_diagnostic_global_allocator_live_bytes(&counter, 32, 64);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 64);
+
+        super::adjust_diagnostic_global_allocator_live_bytes(&counter, 64, 8);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 8);
+
+        super::adjust_diagnostic_global_allocator_live_bytes(&counter, 8, 0);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
     use super::{
         CgroupMemorySnapshot, MEMORY_OBSERVABILITY_SERVICE_NAME, MemoryObservabilityCancellationSource,
         MemoryObservabilityController, MemoryObservabilityDesiredState, MemoryObservabilityServiceState,
         MemoryObservabilityShutdownHandle, MemoryObservabilityWorkerMutation, build_memory_observability_controller_snapshot,
-        build_memory_observability_status_snapshot, parse_kv_stats, read_optional_u64,
+        build_memory_observability_status_snapshot, parse_cgroup_memory_stat, parse_mimalloc_stats_json, read_optional_u64,
     };
     use std::fs;
     use std::path::PathBuf;
 
+    #[tokio::test]
+    async fn runtime_diagnostics_publish_feature_availability() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        metrics::with_local_recorder(&recorder, super::record_tokio_runtime_metrics);
+        let rows = recorder.snapshotter().snapshot().into_vec();
+        let gauge = |name: &str| {
+            rows.iter()
+                .find_map(|(key, _, _, value)| match value {
+                    DebugValue::Gauge(value) if key.key().name() == name => Some(value.into_inner()),
+                    _ => None,
+                })
+                .expect("diagnostic gauge is published")
+        };
+        assert_eq!(
+            gauge("rustfs_runtime_worker_threads"),
+            f64::from(
+                u32::try_from(tokio::runtime::Handle::current().metrics().num_workers()).expect("Tokio worker count fits u32")
+            )
+        );
+        assert_eq!(
+            gauge("rustfs_runtime_blocking_pool_metrics_available"),
+            if cfg!(tokio_unstable) { 1.0 } else { 0.0 }
+        );
+        let allocator_available = cfg!(all(
+            feature = "diagnostic-allocator-live",
+            not(target_os = "windows"),
+            not(all(feature = "hotpath", feature = "hotpath-alloc"))
+        ));
+        assert_eq!(
+            gauge("rustfs_memory_allocator_rust_global_requested_live_bytes_available"),
+            if allocator_available { 1.0 } else { 0.0 }
+        );
+        if allocator_available {
+            assert!(gauge("rustfs_memory_allocator_rust_global_requested_live_bytes") >= 0.0);
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn parse_kv_stats_extracts_numeric_pairs() {
-        let parsed = parse_kv_stats("anon 12\nfile 34\nactive_file 56\n");
-        assert_eq!(parsed.get("anon").copied(), Some(12));
-        assert_eq!(parsed.get("file").copied(), Some(34));
-        assert_eq!(parsed.get("active_file").copied(), Some(56));
+    fn live_resource_metrics_follow_shrink_and_preserve_unknown_observations() {
+        use crate::cgroup_resources::live::ResourceSample;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        // DebuggingRecorder snapshots drain every gauge. Use one snapshot per
+        // independent scenario so later assertions cannot observe that drain.
+        for stage in 0..3 {
+            let recorder = DebuggingRecorder::new();
+            let mut sample = ResourceSample {
+                cpu_millis: 2000,
+                memory_limit: 268435456,
+                memory_headroom: 134217728,
+                cpu_usage_usec: Some(123),
+                cpu_throttled_usec: Some(7),
+                cpu_stall_usec: Some(4),
+                memory_stall_usec: None,
+                io_stall_usec: Some(9),
+                identity: u64::MAX,
+            };
+            metrics::with_local_recorder(&recorder, || {
+                super::record_background_resource_sample(Some(sample), 100);
+                if stage > 0 {
+                    sample.cpu_millis = 1000;
+                    sample.memory_limit = 201326592;
+                    sample.memory_headroom = 0;
+                    sample.io_stall_usec = None;
+                    super::record_background_resource_sample(Some(sample), 101);
+                }
+                if stage > 1 {
+                    super::record_background_resource_sample(None, 102);
+                }
+            });
+            let values = recorder.snapshotter().snapshot().into_vec();
+            let gauge = |name: &str, resource: Option<&str>| {
+                values.iter().find_map(|(key, _, _, value)| {
+                    (key.key().name() == name
+                        && key
+                            .key()
+                            .labels()
+                            .find(|label| label.key() == "resource")
+                            .map(|label| label.value())
+                            == resource)
+                        .then(|| match value {
+                            DebugValue::Gauge(value) => value.into_inner(),
+                            _ => panic!("expected gauge {name}"),
+                        })
+                })
+            };
+            assert_eq!(gauge("rustfs_background_resource_identity_high", None), Some(f64::from(u32::MAX)));
+            assert_eq!(gauge("rustfs_background_resource_identity_low", None), Some(f64::from(u32::MAX)));
+            assert_eq!(gauge("rustfs_background_resource_counter_available", Some("memory_stall")), Some(0.0));
+            assert_eq!(gauge("rustfs_background_resource_memory_stall_microseconds", None), None);
+            assert_eq!(gauge("rustfs_background_resource_io_stall_microseconds", None), Some(9.0));
+            assert_eq!(
+                gauge("rustfs_background_resource_counter_available", Some("io_stall")),
+                Some(if stage == 0 { 1.0 } else { 0.0 })
+            );
+            assert_eq!(
+                gauge("rustfs_background_resource_cpu_millis", None),
+                Some(if stage == 0 { 2000.0 } else { 1000.0 })
+            );
+            assert_eq!(
+                gauge("rustfs_background_resource_memory_limit_bytes", None),
+                Some(if stage == 0 { 268435456.0 } else { 201326592.0 })
+            );
+            assert_eq!(
+                gauge("rustfs_background_resource_memory_headroom_bytes", None),
+                Some(if stage == 0 { 134217728.0 } else { 0.0 })
+            );
+            assert_eq!(
+                gauge("rustfs_background_resource_sample_available", None),
+                Some(if stage == 2 { 0.0 } else { 1.0 })
+            );
+            assert_eq!(
+                gauge("rustfs_background_resource_observed_timestamp_seconds", None),
+                Some(if stage == 0 { 100.0 } else { 101.0 })
+            );
+        }
+    }
+
+    #[test]
+    fn parse_cgroup_memory_stat_extracts_tracked_numeric_fields() {
+        let parsed = parse_cgroup_memory_stat("anon 12\nfile 34\nactive_file 56\nignored 78\nmalformed nope\n");
+        assert_eq!(parsed.anon, Some(12));
+        assert_eq!(parsed.file, Some(34));
+        assert_eq!(parsed.active_file, Some(56));
+        assert_eq!(parsed.inactive_file, None);
     }
 
     #[test]
@@ -364,6 +801,274 @@ mod tests {
         assert_eq!(snapshot.file_bytes, None);
         assert_eq!(snapshot.active_file_bytes, None);
         assert_eq!(snapshot.inactive_file_bytes, None);
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_extracts_allocator_attribution() {
+        let parsed = parse_mimalloc_stats_json(
+            r#"{
+                "process": {
+                    "reserved": { "current": 1048576 },
+                    "committed": { "current": "524288" },
+                    "page_committed": { "current": 262144 },
+                    "malloc_requested": {
+                        "current": 131072,
+                        "peak": 196608,
+                        "total": 10485760
+                    },
+                    "heaps": { "current": 8 }
+                }
+            }"#,
+        )
+        .expect("mimalloc stats should parse");
+
+        assert_eq!(parsed.reserved_bytes, Some(1_048_576));
+        assert_eq!(parsed.committed_bytes, Some(524_288));
+        assert_eq!(parsed.page_committed_bytes, Some(262_144));
+        assert_eq!(parsed.malloc_requested_bytes, Some(131_072));
+        assert_eq!(parsed.malloc_requested_peak_bytes, Some(196_608));
+        assert_eq!(parsed.malloc_requested_total_bytes, Some(10_485_760));
+        assert_eq!(parsed.heap_count, Some(8));
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_does_not_infer_live_bytes_from_allocation_totals() {
+        let parsed = parse_mimalloc_stats_json(
+            r#"{
+                "stat_version": 1,
+                "mimalloc_version": 300,
+                "reserved": { "total": 1048576, "peak": 1048576, "current": 1048576 },
+                "committed": { "total": 524288, "peak": 524288, "current": 524288 },
+                "malloc_normal": { "total": 7340032, "peak": 262144, "current": 196608 },
+                "malloc_huge": { "total": 3145728, "peak": 131072, "current": 65536 },
+                "malloc_requested": { "total": 0, "peak": 0, "current": 0 },
+                "heaps": { "total": 1, "peak": 1, "current": 1 }
+            }"#,
+        )
+        .expect("mimalloc v3 stats should parse");
+
+        assert_eq!(parsed.reserved_bytes, Some(1_048_576));
+        assert_eq!(parsed.committed_bytes, Some(524_288));
+        assert_eq!(parsed.malloc_requested_bytes, None);
+        assert_eq!(parsed.malloc_requested_peak_bytes, None);
+        assert_eq!(parsed.malloc_requested_total_bytes, None);
+        assert_eq!(parsed.heap_count, Some(1));
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_scalar_requested_is_only_a_cumulative_total() {
+        for requested in ["311856733152", "\"311856733152\""] {
+            let payload = format!(r#"{{ "stat_version": 5, "malloc_requested": {requested} }}"#);
+            let parsed = parse_mimalloc_stats_json(&payload).expect("counter stats should parse");
+            assert_eq!(parsed.malloc_requested_bytes, None);
+            assert_eq!(parsed.malloc_requested_peak_bytes, None);
+            assert_eq!(parsed.malloc_requested_total_bytes, Some(311_856_733_152));
+        }
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_preserves_zero_after_live_allocations_are_freed() {
+        let parsed =
+            parse_mimalloc_stats_json(r#"{ "malloc_requested": { "current": 0, "peak": 10485760, "total": 20971520 } }"#)
+                .expect("supported drained allocation stats should parse");
+        assert_eq!(parsed.malloc_requested_bytes, Some(0));
+        assert_eq!(parsed.malloc_requested_peak_bytes, Some(10_485_760));
+        assert_eq!(parsed.malloc_requested_total_bytes, Some(20_971_520));
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_does_not_fabricate_missing_or_invalid_requested_fields() {
+        let parsed = parse_mimalloc_stats_json(r#"{ "malloc_requested": { "total": 10485760 } }"#)
+            .expect("partial counter stats should parse");
+        assert_eq!(parsed.malloc_requested_bytes, None);
+        assert_eq!(parsed.malloc_requested_peak_bytes, None);
+        assert_eq!(parsed.malloc_requested_total_bytes, Some(10_485_760));
+        for payload in [
+            r#"{ "malloc_requested": -1 }"#,
+            r#"{ "malloc_requested": "invalid" }"#,
+            r#"{ "malloc_requested": { "current": -1 } }"#,
+            r#"{ "malloc_requested": { "unexpected": { "current": 123 } } }"#,
+        ] {
+            assert_eq!(parse_mimalloc_stats_json(payload), None, "invalid schema: {payload}");
+        }
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_does_not_mix_duplicate_statistic_nodes() {
+        let parsed = parse_mimalloc_stats_json(
+            r#"{
+                "malloc_requested": 10,
+                "wrapper": { "malloc_requested": { "current": 20, "peak": 30, "total": 40 } }
+            }"#,
+        )
+        .expect("top-level counter should parse");
+        assert_eq!(parsed.malloc_requested_bytes, None);
+        assert_eq!(parsed.malloc_requested_peak_bytes, None);
+        assert_eq!(parsed.malloc_requested_total_bytes, Some(10));
+
+        let parsed = parse_mimalloc_stats_json(
+            r#"{
+                "a": { "malloc_requested": { "current": 7 } },
+                "b": { "malloc_requested": { "peak": 9, "total": 20 } }
+            }"#,
+        )
+        .expect("first wrapped statistic should parse");
+        assert_eq!(parsed.malloc_requested_bytes, Some(7));
+        assert_eq!(parsed.malloc_requested_peak_bytes, None);
+        assert_eq!(parsed.malloc_requested_total_bytes, None);
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_keeps_all_zero_requested_stats_unavailable() {
+        for requested in ["0", "\"0\"", r#"{ "current": 0, "peak": 0, "total": 0 }"#] {
+            let payload = format!(r#"{{ "reserved": {{ "current": 1 }}, "malloc_requested": {requested} }}"#);
+            let parsed = parse_mimalloc_stats_json(&payload).expect("reserved count should parse");
+            assert_eq!(parsed.reserved_bytes, Some(1));
+            assert_eq!(parsed.malloc_requested_bytes, None);
+            assert_eq!(parsed.malloc_requested_peak_bytes, None);
+            assert_eq!(parsed.malloc_requested_total_bytes, None);
+        }
+    }
+
+    fn reclaim_stat_totals(observation: rustfs_io_metrics::AllocatorMemoryObservation) -> [Option<u64>; 6] {
+        [
+            observation.reset_bytes_total,
+            observation.purged_bytes_total,
+            observation.commit_calls_total,
+            observation.reset_calls_total,
+            observation.purge_calls_total,
+            observation.arena_purge_passes_total,
+        ]
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_reclaim_totals_match_schema_six() {
+        // Mimalloc 3.5.4 (rustfs-mimalloc 0.7.0) emits count objects and
+        // scalar counter totals in the same JSON document.
+        let parsed = parse_mimalloc_stats_json(
+            r#"{
+                "stat_version": 6,
+                "mimalloc_version": 30504,
+                "process": { "rss_current": 16384 },
+                "reserved": { "total": 65536, "peak": 32768, "current": 16384 },
+                "committed": { "total": 32768, "peak": 16384, "current": 8192 },
+                "reset": 4096,
+                "purged": 8192,
+                "commit_calls": 3,
+                "reset_calls": 4,
+                "purge_calls": 5,
+                "arena_purges": 6
+            }"#,
+        )
+        .expect("schema-six counter totals should parse");
+        assert_eq!(reclaim_stat_totals(parsed), [Some(4096), Some(8192), Some(3), Some(4), Some(5), Some(6)]);
+        assert_eq!(parsed.reserved_bytes, Some(16384));
+        assert_eq!(parsed.committed_bytes, Some(8192));
+        assert_eq!(parsed.malloc_requested_bytes, None);
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_reclaim_totals_keep_legacy_total_semantics() {
+        let parsed = parse_mimalloc_stats_json(
+            r#"{ "wrapped": {
+                "reset": { "total": 0, "current": 999 },
+                "purged": { "total": "8192", "current": 999 },
+                "commit_calls": { "total": 3, "current": 999 },
+                "reset_calls": { "total": 4, "current": 999 },
+                "purge_calls": { "total": 5, "current": 999 },
+                "arena_purges": { "total": 6, "current": 999 }
+            } }"#,
+        )
+        .expect("legacy total objects should parse");
+        assert_eq!(reclaim_stat_totals(parsed), [Some(0), Some(8192), Some(3), Some(4), Some(5), Some(6)]);
+        assert_eq!(parsed.reserved_bytes, None);
+        assert_eq!(parsed.committed_bytes, None);
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_reclaim_zero_does_not_imply_live_memory_availability() {
+        let parsed = parse_mimalloc_stats_json(
+            r#"{
+                "reset": 0, "purged": "0", "commit_calls": 0,
+                "reset_calls": 0, "purge_calls": 0, "arena_purges": 0,
+                "malloc_requested": { "current": 0, "peak": 0, "total": 0 }
+            }"#,
+        )
+        .expect("present zero totals should not disappear");
+        assert_eq!(reclaim_stat_totals(parsed), [Some(0); 6]);
+        assert_eq!(parsed.reserved_bytes, None);
+        assert_eq!(parsed.committed_bytes, None);
+        assert_eq!(parsed.malloc_requested_bytes, None);
+        assert_eq!(parsed.malloc_requested_peak_bytes, None);
+        assert_eq!(parsed.malloc_requested_total_bytes, None);
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_reclaim_totals_preserve_missing_and_invalid() {
+        for invalid in [
+            "null",
+            "-1",
+            "1.5",
+            "true",
+            "\"invalid\"",
+            "[]",
+            r#"{ "current": 123 }"#,
+            r#"{ "total": -1, "current": 123 }"#,
+            r#"{ "total": "18446744073709551616" }"#,
+        ] {
+            let payload = format!(
+                r#"{{
+                    "reserved": {{ "current": 1 }},
+                    "reset": {invalid}, "purged": {invalid}, "commit_calls": {invalid},
+                    "reset_calls": {invalid}, "purge_calls": {invalid}, "arena_purges": {invalid}
+                }}"#
+            );
+            let parsed = parse_mimalloc_stats_json(&payload).expect("reserved stat should remain available");
+            assert_eq!(reclaim_stat_totals(parsed), [None; 6], "invalid counter: {invalid}");
+            assert_eq!(parsed.reserved_bytes, Some(1));
+        }
+        let missing = parse_mimalloc_stats_json(r#"{ "reserved": { "current": 1 } }"#)
+            .expect("reserved stat should parse without counters");
+        assert_eq!(reclaim_stat_totals(missing), [None; 6]);
+        let duplicate = parse_mimalloc_stats_json(r#"{ "reset": { "current": 7 }, "wrapped": { "reset": 99 } }"#);
+        assert_eq!(duplicate, None, "a duplicate must not supply a total missing from the selected statistic");
+    }
+
+    #[test]
+    fn parse_mimalloc_stats_json_rejects_unrecognized_payload() {
+        assert_eq!(parse_mimalloc_stats_json(r#"{ "allocator": "unknown" }"#), None);
+    }
+
+    #[test]
+    fn missing_allocator_snapshot_marks_requested_bytes_as_unavailable() {
+        let supported = super::AllocatorMemorySnapshot {
+            backend: crate::allocator_reclaim::allocator_backend(),
+            observation: rustfs_io_metrics::AllocatorMemoryObservation {
+                malloc_requested_bytes: Some(128),
+                ..Default::default()
+            },
+        };
+        assert_eq!(super::allocator_snapshot_or_unavailable(Some(supported)), supported);
+        let unavailable = super::allocator_snapshot_or_unavailable(None);
+        assert_eq!(unavailable.backend, supported.backend);
+        assert_eq!(unavailable.observation, rustfs_io_metrics::AllocatorMemoryObservation::default());
+    }
+
+    #[test]
+    fn read_allocator_memory_snapshot_uses_mimalloc_stats_json() {
+        let snapshot = super::read_allocator_memory_snapshot();
+        #[cfg(not(target_os = "windows"))]
+        {
+            let snapshot = snapshot.expect("allocator snapshot should be available on non-Windows");
+            assert!(
+                reclaim_stat_totals(snapshot.observation)
+                    .into_iter()
+                    .all(|value| value.is_some()),
+                "the active mimalloc schema should expose all six cumulative statistics",
+            );
+        }
+        #[cfg(target_os = "windows")]
+        assert!(snapshot.is_none(), "allocator snapshot should be absent without mimalloc");
     }
 
     #[test]

@@ -25,6 +25,7 @@ use futures::future;
 use serde::{Deserialize, Deserializer, Serialize, de, ser::SerializeSeq};
 
 use super::{func::InnerFunc, key_name::KeyName};
+use crate::policy::function::Quantifier;
 use crate::policy::variables::PolicyVariableResolver;
 
 pub type StringFunc = InnerFunc<StringFuncValue>;
@@ -33,7 +34,7 @@ impl StringFunc {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn evaluate_with_resolver(
         &self,
-        for_all: bool,
+        quantifier: Quantifier,
         ignore_case: bool,
         like: bool,
         negate: bool,
@@ -41,10 +42,26 @@ impl StringFunc {
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         for inner in self.0.iter() {
-            let result = if like {
-                inner.eval_like(for_all, values, resolver).await ^ negate
-            } else {
-                inner.eval(for_all, ignore_case, values, resolver).await ^ negate
+            // For `ForAllValues:`/`ForAnyValue:` the negation belongs to the per-value
+            // predicate, so it is pushed down into eval/eval_like. Without a qualifier
+            // the operator applies to the value set as a whole and the aggregate is
+            // negated here, which preserves AWS single-valued-key semantics.
+            let result = match quantifier {
+                Quantifier::None => {
+                    let matched = if like {
+                        inner.eval_like(quantifier, false, values, resolver).await
+                    } else {
+                        inner.eval(quantifier, ignore_case, false, values, resolver).await
+                    };
+                    matched ^ negate
+                }
+                Quantifier::ForAnyValue | Quantifier::ForAllValues => {
+                    if like {
+                        inner.eval_like(quantifier, negate, values, resolver).await
+                    } else {
+                        inner.eval(quantifier, ignore_case, negate, values, resolver).await
+                    }
+                }
             };
 
             if !result {
@@ -56,11 +73,26 @@ impl StringFunc {
     }
 }
 
+/// Replaces every `${...}` reference to a common condition key that has a
+/// non-empty value in the request, not only the first such key.
+fn substitute_common_keys(mut c: String, values: &HashMap<String, Vec<String>>) -> String {
+    for key in KeyName::COMMON_KEYS {
+        if let Some(v) = values.get(key.name()).and_then(|x| x.first())
+            && !v.is_empty()
+        {
+            c = c.replace(&key.var_name(), v);
+        }
+    }
+
+    c
+}
+
 impl FuncKeyValue<StringFuncValue> {
     async fn eval(
         &self,
-        for_all: bool,
+        quantifier: Quantifier,
         ignore_case: bool,
+        negate: bool,
         values: &HashMap<String, Vec<String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
@@ -92,32 +124,24 @@ impl FuncKeyValue<StringFuncValue> {
         let fvalues = resolved_values
             .into_iter()
             .flatten()
-            .map(|resolved_c| {
-                let mut c = Cow::from(resolved_c);
-                for key in KeyName::COMMON_KEYS {
-                    match values.get(key.name()).and_then(|x| x.first()) {
-                        Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
-                        _ => continue,
-                    };
-                }
-
-                c
-            })
+            .map(|resolved_c| Cow::from(substitute_common_keys(resolved_c, values)))
             .map(|x| if ignore_case { Cow::Owned(x.to_lowercase()) } else { x })
             .collect::<Set<_>>();
 
-        let ivalues = rvalues.intersection(&fvalues);
-
-        if for_all {
-            rvalues.is_empty() || rvalues.len() == ivalues.count()
-        } else {
-            ivalues.count() > 0
+        match quantifier {
+            // Unqualified: the operator applies to the value set as a whole. The caller
+            // negates the aggregate, so report the plain "some value matched" result.
+            Quantifier::None => rvalues.intersection(&fvalues).count() > 0,
+            // Qualified: quantify over the per-value predicate, negation included.
+            Quantifier::ForAllValues => rvalues.iter().all(|v| fvalues.contains(v) ^ negate),
+            Quantifier::ForAnyValue => rvalues.iter().any(|v| fvalues.contains(v) ^ negate),
         }
     }
 
     async fn eval_like(
         &self,
-        for_all: bool,
+        quantifier: Quantifier,
+        negate: bool,
         values: &HashMap<String, Vec<String>>,
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
@@ -139,30 +163,35 @@ impl FuncKeyValue<StringFuncValue> {
                 let matched = resolved_values
                     .into_iter()
                     .flatten()
-                    .map(|resolved_c| {
-                        let mut c = Cow::from(resolved_c);
-                        for key in KeyName::COMMON_KEYS {
-                            match values.get(key.name()).and_then(|x| x.first()) {
-                                Some(v) if !v.is_empty() => return Cow::Owned(c.to_mut().replace(&key.var_name(), v)),
-                                _ => continue,
-                            };
-                        }
-
-                        c
-                    })
+                    .map(|resolved_c| substitute_common_keys(resolved_c, values))
                     .any(|x| wildcard::is_match(x, v));
 
-                if for_all {
-                    if !matched {
-                        return false;
+                // Unqualified evaluation reports the plain aggregate match and lets the
+                // caller negate it; the qualifiers fold negation into the per-value
+                // predicate so that ForAllValues/ForAnyValue keep their own meaning.
+                let holds = match quantifier {
+                    Quantifier::None => matched,
+                    Quantifier::ForAllValues | Quantifier::ForAnyValue => matched ^ negate,
+                };
+
+                match quantifier {
+                    Quantifier::ForAllValues => {
+                        if !holds {
+                            return false;
+                        }
                     }
-                } else if matched {
-                    return true;
+                    Quantifier::None | Quantifier::ForAnyValue => {
+                        if holds {
+                            return true;
+                        }
+                    }
                 }
             }
         }
 
-        for_all
+        // No request value settled it: ForAllValues is vacuously satisfied, the other
+        // two are not.
+        quantifier == Quantifier::ForAllValues
     }
 }
 
@@ -243,6 +272,7 @@ impl<'d> Deserialize<'d> for StringFuncValue {
 #[cfg(test)]
 mod tests {
     use super::{StringFunc, StringFuncValue};
+    use crate::policy::function::Quantifier;
     use crate::policy::function::func::FuncKeyValue;
     use crate::policy::function::{
         key::Key,
@@ -251,7 +281,7 @@ mod tests {
     };
     use std::collections::HashMap;
 
-    use crate::policy::function::key_name::S3KeyName::S3LocationConstraint;
+    use crate::policy::function::key_name::S3KeyName::{S3LocationConstraint, S3ObjectLockLegalHold, S3ObjectLockMode};
     use test_case::test_case;
 
     fn new_func(name: KeyName, variable: Option<String>, values: Vec<&str>) -> StringFunc {
@@ -272,6 +302,8 @@ mod tests {
     ))]
     #[test_case(r#"{"aws:username/value": ["johndoe", "aaa"]}"#, new_func(Aws(AWSUsername), Some("value".into()), vec!["johndoe", "aaa"]
     ))]
+    #[test_case(r#"{"s3:object-lock-mode": "COMPLIANCE"}"#, new_func(S3(S3ObjectLockMode), None, vec!["COMPLIANCE"]))]
+    #[test_case(r#"{"s3:object-lock-legal-hold": "ON"}"#, new_func(S3(S3ObjectLockLegalHold), None, vec!["ON"]))]
     fn test_deser(input: &str, expect: StringFunc) -> Result<(), serde_json::Error> {
         let v: StringFunc = serde_json::from_str(input)?;
         assert_eq!(v, expect);
@@ -304,6 +336,9 @@ mod tests {
         }
     }
 
+    /// `for_all` selects `ForAllValues:`; otherwise the operator is unqualified.
+    /// Mirrors the dispatch in `StringFunc::evaluate_with_resolver` so the tests
+    /// exercise the same negation placement as production.
     fn test_eval(
         s: FuncKeyValue<StringFuncValue>,
         for_all: bool,
@@ -315,9 +350,12 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
             .collect();
-        let result = s.eval(for_all, ignore_case, &map, None);
 
-        pollster::block_on(result) ^ negate
+        if for_all {
+            pollster::block_on(s.eval(Quantifier::ForAllValues, ignore_case, negate, &map, None))
+        } else {
+            pollster::block_on(s.eval(Quantifier::None, ignore_case, false, &map, None)) ^ negate
+        }
     }
 
     #[test]
@@ -345,6 +383,44 @@ mod tests {
         ));
     }
 
+    // Real requests always carry earlier common keys such as `signatureversion`
+    // and `SourceIp`; substitution must still reach later keys like `jwt:*`.
+    #[test]
+    fn test_condition_values_substitute_variables_after_other_common_keys() {
+        let request = || {
+            vec![
+                ("signatureversion", vec!["AWS4-HMAC-SHA256"]),
+                ("SourceIp", vec!["192.0.2.10"]),
+                ("preferred_username", vec!["alice"]),
+                ("prefix", vec!["alice/photos/"]),
+            ]
+        };
+
+        assert!(test_eval_like(
+            new_fkv("s3:prefix", vec!["${jwt:preferred_username}/*"]),
+            false,
+            false,
+            request()
+        ));
+        assert!(test_eval(
+            new_fkv("s3:prefix", vec!["${jwt:preferred_username}/photos/"]),
+            false,
+            false,
+            false,
+            request()
+        ));
+        assert!(!test_eval_like(
+            new_fkv("s3:prefix", vec!["${jwt:preferred_username}/*"]),
+            false,
+            false,
+            vec![
+                ("signatureversion", vec!["AWS4-HMAC-SHA256"]),
+                ("preferred_username", vec!["bob"]),
+                ("prefix", vec!["alice/photos/"]),
+            ]
+        ));
+    }
+
     #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["mybucket/myobject"])] => true ; "1")]
     #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["yourbucket/myobject"])] => false ; "2")]
     #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![] => false ; "3")]
@@ -366,6 +442,9 @@ mod tests {
     #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/security", vec!["public"])] => true ; "19")]
     #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/security", vec!["private"])] => false ; "20")]
     #[test_case(new_fkv("s3:ExistingObjectTag/security", vec!["public"]), false, vec![("ExistingObjectTag/project", vec!["webapp"])] => false ; "21")]
+    #[test_case(new_fkv("s3:VersionId", vec!["version-1"]), false, vec![("versionid", vec!["version-1"])] => true ; "aws_version_id")]
+    #[test_case(new_fkv("s3:versionid", vec!["version-1"]), false, vec![("versionid", vec!["version-1"])] => true ; "minio_version_id")]
+    #[test_case(new_fkv("s3:object-lock-mode", vec!["COMPLIANCE"]), false, vec![("object-lock-mode", vec!["COMPLIANCE"])] => true ; "object_lock_mode")]
     fn test_string_equals(s: FuncKeyValue<StringFuncValue>, for_all: bool, values: Vec<(&str, Vec<&str>)>) -> bool {
         test_eval(s, for_all, false, false, values)
     }
@@ -381,8 +460,9 @@ mod tests {
     #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-1", "ap-southeast-1"]), false, vec![("delimiter", vec!["/"])] => true ; "9")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("groups", vec!["prod", "art"])] => false ; "10")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("groups", vec!["art"])] => false ; "11")]
-    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![] => false ; "12")]
-    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("delimiter", vec!["/"])] => false ; "13")]
+    // ForAllValues is vacuously satisfied when the key is absent from the request.
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![] => true ; "12")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), true, vec![("delimiter", vec!["/"])] => true ; "13")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![("groups", vec!["prod", "art"])] => false ; "14")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![("groups", vec!["art"])] => false ; "15")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art"]), false, vec![] => true ; "16")]
@@ -423,8 +503,9 @@ mod tests {
     #[test_case(new_fkv("s3:LocationConstraint", vec!["EU-WEST-1", "AP-southeast-1"]), false, vec![("delimiter", vec!["/"])] => true ; "9")]
     #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("groups", vec!["prod", "art"])] => false ; "10")]
     #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("groups", vec!["art"])] => false ; "11")]
-    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![] => false ; "12")]
-    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("delimiter", vec!["/"])] => false ; "13")]
+    // ForAllValues is vacuously satisfied when the key is absent from the request.
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![] => true ; "12")]
+    #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), true, vec![("delimiter", vec!["/"])] => true ; "13")]
     #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![("groups", vec!["prod", "art"])] => false ; "14")]
     #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![("groups", vec!["art"])] => false ; "15")]
     #[test_case(new_fkv("jwt:groups", vec!["Prod", "Art"]), false, vec![] => true ; "16")]
@@ -442,9 +523,12 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.into_iter().map(ToOwned::to_owned).collect::<Vec<String>>()))
             .collect();
-        let result = s.eval_like(for_all, &map, None);
 
-        pollster::block_on(result) ^ negate
+        if for_all {
+            pollster::block_on(s.eval_like(Quantifier::ForAllValues, negate, &map, None))
+        } else {
+            pollster::block_on(s.eval_like(Quantifier::None, false, &map, None)) ^ negate
+        }
     }
 
     #[test_case(new_fkv("s3:x-amz-copy-source", vec!["mybucket/myobject"]), false, vec![("x-amz-copy-source", vec!["mybucket/myobject"])] => true ; "1")]
@@ -481,8 +565,9 @@ mod tests {
     #[test_case(new_fkv("s3:LocationConstraint", vec!["eu-west-*", "ap-southeast-1"]), false, vec![("LocationConstraint", vec!["eu-west-2"])] => false ; "10")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("groups", vec!["prod", "art"])] => false ; "11")]
     #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("groups", vec!["art"])] => false ; "12")]
-    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![] => false ; "13")]
-    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("delimiter", vec!["/"])] => false ; "14")]
+    // ForAllValues is vacuously satisfied when the key is absent from the request.
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![] => true ; "13")]
+    #[test_case(new_fkv("jwt:groups", vec!["prod", "art*"]), true, vec![("delimiter", vec!["/"])] => true ; "14")]
     #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![("groups", vec!["prod", "art"])] => false ; "15")]
     #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![("groups", vec!["art"])] => false ; "16")]
     #[test_case(new_fkv("jwt:groups", vec!["prod*", "art"]), false, vec![] => true ; "17")]

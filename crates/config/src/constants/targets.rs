@@ -79,6 +79,13 @@ pub const NATS_TLS_CLIENT_KEY: &str = "tls_client_key";
 pub const NATS_TLS_REQUIRED: &str = "tls_required";
 pub const NATS_QUEUE_DIR: &str = "queue_dir";
 pub const NATS_QUEUE_LIMIT: &str = "queue_limit";
+pub const NATS_JETSTREAM_ENABLE: &str = "jetstream_enable";
+pub const NATS_JETSTREAM_STREAM_NAME: &str = "jetstream_stream_name";
+pub const NATS_JETSTREAM_ACK_TIMEOUT_SECS: &str = "jetstream_ack_timeout_secs";
+
+pub const NATS_JETSTREAM_ACK_TIMEOUT_DEFAULT_SECS: u64 = 30;
+pub const NATS_JETSTREAM_ACK_TIMEOUT_MIN_SECS: u64 = 10;
+pub const NATS_JETSTREAM_ACK_TIMEOUT_MAX_SECS: u64 = 120;
 
 pub const PULSAR_BROKER: &str = "broker";
 pub const PULSAR_TOPIC: &str = "topic";
@@ -137,5 +144,17 @@ pub const POSTGRES_QUEUE_LIMIT: &str = "queue_limit";
 /// Applies to both notify and audit target queue stores.
 pub const ENV_TARGET_STORE_COMPRESS: &str = "RUSTFS_TARGET_STORE_COMPRESS";
 
+/// Environment variable that relocates the root of the default notify and audit queue directories.
+///
+/// It applies only to targets whose `queue_dir` is the logical default (`EVENT_DEFAULT_DIR` or
+/// `AUDIT_DEFAULT_DIR`); their queues move to `<root>/events` and `<root>/audit` on this node.
+pub const ENV_TARGET_STORE_DIR: &str = "RUSTFS_TARGET_STORE_DIR";
+
 /// Queue-store compression is enabled by default to reduce disk footprint.
 pub const DEFAULT_TARGET_STORE_COMPRESS: bool = true;
+
+/// Maximum on-disk bytes in each target queue, including failed entries and pending writes.
+pub const ENV_TARGET_STORE_MAX_BYTES: &str = "RUSTFS_TARGET_STORE_MAX_BYTES";
+
+/// Queue writes fail at one GiB unless the operator sets another positive byte budget.
+pub const DEFAULT_TARGET_STORE_MAX_BYTES: u64 = 1024 * 1024 * 1024;

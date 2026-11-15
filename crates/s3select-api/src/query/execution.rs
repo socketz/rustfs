@@ -29,8 +29,9 @@ use tracing::debug;
 use crate::{QueryError, QueryResult};
 
 use super::Query;
+use super::ast::ExtStatement;
 use super::logical_planner::Plan;
-use super::session::SessionCtx;
+use super::session::{QueryExecutionTracker, SessionCtx};
 
 pub struct PhaseTimer {
     phase_name: &'static str,
@@ -172,6 +173,8 @@ pub struct QueryStateMachine {
     pub session: SessionCtx,
     pub query: Query,
 
+    prepared_statement: Option<ExtStatement>,
+    query_tracker: Option<QueryExecutionTracker>,
     state: RwLock<QueryState>,
     start: Instant,
 }
@@ -195,9 +198,45 @@ impl QueryStateMachine {
         Self {
             session,
             query,
+            prepared_statement: None,
+            query_tracker: None,
             state: RwLock::new(QueryState::ACCEPTING),
             start: Instant::now(),
         }
+    }
+
+    pub fn begin_tracked(query: Query, session: SessionCtx, query_tracker: QueryExecutionTracker) -> QueryResult<Self> {
+        if !session.is_bound_to(&query_tracker) {
+            return Err(QueryError::Cancel);
+        }
+        let mut state_machine = Self::begin(query, session);
+        state_machine.query_tracker = Some(query_tracker);
+        Ok(state_machine)
+    }
+
+    pub fn begin_tracked_prepared(
+        query: Query,
+        session: SessionCtx,
+        query_tracker: QueryExecutionTracker,
+        prepared_statement: ExtStatement,
+    ) -> QueryResult<Self> {
+        let mut state_machine = Self::begin_tracked(query, session, query_tracker)?;
+        state_machine.prepared_statement = Some(prepared_statement);
+        Ok(state_machine)
+    }
+
+    pub fn prepared_statement(&self) -> Option<&ExtStatement> {
+        self.prepared_statement.as_ref()
+    }
+
+    pub fn query_tracker(&self) -> Option<&QueryExecutionTracker> {
+        self.query_tracker.as_ref()
+    }
+
+    pub fn tracker_matches_session(&self) -> bool {
+        self.query_tracker
+            .as_ref()
+            .is_some_and(|query_tracker| self.session.is_bound_to(query_tracker))
     }
 
     pub fn begin_analyze(&self) {
@@ -228,17 +267,14 @@ impl QueryStateMachine {
     }
 
     pub fn finish(&self) {
-        // TODO
         self.translate_to(QueryState::DONE(DONE::FINISHED));
     }
 
     pub fn cancel(&self) {
-        // TODO
         self.translate_to(QueryState::DONE(DONE::CANCELLED));
     }
 
     pub fn fail(&self) {
-        // TODO
         self.translate_to(QueryState::DONE(DONE::FAILED));
     }
 

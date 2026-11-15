@@ -18,11 +18,23 @@ use rustfs_security_governance::{
 };
 
 const ALL_ADMIN: AdminActionRef = AdminActionRef::new("AllAdminActions");
-const ADD_USER_TO_GROUP: AdminActionRef = AdminActionRef::new("AddUserToGroupAdminAction");
 const ATTACH_POLICY: AdminActionRef = AdminActionRef::new("AttachPolicyAdminAction");
 const CONFIG_UPDATE: AdminActionRef = AdminActionRef::new("ConfigUpdateAdminAction");
+const TLS_CERTIFICATE_PUBLISH: AdminActionRef = AdminActionRef::new("TLSCertificatePublishAdminAction");
+const TLS_CERTIFICATE_STATUS: AdminActionRef = AdminActionRef::new("TLSCertificateStatusAdminAction");
+const CONSOLE_LOG: AdminActionRef = AdminActionRef::new("ConsoleLogAdminAction");
 const COMMIT_TABLE: AdminActionRef = AdminActionRef::new("CommitTableAction");
+const ISSUE_PLUGIN_ATTEMPT: AdminActionRef = AdminActionRef::new("IssuePluginAttemptAction");
+const SUBMIT_PLUGIN_JOB: AdminActionRef = AdminActionRef::new("SubmitPluginJobAction");
+const GET_PLUGIN_RUN: AdminActionRef = AdminActionRef::new("GetPluginRunAction");
+const CANCEL_PLUGIN_RUN: AdminActionRef = AdminActionRef::new("CancelPluginRunAction");
+const LIST_PLUGIN_RUNS: AdminActionRef = AdminActionRef::new("ListPluginRunsAction");
+const REPLAY_PLUGIN_RUN: AdminActionRef = AdminActionRef::new("ReplayPluginRunAction");
+const GET_PLUGIN_DELEGATION: AdminActionRef = AdminActionRef::new("GetPluginDelegationAction");
+const CREATE_PLUGIN_DELEGATION: AdminActionRef = AdminActionRef::new("CreatePluginDelegationAction");
+const REVOKE_PLUGIN_DELEGATION: AdminActionRef = AdminActionRef::new("RevokePluginDelegationAction");
 const CREATE_POLICY: AdminActionRef = AdminActionRef::new("CreatePolicyAdminAction");
+const CREATE_USER: AdminActionRef = AdminActionRef::new("CreateUserAdminAction");
 const CREATE_SERVICE_ACCOUNT: AdminActionRef = AdminActionRef::new("CreateServiceAccountAdminAction");
 const CREATE_TABLE: AdminActionRef = AdminActionRef::new("CreateTableAction");
 const DECOMMISSION: AdminActionRef = AdminActionRef::new("DecommissionAdminAction");
@@ -34,8 +46,12 @@ const ENABLE_GROUP: AdminActionRef = AdminActionRef::new("EnableGroupAdminAction
 const ENABLE_USER: AdminActionRef = AdminActionRef::new("EnableUserAdminAction");
 const EXPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ExportBucketMetadataAction");
 const EXPORT_IAM: AdminActionRef = AdminActionRef::new("ExportIAMAction");
+const FORCE_UNLOCK: AdminActionRef = AdminActionRef::new("ForceUnlockAdminAction");
 const GET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("GetBucketTargetAction");
+const GET_BUCKET_ON_DEMAND_MIGRATION: AdminActionRef = AdminActionRef::new("GetBucketOnDemandMigrationAction");
 const GET_GROUP: AdminActionRef = AdminActionRef::new("GetGroupAdminAction");
+const GET_USER: AdminActionRef = AdminActionRef::new("GetUserAdminAction");
+const GET_METRICS: AdminActionRef = AdminActionRef::new("GetMetricsAction");
 const GET_POLICY: AdminActionRef = AdminActionRef::new("GetPolicyAdminAction");
 const GET_REPLICATION_METRICS: AdminActionRef = AdminActionRef::new("GetReplicationMetricsAction");
 const GET_TABLE: AdminActionRef = AdminActionRef::new("GetTableAction");
@@ -47,33 +63,50 @@ const GET_TABLE_METADATA: AdminActionRef = AdminActionRef::new("GetTableMetadata
 const GET_TABLE_METADATA_LOCATION: AdminActionRef = AdminActionRef::new("GetTableMetadataLocationAction");
 const GET_TABLE_NAMESPACE: AdminActionRef = AdminActionRef::new("GetTableNamespaceAction");
 const HEAL: AdminActionRef = AdminActionRef::new("HealAdminAction");
+const HEALTH_INFO: AdminActionRef = AdminActionRef::new("HealthInfoAdminAction");
 const IMPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ImportBucketMetadataAction");
+const RECOVER_ORPHANED_BUCKET: AdminActionRef = AdminActionRef::new("RecoverOrphanedBucketAction");
 const IMPORT_IAM: AdminActionRef = AdminActionRef::new("ImportIAMAction");
+const INSPECT_DATA: AdminActionRef = AdminActionRef::new("InspectDataAction");
+const KMS_BACKUP: AdminActionRef = AdminActionRef::new("kms:Backup");
 const KMS_CLEAR_CACHE: AdminActionRef = AdminActionRef::new("kms:ClearCache");
 const KMS_CONFIGURE: AdminActionRef = AdminActionRef::new("kms:Configure");
 const KMS_DELETE_KEY: AdminActionRef = AdminActionRef::new("kms:DeleteKey");
 const KMS_DESCRIBE_KEY: AdminActionRef = AdminActionRef::new("kms:DescribeKey");
+const KMS_DISABLE_KEY: AdminActionRef = AdminActionRef::new("kms:DisableKey");
+const KMS_ENABLE_KEY: AdminActionRef = AdminActionRef::new("kms:EnableKey");
 const KMS_GENERATE_DATA_KEY: AdminActionRef = AdminActionRef::new("kms:GenerateDataKey");
 const KMS_LIST_KEYS: AdminActionRef = AdminActionRef::new("kms:ListKeys");
+const KMS_REKEY: AdminActionRef = AdminActionRef::new("kms:Rekey");
+const KMS_RESTORE: AdminActionRef = AdminActionRef::new("kms:Restore");
+const KMS_ROTATE_KEY: AdminActionRef = AdminActionRef::new("kms:RotateKey");
 const KMS_SERVICE_CONTROL: AdminActionRef = AdminActionRef::new("kms:ServiceControl");
+const KMS_TAG_RESOURCE: AdminActionRef = AdminActionRef::new("kms:TagResource");
+const KMS_UNTAG_RESOURCE: AdminActionRef = AdminActionRef::new("kms:UntagResource");
+const KMS_UPDATE_KEY_DESCRIPTION: AdminActionRef = AdminActionRef::new("kms:UpdateKeyDescription");
 const LIST_GROUPS: AdminActionRef = AdminActionRef::new("ListGroupsAdminAction");
 const LIST_TEMPORARY_ACCOUNTS: AdminActionRef = AdminActionRef::new("ListTemporaryAccountsAdminAction");
 const LIST_TIER: AdminActionRef = AdminActionRef::new("ListTierAction");
 const LIST_USER_POLICIES: AdminActionRef = AdminActionRef::new("ListUserPoliciesAdminAction");
 const LIST_USERS: AdminActionRef = AdminActionRef::new("ListUsersAdminAction");
+const MIGRATE_TABLE_CATALOG: AdminActionRef = AdminActionRef::new("MigrateTableCatalogAction");
 const PROFILING: AdminActionRef = AdminActionRef::new("ProfilingAdminAction");
 const REBALANCE: AdminActionRef = AdminActionRef::new("RebalanceAdminAction");
 const REGISTER_TABLE: AdminActionRef = AdminActionRef::new("RegisterTableAction");
+const REMOVE_SERVICE_ACCOUNT: AdminActionRef = AdminActionRef::new("RemoveServiceAccountAdminAction");
 const REMOVE_USER_FROM_GROUP: AdminActionRef = AdminActionRef::new("RemoveUserFromGroupAdminAction");
 const RUN_TABLE_MAINTENANCE: AdminActionRef = AdminActionRef::new("RunTableMaintenanceAction");
 const SERVER_INFO: AdminActionRef = AdminActionRef::new("ServerInfoAdminAction");
+const SERVER_UPDATE: AdminActionRef = AdminActionRef::new("ServerUpdateAdminAction");
 const SET_BUCKET_QUOTA: AdminActionRef = AdminActionRef::new("SetBucketQuotaAdminAction");
 const SET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("SetBucketTargetAction");
+const SET_BUCKET_ON_DEMAND_MIGRATION: AdminActionRef = AdminActionRef::new("SetBucketOnDemandMigrationAction");
 const SET_TABLE: AdminActionRef = AdminActionRef::new("SetTableAction");
 const SET_TABLE_BUCKET: AdminActionRef = AdminActionRef::new("SetTableBucketAction");
 const SET_TABLE_LIFECYCLE: AdminActionRef = AdminActionRef::new("SetTableLifecycleAction");
 const SET_TABLE_METADATA_LOCATION: AdminActionRef = AdminActionRef::new("SetTableMetadataLocationAction");
 const SET_TABLE_NAMESPACE: AdminActionRef = AdminActionRef::new("SetTableNamespaceAction");
+const UPDATE_TABLE_NAMESPACE_PROPERTIES: AdminActionRef = AdminActionRef::new("UpdateTableNamespacePropertiesAction");
 const SET_TIER: AdminActionRef = AdminActionRef::new("SetTierAction");
 const SITE_REPLICATION_ADD: AdminActionRef = AdminActionRef::new("SiteReplicationAddAction");
 const SITE_REPLICATION_INFO: AdminActionRef = AdminActionRef::new("SiteReplicationInfoAction");
@@ -81,6 +114,14 @@ const SITE_REPLICATION_OPERATION: AdminActionRef = AdminActionRef::new("SiteRepl
 const SITE_REPLICATION_REMOVE: AdminActionRef = AdminActionRef::new("SiteReplicationRemoveAction");
 const SITE_REPLICATION_RESYNC: AdminActionRef = AdminActionRef::new("SiteReplicationResyncAction");
 const STORAGE_INFO: AdminActionRef = AdminActionRef::new("StorageInfoAdminAction");
+// MinIO admin compat: batch jobs and replication diff.
+const START_BATCH_JOB: AdminActionRef = AdminActionRef::new("StartBatchJobAction");
+const LIST_BATCH_JOBS: AdminActionRef = AdminActionRef::new("ListBatchJobsAction");
+const DESCRIBE_BATCH_JOB: AdminActionRef = AdminActionRef::new("DescribeBatchJobAction");
+const CANCEL_BATCH_JOB: AdminActionRef = AdminActionRef::new("CancelBatchJobAction");
+const REPLICATION_DIFF: AdminActionRef = AdminActionRef::new("ReplicationDiff");
+const TOP_LOCKS: AdminActionRef = AdminActionRef::new("TopLocksAdminAction");
+const TRACE: AdminActionRef = AdminActionRef::new("TraceAdminAction");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeferredRoutePolicyReason {
@@ -128,6 +169,14 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/v3/list-users", LIST_USERS, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Delete, "/rustfs/admin/v3/remove-user", DELETE_USER, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/set-user-status", ENABLE_USER, RouteRiskLevel::High),
+    // Resetting somebody else's secret key is the same capability as creating
+    // them, so it carries the same action.
+    admin(HttpMethod::Put, "/rustfs/admin/v3/set-user-secret-key", CREATE_USER, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/user/mfa", GET_USER, RouteRiskLevel::Sensitive),
+    // Clearing another identity's second factor is break-glass: whoever can
+    // re-enable a disabled account can already take the identity over, so this
+    // shares that action rather than inventing a weaker one.
+    admin(HttpMethod::Delete, "/rustfs/admin/v3/user/mfa", ENABLE_USER, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/v3/groups", LIST_GROUPS, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/group", GET_GROUP, RouteRiskLevel::Sensitive),
     admin(
@@ -137,12 +186,6 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(HttpMethod::Put, "/rustfs/admin/v3/set-group-status", ENABLE_GROUP, RouteRiskLevel::High),
-    admin(
-        HttpMethod::Put,
-        "/rustfs/admin/v3/update-group-members",
-        ADD_USER_TO_GROUP,
-        RouteRiskLevel::High,
-    ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/temporary-account-info",
@@ -163,6 +206,55 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/export-iam", EXPORT_IAM, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/import-iam", IMPORT_IAM, RouteRiskLevel::High),
+    admin(HttpMethod::Put, "/rustfs/admin/v3/import-iam-v2", IMPORT_IAM, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/revoke-tokens/{user_provider}",
+        REMOVE_SERVICE_ACCOUNT,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp-config/{idp_type}",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp-config/{idp_type}/{name}",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/idp-config/{idp_type}/{name}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/idp-config/{idp_type}/{name}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/idp-config/{idp_type}/{name}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/idp/ldap/add-service-account",
+        CREATE_SERVICE_ACCOUNT,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/idp/ldap/policy/{operation}",
+        ATTACH_POLICY,
+        RouteRiskLevel::High,
+    ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/list-canned-policies",
@@ -225,25 +317,100 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         GET_BUCKET_TARGET,
         RouteRiskLevel::Sensitive,
     ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/target/{target_type}/{target_name}/subscriptions",
+        GET_BUCKET_TARGET,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/info", SERVER_INFO, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/storageinfo", STORAGE_INFO, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/realtime", GET_METRICS, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/object-data-cache/stats",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/object-data-cache/flush",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
     admin(
         HttpMethod::Post,
         "/rustfs/admin/v3/pools/decommission",
         DECOMMISSION,
         RouteRiskLevel::High,
     ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/decommission/status",
+        DECOMMISSION,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(HttpMethod::Post, "/rustfs/admin/v3/pools/cancel", DECOMMISSION, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/pools/clear", DECOMMISSION, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/rebalance/start", REBALANCE, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/v3/rebalance/status", REBALANCE, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Post, "/rustfs/admin/v3/rebalance/stop", REBALANCE, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/heal/", HEAL, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/heal/{bucket}", HEAL, RouteRiskLevel::High),
-    admin(HttpMethod::Post, "/rustfs/admin/v3/heal/{bucket}/{prefix}", HEAL, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/heal/{bucket}/{*prefix}", HEAL, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/background-heal/status", HEAL, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v4/heal/mrf/cluster", HEAL, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v4/heal/mrf/cluster/responsibilities",
+        HEAL,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v4/heal/mrf/cluster/responsibilities/{node_id}/{id}",
+        HEAL,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v4/heal/mrf/cluster/responsibilities/actions",
+        HEAL,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v4/heal/mrf/responsibilities",
+        HEAL,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v4/heal/mrf/responsibilities/actions",
+        HEAL,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v4/heal/replacement-recovery",
+        HEAL,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier", LIST_TIER, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier-stats", LIST_TIER, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier/{tier}", LIST_TIER, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/tier/{tier}/deletion-check",
+        LIST_TIER,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/tier/{tier}/cleanup-retry",
+        SET_TIER,
+        RouteRiskLevel::High,
+    ),
     admin(HttpMethod::Delete, "/rustfs/admin/v3/tier/{tiername}", SET_TIER, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/tier", SET_TIER, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/tier/{tiername}", SET_TIER, RouteRiskLevel::High),
@@ -260,6 +427,84 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/rustfs/admin/v3/quota/{bucket}",
         SET_BUCKET_QUOTA,
         RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/quota-migration",
+        SET_BUCKET_QUOTA,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/bucket-durability/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/bucket-durability/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/bucket-durability/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/bucket-etag/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/bucket-etag/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/bucket-etag/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/on-demand-migration/{bucket}",
+        SET_BUCKET_ON_DEMAND_MIGRATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/on-demand-migration/{bucket}",
+        GET_BUCKET_ON_DEMAND_MIGRATION,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/on-demand-migration/{bucket}",
+        SET_BUCKET_ON_DEMAND_MIGRATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/on-demand-migration/{bucket}/status",
+        GET_BUCKET_ON_DEMAND_MIGRATION,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/on-demand-migration/{bucket}/backfill",
+        SET_BUCKET_ON_DEMAND_MIGRATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/on-demand-migration/{bucket}/backfill",
+        GET_BUCKET_ON_DEMAND_MIGRATION,
+        RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Get,
@@ -283,6 +528,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Put,
         "/rustfs/admin/v3/import-bucket-metadata",
         IMPORT_BUCKET_METADATA,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/recover-orphaned-bucket/{bucket}",
+        RECOVER_ORPHANED_BUCKET,
         RouteRiskLevel::High,
     ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/get-config-kv", CONFIG_UPDATE, RouteRiskLevel::High),
@@ -309,7 +560,104 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/config", CONFIG_UPDATE, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/tls/certificate-state",
+        TLS_CERTIFICATE_STATUS,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/tls/certificate",
+        TLS_CERTIFICATE_PUBLISH,
+        RouteRiskLevel::High,
+    ),
     admin(HttpMethod::Get, "/rustfs/admin/v3/scanner/status", SERVER_INFO, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/scanner/cycle-state/reset",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/scanner/usage-state/reset",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/scanner/usage-state/recovery-intents/{intent_id}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/ilm/expiry/status",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/ilm/recovery/records",
+        LIST_TIER,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/ilm/recovery/records/{control_id}",
+        LIST_TIER,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/ilm/recovery/records/{control_id}",
+        SET_TIER,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/ilm/recovery/exports/{export_id}",
+        SET_TIER,
+        RouteRiskLevel::High,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SET_TIER, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/ilm/transition/jobs/{job_id}",
+        SET_TIER,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/ilm/transition/jobs/{job_id}",
+        SET_TIER,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}",
+        LIST_TIER,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}",
+        SET_TIER,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/ilm/transition/state/reconcile",
+        LIST_TIER,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/ilm/transition/state/reconcile",
+        SET_TIER,
+        RouteRiskLevel::High,
+    ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/audit/target/list",
@@ -337,6 +685,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Put, "/rustfs/admin/v3/module-switches", CONFIG_UPDATE, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
+        "/rustfs/admin/v4/cluster/snapshot",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
         "/rustfs/admin/v4/extensions/catalog",
         SERVER_INFO,
         RouteRiskLevel::Sensitive,
@@ -346,6 +700,72 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/rustfs/admin/v4/extensions/instances",
         GET_BUCKET_TARGET,
         RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v4/runtime/capabilities",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/issue-attempt",
+        ISSUE_PLUGIN_ATTEMPT,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/submit",
+        SUBMIT_PLUGIN_JOB,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/runs/query",
+        GET_PLUGIN_RUN,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/runs/history",
+        LIST_PLUGIN_RUNS,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/runs/cancel",
+        CANCEL_PLUGIN_RUN,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/runs/page",
+        LIST_PLUGIN_RUNS,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/runs/replay",
+        REPLAY_PLUGIN_RUN,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/plugin-delegations/{id}",
+        GET_PLUGIN_DELEGATION,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations",
+        CREATE_PLUGIN_DELEGATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/plugin-delegations/{id}/revoke",
+        REVOKE_PLUGIN_DELEGATION,
+        RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Get,
@@ -428,13 +848,13 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Post,
         "/rustfs/admin/v3/site-replication/devnull",
-        SITE_REPLICATION_INFO,
+        SITE_REPLICATION_OPERATION,
         RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Post,
         "/rustfs/admin/v3/site-replication/netperf",
-        SITE_REPLICATION_INFO,
+        SITE_REPLICATION_OPERATION,
         RouteRiskLevel::High,
     ),
     admin(
@@ -442,6 +862,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/rustfs/admin/v3/site-replication/rotate-svc-acct",
         SITE_REPLICATION_OPERATION,
         RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/site-replication/join",
+        SITE_REPLICATION_ADD,
+        RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Put,
@@ -481,6 +907,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Put,
+        "/rustfs/admin/v3/site-replication/peer/edit-capabilities",
+        SITE_REPLICATION_OPERATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
         "/rustfs/admin/v3/site-replication/peer/edit",
         SITE_REPLICATION_ADD,
         RouteRiskLevel::High,
@@ -503,9 +935,64 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         SITE_REPLICATION_OPERATION,
         RouteRiskLevel::High,
     ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/site-replication/repair",
+        SITE_REPLICATION_OPERATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/site-replication/repair/status",
+        SITE_REPLICATION_OPERATION,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/profile", PROFILING, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/status", PROFILING, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/debug/tls/status", PROFILING, RouteRiskLevel::High),
+    // MinIO-compatible diagnostics: lock inspection / force-unlock, health/OBD info,
+    // console log, and the speedtest harness family.
+    admin(HttpMethod::Get, "/rustfs/admin/v3/top/locks", TOP_LOCKS, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/force-unlock", FORCE_UNLOCK, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/healthinfo", HEALTH_INFO, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/obdinfo", HEALTH_INFO, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/log", CONSOLE_LOG, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/speedtest", HEALTH_INFO, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/speedtest/object", HEALTH_INFO, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/speedtest/drive", HEALTH_INFO, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/speedtest/net", HEALTH_INFO, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/speedtest/site", HEALTH_INFO, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/speedtest/client/devnull",
+        HEALTH_INFO,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/speedtest/client/devnull",
+        HEALTH_INFO,
+        RouteRiskLevel::High,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v4/inspect/archive", INSPECT_DATA, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/gateway-key-inventory",
+        INSPECT_DATA,
+        RouteRiskLevel::High,
+    ),
+    // MinIO-compatible profiling / trace endpoints.
+    admin(HttpMethod::Post, "/rustfs/admin/v3/profiling/start", PROFILING, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/profiling/download",
+        PROFILING,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/profile", PROFILING, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/trace", TRACE, RouteRiskLevel::Sensitive),
+    // MinIO-compatible service control: binary update.
+    admin(HttpMethod::Post, "/rustfs/admin/v3/update", SERVER_UPDATE, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/create-key", KMS_CONFIGURE, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/key/create", KMS_CONFIGURE, RouteRiskLevel::High),
     admin(
@@ -549,6 +1036,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/configure", KMS_CONFIGURE, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/start", KMS_SERVICE_CONTROL, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/stop", KMS_SERVICE_CONTROL, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/reload", KMS_SERVICE_CONTROL, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/kms/service-status",
@@ -557,11 +1045,16 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/reconfigure", KMS_CONFIGURE, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys", KMS_CONFIGURE, RouteRiskLevel::High),
+    // Critical rather than High: destroying a master key makes every object
+    // encrypted under it permanently unreadable, and nothing on the server can
+    // bring those objects back (rustfs/backlog#1585). The waiting window and
+    // cancel-deletion are the only recovery path, which is why the route below
+    // that reopens it stays merely High.
     admin(
         HttpMethod::Delete,
         "/rustfs/admin/v3/kms/keys/delete",
         KMS_DELETE_KEY,
-        RouteRiskLevel::High,
+        RouteRiskLevel::Critical,
     ),
     admin(
         HttpMethod::Post,
@@ -575,6 +1068,54 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/rustfs/admin/v3/kms/keys/{key_id}",
         KMS_DESCRIBE_KEY,
         RouteRiskLevel::Sensitive,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/enable", KMS_ENABLE_KEY, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/keys/disable",
+        KMS_DISABLE_KEY,
+        RouteRiskLevel::High,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/rotate", KMS_ROTATE_KEY, RouteRiskLevel::High),
+    // The rekey sweep walks and rewrites object metadata across buckets, so it
+    // carries its own cluster-scoped action rather than reusing a per-key one.
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/rekey", KMS_REKEY, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/kms/keys/rekey/status",
+        KMS_REKEY,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/keys/rekey/cancel",
+        KMS_REKEY,
+        RouteRiskLevel::High,
+    ),
+    // Backup and restore act on the material of every key at once, so they
+    // carry their own actions rather than reusing any per-key one.
+    admin(HttpMethod::Get, "/rustfs/admin/v3/kms/backup", KMS_BACKUP, RouteRiskLevel::Sensitive),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/backup", KMS_BACKUP, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/restore/dry-run",
+        KMS_RESTORE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/restore", KMS_RESTORE, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/restore/abort", KMS_RESTORE, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/keys/update-description",
+        KMS_UPDATE_KEY_DESCRIPTION,
+        RouteRiskLevel::High,
+    ),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/tag", KMS_TAG_RESOURCE, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/keys/untag",
+        KMS_UNTAG_RESOURCE,
+        RouteRiskLevel::High,
     ),
     public(
         HttpMethod::Get,
@@ -617,10 +1158,70 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/iceberg/v1/config", GET_TABLE_CATALOG, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET, RouteRiskLevel::High),
     admin(
+        HttpMethod::Delete,
+        "/iceberg/v1/buckets/{warehouse}",
+        SET_TABLE_BUCKET,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Get,
         "/iceberg/v1/buckets/{warehouse}",
         GET_TABLE_BUCKET,
         RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/catalog/directory",
+        GET_TABLE_CATALOG,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/directory",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/iceberg/v1/{warehouse}/catalog/directory",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/backup",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/restore",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/backup/export",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/backup/import",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/backup/prepare",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/warehouse-index/backfill",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Get,
@@ -647,11 +1248,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/properties",
+        UPDATE_TABLE_NAMESPACE_PROPERTIES,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Delete,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}",
         DELETE_TABLE_NAMESPACE,
         RouteRiskLevel::High,
     ),
+    admin(HttpMethod::Post, "/iceberg/v1/{warehouse}/tables/rename", SET_TABLE, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables",
@@ -668,6 +1276,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Post,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/register",
         REGISTER_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/views",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/views",
+        CREATE_TABLE,
         RouteRiskLevel::High,
     ),
     admin(
@@ -698,6 +1318,48 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Delete,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
         DELETE_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Head,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        GET_TABLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        DELETE_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+        COMMIT_TABLE,
         RouteRiskLevel::High,
     ),
     admin(
@@ -738,6 +1400,36 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
+        GET_TABLE_LIFECYCLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler/run",
+        RUN_TABLE_MAINTENANCE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
+        RUN_TABLE_MAINTENANCE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
+        RUN_TABLE_MAINTENANCE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/quarantine",
+        RUN_TABLE_MAINTENANCE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
         GET_TABLE_METADATA,
         RouteRiskLevel::Sensitive,
@@ -746,6 +1438,24 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Post,
         "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
         REGISTER_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+        REGISTER_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external/sync",
+        SET_TABLE_METADATA_LOCATION,
         RouteRiskLevel::High,
     ),
     admin(
@@ -768,6 +1478,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(HttpMethod::Get, "/_iceberg/v1/config", GET_TABLE_CATALOG, RouteRiskLevel::Sensitive),
     admin(
+        HttpMethod::Delete,
+        "/_iceberg/v1/buckets/{warehouse}",
+        SET_TABLE_BUCKET,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Put,
         "/_iceberg/v1/buckets/{warehouse}",
         SET_TABLE_BUCKET,
@@ -778,6 +1494,60 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/_iceberg/v1/buckets/{warehouse}",
         GET_TABLE_BUCKET,
         RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/catalog/directory",
+        GET_TABLE_CATALOG,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/directory",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/_iceberg/v1/{warehouse}/catalog/directory",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/backup",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/restore",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/backup/export",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/backup/import",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/backup/prepare",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/warehouse-index/backfill",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Get,
@@ -804,9 +1574,21 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/properties",
+        UPDATE_TABLE_NAMESPACE_PROPERTIES,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Delete,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}",
         DELETE_TABLE_NAMESPACE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/tables/rename",
+        SET_TABLE,
         RouteRiskLevel::High,
     ),
     admin(
@@ -825,6 +1607,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Post,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/register",
         REGISTER_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views",
+        CREATE_TABLE,
         RouteRiskLevel::High,
     ),
     admin(
@@ -855,6 +1649,48 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Delete,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
         DELETE_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Head,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        GET_TABLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+        DELETE_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+        COMMIT_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+        COMMIT_TABLE,
         RouteRiskLevel::High,
     ),
     admin(
@@ -895,6 +1731,36 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
+        GET_TABLE_LIFECYCLE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler/run",
+        RUN_TABLE_MAINTENANCE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
+        RUN_TABLE_MAINTENANCE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
+        RUN_TABLE_MAINTENANCE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/quarantine",
+        RUN_TABLE_MAINTENANCE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
         GET_TABLE_METADATA,
         RouteRiskLevel::Sensitive,
@@ -903,6 +1769,24 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         HttpMethod::Post,
         "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
         REGISTER_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+        GET_TABLE_METADATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+        REGISTER_TABLE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external/sync",
+        SET_TABLE_METADATA_LOCATION,
         RouteRiskLevel::High,
     ),
     admin(
@@ -923,10 +1807,129 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         COMMIT_TABLE,
         RouteRiskLevel::High,
     ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/integrity/readiness",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/integrity/{bucket}/inventory",
+        INSPECT_DATA,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/integrity/{bucket}/jobs",
+        START_BATCH_JOB,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/integrity/{bucket}/jobs/{job_id}",
+        DESCRIBE_BATCH_JOB,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/integrity/{bucket}/jobs/{job_id}/control",
+        START_BATCH_JOB,
+        RouteRiskLevel::High,
+    ),
+    // MinIO admin compat: batch job lifecycle (backlog#613).
+    admin(HttpMethod::Post, "/rustfs/admin/v3/start-job", START_BATCH_JOB, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/list-jobs", LIST_BATCH_JOBS, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/status-job",
+        DESCRIBE_BATCH_JOB,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/describe-job",
+        DESCRIBE_BATCH_JOB,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(HttpMethod::Delete, "/rustfs/admin/v3/cancel-job", CANCEL_BATCH_JOB, RouteRiskLevel::High),
+    // MinIO admin compat: replication diff / MRF inspection (backlog#611).
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/replication/diff",
+        REPLICATION_DIFF,
+        RouteRiskLevel::Sensitive,
+    ),
+    // The default stream enumerates object names/version ids and requires
+    // ReplicationDiff (MinIO parity); only ?aggregate=true relaxes to
+    // GetReplicationMetrics in the handler.
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/replication/mrf",
+        REPLICATION_DIFF,
+        RouteRiskLevel::Sensitive,
+    ),
 ];
 
 pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
+    deferred(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/update-group-members",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
     deferred(HttpMethod::Get, "/rustfs/admin/v3/accountinfo", DeferredRoutePolicyReason::S3Action),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v4/account/permissions",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    // The self-service account routes act on the caller, never on a target
+    // named in the request, so they gate on possession of the credential (plus,
+    // for the mutation, knowledge of the current secret) rather than on an
+    // admin action. Giving them one would be wrong in both directions: it would
+    // stop an ordinary user from managing their own password, and it would let
+    // any holder of that action manage somebody else's.
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/account/info",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/password",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    // The MFA self-service family gates the same way, plus a proof of the
+    // second factor (and, for disable, of the account password) inside the
+    // handler.
+    deferred(HttpMethod::Get, "/rustfs/admin/v3/account/mfa", DeferredRoutePolicyReason::CredentialOnly),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/mfa/enroll",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/mfa/activate",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/mfa/disable",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/mfa/recovery-codes",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    // The login challenge is signed with the identity's own credentials, so
+    // possession of them is the whole authorization.
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/mfa/challenge",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
     deferred(
         HttpMethod::Get,
         "/rustfs/admin/v3/user-info",
@@ -977,6 +1980,26 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         "/rustfs/admin/v3/idp/builtin/policy-entities",
         DeferredRoutePolicyReason::MultipleActions,
     ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp/ldap/policy-entities",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp/ldap/list-access-keys",
+        DeferredRoutePolicyReason::ContextualAuthorization,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp/ldap/list-access-keys-bulk",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/idp/openid/list-access-keys-bulk",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
     deferred(HttpMethod::Post, "/rustfs/admin/v3/service", DeferredRoutePolicyReason::NotImplemented),
     deferred(
         HttpMethod::Get,
@@ -994,6 +2017,11 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         DeferredRoutePolicyReason::MultipleActions,
     ),
     deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/usage/{bucket}",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
+    deferred(
         HttpMethod::Post,
         "/rustfs/admin/v3/object-zip-downloads",
         DeferredRoutePolicyReason::S3Action,
@@ -1003,7 +2031,6 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         "/rustfs/admin/v3/object-zip-downloads/{id}.zip",
         DeferredRoutePolicyReason::CredentialOnly,
     ),
-    deferred(HttpMethod::Get, "/rustfs/admin/v3/metrics", DeferredRoutePolicyReason::CredentialOnly),
     deferred(HttpMethod::Get, "/rustfs/admin/v3/pools/list", DeferredRoutePolicyReason::MultipleActions),
     deferred(
         HttpMethod::Get,
@@ -1027,8 +2054,24 @@ pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
         "/rustfs/admin/v3/list-remote-targets",
         DeferredRoutePolicyReason::CredentialOnly,
     ),
+    // S3-shaped extension routes (handlers::s3_extension), keyed `?<sub-resource>/<bucket>`.
+    // Each authorizes one S3 action on the bucket: reset and reset-status
+    // s3:ResetBucketReplicationState, check s3:PutReplicationConfiguration, both
+    // metrics s3:GetReplicationConfiguration; the listen routes
+    // s3:ListenNotification and s3:ListenBucketNotification.
+    deferred(HttpMethod::Put, "?replication-reset/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?replication-reset-status/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?replication-check/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?replication-metrics=2/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?replication-metrics/{bucket}", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?events/", DeferredRoutePolicyReason::S3Action),
+    deferred(HttpMethod::Get, "?events/{bucket}", DeferredRoutePolicyReason::S3Action),
 ];
 
+#[allow(
+    dead_code,
+    reason = "asserted by this file's tests; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub fn validate_admin_route_policy_specs() -> Result<(), AdminRouteMatrixError> {
     validate_admin_route_specs(ADMIN_ROUTE_POLICY_SPECS)
 }
@@ -1057,6 +2100,72 @@ mod tests {
     #[test]
     fn admin_route_policy_specs_validate() {
         assert!(validate_admin_route_policy_specs().is_ok());
+    }
+
+    #[test]
+    fn plugin_submit_route_is_registered_as_high_risk_authenticated_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/submit";
+        assert_action(HttpMethod::Post, path, SUBMIT_PLUGIN_JOB);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("submit route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::High);
+    }
+
+    #[test]
+    fn plugin_run_query_route_uses_dedicated_authenticated_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/runs/query";
+        assert_action(HttpMethod::Post, path, GET_PLUGIN_RUN);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("plugin run query route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
+    }
+
+    #[test]
+    fn plugin_run_history_route_uses_list_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/runs/history";
+        assert_action(HttpMethod::Post, path, LIST_PLUGIN_RUNS);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("plugin run history route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
+    }
+
+    #[test]
+    fn plugin_run_cancel_route_uses_dedicated_authenticated_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/runs/cancel";
+        assert_action(HttpMethod::Post, path, CANCEL_PLUGIN_RUN);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("plugin run cancel route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
+    }
+
+    #[test]
+    fn plugin_run_page_route_uses_dedicated_authenticated_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/runs/page";
+        assert_action(HttpMethod::Post, path, LIST_PLUGIN_RUNS);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("plugin run page route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
+    }
+
+    #[test]
+    fn plugin_run_replay_route_uses_dedicated_authenticated_action() {
+        let path = "/rustfs/admin/v3/plugin-delegations/{id}/runs/replay";
+        assert_action(HttpMethod::Post, path, REPLAY_PLUGIN_RUN);
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == HttpMethod::Post && spec.path() == path)
+            .expect("plugin run replay route policy");
+        assert_eq!(spec.risk_level(), RouteRiskLevel::Sensitive);
     }
 
     #[test]
@@ -1106,15 +2215,35 @@ mod tests {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
             .filter(|spec| spec.path().starts_with("/iceberg/v1") || spec.path().starts_with("/_iceberg/v1"));
-        assert_eq!(table_specs.count(), 54);
+        assert_eq!(table_specs.count(), 112);
         assert_action(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
+        assert_action(HttpMethod::Delete, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
+        assert_action(HttpMethod::Delete, "/_iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/_iceberg/v1/buckets/{warehouse}", GET_TABLE_BUCKET);
         assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Get, "/_iceberg/v1/{warehouse}/namespaces", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Head, "/iceberg/v1/{warehouse}/namespaces/{namespace}", GET_TABLE_NAMESPACE);
         assert_action(HttpMethod::Head, "/_iceberg/v1/{warehouse}/namespaces/{namespace}", GET_TABLE_NAMESPACE);
+        assert_action(
+            HttpMethod::Post,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/properties",
+            UPDATE_TABLE_NAMESPACE_PROPERTIES,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/properties",
+            UPDATE_TABLE_NAMESPACE_PROPERTIES,
+        );
         assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
         assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables", CREATE_TABLE);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/tables/rename", SET_TABLE);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/tables/rename", SET_TABLE);
+        assert_action(
+            HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/views",
+            GET_TABLE_METADATA,
+        );
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views", CREATE_TABLE);
         assert_action(
             HttpMethod::Get,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}",
@@ -1124,6 +2253,41 @@ mod tests {
             HttpMethod::Get,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
             GET_TABLE_CREDENTIALS,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+            GET_TABLE_METADATA,
+        );
+        assert_action(
+            HttpMethod::Head,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+            GET_TABLE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+            COMMIT_TABLE,
+        );
+        assert_action(
+            HttpMethod::Delete,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/views/{view}",
+            DELETE_TABLE,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs",
+            GET_TABLE_METADATA,
+        );
+        assert_action(
+            HttpMethod::Put,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+            COMMIT_TABLE,
+        );
+        assert_action(
+            HttpMethod::Delete,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+            COMMIT_TABLE,
         );
         assert_action(
             HttpMethod::Get,
@@ -1191,9 +2355,90 @@ mod tests {
             GET_TABLE_LIFECYCLE,
         );
         assert_action(
+            HttpMethod::Get,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
+            GET_TABLE_LIFECYCLE,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
+            GET_TABLE_LIFECYCLE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler/run",
+            RUN_TABLE_MAINTENANCE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler/run",
+            RUN_TABLE_MAINTENANCE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
+            RUN_TABLE_MAINTENANCE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
+            RUN_TABLE_MAINTENANCE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/quarantine",
+            RUN_TABLE_MAINTENANCE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/quarantine",
+            RUN_TABLE_MAINTENANCE,
+        );
+        assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/catalog/directory", GET_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/directory", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Delete, "/iceberg/v1/{warehouse}/catalog/directory", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Get, "/_iceberg/v1/{warehouse}/catalog/directory", GET_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/directory", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Delete, "/_iceberg/v1/{warehouse}/catalog/directory", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/backup", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/backup", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/restore", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/restore", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/backup/export", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/backup/export", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/backup/import", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/backup/import", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/backup/prepare", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/backup/prepare", MIGRATE_TABLE_CATALOG);
+        assert_action(
+            HttpMethod::Post,
+            "/iceberg/v1/{warehouse}/catalog/warehouse-index/backfill",
+            MIGRATE_TABLE_CATALOG,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/catalog/warehouse-index/backfill",
+            MIGRATE_TABLE_CATALOG,
+        );
+        assert_action(
             HttpMethod::Post,
             "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
             REGISTER_TABLE,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+            GET_TABLE_METADATA,
+        );
+        assert_action(
+            HttpMethod::Put,
+            "/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+            REGISTER_TABLE,
+        );
+        assert_action(
+            HttpMethod::Post,
+            "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external/sync",
+            SET_TABLE_METADATA_LOCATION,
         );
         assert_action(
             HttpMethod::Post,
@@ -1221,9 +2466,103 @@ mod tests {
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/clear-cache", KMS_CLEAR_CACHE);
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/configure", KMS_CONFIGURE);
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/start", KMS_SERVICE_CONTROL);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/reload", KMS_SERVICE_CONTROL);
         assert_action(HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete", KMS_DELETE_KEY);
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/cancel-deletion", KMS_DELETE_KEY);
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/kms/keys/{key_id}", KMS_DESCRIBE_KEY);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/backup", KMS_BACKUP);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/kms/backup", KMS_BACKUP);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/restore", KMS_RESTORE);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/restore/dry-run", KMS_RESTORE);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/restore/abort", KMS_RESTORE);
+        assert_action(
+            HttpMethod::Post,
+            "/rustfs/admin/v3/kms/keys/update-description",
+            KMS_UPDATE_KEY_DESCRIPTION,
+        );
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/tag", KMS_TAG_RESOURCE);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/untag", KMS_UNTAG_RESOURCE);
+
+        // Key metadata updates must not fall back to the service-configuration
+        // action: holding it would otherwise imply the right to relabel keys.
+        for path in [
+            "/rustfs/admin/v3/kms/keys/update-description",
+            "/rustfs/admin/v3/kms/keys/tag",
+            "/rustfs/admin/v3/kms/keys/untag",
+        ] {
+            assert_not_action(HttpMethod::Post, path, KMS_CONFIGURE);
+        }
+    }
+
+    #[test]
+    fn route_policy_records_dedicated_tls_actions() {
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/tls/certificate-state", TLS_CERTIFICATE_STATUS);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/tls/certificate", TLS_CERTIFICATE_PUBLISH);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/tls/certificate", CONFIG_UPDATE);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/tls/certificate-state", TLS_CERTIFICATE_PUBLISH);
+    }
+
+    /// `Critical` marks the routes whose worst case is permanent loss of user
+    /// data, so the inventory is pinned in both directions: the KMS key
+    /// deletion route may not be quietly downgraded, and no other route may be
+    /// promoted without the same review.
+    #[test]
+    fn route_policy_reserves_critical_risk_for_unrecoverable_destruction() {
+        let critical = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .filter(|spec| spec.risk_level() == RouteRiskLevel::Critical)
+            .map(|spec| route_key(spec.method(), spec.path()))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            critical,
+            BTreeSet::from([route_key(HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete")]),
+            "the Critical set changed; classify the new route deliberately or restore the old one"
+        );
+    }
+
+    /// The routes that recover from, or merely describe, a pending deletion are
+    /// not Critical: refusing them is what leaves an operator without a way
+    /// back.
+    #[test]
+    fn route_policy_keeps_kms_deletion_recovery_below_critical() {
+        for (method, path) in [
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/cancel-deletion"),
+            (HttpMethod::Get, "/rustfs/admin/v3/kms/keys/{key_id}"),
+            (HttpMethod::Get, "/rustfs/admin/v3/kms/keys"),
+        ] {
+            assert_risk_below_critical(method, path);
+        }
+    }
+
+    /// Backup and restore expose the whole key inventory at once, so no other
+    /// KMS action may reach them: holding `kms:Configure` or a per-key action
+    /// must not be enough.
+    #[test]
+    fn route_policy_isolates_backup_and_restore_from_other_kms_actions() {
+        for (method, path) in [
+            (HttpMethod::Get, "/rustfs/admin/v3/kms/backup"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/backup"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/restore"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/restore/dry-run"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/restore/abort"),
+        ] {
+            for action in [
+                SERVER_INFO,
+                KMS_CONFIGURE,
+                KMS_DESCRIBE_KEY,
+                KMS_LIST_KEYS,
+                KMS_SERVICE_CONTROL,
+                KMS_DELETE_KEY,
+            ] {
+                assert_not_action(method, path, action);
+            }
+        }
+
+        // Backup and restore are separate privileges: neither implies the
+        // other.
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/kms/backup", KMS_RESTORE);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/kms/restore", KMS_BACKUP);
     }
 
     #[test]
@@ -1234,9 +2573,71 @@ mod tests {
             (HttpMethod::Post, "/rustfs/admin/v3/kms/configure"),
             (HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete"),
             (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/cancel-deletion"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/update-description"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/tag"),
+            (HttpMethod::Post, "/rustfs/admin/v3/kms/keys/untag"),
         ] {
             assert_not_action(method, path, SERVER_INFO);
         }
+    }
+
+    #[test]
+    fn route_policy_allows_server_info_for_ilm_expiry_status() {
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/expiry/status", SERVER_INFO);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/expiry/status", SET_TIER);
+    }
+
+    #[test]
+    fn route_policy_requires_config_update_for_scanner_cycle_reset() {
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/scanner/cycle-state/reset", CONFIG_UPDATE);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/scanner/cycle-state/reset", SERVER_INFO);
+    }
+
+    #[test]
+    fn route_policy_requires_config_update_for_scanner_usage_reset() {
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/scanner/usage-state/reset", CONFIG_UPDATE);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/scanner/usage-state/reset", SERVER_INFO);
+    }
+
+    #[test]
+    fn route_policy_requires_config_update_for_scanner_usage_recovery_intent() {
+        assert_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/scanner/usage-state/recovery-intents/{intent_id}",
+            CONFIG_UPDATE,
+        );
+        assert_not_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/scanner/usage-state/recovery-intents/{intent_id}",
+            SERVER_INFO,
+        );
+    }
+
+    #[test]
+    fn route_policy_uses_tier_actions_for_transition_routes() {
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/tier/{tier}/deletion-check", LIST_TIER);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/tier/{tier}/cleanup-retry", SET_TIER);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/tier/{tier}/deletion-check", SET_TIER);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/tier/{tier}/cleanup-retry", LIST_TIER);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/recovery/records", LIST_TIER);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/recovery/records/{control_id}", LIST_TIER);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/recovery/records/{control_id}", SET_TIER);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/recovery/exports/{export_id}", SET_TIER);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SET_TIER);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SET_TIER);
+        assert_action(HttpMethod::Delete, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SET_TIER);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}", LIST_TIER);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}", SET_TIER);
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/state/reconcile", LIST_TIER);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/state/reconcile", SET_TIER);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/run", SERVER_INFO);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/recovery/records", SERVER_INFO);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SERVER_INFO);
+        assert_not_action(HttpMethod::Delete, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}", SERVER_INFO);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}", SET_TIER);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/reconcile/{transaction_id}", LIST_TIER);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/transition/state/reconcile", SET_TIER);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/transition/state/reconcile", LIST_TIER);
     }
 
     #[test]
@@ -1254,6 +2655,11 @@ mod tests {
         assert_deferred(HttpMethod::Get, "/rustfs/admin/v3/accountinfo", DeferredRoutePolicyReason::S3Action);
         assert_deferred(
             HttpMethod::Post,
+            "/rustfs/admin/v4/account/permissions",
+            DeferredRoutePolicyReason::CredentialOnly,
+        );
+        assert_deferred(
+            HttpMethod::Post,
             "/rustfs/admin/v3/object-zip-downloads",
             DeferredRoutePolicyReason::S3Action,
         );
@@ -1261,6 +2667,95 @@ mod tests {
             HttpMethod::Get,
             "/rustfs/admin/v3/object-zip-downloads/{id}.zip",
             DeferredRoutePolicyReason::CredentialOnly,
+        );
+    }
+
+    #[test]
+    fn route_policy_maps_metrics_to_explicit_admin_action() {
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/realtime", GET_METRICS);
+    }
+
+    #[test]
+    fn route_policy_splits_on_demand_migration_into_set_and_get_actions() {
+        assert_action(
+            HttpMethod::Put,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}",
+            SET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        assert_action(
+            HttpMethod::Delete,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}",
+            SET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}",
+            GET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}/status",
+            GET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        // Backfill control (start/cancel) is a write; reading the checkpoint is not.
+        assert_action(
+            HttpMethod::Post,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}/backfill",
+            SET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}/backfill",
+            GET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        assert_not_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}/backfill",
+            SET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        // Reads never require the write action, and the routes are not bucket-target routes.
+        assert_not_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}",
+            SET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        assert_not_action(HttpMethod::Put, "/rustfs/admin/v3/on-demand-migration/{bucket}", SET_BUCKET_TARGET);
+    }
+
+    #[test]
+    fn route_policy_requires_dedicated_inspect_action_for_encrypted_archive() {
+        assert_action(HttpMethod::Post, "/rustfs/admin/v4/inspect/archive", INSPECT_DATA);
+    }
+
+    #[test]
+    fn route_policy_requires_inspect_action_for_gateway_key_inventory() {
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/gateway-key-inventory", INSPECT_DATA);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/gateway-key-inventory", SERVER_INFO);
+    }
+
+    #[test]
+    fn route_policy_requires_operation_for_site_replication_diagnostics() {
+        for path in [
+            "/rustfs/admin/v3/site-replication/devnull",
+            "/rustfs/admin/v3/site-replication/netperf",
+        ] {
+            assert_action(HttpMethod::Post, path, SITE_REPLICATION_OPERATION);
+            assert_not_action(HttpMethod::Post, path, SITE_REPLICATION_INFO);
+        }
+    }
+
+    #[test]
+    fn route_policy_accepts_minio_style_site_replication_join_alias() {
+        assert_action(HttpMethod::Put, "/rustfs/admin/v3/site-replication/join", SITE_REPLICATION_ADD);
+    }
+
+    #[test]
+    fn route_policy_requires_operation_for_site_replication_repair() {
+        assert_action(HttpMethod::Put, "/rustfs/admin/v3/site-replication/repair", SITE_REPLICATION_OPERATION);
+        assert_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/site-replication/repair/status",
+            SITE_REPLICATION_OPERATION,
         );
     }
 
@@ -1294,6 +2789,14 @@ mod tests {
             .find(|spec| spec.method() == method && spec.path() == path)
             .expect("expected direct route policy");
         assert_ne!(spec.access().admin_action(), Some(action));
+    }
+
+    fn assert_risk_below_critical(method: HttpMethod, path: &str) {
+        let spec = ADMIN_ROUTE_POLICY_SPECS
+            .iter()
+            .find(|spec| spec.method() == method && spec.path() == path)
+            .expect("expected direct route policy");
+        assert_ne!(spec.risk_level(), RouteRiskLevel::Critical, "{path} must not be Critical");
     }
 
     fn assert_public(method: HttpMethod, path: &str, kind: PublicRouteKind) {

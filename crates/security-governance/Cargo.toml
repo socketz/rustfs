@@ -30,5 +30,11 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = []
+hotpath-alloc = ["hotpath"]
+hotpath-cpu = ["hotpath"]
+
 [dependencies]
 thiserror = { workspace = true }

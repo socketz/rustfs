@@ -14,8 +14,13 @@
 
 //! Stable storage error contracts shared across storage consumers.
 
+/// Result type alias for storage operations.
 pub type StorageResult<T, E = StorageErrorCode> = core::result::Result<T, E>;
 
+/// Error codes for storage operations.
+///
+/// These codes provide a stable, cross-crate error classification
+/// that can be serialized and transmitted between nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StorageErrorCode {
     Io,
@@ -76,12 +81,36 @@ pub enum StorageErrorCode {
     InsufficientWriteQuorum,
     PreconditionFailed,
     EntityTooSmall,
+    EntityTooLarge,
     InvalidRangeSpec,
     NotModified,
     InvalidPartNumber,
     RebalanceAlreadyRunning,
     OperationCanceled,
     NamespaceLockQuorumUnavailable,
+    MaxVersionsExceeded,
+    InconsistentDisk,
+    UnsupportedDisk,
+    DiskNotDir,
+    DiskOngoingReq,
+    PathNotFound,
+    BitrotHashAlgoInvalid,
+    CrossDeviceLink,
+    LessData,
+    MoreData,
+    OutdatedXLMeta,
+    PartMissingOrCorrupt,
+    ShortWrite,
+    SourceStalled,
+    Timeout,
+    InvalidPath,
+    QuotaExceeded,
+    RemoteClientUnavailable,
+    RemoteNotInitialized,
+    ConditionalDeleteConflict,
+    GuardedDeleteUnsupported,
+    DeleteRecoveryLegacyAmbiguous,
+    DeleteRecoveryWorkLimit,
 }
 
 impl StorageErrorCode {
@@ -145,12 +174,36 @@ impl StorageErrorCode {
             Self::InsufficientWriteQuorum => 0x3A,
             Self::PreconditionFailed => 0x3B,
             Self::EntityTooSmall => 0x3C,
+            Self::EntityTooLarge => 0x56,
             Self::InvalidRangeSpec => 0x3D,
             Self::NotModified => 0x3E,
             Self::InvalidPartNumber => 0x3F,
             Self::RebalanceAlreadyRunning => 0x40,
             Self::OperationCanceled => 0x41,
             Self::NamespaceLockQuorumUnavailable => 0x42,
+            Self::MaxVersionsExceeded => 0x43,
+            Self::InconsistentDisk => 0x44,
+            Self::UnsupportedDisk => 0x45,
+            Self::DiskNotDir => 0x46,
+            Self::DiskOngoingReq => 0x47,
+            Self::PathNotFound => 0x48,
+            Self::BitrotHashAlgoInvalid => 0x49,
+            Self::CrossDeviceLink => 0x4A,
+            Self::LessData => 0x4B,
+            Self::MoreData => 0x4C,
+            Self::OutdatedXLMeta => 0x4D,
+            Self::PartMissingOrCorrupt => 0x4E,
+            Self::ShortWrite => 0x4F,
+            Self::SourceStalled => 0x50,
+            Self::Timeout => 0x51,
+            Self::InvalidPath => 0x52,
+            Self::QuotaExceeded => 0x53,
+            Self::RemoteClientUnavailable => 0x54,
+            Self::RemoteNotInitialized => 0x55,
+            Self::ConditionalDeleteConflict => 0x57,
+            Self::GuardedDeleteUnsupported => 0x58,
+            Self::DeleteRecoveryLegacyAmbiguous => 0x59,
+            Self::DeleteRecoveryWorkLimit => 0x5A,
         }
     }
 
@@ -214,12 +267,36 @@ impl StorageErrorCode {
             0x3A => Some(Self::InsufficientWriteQuorum),
             0x3B => Some(Self::PreconditionFailed),
             0x3C => Some(Self::EntityTooSmall),
+            0x56 => Some(Self::EntityTooLarge),
             0x3D => Some(Self::InvalidRangeSpec),
             0x3E => Some(Self::NotModified),
             0x3F => Some(Self::InvalidPartNumber),
             0x40 => Some(Self::RebalanceAlreadyRunning),
             0x41 => Some(Self::OperationCanceled),
             0x42 => Some(Self::NamespaceLockQuorumUnavailable),
+            0x43 => Some(Self::MaxVersionsExceeded),
+            0x44 => Some(Self::InconsistentDisk),
+            0x45 => Some(Self::UnsupportedDisk),
+            0x46 => Some(Self::DiskNotDir),
+            0x47 => Some(Self::DiskOngoingReq),
+            0x48 => Some(Self::PathNotFound),
+            0x49 => Some(Self::BitrotHashAlgoInvalid),
+            0x4A => Some(Self::CrossDeviceLink),
+            0x4B => Some(Self::LessData),
+            0x4C => Some(Self::MoreData),
+            0x4D => Some(Self::OutdatedXLMeta),
+            0x4E => Some(Self::PartMissingOrCorrupt),
+            0x4F => Some(Self::ShortWrite),
+            0x50 => Some(Self::SourceStalled),
+            0x51 => Some(Self::Timeout),
+            0x52 => Some(Self::InvalidPath),
+            0x53 => Some(Self::QuotaExceeded),
+            0x54 => Some(Self::RemoteClientUnavailable),
+            0x55 => Some(Self::RemoteNotInitialized),
+            0x57 => Some(Self::ConditionalDeleteConflict),
+            0x58 => Some(Self::GuardedDeleteUnsupported),
+            0x59 => Some(Self::DeleteRecoveryLegacyAmbiguous),
+            0x5A => Some(Self::DeleteRecoveryWorkLimit),
             _ => None,
         }
     }
@@ -288,17 +365,52 @@ mod tests {
         (StorageErrorCode::InsufficientWriteQuorum, 0x3A),
         (StorageErrorCode::PreconditionFailed, 0x3B),
         (StorageErrorCode::EntityTooSmall, 0x3C),
+        (StorageErrorCode::EntityTooLarge, 0x56),
         (StorageErrorCode::InvalidRangeSpec, 0x3D),
         (StorageErrorCode::NotModified, 0x3E),
         (StorageErrorCode::InvalidPartNumber, 0x3F),
         (StorageErrorCode::RebalanceAlreadyRunning, 0x40),
         (StorageErrorCode::OperationCanceled, 0x41),
         (StorageErrorCode::NamespaceLockQuorumUnavailable, 0x42),
+        (StorageErrorCode::QuotaExceeded, 0x53),
+        (StorageErrorCode::RemoteClientUnavailable, 0x54),
+        (StorageErrorCode::RemoteNotInitialized, 0x55),
+    ];
+
+    const DISK_PRESERVATION_ERROR_CODES: &[(StorageErrorCode, u32)] = &[
+        (StorageErrorCode::MaxVersionsExceeded, 0x43),
+        (StorageErrorCode::InconsistentDisk, 0x44),
+        (StorageErrorCode::UnsupportedDisk, 0x45),
+        (StorageErrorCode::DiskNotDir, 0x46),
+        (StorageErrorCode::DiskOngoingReq, 0x47),
+        (StorageErrorCode::PathNotFound, 0x48),
+        (StorageErrorCode::BitrotHashAlgoInvalid, 0x49),
+        (StorageErrorCode::CrossDeviceLink, 0x4A),
+        (StorageErrorCode::LessData, 0x4B),
+        (StorageErrorCode::MoreData, 0x4C),
+        (StorageErrorCode::OutdatedXLMeta, 0x4D),
+        (StorageErrorCode::PartMissingOrCorrupt, 0x4E),
+        (StorageErrorCode::ShortWrite, 0x4F),
+        (StorageErrorCode::SourceStalled, 0x50),
+        (StorageErrorCode::Timeout, 0x51),
+        (StorageErrorCode::InvalidPath, 0x52),
+        (StorageErrorCode::ConditionalDeleteConflict, 0x57),
+        (StorageErrorCode::GuardedDeleteUnsupported, 0x58),
+        (StorageErrorCode::DeleteRecoveryLegacyAmbiguous, 0x59),
+        (StorageErrorCode::DeleteRecoveryWorkLimit, 0x5A),
     ];
 
     #[test]
     fn storage_error_codes_roundtrip() {
-        for (error_code, raw_code) in ERROR_CODES {
+        for (error_code, raw_code) in ERROR_CODES.iter().chain(DISK_PRESERVATION_ERROR_CODES) {
+            assert_eq!(error_code.as_u32(), *raw_code);
+            assert_eq!(StorageErrorCode::from_u32(*raw_code), Some(*error_code));
+        }
+    }
+
+    #[test]
+    fn storage_error_disk_preservation_codes_roundtrip() {
+        for (error_code, raw_code) in DISK_PRESERVATION_ERROR_CODES {
             assert_eq!(error_code.as_u32(), *raw_code);
             assert_eq!(StorageErrorCode::from_u32(*raw_code), Some(*error_code));
         }

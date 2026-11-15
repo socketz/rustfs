@@ -12,28 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod compat_manifest;
 // SAFETY: `generated` is prost/tonic-generated protocol code. The allowance is
 // scoped to that module so generated internals do not relax lints elsewhere.
 #[allow(unsafe_code)]
 mod generated;
+pub mod heal_control;
+mod runtime_sources;
 
+use hyper_util::client::legacy::connect::HttpConnector;
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::{GLOBAL_CONN_MAP, evict_connection};
-use rustfs_io_metrics::internode_metrics::global_internode_metrics;
-use rustfs_tls_runtime::{load_global_outbound_tls_state, record_tls_consumer_stale_generation};
+use rustfs_common::{
+    GrpcConnectionSnapshot, GrpcConnectionState, cache_connection_with_state, cached_connection_with_state,
+    remove_connection_with_log_level,
+};
+#[cfg(test)]
+use rustfs_common::{cache_connection, evict_connection_with_log_level};
 use std::{
+    borrow::Cow,
     collections::HashMap,
     error::Error,
-    sync::LazyLock,
+    future::Future,
+    pin::Pin,
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+    sync::{Arc, LazyLock, Mutex as StdMutex, RwLock as StdRwLock, Weak},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tonic::{
     Request, Status,
+    body::Body,
+    codegen::{Service, http::Request as HttpRequest, http::Uri},
     service::interceptor::InterceptedService,
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 // Type alias for the complex client type
 pub type NodeServiceClientType = NodeServiceClient<
@@ -41,6 +56,38 @@ pub type NodeServiceClientType = NodeServiceClient<
 >;
 
 pub use generated::*;
+
+impl std::fmt::Debug for proto_gen::node_service::RenameDataResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RenameDataResponse")
+            .field("success", &self.success)
+            .field("payload", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for proto_gen::node_service::RecoverMultipartSourceRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoverMultipartSourceRequest")
+            .field("protocol_version", &self.protocol_version)
+            .field("operation", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for proto_gen::node_service::RecoverMultipartSourceResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoverMultipartSourceResponse")
+            .field("success", &self.success)
+            .field("protocol_version", &self.protocol_version)
+            .field("result", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+pub use rustfs_common::ConnectionEvictionLogLevel;
 
 // Default 100 MB
 pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
@@ -51,7 +98,49 @@ pub const DEFAULT_GRPC_SERVER_MESSAGE_LEN: usize = 100 * 1024 * 1024;
 /// Default value: https://
 const RUSTFS_HTTPS_PREFIX: &str = "https://";
 const TLS_GENERATION_CACHE_MAX_SIZE: usize = 512;
-static TLS_GENERATION_CACHE: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+const INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET: u8 = 0;
+const INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE: u8 = 1;
+const INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE: u8 = 2;
+static TLS_GENERATION_CACHE: LazyLock<RwLock<HashMap<String, u64>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+// Lock order: generation metadata, then the common connection cache. The dial
+// registry's standard mutex is released before waiting on any async lock.
+static DIAL_LOCK_REGISTRY: LazyLock<StdMutex<HashMap<String, Weak<Mutex<()>>>>> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+struct DialLock {
+    key: String,
+    mutex: Arc<Mutex<()>>,
+}
+
+impl DialLock {
+    fn for_key(key: &str) -> Self {
+        let mut registry = DIAL_LOCK_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, lock| lock.strong_count() != 0);
+        let mutex = registry.get(key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let mutex = Arc::new(Mutex::new(()));
+            registry.insert(key.to_string(), Arc::downgrade(&mutex));
+            mutex
+        });
+        Self {
+            key: key.to_string(),
+            mutex,
+        }
+    }
+}
+
+impl Drop for DialLock {
+    fn drop(&mut self) {
+        let mut registry = DIAL_LOCK_REGISTRY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Arc::strong_count(&self.mutex) == 1
+            && registry
+                .get(&self.key)
+                .is_some_and(|slot| Weak::ptr_eq(slot, &Arc::downgrade(&self.mutex)))
+        {
+            registry.remove(&self.key);
+        }
+    }
+}
+
+static INTERNODE_RPC_MSGPACK_ONLY_CACHE: AtomicU8 = AtomicU8::new(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET);
 
 fn enforce_tls_generation_cache_bound(generation_cache: &mut HashMap<String, u64>, generation: u64, addr: &str) {
     if generation_cache.len() < TLS_GENERATION_CACHE_MAX_SIZE || generation_cache.contains_key(addr) {
@@ -95,10 +184,3693 @@ fn internode_http2_keep_alive_timeout() -> Duration {
 }
 
 fn internode_rpc_timeout() -> Duration {
-    Duration::from_secs(rustfs_utils::get_env_u64(
+    normalize_internode_rpc_timeout(Duration::from_secs(rustfs_utils::get_env_u64(
         rustfs_config::ENV_INTERNODE_RPC_TIMEOUT_SECS,
         rustfs_config::DEFAULT_INTERNODE_RPC_TIMEOUT_SECS,
-    ))
+    )))
+}
+
+fn normalize_internode_rpc_timeout(timeout: Duration) -> Duration {
+    timeout.max(Duration::from_secs(1))
+}
+
+/// Budget for one heal-control execution, kept below the transport timeout so
+/// the coordinator stops waiting for admission before the caller gives up.
+pub fn heal_control_execution_timeout() -> Duration {
+    heal_control_execution_timeout_for(internode_rpc_timeout())
+}
+
+fn heal_control_execution_timeout_for(transport_timeout: Duration) -> Duration {
+    const TRANSPORT_GUARD: Duration = Duration::from_secs(1);
+    let transport_timeout = transport_timeout.max(Duration::from_secs(1));
+    transport_timeout
+        .saturating_sub(TRANSPORT_GUARD.min(transport_timeout / 2))
+        .max(Duration::from_millis(1))
+        .min(Duration::from_millis(
+            u64::try_from(heal_control::MAX_LIFETIME_MS).expect("positive heal control lifetime must fit u64"),
+        ))
+}
+
+fn internode_rpc_tcp_nodelay() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_TCP_NODELAY,
+        rustfs_config::DEFAULT_INTERNODE_RPC_TCP_NODELAY,
+    )
+}
+
+/// HTTP/2 initial stream window size for the client channel, or `None` to use the
+/// library default (a configured value of `0` opts out).
+fn internode_rpc_http2_stream_window() -> Option<u32> {
+    match rustfs_utils::get_env_u32(
+        rustfs_config::ENV_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE,
+        rustfs_config::DEFAULT_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE,
+    ) {
+        0 => None,
+        v => Some(v),
+    }
+}
+
+/// HTTP/2 initial connection window size for the client channel, or `None` to use the
+/// library default (a configured value of `0` opts out).
+fn internode_rpc_http2_conn_window() -> Option<u32> {
+    match rustfs_utils::get_env_u32(
+        rustfs_config::ENV_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE,
+        rustfs_config::DEFAULT_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE,
+    ) {
+        0 => None,
+        v => Some(v),
+    }
+}
+
+/// Maximum encoded/decoded internode gRPC message size (bytes), shared by the client
+/// `NodeServiceClient` and server `NodeServiceServer`. Defaults to
+/// [`DEFAULT_GRPC_SERVER_MESSAGE_LEN`] (100 MiB) when the env var is unset.
+pub fn internode_rpc_max_message_size() -> usize {
+    rustfs_utils::get_env_usize(rustfs_config::ENV_INTERNODE_RPC_MAX_MESSAGE_SIZE, DEFAULT_GRPC_SERVER_MESSAGE_LEN)
+}
+
+pub const HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE: usize = heal_control::RESULT_MAX_SIZE + 1024;
+pub const HEAL_CONTROL_PROTOCOL_VERSION: u32 = 3;
+pub const DYNAMIC_CONFIG_PROTOCOL_VERSION: u32 = 1;
+pub const BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION: u32 = 2;
+// v4 is an admission boundary, not a transport version bump. A peer that
+// cannot recognize this probe must fail the Admin Heal capability preflight;
+// accepting the older v3 probe would allow an upgraded node to silently lose
+// newly validated request semantics during a rolling upgrade.
+pub const HEAL_CONTROL_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-heal-control-capability-v4\0";
+pub const REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-tier-remote-version-state-capability-v1\0";
+pub const RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-restore-copyback-capability-v1\0";
+pub const CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-cross-pool-fence-capability-v1\0";
+pub const MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-mrf-lifecycle-reader-capability-v1\0";
+pub const ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX: &[u8] = b"rustfs-ilm-recovery-export-capability-v1\0";
+pub const TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX: &[u8] =
+    b"rustfs-transition-transaction-compaction-capability-v1\0";
+pub const TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE: usize = 64 * 1024;
+pub const TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE: usize = 1024;
+pub const TIER_MUTATION_RPC_MAX_ABORT_PAYLOAD_SIZE: usize = TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE;
+pub const TIER_MUTATION_RPC_MAX_MESSAGE_SIZE: usize = TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE + 4096;
+
+pub fn heal_control_coordinator_epoch(topology_fingerprint: &str) -> Result<u64, &'static str> {
+    let prefix = topology_fingerprint
+        .get(..16)
+        .ok_or("heal control topology fingerprint is too short")?;
+    let epoch = u64::from_str_radix(prefix, 16).map_err(|_| "heal control topology fingerprint is not hexadecimal")?;
+    if epoch == 0 {
+        return Err("heal control topology epoch is zero");
+    }
+    Ok(epoch)
+}
+
+pub fn heal_control_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_heal_control_capability_probe(command: &[u8]) -> bool {
+    command.len() == HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.len() + 16 && command.starts_with(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn remote_version_state_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_remote_version_state_capability_probe(command: &[u8]) -> bool {
+    command.len() == REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn restore_copyback_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_restore_copyback_capability_probe(command: &[u8]) -> bool {
+    command.len() == RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn is_cross_pool_fence_capability_probe(command: &[u8]) -> bool {
+    command.len() == CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn ilm_recovery_export_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_ilm_recovery_export_capability_probe(command: &[u8]) -> bool {
+    command.len() == ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn transition_transaction_compaction_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_transition_transaction_compaction_capability_probe(command: &[u8]) -> bool {
+    command.len() == TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn mrf_lifecycle_reader_capability_probe(nonce: &[u8; 16]) -> Vec<u8> {
+    let mut probe = Vec::with_capacity(MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX.len() + nonce.len());
+    probe.extend_from_slice(MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX);
+    probe.extend_from_slice(nonce);
+    probe
+}
+
+pub fn is_mrf_lifecycle_reader_capability_probe(command: &[u8]) -> bool {
+    command.len() == MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX.len() + 16
+        && command.starts_with(MRF_LIFECYCLE_READER_CAPABILITY_PROBE_PREFIX)
+}
+
+pub fn encode_mrf_lifecycle_reader_capability(
+    maximum_format_version: u8,
+    topology_member: &str,
+    process_epoch: &[u8; 16],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let identity = encode_remote_version_state_capability(topology_member, process_epoch)?;
+    let mut result = Vec::with_capacity(1 + identity.len());
+    result.push(maximum_format_version);
+    result.extend_from_slice(&identity);
+    Ok(result)
+}
+
+pub fn encode_remote_version_state_capability(
+    topology_member: &str,
+    process_epoch: &[u8; 16],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let topology_member = topology_member.as_bytes();
+    let mut result = Vec::with_capacity(8 + topology_member.len() + process_epoch.len());
+    result.extend_from_slice(&u64::try_from(topology_member.len())?.to_be_bytes());
+    result.extend_from_slice(topology_member);
+    result.extend_from_slice(process_epoch);
+    Ok(result)
+}
+
+pub fn decode_remote_version_state_capability(result: &[u8]) -> Result<(&str, &[u8; 16]), &'static str> {
+    let member_len = result
+        .get(..8)
+        .and_then(|value| value.try_into().ok())
+        .map(u64::from_be_bytes)
+        .ok_or("remote version state capability is truncated")?;
+    let member_len = usize::try_from(member_len).map_err(|_| "remote version state member length cannot be represented")?;
+    let member_end = 8_usize
+        .checked_add(member_len)
+        .ok_or("remote version state member length overflow")?;
+    let topology_member = std::str::from_utf8(result.get(8..member_end).ok_or("remote version state member is truncated")?)
+        .map_err(|_| "remote version state member is not UTF-8")?;
+    let process_epoch = result
+        .get(member_end..)
+        .and_then(|value| value.try_into().ok())
+        .ok_or("remote version state process epoch has an invalid length")?;
+    Ok((topology_member, process_epoch))
+}
+
+pub fn encode_cross_pool_fence_capability(
+    supported_version: u32,
+    topology_member: &str,
+    process_epoch: &[u8; 16],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let identity = encode_remote_version_state_capability(topology_member, process_epoch)?;
+    let mut result = Vec::with_capacity(4 + identity.len());
+    result.extend_from_slice(&supported_version.to_be_bytes());
+    result.extend_from_slice(&identity);
+    Ok(result)
+}
+
+/// Builds the stable byte representation authenticated for a heal-control request.
+///
+/// This deliberately does not reuse protobuf encoding: mixed-version peers may
+/// retain unknown protobuf fields, which must not change the signed contract.
+pub fn canonical_heal_control_request_body(
+    version: u32,
+    topology_fingerprint: &str,
+    command: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-heal-control-v3\0";
+
+    let fingerprint = topology_fingerprint.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + command.len());
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(fingerprint.len())?.to_be_bytes());
+    body.extend_from_slice(fingerprint);
+    body.extend_from_slice(&u64::try_from(command.len())?.to_be_bytes());
+    body.extend_from_slice(command);
+    Ok(body)
+}
+
+/// Builds the exact acknowledgement expected from a peer that supports the
+/// heal-control protocol and agrees with the caller's storage topology.
+pub fn canonical_heal_control_capability_ack(
+    version: u32,
+    topology_fingerprint: &str,
+    probe: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-heal-control-capability-ack-v4\0";
+
+    let fingerprint = topology_fingerprint.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + probe.len());
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(fingerprint.len())?.to_be_bytes());
+    body.extend_from_slice(fingerprint);
+    body.extend_from_slice(&u64::try_from(probe.len())?.to_be_bytes());
+    body.extend_from_slice(probe);
+    Ok(body)
+}
+
+pub fn canonical_heal_control_response_body(
+    version: u32,
+    topology_fingerprint: &str,
+    command: &[u8],
+    result: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-heal-control-response-v3\0";
+
+    let fingerprint = topology_fingerprint.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + fingerprint.len() + 8 + command.len() + 8 + result.len());
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(fingerprint.len())?.to_be_bytes());
+    body.extend_from_slice(fingerprint);
+    body.extend_from_slice(&u64::try_from(command.len())?.to_be_bytes());
+    body.extend_from_slice(command);
+    body.extend_from_slice(&u64::try_from(result.len())?.to_be_bytes());
+    body.extend_from_slice(result);
+    Ok(body)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TierMutationRpcPhase {
+    Prepare,
+    Commit,
+    Abort,
+}
+
+impl TierMutationRpcPhase {
+    fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::Commit => "commit",
+            Self::Abort => "abort",
+        }
+    }
+}
+
+// Version 2 required peer Prepare to block new tier-reference creators and
+// drain their in-flight operation leases. Version 3 additionally binds Abort
+// to the canonical Prepare intent so a missing-record Abort can persist an
+// identity-bound tombstone and linearize against a delayed Prepare. Version 4
+// signs a typed failure classification while retaining the exact v3 proof
+// bytes for rolling compatibility.
+pub const TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION: u32 = 3;
+pub const TIER_MUTATION_RPC_PROTOCOL_VERSION: u32 = 4;
+pub const TIER_MUTATION_RPC_MAX_ERROR_INFO_SIZE: usize = 1024;
+pub const TIER_MUTATION_RPC_MAX_RESPONSE_PROOF_SIZE: usize = 4096;
+
+pub fn canonical_tier_mutation_rpc_body(
+    version: u32,
+    phase: TierMutationRpcPhase,
+    mutation_id: Uuid,
+    canonical_payload: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-tier-mutation-rpc-v1\0";
+
+    let phase = phase.as_wire_str().as_bytes();
+    let mutation_id = mutation_id.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + 4 + 8 + phase.len() + mutation_id.len() + 8 + canonical_payload.len());
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(phase.len())?.to_be_bytes());
+    body.extend_from_slice(phase);
+    body.extend_from_slice(mutation_id);
+    body.extend_from_slice(&u64::try_from(canonical_payload.len())?.to_be_bytes());
+    body.extend_from_slice(canonical_payload);
+    Ok(body)
+}
+
+pub struct TierMutationRpcResponseProofInput<'a> {
+    pub version: u32,
+    pub phase: TierMutationRpcPhase,
+    pub mutation_id: Uuid,
+    pub canonical_payload: &'a [u8],
+    pub success: bool,
+    pub state: i32,
+    pub applied: bool,
+    pub error_info: Option<&'a str>,
+    pub failure_class: i32,
+}
+
+pub fn canonical_tier_mutation_rpc_response_body(
+    input: TierMutationRpcResponseProofInput<'_>,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const V3_DOMAIN: &[u8] = b"rustfs-tier-mutation-rpc-response-v1\0";
+    const V4_DOMAIN: &[u8] = b"rustfs-tier-mutation-rpc-response-v2\0";
+
+    let phase = input.phase.as_wire_str().as_bytes();
+    let mutation_id = input.mutation_id.as_bytes();
+    let error_info = input.error_info.map(str::as_bytes);
+    let error_info_len = error_info.map_or(0, <[u8]>::len);
+    let is_v4 = input.version >= TIER_MUTATION_RPC_PROTOCOL_VERSION;
+    let domain = if is_v4 { V4_DOMAIN } else { V3_DOMAIN };
+    let mut body = Vec::with_capacity(
+        domain.len()
+            + 4
+            + 8
+            + phase.len()
+            + mutation_id.len()
+            + 8
+            + input.canonical_payload.len()
+            + 1
+            + 4
+            + 1
+            + 1
+            + 8
+            + error_info_len
+            + if is_v4 { 4 } else { 0 },
+    );
+    body.extend_from_slice(domain);
+    body.extend_from_slice(&input.version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(phase.len())?.to_be_bytes());
+    body.extend_from_slice(phase);
+    body.extend_from_slice(mutation_id);
+    body.extend_from_slice(&u64::try_from(input.canonical_payload.len())?.to_be_bytes());
+    body.extend_from_slice(input.canonical_payload);
+    body.push(u8::from(input.success));
+    body.extend_from_slice(&input.state.to_be_bytes());
+    body.push(u8::from(input.applied));
+    body.push(u8::from(error_info.is_some()));
+    body.extend_from_slice(&u64::try_from(error_info_len)?.to_be_bytes());
+    if let Some(error_info) = error_info {
+        body.extend_from_slice(error_info);
+    }
+    if is_v4 {
+        body.extend_from_slice(&input.failure_class.to_be_bytes());
+    }
+    Ok(body)
+}
+
+/// Builds the stable byte representation authenticated for a scanner activity request.
+pub fn canonical_scanner_activity_request_body(
+    request: &proto_gen::node_service::ScannerActivityRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-request-v1\0";
+
+    let challenge = request.challenge.as_ref();
+    let acknowledge_instance_id = request.acknowledge_instance_id.as_bytes();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + acknowledge_instance_id.len() + 4 + 8 * 3);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&request.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(acknowledge_instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(acknowledge_instance_id);
+    body.extend_from_slice(&request.acknowledge_dirty_usage_generation.to_be_bytes());
+    Ok(body)
+}
+
+/// Builds the protocol-v4 byte representation authenticated for a scanner activity response.
+pub fn canonical_scanner_activity_v4_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-response-v1\0";
+
+    let instance_id = response.instance_id.as_bytes();
+    let topology_digest = response.topology_digest.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + instance_id.len() + topology_digest.len() + 4 + 8 * 5 + 1);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(instance_id);
+    body.extend_from_slice(&response.namespace_generation.to_be_bytes());
+    body.extend_from_slice(&response.maintenance_generation.to_be_bytes());
+    body.extend_from_slice(&response.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(topology_digest.len())?.to_be_bytes());
+    body.extend_from_slice(topology_digest);
+    body.push(u8::from(response.data_movement_active));
+    Ok(body)
+}
+
+/// Builds the stable byte representation authenticated for a scanner activity response.
+pub fn canonical_scanner_activity_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-response-v2\0";
+
+    let instance_id = response.instance_id.as_bytes();
+    let topology_digest = response.topology_digest.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + instance_id.len() + topology_digest.len() + 4 + 8 * 6 + 2);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(instance_id);
+    body.extend_from_slice(&response.namespace_generation.to_be_bytes());
+    body.extend_from_slice(&response.maintenance_generation.to_be_bytes());
+    body.extend_from_slice(&response.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(topology_digest.len())?.to_be_bytes());
+    body.extend_from_slice(topology_digest);
+    body.push(u8::from(response.data_movement_active));
+    body.extend_from_slice(&response.dirty_usage_generation.to_be_bytes());
+    body.push(u8::from(response.dirty_usage_pending));
+    Ok(body)
+}
+
+/// Builds the protocol-v7 response body.  The optional movement fields are
+/// presence-bound so a missing terminal-generation proof cannot authenticate
+/// as the value zero.
+pub fn canonical_scanner_activity_v7_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerActivityResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-activity-response-v3\0";
+
+    let instance_id = response.instance_id.as_bytes();
+    let topology_digest = response.topology_digest.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + instance_id.len() + topology_digest.len() + 4 + 8 * 8 + 4);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(instance_id.len())?.to_be_bytes());
+    body.extend_from_slice(instance_id);
+    body.extend_from_slice(&response.namespace_generation.to_be_bytes());
+    body.extend_from_slice(&response.maintenance_generation.to_be_bytes());
+    body.extend_from_slice(&response.protocol_version.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(topology_digest.len())?.to_be_bytes());
+    body.extend_from_slice(topology_digest);
+    body.push(u8::from(response.data_movement_active));
+    body.extend_from_slice(&response.dirty_usage_generation.to_be_bytes());
+    body.push(u8::from(response.dirty_usage_pending));
+    body.push(u8::from(response.movement_generation.is_some()));
+    if let Some(generation) = response.movement_generation {
+        body.extend_from_slice(&generation.to_be_bytes());
+    }
+    body.push(u8::from(response.publication_blocked.is_some()));
+    if let Some(blocked) = response.publication_blocked {
+        body.push(u8::from(blocked));
+    }
+    Ok(body)
+}
+
+pub mod scoped_dirty_usage;
+pub mod usage_watch;
+
+pub fn canonical_scanner_dirty_usage_snapshot_request_body(
+    request: &proto_gen::node_service::ScannerDirtyUsageSnapshotRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-scanner-dirty-usage-snapshot-request-v1\0");
+    body.push_u32(request.protocol_version);
+    body.push_bytes(request.challenge.as_ref())?;
+    Ok(body.finish())
+}
+
+pub fn canonical_scanner_dirty_usage_snapshot_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerDirtyUsageSnapshotResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-scanner-dirty-usage-snapshot-response-v1\0");
+    body.push_bytes(challenge)?;
+    body.push_str(&response.instance_id)?;
+    body.push_u64(response.generation);
+    body.push_u64(response.pending_bucket_count);
+    body.push_u32(response.protocol_version);
+    body.push_str(&response.owner_id)?;
+    body.push_bool(response.complete);
+    body.push_count(response.buckets.len())?;
+    for bucket in &response.buckets {
+        body.push_str(&bucket.bucket)?;
+        body.push_u64(bucket.generation);
+        body.push_bytes(bucket.bucket_incarnation.as_ref())?;
+    }
+    Ok(body.finish())
+}
+
+/// Builds the body authenticated by the short-lived remote scanner publication
+/// lease request. This is a separate domain from ScannerActivity so v6/v7
+/// observation proofs remain byte-for-byte compatible.
+pub fn canonical_scanner_publication_lease_request_body(
+    request: &proto_gen::node_service::ScannerPublicationLeaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const STRICT_DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-request-v1\0";
+    const OBSERVATIONAL_DOMAIN: &[u8] = b"rustfs-scanner-observed-usage-lease-request-v1\0";
+    let domain = if request.observational_only {
+        OBSERVATIONAL_DOMAIN
+    } else {
+        STRICT_DOMAIN
+    };
+    let challenge = request.challenge.as_ref();
+    let session_id = request.expected_session_id.as_bytes();
+    let mut body = Vec::with_capacity(domain.len() + challenge.len() + session_id.len() + 40);
+    body.extend_from_slice(domain);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&request.expected_movement_generation.to_be_bytes());
+    body.extend_from_slice(&request.ttl_ms.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    // Empty keeps the original acquire body byte-for-byte compatible.  A
+    // non-empty token is the authenticated validation form used immediately
+    // before a coordinator commits its final publication.
+    let token = request.token.as_ref();
+    if !token.is_empty() {
+        body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+        body.extend_from_slice(token);
+    }
+    Ok(body)
+}
+
+/// Builds the body authenticated by a remote scanner publication lease
+/// release request.
+pub fn canonical_scanner_publication_lease_release_request_body(
+    request: &proto_gen::node_service::ScannerPublicationLeaseReleaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-release-request-v1\0";
+    let challenge = request.challenge.as_ref();
+    let token = request.token.as_ref();
+    let mut body = Vec::with_capacity(DOMAIN.len() + challenge.len() + token.len() + 16);
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    let owner_id = request.owner_id.as_bytes();
+    let session_id = request.session_id.as_bytes();
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    Ok(body)
+}
+
+pub fn canonical_scanner_publication_lease_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerPublicationLeaseResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const STRICT_DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-response-v1\0";
+    const OBSERVATIONAL_DOMAIN: &[u8] = b"rustfs-scanner-observed-usage-lease-response-v1\0";
+    let domain = if response.observational_only {
+        OBSERVATIONAL_DOMAIN
+    } else {
+        STRICT_DOMAIN
+    };
+    let token = response.token.as_ref();
+    let owner_id = response.owner_id.as_bytes();
+    let session_id = response.session_id.as_bytes();
+    let error_info = response.error.as_ref().map(|error| error.error_info.as_bytes());
+    let error_code = response.error.as_ref().map_or(0, |error| error.code);
+    let mut body = Vec::with_capacity(
+        domain.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 72,
+    );
+    body.extend_from_slice(domain);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.push(u8::from(response.success));
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    body.extend_from_slice(&response.movement_generation.to_be_bytes());
+    body.extend_from_slice(&response.lease_ttl_ms.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    body.push(u8::from(response.error.is_some()));
+    body.extend_from_slice(&error_code.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(error_info.map_or(0, |value| value.len()))?.to_be_bytes());
+    if let Some(error_info) = error_info {
+        body.extend_from_slice(error_info);
+    }
+    Ok(body)
+}
+
+pub fn canonical_scanner_publication_lease_release_response_body(
+    challenge: &[u8],
+    request: &proto_gen::node_service::ScannerPublicationLeaseReleaseRequest,
+    response: &proto_gen::node_service::ScannerPublicationLeaseReleaseResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    const DOMAIN: &[u8] = b"rustfs-scanner-publication-lease-release-response-v1\0";
+    let token = request.token.as_ref();
+    let owner_id = request.owner_id.as_bytes();
+    let session_id = request.session_id.as_bytes();
+    let error_info = response.error.as_ref().map(|error| error.error_info.as_bytes());
+    let error_code = response.error.as_ref().map_or(0, |error| error.code);
+    let mut body = Vec::with_capacity(
+        DOMAIN.len() + challenge.len() + token.len() + owner_id.len() + session_id.len() + error_info.map_or(0, |v| v.len()) + 56,
+    );
+    body.extend_from_slice(DOMAIN);
+    body.extend_from_slice(&u64::try_from(challenge.len())?.to_be_bytes());
+    body.extend_from_slice(challenge);
+    body.extend_from_slice(&u64::try_from(token.len())?.to_be_bytes());
+    body.extend_from_slice(token);
+    body.extend_from_slice(&u64::try_from(owner_id.len())?.to_be_bytes());
+    body.extend_from_slice(owner_id);
+    body.extend_from_slice(&u64::try_from(session_id.len())?.to_be_bytes());
+    body.extend_from_slice(session_id);
+    body.push(u8::from(response.success));
+    body.push(u8::from(response.error.is_some()));
+    body.extend_from_slice(&error_code.to_be_bytes());
+    body.extend_from_slice(&u64::try_from(error_info.map_or(0, |value| value.len()))?.to_be_bytes());
+    if let Some(error_info) = error_info {
+        body.extend_from_slice(error_info);
+    }
+    Ok(body)
+}
+
+/// Length-prefixed, domain-separated byte builder for the disk-mutation canonical bodies below.
+/// Every variable-length field is u64-length-prefixed and every list u64-count-prefixed, so
+/// distinct field values can never collide into the same canonical bytes.
+struct CanonicalBodyBuilder {
+    body: Vec<u8>,
+}
+
+impl CanonicalBodyBuilder {
+    fn new(domain: &'static [u8]) -> Self {
+        let mut body = Vec::with_capacity(domain.len() + 128);
+        body.extend_from_slice(domain);
+        Self { body }
+    }
+
+    fn push_bytes(&mut self, field: &[u8]) -> Result<(), std::num::TryFromIntError> {
+        self.body.extend_from_slice(&u64::try_from(field.len())?.to_be_bytes());
+        self.body.extend_from_slice(field);
+        Ok(())
+    }
+
+    fn push_str(&mut self, field: &str) -> Result<(), std::num::TryFromIntError> {
+        self.push_bytes(field.as_bytes())
+    }
+
+    fn push_optional_str(&mut self, field: Option<&str>) -> Result<(), std::num::TryFromIntError> {
+        self.body.push(u8::from(field.is_some()));
+        self.push_str(field.unwrap_or_default())
+    }
+
+    fn push_bool(&mut self, field: bool) {
+        self.body.push(u8::from(field));
+    }
+
+    fn push_u32(&mut self, field: u32) {
+        self.body.extend_from_slice(&field.to_be_bytes());
+    }
+
+    fn push_u64(&mut self, field: u64) {
+        self.body.extend_from_slice(&field.to_be_bytes());
+    }
+
+    fn push_count(&mut self, count: usize) -> Result<(), std::num::TryFromIntError> {
+        self.body.extend_from_slice(&u64::try_from(count)?.to_be_bytes());
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.body
+    }
+}
+
+pub const PEER_RESTSIGNAL: &str = "signal";
+pub const PEER_RESTSUB_SYS: &str = "sub-sys";
+pub const PEER_RESTDRY_RUN: &str = "dry-run";
+
+/// A stable semantic body for a side-effecting unary RPC.
+///
+/// Implementations deliberately enumerate handler-consumed fields instead of re-encoding the
+/// protobuf message, whose unknown fields and map order are not a mixed-version contract.
+pub trait CanonicalMutationBody {
+    fn canonical_body(&self) -> Result<Vec<u8>, std::num::TryFromIntError>;
+}
+
+pub const MRF_LIFECYCLE_PROTOCOL_VERSION: u32 = 1;
+pub const MRF_LIFECYCLE_MAX_COMMAND_BYTES: usize = 16 * 1024;
+pub const MRF_LIFECYCLE_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+impl CanonicalMutationBody for proto_gen::node_service::MrfLifecycleRequest {
+    fn canonical_body(&self) -> Result<Vec<u8>, std::num::TryFromIntError> {
+        let mut body = CanonicalBodyBuilder::new(b"rustfs-mrf-lifecycle-request-v1\0");
+        body.push_u32(self.protocol_version);
+        body.push_str(&self.topology_fingerprint)?;
+        body.push_str(&self.node_id)?;
+        body.push_bytes(&self.command)?;
+        body.push_bytes(&self.challenge)?;
+        Ok(body.finish())
+    }
+}
+
+/// Binds a node observation or action acknowledgement to the exact challenged request.
+/// Returns a length conversion error if a field cannot be represented on the wire.
+pub fn canonical_mrf_lifecycle_response_body(
+    request: &proto_gen::node_service::MrfLifecycleRequest,
+    response: &proto_gen::node_service::MrfLifecycleResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-mrf-lifecycle-response-v1\0");
+    body.push_bytes(&request.canonical_body()?)?;
+    body.push_u32(response.protocol_version);
+    body.push_bytes(&response.result)?;
+    Ok(body.finish())
+}
+
+macro_rules! impl_canonical_mutation_body {
+    ($request:ty, $domain:expr, |$value:ident, $body:ident| $fields:block) => {
+        impl CanonicalMutationBody for $request {
+            fn canonical_body(&self) -> Result<Vec<u8>, std::num::TryFromIntError> {
+                let $value = self;
+                let mut $body = CanonicalBodyBuilder::new($domain);
+                $fields
+                Ok($body.finish())
+            }
+        }
+    };
+    ($request:ty, $domain:expr) => {
+        impl CanonicalMutationBody for $request {
+            fn canonical_body(&self) -> Result<Vec<u8>, std::num::TryFromIntError> {
+                Ok(CanonicalBodyBuilder::new($domain).finish())
+            }
+        }
+    };
+}
+
+impl_canonical_mutation_body!(
+    proto_gen::node_service::SignalServiceRequest,
+    b"rustfs-signal-service-request-v1\0",
+    |request, body| {
+        let vars = request.vars.as_ref().map(|vars| &vars.value);
+        body.push_optional_str(vars.and_then(|vars| vars.get(PEER_RESTSIGNAL).map(String::as_str)))?;
+        body.push_optional_str(vars.and_then(|vars| vars.get(PEER_RESTSUB_SYS).map(String::as_str)))?;
+        body.push_optional_str(vars.and_then(|vars| vars.get(PEER_RESTDRY_RUN).map(String::as_str)))?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::HealBucketRequest,
+    b"rustfs-heal-bucket-request-v1\0",
+    |request, body| {
+        body.push_str(&request.bucket)?;
+        body.push_str(&request.options)?;
+        if !request.bucket_incarnation_id.is_empty() {
+            body.push_bytes(&request.bucket_incarnation_id)?;
+        }
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::MakeBucketRequest,
+    b"rustfs-make-bucket-request-v1\0",
+    |request, body| {
+        body.push_str(&request.name)?;
+        body.push_str(&request.options)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::DeleteBucketRequest,
+    b"rustfs-delete-bucket-request-v1\0",
+    |request, body| {
+        body.push_str(&request.bucket)?;
+        body.push_str(&request.options)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::GenerallyLockRequest,
+    b"rustfs-lock-request-v1\0",
+    |request, body| {
+        body.push_str(&request.args)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::BatchGenerallyLockRequest,
+    b"rustfs-lock-batch-request-v1\0",
+    |request, body| {
+        body.push_count(request.args.len())?;
+        for arg in &request.args {
+            body.push_str(arg)?;
+        }
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadBucketMetadataRequest,
+    b"rustfs-load-bucket-metadata-request-v1\0",
+    |request, body| {
+        body.push_str(&request.bucket)?;
+        body.push_bool(request.scanner_maintenance_change);
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::DeleteBucketMetadataRequest,
+    b"rustfs-delete-bucket-metadata-request-v1\0",
+    |request, body| {
+        body.push_str(&request.bucket)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::DeletePolicyRequest,
+    b"rustfs-delete-policy-request-v1\0",
+    |request, body| {
+        body.push_str(&request.policy_name)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadPolicyRequest,
+    b"rustfs-load-policy-request-v1\0",
+    |request, body| {
+        body.push_str(&request.policy_name)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadPolicyMappingRequest,
+    b"rustfs-load-policy-mapping-request-v1\0",
+    |request, body| {
+        body.push_str(&request.user_or_group)?;
+        body.push_u64(request.user_type);
+        body.push_bool(request.is_group);
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::DeleteUserRequest,
+    b"rustfs-delete-user-request-v1\0",
+    |request, body| {
+        body.push_str(&request.access_key)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::DeleteServiceAccountRequest,
+    b"rustfs-delete-service-account-request-v1\0",
+    |request, body| {
+        body.push_str(&request.access_key)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadUserRequest,
+    b"rustfs-load-user-request-v1\0",
+    |request, body| {
+        body.push_str(&request.access_key)?;
+        body.push_bool(request.temp);
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadServiceAccountRequest,
+    b"rustfs-load-service-account-request-v1\0",
+    |request, body| {
+        body.push_str(&request.access_key)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadGroupRequest,
+    b"rustfs-load-group-request-v1\0",
+    |request, body| {
+        body.push_str(&request.group)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::ReloadSiteReplicationConfigRequest,
+    b"rustfs-reload-site-replication-config-request-v1\0"
+);
+impl_canonical_mutation_body!(proto_gen::node_service::ReloadPoolMetaRequest, b"rustfs-reload-pool-meta-request-v1\0");
+impl_canonical_mutation_body!(
+    proto_gen::node_service::StopRebalanceRequest,
+    b"rustfs-stop-rebalance-request-v1\0",
+    |request, body| {
+        body.push_str(&request.expected_rebalance_id)?;
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadRebalanceMetaRequest,
+    b"rustfs-load-rebalance-meta-request-v1\0",
+    |request, body| {
+        body.push_bool(request.start_rebalance);
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::StartDecommissionRequest,
+    b"rustfs-start-decommission-request-v1\0",
+    |request, body| {
+        body.push_count(request.pool_indices.len())?;
+        for pool_index in &request.pool_indices {
+            body.push_u32(*pool_index);
+        }
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::CancelDecommissionRequest,
+    b"rustfs-cancel-decommission-request-v1\0",
+    |request, body| {
+        body.push_u32(request.pool_index);
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::ClearDecommissionRequest,
+    b"rustfs-clear-decommission-request-v1\0",
+    |request, body| {
+        body.push_u32(request.pool_index);
+    }
+);
+impl_canonical_mutation_body!(
+    proto_gen::node_service::LoadTransitionTierConfigRequest,
+    b"rustfs-load-transition-tier-config-request-v1\0"
+);
+
+// Canonical request bodies for the mutating NodeService disk RPCs (backlog#1327 body-digest
+// binding). Each covers every semantic wire field — including both the msgpack `_bin` payload and
+// its JSON compatibility copy — so tampering with either encoding, or stripping `_bin` to force
+// the JSON fallback decode path, breaks the signature-bound digest.
+
+pub fn canonical_rename_data_request_body(
+    request: &proto_gen::node_service::RenameDataRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-rename-data-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.src_volume)?;
+    body.push_str(&request.src_path)?;
+    body.push_str(&request.file_info)?;
+    body.push_str(&request.dst_volume)?;
+    body.push_str(&request.dst_path)?;
+    body.push_bytes(&request.file_info_bin)?;
+    // Keep legacy rename requests byte-for-byte compatible.  The optional
+    // token is included only for the scanner's target-side lease fence.
+    if !request.scanner_publication_lease_token.is_empty() {
+        body.push_bytes(&request.scanner_publication_lease_token)?;
+    }
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
+    Ok(body.finish())
+}
+
+/// The fixed-MPU recovery method authenticates every wire field in its own domain.
+pub fn canonical_recover_multipart_source_request_body(
+    request: &proto_gen::node_service::RecoverMultipartSourceRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-recover-multipart-source-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.path)?;
+    body.push_u32(request.protocol_version);
+    body.push_bytes(&request.operation)?;
+    Ok(body.finish())
+}
+
+pub const MULTIPART_SOURCE_RECOVERY_MAX_PAYLOAD_BYTES: usize = DEFAULT_GRPC_SERVER_MESSAGE_LEN;
+
+/// Recovery transports exactly one bounded, typed operation or response.
+pub fn decode_multipart_source_recovery_payload<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result<T> {
+    if payload.is_empty() || payload.len() > MULTIPART_SOURCE_RECOVERY_MAX_PAYLOAD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid multipart source recovery payload length",
+        ));
+    }
+    let mut cursor = std::io::Cursor::new(payload);
+    let value = rmp_serde::from_read(&mut cursor)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid multipart source recovery payload"))?;
+    if cursor.position() != u64::try_from(payload.len()).map_err(std::io::Error::other)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trailing multipart source recovery payload",
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod multipart_source_rpc_tests {
+    use super::*;
+
+    #[test]
+    fn multipart_source_recovery_canonical_body_binds_all_wire_fields_and_domain() {
+        let request = proto_gen::node_service::RecoverMultipartSourceRequest {
+            disk: "disk".into(),
+            path: "upload".into(),
+            protocol_version: 1,
+            operation: vec![0x80].into(),
+        };
+        let canonical = canonical_recover_multipart_source_request_body(&request).expect("canonical recovery body");
+        let mut bodies = std::collections::HashSet::from([canonical.clone()]);
+        for change in [
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.disk = "other".into(),
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.path = "other".into(),
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.protocol_version = 2,
+            |request: &mut proto_gen::node_service::RecoverMultipartSourceRequest| request.operation = vec![0x81].into(),
+        ] {
+            let mut changed = request.clone();
+            change(&mut changed);
+            assert!(bodies.insert(canonical_recover_multipart_source_request_body(&changed).expect("changed recovery body")));
+        }
+        let delete = proto_gen::node_service::RecoverDeleteTransactionRequest {
+            disk: request.disk,
+            volume: request.path,
+            protocol_version: request.protocol_version,
+            operation: request.operation,
+        };
+        assert_ne!(
+            canonical,
+            canonical_recover_delete_transaction_request_body(&delete).expect("other recovery domain")
+        );
+    }
+
+    #[test]
+    fn multipart_source_recovery_payload_requires_one_bounded_value() {
+        let encoded = rmp_serde::to_vec_named(&vec![1_u32, 2]).expect("encoded operation");
+        assert_eq!(
+            decode_multipart_source_recovery_payload::<Vec<u32>>(&encoded).expect("one value"),
+            vec![1, 2]
+        );
+        let mut trailing = encoded;
+        trailing.push(0xc0);
+        assert!(decode_multipart_source_recovery_payload::<Vec<u32>>(&trailing).is_err());
+        assert!(decode_multipart_source_recovery_payload::<Vec<u32>>(&[]).is_err());
+        assert!(decode_multipart_source_recovery_payload::<Vec<u32>>(&[0xc1]).is_err());
+        assert!(
+            decode_multipart_source_recovery_payload::<Vec<u32>>(&vec![0xc0; MULTIPART_SOURCE_RECOVERY_MAX_PAYLOAD_BYTES + 1])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn multipart_source_wire_debug_redacts_capability_payloads() {
+        let secret = "private-undo-capability";
+        let rename = proto_gen::node_service::RenameDataResponse {
+            success: true,
+            rename_data_resp: secret.into(),
+            rename_data_resp_bin: secret.as_bytes().to_vec().into(),
+            error: None,
+        };
+        assert_eq!(
+            format!("{rename:?}"),
+            r#"RenameDataResponse { success: true, payload: "[REDACTED]", .. }"#
+        );
+        let request = proto_gen::node_service::RecoverMultipartSourceRequest {
+            disk: secret.into(),
+            path: secret.into(),
+            protocol_version: 1,
+            operation: secret.as_bytes().to_vec().into(),
+        };
+        assert_eq!(
+            format!("{request:?}"),
+            r#"RecoverMultipartSourceRequest { protocol_version: 1, operation: "[REDACTED]", .. }"#
+        );
+        let response = proto_gen::node_service::RecoverMultipartSourceResponse {
+            success: true,
+            protocol_version: 1,
+            result: secret.as_bytes().to_vec().into(),
+            error: None,
+        };
+        assert_eq!(
+            format!("{response:?}"),
+            r#"RecoverMultipartSourceResponse { success: true, protocol_version: 1, result: "[REDACTED]", .. }"#
+                .replace("\\\"", "\"")
+        );
+    }
+}
+
+pub fn canonical_pool_meta_native_recovery_request_body(
+    request: &proto_gen::node_service::PoolMetaNativeRecoveryRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-pool-meta-native-recovery-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_bytes(&request.payload)?;
+    Ok(body.finish())
+}
+
+/// The native recovery RPC accepts exactly one bounded MessagePack value.
+pub const POOL_META_NATIVE_RECOVERY_MAX_PAYLOAD_BYTES: usize = DEFAULT_GRPC_SERVER_MESSAGE_LEN;
+
+pub fn decode_pool_meta_native_recovery_payload<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result<T> {
+    if payload.is_empty() || payload.len() > POOL_META_NATIVE_RECOVERY_MAX_PAYLOAD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid pool metadata recovery payload length",
+        ));
+    }
+    let mut cursor = std::io::Cursor::new(payload);
+    let value = rmp_serde::from_read(&mut cursor)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid pool metadata recovery payload"))?;
+    if cursor.position() != u64::try_from(payload.len()).map_err(std::io::Error::other)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "trailing pool metadata recovery payload",
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod pool_meta_native_rpc_tests {
+    use super::*;
+
+    #[test]
+    fn pool_meta_native_recovery_body_binds_disk_and_payload_without_field_aliasing() {
+        use proto_gen::node_service::PoolMetaNativeRecoveryRequest;
+        let baseline = PoolMetaNativeRecoveryRequest {
+            disk: "disk-a".to_owned(),
+            payload: vec![1, 2].into(),
+        };
+        let body = canonical_pool_meta_native_recovery_request_body(&baseline).expect("body must encode");
+        for changed in [
+            PoolMetaNativeRecoveryRequest {
+                disk: "disk-b".to_owned(),
+                ..baseline.clone()
+            },
+            PoolMetaNativeRecoveryRequest {
+                payload: vec![1, 3].into(),
+                ..baseline
+            },
+            PoolMetaNativeRecoveryRequest {
+                disk: "disk-a\u{1}".to_owned(),
+                payload: vec![2].into(),
+            },
+        ] {
+            assert_ne!(
+                body,
+                canonical_pool_meta_native_recovery_request_body(&changed).expect("changed body must encode")
+            );
+        }
+    }
+
+    #[test]
+    fn pool_meta_native_recovery_codec_rejects_empty_malformed_and_trailing_values() {
+        for payload in [vec![], vec![0xc1], vec![0x90, 0xc0]] {
+            assert!(decode_pool_meta_native_recovery_payload::<Vec<u8>>(&payload).is_err());
+        }
+        assert_eq!(
+            decode_pool_meta_native_recovery_payload::<Vec<u8>>(&[0x90]).expect("one empty array is valid"),
+            Vec::<u8>::new()
+        );
+    }
+}
+
+pub const QUOTA_MUTATION_TOPOLOGY_HEADER: &str = "x-rustfs-quota-topology";
+
+/// Binds a quota mutation to the coordinator's complete, ordered storage layout.
+/// The inner canonical body retains its operation-specific domain and wire fields.
+pub fn canonical_quota_mutation_request_body(
+    topology_fingerprint: &str,
+    mutation_body: &[u8],
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-quota-mutation-topology-request-v1\0");
+    body.push_str(topology_fingerprint)?;
+    body.push_bytes(mutation_body)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_version_request_body(
+    request: &proto_gen::node_service::DeleteVersionRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-version-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_str(&request.file_info)?;
+    body.push_bool(request.force_del_marker);
+    body.push_str(&request.opts)?;
+    body.push_bytes(&request.file_info_bin)?;
+    body.push_bytes(&request.opts_bin)?;
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_versions_request_body(
+    request: &proto_gen::node_service::DeleteVersionsRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-versions-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_count(request.versions.len())?;
+    for version in &request.versions {
+        body.push_str(version)?;
+    }
+    body.push_str(&request.opts)?;
+    body.push_count(request.versions_bin.len())?;
+    for version_bin in &request.versions_bin {
+        body.push_bytes(version_bin)?;
+    }
+    body.push_bytes(&request.opts_bin)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_guarded_delete_versions_request_body(
+    request: &proto_gen::node_service::GuardedDeleteVersionsRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-guarded-delete-versions-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_bytes(&request.payload)?;
+    body.push_bool(request.probe_only);
+    Ok(body.finish())
+}
+
+pub fn canonical_write_metadata_request_body(
+    request: &proto_gen::node_service::WriteMetadataRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-write-metadata-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_str(&request.file_info)?;
+    body.push_bytes(&request.file_info_bin)?;
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
+    Ok(body.finish())
+}
+
+pub fn canonical_update_metadata_request_body(
+    request: &proto_gen::node_service::UpdateMetadataRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-update-metadata-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_str(&request.file_info)?;
+    body.push_str(&request.opts)?;
+    body.push_bytes(&request.file_info_bin)?;
+    body.push_bytes(&request.opts_bin)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_write_all_request_body(
+    request: &proto_gen::node_service::WriteAllRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-write-all-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bytes(&request.data)?;
+    Ok(body.finish())
+}
+
+/// Build the signed semantic body for atomic format-control publication.
+///
+/// # Errors
+/// Returns a length conversion error when a field exceeds the canonical wire limit.
+pub fn canonical_write_format_control_request_body(
+    request: &proto_gen::node_service::WriteFormatControlRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-write-format-control-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.path)?;
+    body.push_bytes(&request.data)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_compare_and_update_file_request_body(
+    request: &proto_gen::node_service::CompareAndUpdateFileRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-compare-and-update-file-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bool(request.expected.is_some());
+    body.push_bytes(request.expected.as_deref().unwrap_or_default())?;
+    body.push_bool(request.replacement.is_some());
+    body.push_bytes(request.replacement.as_deref().unwrap_or_default())?;
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_request_body(
+    request: &proto_gen::node_service::DeleteRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_str(&request.options)?;
+    if !request.scanner_publication_lease_token.is_empty() {
+        body.push_bytes(&request.scanner_publication_lease_token)?;
+    }
+    if !request.bucket_incarnation_id.is_empty() {
+        body.push_str("bucket-incarnation-v1")?;
+        body.push_bytes(&request.bucket_incarnation_id)?;
+    }
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_paths_request_body(
+    request: &proto_gen::node_service::DeletePathsRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-paths-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_count(request.paths.len())?;
+    for path in &request.paths {
+        body.push_str(path)?;
+    }
+    Ok(body.finish())
+}
+
+pub fn canonical_snapshot_lease_request_body(
+    request: &proto_gen::node_service::SnapshotLeaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-snapshot-lease-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_u64(request.ttl_ms);
+    Ok(body.finish())
+}
+
+pub fn canonical_snapshot_lease_renew_request_body(
+    request: &proto_gen::node_service::SnapshotLeaseRenewRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-snapshot-lease-renew-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bytes(&request.token)?;
+    body.push_u64(request.ttl_ms);
+    Ok(body.finish())
+}
+
+pub fn canonical_snapshot_lease_release_request_body(
+    request: &proto_gen::node_service::SnapshotLeaseReleaseRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-snapshot-lease-release-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bytes(&request.token)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_rename_file_request_body(
+    request: &proto_gen::node_service::RenameFileRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-rename-file-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.src_volume)?;
+    body.push_str(&request.src_path)?;
+    body.push_str(&request.dst_volume)?;
+    body.push_str(&request.dst_path)?;
+    // Preserve the release signature for ordinary renames. An older server
+    // computes a different digest for a durable request and rejects mutation.
+    if request.durable {
+        body.push_bool(true);
+    }
+    Ok(body.finish())
+}
+
+pub fn canonical_rename_part_request_body(
+    request: &proto_gen::node_service::RenamePartRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-rename-part-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.src_volume)?;
+    body.push_str(&request.src_path)?;
+    body.push_str(&request.dst_volume)?;
+    body.push_str(&request.dst_path)?;
+    body.push_bytes(&request.meta)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_prepare_part_transaction_request_body(
+    request: &proto_gen::node_service::PreparePartTransactionRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-prepare-part-transaction-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.src_volume)?;
+    body.push_str(&request.src_path)?;
+    body.push_str(&request.dst_volume)?;
+    body.push_str(&request.dst_path)?;
+    body.push_bytes(&request.meta)?;
+    Ok(body.finish())
+}
+
+/// Recovery messages are bounded and must contain exactly one MessagePack value.
+pub const DELETE_RECOVERY_MAX_PAYLOAD_BYTES: usize = DEFAULT_GRPC_SERVER_MESSAGE_LEN;
+pub const DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES: usize = 1024 * 1024;
+
+pub fn decode_delete_recovery_payload<T: serde::de::DeserializeOwned>(payload: &[u8]) -> std::io::Result<T> {
+    if payload.is_empty() || payload.len() > DELETE_RECOVERY_MAX_PAYLOAD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid delete recovery payload length",
+        ));
+    }
+    let mut cursor = std::io::Cursor::new(payload);
+    let value = rmp_serde::from_read(&mut cursor)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid delete recovery payload"))?;
+    if cursor.position() != u64::try_from(payload.len()).map_err(std::io::Error::other)? {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "trailing delete recovery payload"));
+    }
+    Ok(value)
+}
+
+pub fn canonical_recover_delete_transaction_request_body(
+    request: &proto_gen::node_service::RecoverDeleteTransactionRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-recover-delete-transaction-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_u32(request.protocol_version);
+    body.push_bytes(&request.operation)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_settle_part_transaction_request_body(
+    request: &proto_gen::node_service::SettlePartTransactionRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-settle-part-transaction-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    body.push_str(&request.path)?;
+    body.push_bool(request.rollback);
+    Ok(body.finish())
+}
+
+pub fn canonical_delete_volume_request_body(
+    request: &proto_gen::node_service::DeleteVolumeRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-delete-volume-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    // Binding `force` is the point: an unbound recursive-delete flag lets an on-path attacker
+    // turn a refuse-if-nonempty delete into a recursive volume wipe (backlog#1327).
+    body.push_bool(request.force);
+    Ok(body.finish())
+}
+
+pub fn canonical_make_volume_request_body(
+    request: &proto_gen::node_service::MakeVolumeRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-make-volume-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.volume)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_make_volumes_request_body(
+    request: &proto_gen::node_service::MakeVolumesRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-make-volumes-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_count(request.volumes.len())?;
+    for volume in &request.volumes {
+        body.push_str(volume)?;
+    }
+    Ok(body.finish())
+}
+
+#[cfg(test)]
+mod disk_mutation_canonical_tests {
+    use super::proto_gen::node_service::{
+        CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
+        DeleteVolumeRequest, MakeVolumeRequest, MakeVolumesRequest, PreparePartTransactionRequest, RenameDataRequest,
+        RenameFileRequest, RenamePartRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest,
+        SnapshotLeaseRenewRequest, SnapshotLeaseRequest, UpdateMetadataRequest, WriteAllRequest, WriteMetadataRequest,
+    };
+    use super::*;
+
+    #[test]
+    fn quota_mutation_envelope_binds_topology_operation_and_field_boundaries() {
+        let acquire = canonical_snapshot_lease_request_body(&SnapshotLeaseRequest::default()).expect("acquire body");
+        let release =
+            canonical_snapshot_lease_release_request_body(&SnapshotLeaseReleaseRequest::default()).expect("release body");
+        let rename = canonical_rename_data_request_body(&RenameDataRequest::default()).expect("rename body");
+        let topology = "a".repeat(64);
+        let envelope = canonical_quota_mutation_request_body(&topology, &acquire).expect("quota envelope");
+        assert_ne!(envelope, acquire, "quota and ordinary mutation domains must differ");
+        assert_all_distinct(&[
+            envelope,
+            canonical_quota_mutation_request_body(&"b".repeat(64), &acquire).expect("changed topology"),
+            canonical_quota_mutation_request_body(&topology, &release).expect("release envelope"),
+            canonical_quota_mutation_request_body(&topology, &rename).expect("rename envelope"),
+        ]);
+        assert_ne!(
+            canonical_quota_mutation_request_body("ab", b"c").expect("first boundary"),
+            canonical_quota_mutation_request_body("a", b"bc").expect("second boundary"),
+            "topology and operation bytes must be independently length delimited"
+        );
+    }
+
+    #[test]
+    fn guarded_delete_digest_binds_probe_and_payload() {
+        let request = proto_gen::node_service::GuardedDeleteVersionsRequest {
+            disk: "disk-a".into(),
+            volume: "bucket-a".into(),
+            payload: vec![0x80].into(),
+            probe_only: false,
+        };
+        let original = canonical_guarded_delete_versions_request_body(&request).expect("encode guarded body");
+        let mut candidates = Vec::new();
+        let mut changed = request.clone();
+        changed.disk = "disk-b".into();
+        candidates.push(changed);
+        let mut changed = request.clone();
+        changed.volume = "bucket-b".into();
+        candidates.push(changed);
+        let mut changed = request.clone();
+        changed.payload = vec![0x81].into();
+        candidates.push(changed);
+        let mut changed = request;
+        changed.probe_only = true;
+        candidates.push(changed);
+        for changed in candidates {
+            assert_ne!(
+                canonical_guarded_delete_versions_request_body(&changed).expect("encode changed body"),
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn delete_recovery_canonical_body_binds_all_wire_fields() {
+        let request = proto_gen::node_service::RecoverDeleteTransactionRequest {
+            disk: "disk".into(),
+            volume: "volume".into(),
+            protocol_version: 1,
+            operation: vec![0x80].into(),
+        };
+        let mut bodies = vec![canonical_recover_delete_transaction_request_body(&request).expect("canonical body")];
+        for mutate in [
+            |r: &mut proto_gen::node_service::RecoverDeleteTransactionRequest| r.disk = "other".into(),
+            |r: &mut proto_gen::node_service::RecoverDeleteTransactionRequest| r.volume = "other".into(),
+            |r: &mut proto_gen::node_service::RecoverDeleteTransactionRequest| r.protocol_version = 2,
+            |r: &mut proto_gen::node_service::RecoverDeleteTransactionRequest| r.operation = vec![0x81].into(),
+        ] {
+            let mut changed = request.clone();
+            mutate(&mut changed);
+            bodies.push(canonical_recover_delete_transaction_request_body(&changed).expect("changed canonical body"));
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn delete_recovery_payload_rejects_trailing_malformed_and_oversized_values() {
+        let payload = rmp_serde::to_vec_named(&vec![1_u32, 2]).expect("encode test payload");
+        assert_eq!(decode_delete_recovery_payload::<Vec<u32>>(&payload).expect("one payload"), vec![1, 2]);
+        let mut trailing = payload;
+        trailing.push(0xc0);
+        assert!(decode_delete_recovery_payload::<Vec<u32>>(&trailing).is_err());
+        assert!(decode_delete_recovery_payload::<Vec<u32>>(&[]).is_err());
+        assert!(decode_delete_recovery_payload::<Vec<u32>>(&[0xc1]).is_err());
+        assert!(decode_delete_recovery_payload::<Vec<u32>>(&vec![0xc0; DELETE_RECOVERY_MAX_PAYLOAD_BYTES + 1]).is_err());
+    }
+
+    fn assert_all_distinct(bodies: &[Vec<u8>]) {
+        for (i, a) in bodies.iter().enumerate() {
+            for (j, b) in bodies.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "canonical bodies {i} and {j} must differ");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rename_data_canonical_body_binds_every_field() {
+        let baseline = RenameDataRequest {
+            bucket_incarnation_id: Default::default(),
+            disk: "disk-a".into(),
+            src_volume: "src-vol".into(),
+            src_path: "src-path".into(),
+            file_info: "{\"v\":1}".into(),
+            dst_volume: "dst-vol".into(),
+            dst_path: "dst-path".into(),
+            file_info_bin: vec![0x81, 0x01].into(),
+            scanner_publication_lease_token: Vec::new().into(),
+        };
+        let mut bodies = vec![canonical_rename_data_request_body(&baseline).unwrap()];
+        for mutate in [
+            |r: &mut RenameDataRequest| r.disk = "disk-b".into(),
+            |r: &mut RenameDataRequest| r.src_volume = "src-vol2".into(),
+            |r: &mut RenameDataRequest| r.src_path = "src-path2".into(),
+            |r: &mut RenameDataRequest| r.file_info = "{\"v\":2}".into(),
+            |r: &mut RenameDataRequest| r.dst_volume = "dst-vol2".into(),
+            |r: &mut RenameDataRequest| r.dst_path = "dst-path2".into(),
+            |r: &mut RenameDataRequest| r.file_info_bin = vec![0x81, 0x02].into(),
+            |r: &mut RenameDataRequest| r.file_info_bin = Vec::new().into(),
+            |r: &mut RenameDataRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
+            |r: &mut RenameDataRequest| r.bucket_incarnation_id = vec![0x01; 16].into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_rename_data_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn rename_data_canonical_body_is_injective_across_field_boundaries() {
+        // Length prefixes must prevent moving bytes between adjacent fields from colliding.
+        let shifted_left = RenameDataRequest {
+            src_volume: "ab".into(),
+            src_path: "c".into(),
+            ..Default::default()
+        };
+        let shifted_right = RenameDataRequest {
+            src_volume: "a".into(),
+            src_path: "bc".into(),
+            ..Default::default()
+        };
+        assert_ne!(
+            canonical_rename_data_request_body(&shifted_left).unwrap(),
+            canonical_rename_data_request_body(&shifted_right).unwrap(),
+        );
+    }
+
+    #[test]
+    fn delete_version_canonical_body_binds_every_field() {
+        let baseline = DeleteVersionRequest {
+            bucket_incarnation_id: Default::default(),
+            disk: "disk-a".into(),
+            volume: "vol".into(),
+            path: "path".into(),
+            file_info: "{\"v\":1}".into(),
+            force_del_marker: false,
+            opts: "{}".into(),
+            file_info_bin: vec![0x81].into(),
+            opts_bin: vec![0x80].into(),
+        };
+        let mut bodies = vec![canonical_delete_version_request_body(&baseline).unwrap()];
+        for mutate in [
+            |r: &mut DeleteVersionRequest| r.disk = "disk-b".into(),
+            |r: &mut DeleteVersionRequest| r.volume = "vol2".into(),
+            |r: &mut DeleteVersionRequest| r.path = "path2".into(),
+            |r: &mut DeleteVersionRequest| r.file_info = "{\"v\":2}".into(),
+            |r: &mut DeleteVersionRequest| r.force_del_marker = true,
+            |r: &mut DeleteVersionRequest| r.opts = "{\"o\":1}".into(),
+            |r: &mut DeleteVersionRequest| r.file_info_bin = vec![0x82].into(),
+            |r: &mut DeleteVersionRequest| r.opts_bin = Vec::new().into(),
+            |r: &mut DeleteVersionRequest| r.bucket_incarnation_id = vec![1; 16].into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_delete_version_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn delete_versions_canonical_body_binds_lists_and_options() {
+        let baseline = DeleteVersionsRequest {
+            disk: "disk-a".into(),
+            volume: "vol".into(),
+            versions: vec!["v1".into(), "v2".into()],
+            opts: "{}".into(),
+            versions_bin: vec![vec![0x01].into(), vec![0x02].into()],
+            opts_bin: vec![0x80].into(),
+        };
+        let mut bodies = vec![canonical_delete_versions_request_body(&baseline).unwrap()];
+        for mutate in [
+            |r: &mut DeleteVersionsRequest| r.disk = "disk-b".into(),
+            |r: &mut DeleteVersionsRequest| r.volume = "vol2".into(),
+            |r: &mut DeleteVersionsRequest| r.versions = vec!["v1".into(), "v3".into()],
+            |r: &mut DeleteVersionsRequest| r.versions = vec!["v1v2".into()],
+            |r: &mut DeleteVersionsRequest| r.opts = "{\"o\":1}".into(),
+            |r: &mut DeleteVersionsRequest| r.versions_bin = vec![vec![0x01].into(), vec![0x03].into()],
+            |r: &mut DeleteVersionsRequest| r.versions_bin = vec![vec![0x01, 0x02].into()],
+            |r: &mut DeleteVersionsRequest| r.versions_bin = Vec::new(),
+            |r: &mut DeleteVersionsRequest| r.opts_bin = vec![0x81].into(),
+        ] {
+            let mut request = baseline.clone();
+            mutate(&mut request);
+            bodies.push(canonical_delete_versions_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn remaining_disk_mutation_canonical_bodies_bind_every_field() {
+        // Mutating each field in turn and asserting all bodies differ catches a dropped or
+        // duplicated `push_*` in these hand-written builders — an unbound field is tamperable.
+        let write_metadata = WriteMetadataRequest {
+            bucket_incarnation_id: Default::default(),
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            file_info: "{\"a\":1}".into(),
+            file_info_bin: vec![0x81].into(),
+        };
+        let mut bodies = vec![canonical_write_metadata_request_body(&write_metadata).unwrap()];
+        for mutate in [
+            |r: &mut WriteMetadataRequest| r.disk = "d2".into(),
+            |r: &mut WriteMetadataRequest| r.volume = "v2".into(),
+            |r: &mut WriteMetadataRequest| r.path = "p2".into(),
+            |r: &mut WriteMetadataRequest| r.file_info = "{\"a\":2}".into(),
+            |r: &mut WriteMetadataRequest| r.file_info_bin = vec![0x82].into(),
+            |r: &mut WriteMetadataRequest| r.bucket_incarnation_id = vec![1; 16].into(),
+        ] {
+            let mut request = write_metadata.clone();
+            mutate(&mut request);
+            bodies.push(canonical_write_metadata_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let update_metadata = UpdateMetadataRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            file_info: "{\"a\":1}".into(),
+            opts: "{\"o\":1}".into(),
+            file_info_bin: vec![0x81].into(),
+            opts_bin: vec![0x80].into(),
+        };
+        let mut bodies = vec![canonical_update_metadata_request_body(&update_metadata).unwrap()];
+        for mutate in [
+            |r: &mut UpdateMetadataRequest| r.disk = "d2".into(),
+            |r: &mut UpdateMetadataRequest| r.volume = "v2".into(),
+            |r: &mut UpdateMetadataRequest| r.path = "p2".into(),
+            |r: &mut UpdateMetadataRequest| r.file_info = "{\"a\":2}".into(),
+            |r: &mut UpdateMetadataRequest| r.opts = "{\"o\":2}".into(),
+            |r: &mut UpdateMetadataRequest| r.file_info_bin = vec![0x82].into(),
+            |r: &mut UpdateMetadataRequest| r.opts_bin = vec![0x81].into(),
+        ] {
+            let mut request = update_metadata.clone();
+            mutate(&mut request);
+            bodies.push(canonical_update_metadata_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let write_all = WriteAllRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            data: vec![0xAA, 0xBB].into(),
+        };
+        let mut bodies = vec![canonical_write_all_request_body(&write_all).unwrap()];
+        for mutate in [
+            |r: &mut WriteAllRequest| r.disk = "d2".into(),
+            |r: &mut WriteAllRequest| r.volume = "v2".into(),
+            |r: &mut WriteAllRequest| r.path = "p2".into(),
+            |r: &mut WriteAllRequest| r.data = vec![0xAA, 0xBC].into(),
+        ] {
+            let mut request = write_all.clone();
+            mutate(&mut request);
+            bodies.push(canonical_write_all_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let compare_and_update_file = CompareAndUpdateFileRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            expected: Some(vec![0xAA, 0xBB].into()),
+            replacement: Some(vec![0xCC, 0xDD].into()),
+        };
+        let mut bodies = vec![canonical_compare_and_update_file_request_body(&compare_and_update_file).unwrap()];
+        for mutate in [
+            |r: &mut CompareAndUpdateFileRequest| r.disk = "d2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.volume = "v2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.path = "p2".into(),
+            |r: &mut CompareAndUpdateFileRequest| r.expected = None,
+            |r: &mut CompareAndUpdateFileRequest| r.expected = Some(Vec::new().into()),
+            |r: &mut CompareAndUpdateFileRequest| r.expected = Some(vec![0xAA, 0xBC].into()),
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = None,
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = Some(Vec::new().into()),
+            |r: &mut CompareAndUpdateFileRequest| r.replacement = Some(vec![0xCC, 0xDE].into()),
+        ] {
+            let mut request = compare_and_update_file.clone();
+            mutate(&mut request);
+            bodies.push(canonical_compare_and_update_file_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let delete = DeleteRequest {
+            bucket_incarnation_id: Default::default(),
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            options: "{\"o\":1}".into(),
+            scanner_publication_lease_token: Vec::new().into(),
+        };
+        let mut bodies = vec![canonical_delete_request_body(&delete).unwrap()];
+        for mutate in [
+            |r: &mut DeleteRequest| r.disk = "d2".into(),
+            |r: &mut DeleteRequest| r.volume = "v2".into(),
+            |r: &mut DeleteRequest| r.path = "p2".into(),
+            |r: &mut DeleteRequest| r.options = "{\"recursive\":true}".into(),
+            |r: &mut DeleteRequest| r.bucket_incarnation_id = vec![1; 16].into(),
+            |r: &mut DeleteRequest| r.scanner_publication_lease_token = vec![0x01; 16].into(),
+        ] {
+            let mut request = delete.clone();
+            mutate(&mut request);
+            bodies.push(canonical_delete_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let delete_paths = DeletePathsRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            paths: vec!["a".into(), "b".into()],
+        };
+        let mut bodies = vec![canonical_delete_paths_request_body(&delete_paths).unwrap()];
+        for mutate in [
+            |r: &mut DeletePathsRequest| r.disk = "d2".into(),
+            |r: &mut DeletePathsRequest| r.volume = "v2".into(),
+            |r: &mut DeletePathsRequest| r.paths = vec!["a".into(), "c".into()],
+            |r: &mut DeletePathsRequest| r.paths = vec!["ab".into()],
+        ] {
+            let mut request = delete_paths.clone();
+            mutate(&mut request);
+            bodies.push(canonical_delete_paths_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let rename_file = RenameFileRequest {
+            durable: false,
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+        };
+        let mut bodies = vec![canonical_rename_file_request_body(&rename_file).unwrap()];
+        for mutate in [
+            |r: &mut RenameFileRequest| r.durable = true,
+            |r: &mut RenameFileRequest| r.disk = "d2".into(),
+            |r: &mut RenameFileRequest| r.src_volume = "sv2".into(),
+            |r: &mut RenameFileRequest| r.src_path = "sp2".into(),
+            |r: &mut RenameFileRequest| r.dst_volume = "dv2".into(),
+            |r: &mut RenameFileRequest| r.dst_path = "dp2".into(),
+        ] {
+            let mut request = rename_file.clone();
+            mutate(&mut request);
+            bodies.push(canonical_rename_file_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let prepare_part = PreparePartTransactionRequest {
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+            meta: vec![0x01].into(),
+        };
+        let mut bodies = vec![canonical_prepare_part_transaction_request_body(&prepare_part).unwrap()];
+        for mutate in [
+            |r: &mut PreparePartTransactionRequest| r.disk = "d2".into(),
+            |r: &mut PreparePartTransactionRequest| r.src_volume = "sv2".into(),
+            |r: &mut PreparePartTransactionRequest| r.src_path = "sp2".into(),
+            |r: &mut PreparePartTransactionRequest| r.dst_volume = "dv2".into(),
+            |r: &mut PreparePartTransactionRequest| r.dst_path = "dp2".into(),
+            |r: &mut PreparePartTransactionRequest| r.meta = vec![0x02].into(),
+        ] {
+            let mut request = prepare_part.clone();
+            mutate(&mut request);
+            bodies.push(canonical_prepare_part_transaction_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let settle_part = SettlePartTransactionRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            rollback: false,
+        };
+        let mut bodies = vec![canonical_settle_part_transaction_request_body(&settle_part).unwrap()];
+        for mutate in [
+            |r: &mut SettlePartTransactionRequest| r.disk = "d2".into(),
+            |r: &mut SettlePartTransactionRequest| r.volume = "v2".into(),
+            |r: &mut SettlePartTransactionRequest| r.path = "p2".into(),
+            |r: &mut SettlePartTransactionRequest| r.rollback = true,
+        ] {
+            let mut request = settle_part.clone();
+            mutate(&mut request);
+            bodies.push(canonical_settle_part_transaction_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+
+        let rename_part = RenamePartRequest {
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+            meta: vec![0x01].into(),
+        };
+        let mut bodies = vec![canonical_rename_part_request_body(&rename_part).unwrap()];
+        for mutate in [
+            |r: &mut RenamePartRequest| r.disk = "d2".into(),
+            |r: &mut RenamePartRequest| r.src_volume = "sv2".into(),
+            |r: &mut RenamePartRequest| r.src_path = "sp2".into(),
+            |r: &mut RenamePartRequest| r.dst_volume = "dv2".into(),
+            |r: &mut RenamePartRequest| r.dst_path = "dp2".into(),
+            |r: &mut RenamePartRequest| r.meta = vec![0x02].into(),
+        ] {
+            let mut request = rename_part.clone();
+            mutate(&mut request);
+            bodies.push(canonical_rename_part_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&bodies);
+    }
+
+    #[test]
+    fn volume_mutation_canonical_bodies_bind_their_fields() {
+        let delete_volume = DeleteVolumeRequest {
+            disk: "http://node-a:9000/data/rustfs0".into(),
+            volume: "bucket".into(),
+            force: false,
+        };
+        // The force flag must be part of the signed body: false → true is a recursive wipe.
+        let mut recursive = delete_volume.clone();
+        recursive.force = true;
+        assert_ne!(
+            canonical_delete_volume_request_body(&delete_volume).unwrap(),
+            canonical_delete_volume_request_body(&recursive).unwrap(),
+        );
+        let mut retargeted = delete_volume.clone();
+        retargeted.volume = "victim".into();
+        assert_ne!(
+            canonical_delete_volume_request_body(&delete_volume).unwrap(),
+            canonical_delete_volume_request_body(&retargeted).unwrap(),
+        );
+
+        let make_volume = MakeVolumeRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+        };
+        let mut tampered = make_volume.clone();
+        tampered.volume = "v2".into();
+        assert_ne!(
+            canonical_make_volume_request_body(&make_volume).unwrap(),
+            canonical_make_volume_request_body(&tampered).unwrap(),
+        );
+
+        let make_volumes = MakeVolumesRequest {
+            disk: "d".into(),
+            volumes: vec!["a".into(), "b".into()],
+        };
+        let mut merged = make_volumes.clone();
+        merged.volumes = vec!["ab".into()];
+        assert_ne!(
+            canonical_make_volumes_request_body(&make_volumes).unwrap(),
+            canonical_make_volumes_request_body(&merged).unwrap(),
+        );
+    }
+
+    #[test]
+    fn snapshot_lease_canonical_bodies_bind_every_field() {
+        let acquire = SnapshotLeaseRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            ttl_ms: 60_000,
+        };
+        let mut acquire_bodies = vec![canonical_snapshot_lease_request_body(&acquire).unwrap()];
+        for mutate in [
+            |r: &mut SnapshotLeaseRequest| r.disk = "d2".into(),
+            |r: &mut SnapshotLeaseRequest| r.volume = "v2".into(),
+            |r: &mut SnapshotLeaseRequest| r.path = "p2".into(),
+            |r: &mut SnapshotLeaseRequest| r.ttl_ms = 60_001,
+        ] {
+            let mut request = acquire.clone();
+            mutate(&mut request);
+            acquire_bodies.push(canonical_snapshot_lease_request_body(&request).unwrap());
+        }
+        assert_all_distinct(&acquire_bodies);
+
+        let renew = SnapshotLeaseRenewRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            token: vec![1; 16].into(),
+            ttl_ms: 60_000,
+        };
+        let mut changed_token = renew.clone();
+        changed_token.token = vec![2; 16].into();
+        let mut changed_ttl = renew.clone();
+        changed_ttl.ttl_ms += 1;
+        assert_all_distinct(&[
+            canonical_snapshot_lease_renew_request_body(&renew).unwrap(),
+            canonical_snapshot_lease_renew_request_body(&changed_token).unwrap(),
+            canonical_snapshot_lease_renew_request_body(&changed_ttl).unwrap(),
+        ]);
+
+        let release = SnapshotLeaseReleaseRequest {
+            disk: "d".into(),
+            volume: "v".into(),
+            path: "p".into(),
+            token: vec![1; 16].into(),
+        };
+        let mut changed_release = release.clone();
+        changed_release.token = vec![2; 16].into();
+        assert_ne!(
+            canonical_snapshot_lease_release_request_body(&release).unwrap(),
+            canonical_snapshot_lease_release_request_body(&changed_release).unwrap()
+        );
+    }
+
+    #[test]
+    fn durable_rename_extension_preserves_old_wire_defaults_and_signatures() {
+        use crate::proto_gen::node_service::RenameFileResponse;
+        use prost::Message;
+        // Release wire messages omitted request tag 6 and response tag 3.
+        let mut request =
+            RenameFileRequest::decode(b"\x0a\x01d\x12\x01s\x1a\x01p\x22\x01v\x2a\x01q".as_slice()).expect("release request");
+        assert!(!request.durable);
+        let old_body = b"rustfs-rename-file-request-v1\0\0\0\0\0\0\0\0\x01d\0\0\0\0\0\0\0\x01s\0\0\0\0\0\0\0\x01p\0\0\0\0\0\0\0\x01v\0\0\0\0\0\0\0\x01q";
+        assert_eq!(canonical_rename_file_request_body(&request).expect("body"), old_body);
+        request.durable = true;
+        assert_ne!(canonical_rename_file_request_body(&request).expect("durable body"), old_body);
+        let old_success = RenameFileResponse::decode(b"\x08\x01".as_slice()).expect("release response");
+        assert!(old_success.success);
+        assert!(!old_success.durability_applied, "old success cannot certify durable publication");
+    }
+
+    #[test]
+    fn disk_mutation_canonical_domains_are_distinct_per_message() {
+        // The same field values must never authenticate one RPC's request as another's.
+        let rename_file = RenameFileRequest {
+            durable: false,
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+        };
+        let rename_part = RenamePartRequest {
+            disk: "d".into(),
+            src_volume: "sv".into(),
+            src_path: "sp".into(),
+            dst_volume: "dv".into(),
+            dst_path: "dp".into(),
+            meta: Vec::new().into(),
+        };
+        assert_ne!(
+            canonical_rename_file_request_body(&rename_file).unwrap(),
+            canonical_rename_part_request_body(&rename_part).unwrap(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod non_disk_mutation_canonical_tests {
+    use super::*;
+    use proto_gen::node_service::*;
+    use std::collections::HashMap;
+
+    macro_rules! assert_fields_bound {
+        ($request:ty, {$($field:ident: $value:expr),+ $(,)?}) => {{
+            let baseline = <$request>::default();
+            let expected = baseline.canonical_body().expect("baseline canonical body should encode");
+            $(
+                let mut variant = baseline.clone();
+                variant.$field = $value;
+                assert_ne!(
+                    expected,
+                    variant.canonical_body().expect("variant canonical body should encode"),
+                    concat!(stringify!($request), " omitted field ", stringify!($field)),
+                );
+            )+
+        }};
+    }
+
+    fn signal_request(signal: Option<&str>, sub_system: Option<&str>, dry_run: Option<&str>) -> SignalServiceRequest {
+        let mut value = HashMap::new();
+        if let Some(signal) = signal {
+            value.insert(PEER_RESTSIGNAL.to_string(), signal.to_string());
+        }
+        if let Some(sub_system) = sub_system {
+            value.insert(PEER_RESTSUB_SYS.to_string(), sub_system.to_string());
+        }
+        if let Some(dry_run) = dry_run {
+            value.insert(PEER_RESTDRY_RUN.to_string(), dry_run.to_string());
+        }
+        SignalServiceRequest {
+            vars: Some(Mss { value }),
+        }
+    }
+
+    #[test]
+    fn signal_service_canonical_body_is_versioned_and_binds_every_semantic_field() {
+        let request = signal_request(Some("2"), Some("scanner"), Some("false"));
+        let baseline = request.canonical_body().expect("small signal request should encode");
+        assert!(baseline.starts_with(b"rustfs-signal-service-request-v1\0"));
+
+        for variant in [
+            signal_request(Some("1"), Some("scanner"), Some("false")),
+            signal_request(Some("2"), Some("heal"), Some("false")),
+            signal_request(Some("2"), Some("scanner"), Some("true")),
+            signal_request(None, Some("scanner"), Some("false")),
+            signal_request(Some("2"), None, Some("false")),
+            signal_request(Some("2"), Some("scanner"), None),
+        ] {
+            assert_ne!(baseline, variant.canonical_body().expect("small signal request should encode"));
+        }
+
+        let mut ignored_field = request;
+        ignored_field
+            .vars
+            .as_mut()
+            .expect("signal vars should exist")
+            .value
+            .insert("future-field".to_string(), "ignored".to_string());
+        assert_eq!(
+            baseline,
+            ignored_field
+                .canonical_body()
+                .expect("unknown signal field should not affect the semantic body"),
+        );
+    }
+
+    #[test]
+    fn signal_service_canonical_body_distinguishes_missing_and_empty_fields() {
+        assert_ne!(
+            signal_request(None, Some("scanner"), Some("false"))
+                .canonical_body()
+                .expect("missing signal should encode"),
+            signal_request(Some(""), Some("scanner"), Some("false"))
+                .canonical_body()
+                .expect("empty signal should encode"),
+        );
+    }
+
+    #[test]
+    fn bucket_and_lock_canonical_bodies_bind_every_semantic_field() {
+        assert_fields_bound!(HealBucketRequest, { bucket: "bucket".into(), options: "opts".into(), bucket_incarnation_id: vec![1; 16].into() });
+        assert_fields_bound!(MakeBucketRequest, { name: "bucket".into(), options: "opts".into() });
+        assert_fields_bound!(DeleteBucketRequest, { bucket: "bucket".into(), options: "opts".into() });
+        assert_fields_bound!(GenerallyLockRequest, { args: "lock".into() });
+        assert_fields_bound!(BatchGenerallyLockRequest, { args: vec!["first".into(), "second".into()] });
+
+        let first = BatchGenerallyLockRequest {
+            args: vec!["first".into(), "second".into()],
+        };
+        let reversed = BatchGenerallyLockRequest {
+            args: vec!["second".into(), "first".into()],
+        };
+        assert_ne!(first.canonical_body().unwrap(), reversed.canonical_body().unwrap());
+    }
+
+    #[test]
+    fn metadata_and_iam_canonical_bodies_bind_every_semantic_field() {
+        assert_fields_bound!(LoadBucketMetadataRequest, {
+            bucket: "bucket".into(),
+            scanner_maintenance_change: true,
+        });
+        assert_fields_bound!(DeleteBucketMetadataRequest, { bucket: "bucket".into() });
+        assert_fields_bound!(DeletePolicyRequest, { policy_name: "policy".into() });
+        assert_fields_bound!(LoadPolicyRequest, { policy_name: "policy".into() });
+        assert_fields_bound!(LoadPolicyMappingRequest, {
+            user_or_group: "user".into(),
+            user_type: 1,
+            is_group: true,
+        });
+        assert_fields_bound!(DeleteUserRequest, { access_key: "user".into() });
+        assert_fields_bound!(DeleteServiceAccountRequest, { access_key: "service".into() });
+        assert_fields_bound!(LoadUserRequest, { access_key: "user".into(), temp: true });
+        assert_fields_bound!(LoadServiceAccountRequest, { access_key: "service".into() });
+        assert_fields_bound!(LoadGroupRequest, { group: "group".into() });
+    }
+
+    #[test]
+    fn control_plane_canonical_bodies_bind_every_semantic_field() {
+        assert_fields_bound!(StopRebalanceRequest, { expected_rebalance_id: "rebalance".into() });
+        assert_fields_bound!(LoadRebalanceMetaRequest, { start_rebalance: true });
+        assert_fields_bound!(StartDecommissionRequest, { pool_indices: vec![1, 2] });
+        assert_fields_bound!(CancelDecommissionRequest, { pool_index: 1 });
+        assert_fields_bound!(ClearDecommissionRequest, { pool_index: 1 });
+
+        let first = StartDecommissionRequest {
+            pool_indices: vec![1, 2],
+        };
+        let reversed = StartDecommissionRequest {
+            pool_indices: vec![2, 1],
+        };
+        assert_ne!(first.canonical_body().unwrap(), reversed.canonical_body().unwrap());
+
+        let empty_domains = [
+            ReloadSiteReplicationConfigRequest::default().canonical_body().unwrap(),
+            ReloadPoolMetaRequest::default().canonical_body().unwrap(),
+            LoadTransitionTierConfigRequest::default().canonical_body().unwrap(),
+        ];
+        assert!(empty_domains.iter().all(|body| !body.is_empty()));
+        assert_ne!(empty_domains[0], empty_domains[1]);
+        assert_ne!(empty_domains[0], empty_domains[2]);
+        assert_ne!(empty_domains[1], empty_domains[2]);
+    }
+}
+
+#[cfg(test)]
+mod scanner_activity_tests {
+    use super::{
+        canonical_scanner_activity_request_body, canonical_scanner_activity_response_body,
+        canonical_scanner_activity_v4_response_body, canonical_scanner_activity_v7_response_body,
+        canonical_scanner_dirty_usage_snapshot_request_body, canonical_scanner_dirty_usage_snapshot_response_body,
+        canonical_scanner_publication_lease_release_request_body, canonical_scanner_publication_lease_request_body,
+        canonical_scanner_publication_lease_response_body,
+        proto_gen::node_service::{
+            ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageBucket, ScannerDirtyUsageSnapshotRequest,
+            ScannerDirtyUsageSnapshotResponse, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
+        },
+    };
+
+    #[test]
+    fn canonical_scanner_dirty_usage_snapshot_request_binds_every_field() {
+        let request = ScannerDirtyUsageSnapshotRequest {
+            challenge: vec![1; 16].into(),
+            protocol_version: 1,
+        };
+        let baseline = canonical_scanner_dirty_usage_snapshot_request_body(&request)
+            .expect("scanner dirty usage snapshot request should encode");
+
+        for variant in [
+            ScannerDirtyUsageSnapshotRequest {
+                challenge: vec![2; 16].into(),
+                ..request.clone()
+            },
+            ScannerDirtyUsageSnapshotRequest {
+                protocol_version: 2,
+                ..request
+            },
+        ] {
+            assert_ne!(
+                baseline,
+                canonical_scanner_dirty_usage_snapshot_request_body(&variant)
+                    .expect("scanner dirty usage snapshot request variant should encode")
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_scanner_dirty_usage_snapshot_response_binds_every_field() {
+        let response = ScannerDirtyUsageSnapshotResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            generation: 7,
+            pending_bucket_count: 2,
+            protocol_version: 1,
+            complete: true,
+            buckets: vec![
+                ScannerDirtyUsageBucket {
+                    bucket: "archive".to_string(),
+                    generation: 3,
+                    bucket_incarnation: vec![1; 16].into(),
+                },
+                ScannerDirtyUsageBucket {
+                    bucket: "photos".to_string(),
+                    generation: 7,
+                    bucket_incarnation: vec![2; 16].into(),
+                },
+            ],
+            response_proof: vec![9; 32].into(),
+            owner_id: "11111111-1111-1111-1111-111111111111".to_string(),
+        };
+        let baseline = canonical_scanner_dirty_usage_snapshot_response_body(&[1; 16], &response)
+            .expect("scanner dirty usage snapshot response should encode");
+        let mut variants = Vec::new();
+        let mut instance = response.clone();
+        instance.instance_id = "fedcba9876543210fedcba9876543210".to_string();
+        variants.push(instance);
+        let mut generation = response.clone();
+        generation.generation = 8;
+        variants.push(generation);
+        let mut count = response.clone();
+        count.pending_bucket_count = 3;
+        variants.push(count);
+        let mut protocol = response.clone();
+        protocol.protocol_version = 2;
+        variants.push(protocol);
+        let mut owner = response.clone();
+        owner.owner_id = "22222222-2222-2222-2222-222222222222".to_string();
+        variants.push(owner);
+        let mut complete = response.clone();
+        complete.complete = false;
+        variants.push(complete);
+        let mut bucket_name = response.clone();
+        bucket_name.buckets[0].bucket = "backups".to_string();
+        variants.push(bucket_name);
+        let mut bucket_generation = response.clone();
+        bucket_generation.buckets[0].generation = 4;
+        variants.push(bucket_generation);
+        let mut bucket_incarnation = response.clone();
+        bucket_incarnation.buckets[0].bucket_incarnation = vec![3; 16].into();
+        variants.push(bucket_incarnation);
+        let mut bucket_order = response.clone();
+        bucket_order.buckets.reverse();
+        variants.push(bucket_order);
+
+        for variant in variants {
+            assert_ne!(
+                baseline,
+                canonical_scanner_dirty_usage_snapshot_response_body(&[1; 16], &variant)
+                    .expect("scanner dirty usage snapshot response variant should encode")
+            );
+        }
+        assert_ne!(
+            baseline,
+            canonical_scanner_dirty_usage_snapshot_response_body(&[2; 16], &response)
+                .expect("scanner dirty usage snapshot response challenge variant should encode")
+        );
+
+        let mut proof_only = response;
+        proof_only.response_proof = vec![8; 32].into();
+        assert_eq!(
+            baseline,
+            canonical_scanner_dirty_usage_snapshot_response_body(&[1; 16], &proof_only)
+                .expect("response proof must not authenticate itself")
+        );
+    }
+
+    #[test]
+    fn canonical_scanner_activity_request_binds_every_field() {
+        let request = ScannerActivityRequest {
+            challenge: vec![1; 16].into(),
+            protocol_version: 5,
+            acknowledge_instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            acknowledge_dirty_usage_generation: 11,
+        };
+        let baseline = canonical_scanner_activity_request_body(&request).expect("scanner activity request should encode");
+
+        let variants = [
+            ScannerActivityRequest {
+                challenge: vec![2; 16].into(),
+                ..request.clone()
+            },
+            ScannerActivityRequest {
+                protocol_version: 4,
+                ..request.clone()
+            },
+            ScannerActivityRequest {
+                acknowledge_instance_id: "1123456789abcdef0123456789abcdef".to_string(),
+                ..request.clone()
+            },
+            ScannerActivityRequest {
+                acknowledge_dirty_usage_generation: 12,
+                ..request
+            },
+        ];
+        for variant in variants {
+            assert_ne!(
+                baseline,
+                canonical_scanner_activity_request_body(&variant).expect("scanner activity request variant should encode")
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_scanner_activity_response_binds_challenge_and_every_status_field() {
+        let response = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: 4,
+            topology_digest: vec![9; 32].into(),
+            data_movement_active: true,
+            response_proof: Vec::new().into(),
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
+            movement_generation: Some(19),
+            publication_blocked: Some(false),
+        };
+        let baseline =
+            canonical_scanner_activity_response_body(&[1; 16], &response).expect("scanner activity response should encode");
+
+        let variants = [
+            ScannerActivityResponse {
+                instance_id: "1123456789abcdef0123456789abcdef".to_string(),
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                namespace_generation: 8,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                maintenance_generation: 4,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                protocol_version: 5,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                topology_digest: vec![8; 32].into(),
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                data_movement_active: false,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                dirty_usage_generation: 12,
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                dirty_usage_pending: false,
+                ..response.clone()
+            },
+        ];
+        for variant in variants {
+            assert_ne!(
+                baseline,
+                canonical_scanner_activity_response_body(&[1; 16], &variant)
+                    .expect("scanner activity response variant should encode")
+            );
+        }
+        assert_ne!(
+            baseline,
+            canonical_scanner_activity_response_body(&[2; 16], &response)
+                .expect("scanner activity response with a different challenge should encode")
+        );
+
+        let v7_baseline =
+            canonical_scanner_activity_v7_response_body(&[1; 16], &response).expect("scanner activity v7 response should encode");
+        for variant in [
+            ScannerActivityResponse {
+                movement_generation: Some(20),
+                ..response.clone()
+            },
+            ScannerActivityResponse {
+                publication_blocked: Some(true),
+                ..response
+            },
+        ] {
+            assert_ne!(
+                v7_baseline,
+                canonical_scanner_activity_v7_response_body(&[1; 16], &variant)
+                    .expect("scanner activity v7 response variant should encode")
+            );
+        }
+    }
+
+    #[test]
+    fn scanner_activity_v4_response_canonicalization_ignores_v5_fields() {
+        let response = ScannerActivityResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 7,
+            maintenance_generation: 3,
+            protocol_version: 4,
+            topology_digest: vec![9; 32].into(),
+            data_movement_active: true,
+            response_proof: Vec::new().into(),
+            dirty_usage_generation: 0,
+            dirty_usage_pending: false,
+            movement_generation: None,
+            publication_blocked: None,
+        };
+        let baseline =
+            canonical_scanner_activity_v4_response_body(&[1; 16], &response).expect("scanner activity v4 response should encode");
+        let expected = [
+            b"rustfs-scanner-activity-response-v1\0".as_slice(),
+            16u64.to_be_bytes().as_slice(),
+            [1u8; 16].as_slice(),
+            32u64.to_be_bytes().as_slice(),
+            b"0123456789abcdef0123456789abcdef".as_slice(),
+            7u64.to_be_bytes().as_slice(),
+            3u64.to_be_bytes().as_slice(),
+            4u32.to_be_bytes().as_slice(),
+            32u64.to_be_bytes().as_slice(),
+            [9u8; 32].as_slice(),
+            [1u8].as_slice(),
+        ]
+        .concat();
+        assert_eq!(
+            baseline, expected,
+            "protocol v4 response bytes must remain stable during rolling upgrades"
+        );
+        let extended = ScannerActivityResponse {
+            dirty_usage_generation: 11,
+            dirty_usage_pending: true,
+            ..response
+        };
+
+        assert_eq!(
+            baseline,
+            canonical_scanner_activity_v4_response_body(&[1; 16], &extended)
+                .expect("scanner activity v4 response should ignore v5 fields")
+        );
+    }
+
+    #[test]
+    fn scanner_publication_lease_canonical_bodies_bind_session_owner_and_generation() {
+        let request = ScannerPublicationLeaseRequest {
+            challenge: vec![1; 16].into(),
+            expected_movement_generation: 7,
+            ttl_ms: 60_000,
+            expected_session_id: "session-a".to_string(),
+            token: Vec::new().into(),
+            observational_only: false,
+        };
+        let baseline = canonical_scanner_publication_lease_request_body(&request).unwrap();
+        for variant in [
+            ScannerPublicationLeaseRequest {
+                expected_movement_generation: 8,
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                expected_session_id: "session-b".to_string(),
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                ttl_ms: 30_000,
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                token: vec![3; 16].into(),
+                ..request.clone()
+            },
+            ScannerPublicationLeaseRequest {
+                observational_only: true,
+                ..request
+            },
+        ] {
+            assert_ne!(baseline, canonical_scanner_publication_lease_request_body(&variant).unwrap());
+        }
+
+        let release_a = crate::proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
+            challenge: vec![2; 16].into(),
+            token: vec![3; 16].into(),
+            owner_id: "owner-a".to_string(),
+            session_id: "session-a".to_string(),
+        };
+        let release_b = crate::proto_gen::node_service::ScannerPublicationLeaseReleaseRequest {
+            owner_id: "owner-b".to_string(),
+            ..release_a.clone()
+        };
+        assert_ne!(
+            canonical_scanner_publication_lease_release_request_body(&release_a).unwrap(),
+            canonical_scanner_publication_lease_release_request_body(&release_b).unwrap()
+        );
+
+        let response = ScannerPublicationLeaseResponse {
+            success: true,
+            token: vec![4; 16].into(),
+            movement_generation: 7,
+            lease_ttl_ms: 60_000,
+            error: None,
+            response_proof: Vec::new().into(),
+            owner_id: "owner-a".to_string(),
+            session_id: "session-a".to_string(),
+            observational_only: false,
+        };
+        let response_changed = ScannerPublicationLeaseResponse {
+            owner_id: "owner-b".to_string(),
+            ..response.clone()
+        };
+        assert_ne!(
+            canonical_scanner_publication_lease_response_body(&[1; 16], &response).unwrap(),
+            canonical_scanner_publication_lease_response_body(&[1; 16], &response_changed).unwrap()
+        );
+        let observational_response = ScannerPublicationLeaseResponse {
+            observational_only: true,
+            ..response.clone()
+        };
+        assert_ne!(
+            canonical_scanner_publication_lease_response_body(&[1; 16], &response).unwrap(),
+            canonical_scanner_publication_lease_response_body(&[1; 16], &observational_response).unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod mrf_lifecycle_canonical_tests {
+    use super::{CanonicalMutationBody as _, canonical_mrf_lifecycle_response_body};
+    use crate::proto_gen::node_service::{MrfLifecycleRequest, MrfLifecycleResponse};
+
+    fn request() -> MrfLifecycleRequest {
+        MrfLifecycleRequest {
+            protocol_version: 1,
+            topology_fingerprint: "ab".into(),
+            node_id: "c".into(),
+            command: b"de".to_vec().into(),
+            challenge: b"f".to_vec().into(),
+        }
+    }
+
+    fn changed_requests(baseline: &MrfLifecycleRequest) -> Vec<MrfLifecycleRequest> {
+        [
+            |r: &mut MrfLifecycleRequest| r.protocol_version += 1,
+            |r: &mut MrfLifecycleRequest| r.topology_fingerprint = "ac".into(),
+            |r: &mut MrfLifecycleRequest| r.node_id = "d".into(),
+            |r: &mut MrfLifecycleRequest| r.command = b"df".to_vec().into(),
+            |r: &mut MrfLifecycleRequest| r.challenge = b"g".to_vec().into(),
+        ]
+        .into_iter()
+        .map(|change| {
+            let mut request = baseline.clone();
+            change(&mut request);
+            request
+        })
+        .collect()
+    }
+
+    #[test]
+    fn mrf_lifecycle_request_canonical_body_binds_every_field_and_wire_layout() {
+        let request = request();
+        let actual = request.canonical_body().expect("MRF request canonical body");
+        let mut expected = b"rustfs-mrf-lifecycle-request-v1\0".to_vec();
+        expected.extend_from_slice(&1_u32.to_be_bytes());
+        for field in [b"ab".as_slice(), b"c", b"de", b"f"] {
+            expected.extend_from_slice(&u64::try_from(field.len()).expect("fixture length").to_be_bytes());
+            expected.extend_from_slice(field);
+        }
+        assert_eq!(actual, expected);
+        for changed in changed_requests(&request) {
+            assert_ne!(actual, changed.canonical_body().expect("changed MRF request"));
+        }
+    }
+
+    #[test]
+    fn mrf_lifecycle_request_canonical_body_separates_adjacent_field_boundaries() {
+        let baseline = request();
+        let baseline_body = baseline.canonical_body().expect("MRF request canonical body");
+        let changes = [
+            MrfLifecycleRequest {
+                topology_fingerprint: "a".into(),
+                node_id: "bc".into(),
+                ..baseline.clone()
+            },
+            MrfLifecycleRequest {
+                node_id: "cd".into(),
+                command: b"e".to_vec().into(),
+                ..baseline.clone()
+            },
+            MrfLifecycleRequest {
+                command: b"d".to_vec().into(),
+                challenge: b"ef".to_vec().into(),
+                ..baseline
+            },
+        ];
+        for changed in changes {
+            assert_ne!(baseline_body, changed.canonical_body().expect("shifted MRF fields"));
+        }
+    }
+
+    #[test]
+    fn mrf_lifecycle_response_canonical_body_binds_request_and_response_fields() {
+        let request = request();
+        let response = MrfLifecycleResponse {
+            protocol_version: 1,
+            result: b"result".to_vec().into(),
+            response_proof: b"proof".to_vec().into(),
+        };
+        let actual = canonical_mrf_lifecycle_response_body(&request, &response).expect("MRF response canonical body");
+        let request_body = request.canonical_body().expect("MRF request canonical body");
+        let mut expected = b"rustfs-mrf-lifecycle-response-v1\0".to_vec();
+        expected.extend_from_slice(&u64::try_from(request_body.len()).expect("fixture length").to_be_bytes());
+        expected.extend_from_slice(&request_body);
+        expected.extend_from_slice(&1_u32.to_be_bytes());
+        expected.extend_from_slice(&6_u64.to_be_bytes());
+        expected.extend_from_slice(b"result");
+        assert_eq!(actual, expected);
+        assert_ne!(actual, request_body, "request and response domains must differ");
+        for changed in changed_requests(&request) {
+            assert_ne!(
+                actual,
+                canonical_mrf_lifecycle_response_body(&changed, &response).expect("changed response context")
+            );
+        }
+        for change in [
+            |r: &mut MrfLifecycleResponse| r.protocol_version += 1,
+            |r: &mut MrfLifecycleResponse| r.result = b"changed".to_vec().into(),
+        ] {
+            let mut changed = response.clone();
+            change(&mut changed);
+            assert_ne!(
+                actual,
+                canonical_mrf_lifecycle_response_body(&request, &changed).expect("changed response")
+            );
+        }
+        let mut changed_proof = response;
+        changed_proof.response_proof = b"other-proof".to_vec().into();
+        assert_eq!(
+            actual,
+            canonical_mrf_lifecycle_response_body(&request, &changed_proof).expect("proof excluded from its own input")
+        );
+    }
+}
+
+#[cfg(test)]
+mod heal_control_tests {
+    use super::{
+        CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_CAPABILITY_PROBE_PREFIX, HEAL_CONTROL_PROTOCOL_VERSION,
+        ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX, REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX,
+        RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX, TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX,
+        canonical_heal_control_capability_ack, canonical_heal_control_request_body, canonical_heal_control_response_body,
+        decode_remote_version_state_capability, encode_cross_pool_fence_capability, encode_remote_version_state_capability,
+        heal_control_capability_probe, heal_control_coordinator_epoch, heal_control_execution_timeout,
+        heal_control_execution_timeout_for, ilm_recovery_export_capability_probe, internode_rpc_timeout,
+        is_cross_pool_fence_capability_probe, is_heal_control_capability_probe, is_ilm_recovery_export_capability_probe,
+        is_remote_version_state_capability_probe, is_restore_copyback_capability_probe,
+        is_transition_transaction_compaction_capability_probe, normalize_internode_rpc_timeout,
+        remote_version_state_capability_probe, restore_copyback_capability_probe,
+        transition_transaction_compaction_capability_probe,
+    };
+    use crate::heal_control;
+    use std::time::Duration;
+
+    #[test]
+    fn mrf_lifecycle_reader_capability_probe_is_distinct_and_strict() {
+        let probe = super::mrf_lifecycle_reader_capability_probe(&[7; 16]);
+        let mut expected = b"rustfs-mrf-lifecycle-reader-capability-v1\0".to_vec();
+        expected.extend_from_slice(&[7; 16]);
+        assert_eq!(probe, expected);
+        assert!(super::is_mrf_lifecycle_reader_capability_probe(&probe));
+        assert!(!is_heal_control_capability_probe(&probe));
+        assert!(!is_cross_pool_fence_capability_probe(&probe));
+        assert!(!is_remote_version_state_capability_probe(&probe));
+        for length in 0..probe.len() {
+            assert!(!super::is_mrf_lifecycle_reader_capability_probe(&probe[..length]));
+        }
+        let mut trailing = probe.clone();
+        trailing.push(0);
+        assert!(!super::is_mrf_lifecycle_reader_capability_probe(&trailing));
+        let mut unknown = probe;
+        unknown[0] ^= 1;
+        assert!(!super::is_mrf_lifecycle_reader_capability_probe(&unknown));
+        assert!(!super::is_mrf_lifecycle_reader_capability_probe(&heal_control_capability_probe(&[7; 16])));
+    }
+
+    #[test]
+    fn mrf_lifecycle_reader_capability_carries_the_reported_format_and_identity() {
+        let epoch = [9; 16];
+        let result = super::encode_mrf_lifecycle_reader_capability(2, "node-a:9000", &epoch).expect("reader capability");
+        assert_eq!(result[0], 2);
+        assert_eq!(result.len(), 1 + 8 + "node-a:9000".len() + 16);
+        let (member, decoded_epoch) = decode_remote_version_state_capability(&result[1..]).expect("capability identity");
+        assert_eq!(member, "node-a:9000");
+        assert_eq!(decoded_epoch, &epoch);
+    }
+
+    #[test]
+    fn canonical_heal_control_body_binds_every_field_and_boundary() {
+        let baseline = canonical_heal_control_request_body(1, "ab", b"c").expect("small request should encode");
+        let mut golden = b"rustfs-heal-control-v3\0".to_vec();
+        golden.extend_from_slice(&1_u32.to_be_bytes());
+        golden.extend_from_slice(&2_u64.to_be_bytes());
+        golden.extend_from_slice(b"ab");
+        golden.extend_from_slice(&1_u64.to_be_bytes());
+        golden.extend_from_slice(b"c");
+        assert_eq!(baseline, golden);
+
+        assert_ne!(
+            baseline,
+            canonical_heal_control_request_body(2, "ab", b"c").expect("small request should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_heal_control_request_body(1, "ac", b"c").expect("small request should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_heal_control_request_body(1, "ab", b"d").expect("small request should encode")
+        );
+        assert_ne!(
+            canonical_heal_control_request_body(1, "ab", b"c").expect("small request should encode"),
+            canonical_heal_control_request_body(1, "a", b"bc").expect("small request should encode")
+        );
+    }
+
+    #[test]
+    fn canonical_capability_ack_binds_version_and_topology() {
+        assert_eq!(HEAL_CONTROL_PROTOCOL_VERSION, 3);
+        assert!(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX.starts_with(b"rustfs-heal-control-capability-v4"));
+        let probe = heal_control_capability_probe(&[7; 16]);
+        let ack = canonical_heal_control_capability_ack(1, "ab", &probe).expect("small acknowledgement should encode");
+        let mut golden = b"rustfs-heal-control-capability-ack-v4\0".to_vec();
+        golden.extend_from_slice(&1_u32.to_be_bytes());
+        golden.extend_from_slice(&2_u64.to_be_bytes());
+        golden.extend_from_slice(b"ab");
+        golden.extend_from_slice(&u64::try_from(probe.len()).unwrap().to_be_bytes());
+        golden.extend_from_slice(&probe);
+        assert_eq!(ack, golden);
+        assert_ne!(ack, canonical_heal_control_capability_ack(2, "ab", &probe).unwrap());
+        assert_ne!(ack, canonical_heal_control_capability_ack(1, "ac", &probe).unwrap());
+        assert_ne!(
+            ack,
+            canonical_heal_control_capability_ack(1, "ab", &heal_control_capability_probe(&[8; 16])).unwrap()
+        );
+        assert!(is_heal_control_capability_probe(&probe));
+        assert!(!is_heal_control_capability_probe(HEAL_CONTROL_CAPABILITY_PROBE_PREFIX));
+        let legacy_probe = [b"rustfs-heal-control-capability-v3\0".as_slice(), &[7; 16]].concat();
+        assert!(!is_heal_control_capability_probe(&legacy_probe));
+    }
+
+    #[test]
+    fn remote_version_state_capability_probe_requires_exact_nonce() {
+        let probe = remote_version_state_capability_probe(&[7; 16]);
+        assert!(is_remote_version_state_capability_probe(&probe));
+        assert!(!is_remote_version_state_capability_probe(REMOTE_VERSION_STATE_CAPABILITY_PROBE_PREFIX));
+    }
+
+    #[test]
+    fn restore_copyback_capability_probe_requires_exact_prefix_and_nonce() {
+        let probe = restore_copyback_capability_probe(&[7; 16]);
+        assert!(is_restore_copyback_capability_probe(&probe));
+        assert!(!is_restore_copyback_capability_probe(RESTORE_COPYBACK_CAPABILITY_PROBE_PREFIX));
+        let mut wrong_prefix = probe.clone();
+        wrong_prefix[0] ^= 1;
+        assert!(!is_restore_copyback_capability_probe(&wrong_prefix));
+        let mut extra = probe;
+        extra.push(0);
+        assert!(!is_restore_copyback_capability_probe(&extra));
+    }
+
+    #[test]
+    fn ilm_recovery_export_capability_probe_requires_exact_prefix_and_nonce() {
+        let probe = ilm_recovery_export_capability_probe(&[7; 16]);
+        assert!(is_ilm_recovery_export_capability_probe(&probe));
+        assert!(!is_ilm_recovery_export_capability_probe(ILM_RECOVERY_EXPORT_CAPABILITY_PROBE_PREFIX));
+        let mut wrong_prefix = probe.clone();
+        wrong_prefix[0] ^= 1;
+        assert!(!is_ilm_recovery_export_capability_probe(&wrong_prefix));
+        let mut extra = probe;
+        extra.push(0);
+        assert!(!is_ilm_recovery_export_capability_probe(&extra));
+    }
+
+    #[test]
+    fn transition_transaction_compaction_probe_requires_exact_prefix_and_nonce() {
+        let probe = transition_transaction_compaction_capability_probe(&[7; 16]);
+        assert!(is_transition_transaction_compaction_capability_probe(&probe));
+        assert!(!is_transition_transaction_compaction_capability_probe(
+            TRANSITION_TRANSACTION_COMPACTION_CAPABILITY_PROBE_PREFIX,
+        ));
+        let mut wrong_prefix = probe.clone();
+        wrong_prefix[0] ^= 1;
+        assert!(!is_transition_transaction_compaction_capability_probe(&wrong_prefix));
+        let mut extra = probe;
+        extra.push(0);
+        assert!(!is_transition_transaction_compaction_capability_probe(&extra));
+    }
+
+    #[test]
+    fn remote_version_state_capability_binds_member_and_process_epoch() {
+        let encoded =
+            encode_remote_version_state_capability("node-a:9000", &[7; 16]).expect("small capability response should encode");
+        assert_eq!(
+            decode_remote_version_state_capability(&encoded).expect("capability response should decode"),
+            ("node-a:9000", &[7; 16])
+        );
+        assert!(decode_remote_version_state_capability(&encoded[..encoded.len() - 1]).is_err());
+
+        let mut invalid_utf8 =
+            encode_remote_version_state_capability("node-a", &[7; 16]).expect("small capability response should encode");
+        invalid_utf8[8] = 0xff;
+        assert!(decode_remote_version_state_capability(&invalid_utf8).is_err());
+    }
+
+    #[test]
+    fn cross_pool_fence_capability_binds_version_member_and_epoch() {
+        assert_eq!(CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX, b"rustfs-cross-pool-fence-capability-v1\0");
+        let mut probe = b"rustfs-cross-pool-fence-capability-v1\0".to_vec();
+        probe.extend_from_slice(&[7; 16]);
+        assert!(is_cross_pool_fence_capability_probe(&probe));
+        assert!(!is_cross_pool_fence_capability_probe(CROSS_POOL_FENCE_CAPABILITY_PROBE_PREFIX));
+        let mut wrong_prefix = probe.clone();
+        wrong_prefix[0] ^= 1;
+        assert!(!is_cross_pool_fence_capability_probe(&wrong_prefix));
+
+        let encoded = encode_cross_pool_fence_capability(0x0102_0304, "node-a:9000", &[7; 16])
+            .expect("small capability response should encode");
+        let mut expected_response = vec![1, 2, 3, 4];
+        expected_response.extend_from_slice(&11_u64.to_be_bytes());
+        expected_response.extend_from_slice(b"node-a:9000");
+        expected_response.extend_from_slice(&[7; 16]);
+        assert_eq!(encoded, expected_response);
+    }
+
+    #[test]
+    fn canonical_response_binds_request_and_result() {
+        let baseline = canonical_heal_control_response_body(2, "abcdef", b"query", b"result").unwrap();
+        assert_ne!(baseline, canonical_heal_control_response_body(1, "abcdef", b"query", b"result").unwrap());
+        assert_ne!(baseline, canonical_heal_control_response_body(2, "bbcdef", b"query", b"result").unwrap());
+        assert_ne!(baseline, canonical_heal_control_response_body(2, "abcdef", b"cancel", b"result").unwrap());
+        assert_ne!(
+            baseline,
+            canonical_heal_control_response_body(2, "abcdef", b"query", b"tampered").unwrap()
+        );
+    }
+
+    #[test]
+    fn coordinator_epoch_is_stable_and_rejects_invalid_fingerprints() {
+        assert_eq!(heal_control_coordinator_epoch("0123456789abcdefextra"), Ok(0x0123_4567_89ab_cdef));
+        assert_eq!(
+            heal_control_coordinator_epoch("0000000000000000"),
+            Err("heal control topology epoch is zero")
+        );
+        assert_eq!(
+            heal_control_coordinator_epoch("short"),
+            Err("heal control topology fingerprint is too short")
+        );
+        assert_eq!(
+            heal_control_coordinator_epoch("not-hex-value!!!!"),
+            Err("heal control topology fingerprint is not hexadecimal")
+        );
+    }
+
+    #[test]
+    fn execution_budget_precedes_transport_timeout() {
+        let execution = heal_control_execution_timeout();
+        assert!(!execution.is_zero());
+        assert!(execution < internode_rpc_timeout());
+        assert!(execution <= std::time::Duration::from_millis(heal_control::MAX_LIFETIME_MS as u64));
+    }
+
+    #[test]
+    fn execution_budget_is_nonzero_for_zero_transport_configuration() {
+        let normalized_transport = Duration::from_secs(1);
+        assert_eq!(normalize_internode_rpc_timeout(Duration::ZERO), normalized_transport);
+        for configured_transport in [Duration::ZERO, normalized_transport] {
+            let execution = heal_control_execution_timeout_for(configured_transport);
+            assert!(execution > Duration::ZERO);
+            assert!(execution < normalized_transport);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tier_mutation_rpc_tests {
+    use super::{
+        TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION, TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase,
+        TierMutationRpcResponseProofInput, canonical_tier_mutation_rpc_body, canonical_tier_mutation_rpc_response_body,
+    };
+    use crate::proto_gen::node_service::{TierMutationFailureClass, TierMutationPeerState};
+    use uuid::uuid;
+
+    #[test]
+    fn canonical_tier_mutation_body_binds_phase_id_and_payload() {
+        let mutation_id = uuid!("12345678-1234-5678-9abc-def012345678");
+        let payload = b"canonical-intent-record";
+        let baseline = canonical_tier_mutation_rpc_body(
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            payload,
+        )
+        .expect("small mutation body should encode");
+        let mut golden = b"rustfs-tier-mutation-rpc-v1\0".to_vec();
+        golden.extend_from_slice(&TIER_MUTATION_RPC_PROTOCOL_VERSION.to_be_bytes());
+        golden.extend_from_slice(&7_u64.to_be_bytes());
+        golden.extend_from_slice(b"prepare");
+        golden.extend_from_slice(mutation_id.as_bytes());
+        golden.extend_from_slice(&u64::try_from(payload.len()).expect("payload length should fit").to_be_bytes());
+        golden.extend_from_slice(payload);
+        assert_eq!(baseline, golden);
+
+        assert_ne!(
+            baseline,
+            canonical_tier_mutation_rpc_body(
+                TIER_MUTATION_RPC_PROTOCOL_VERSION + 1,
+                TierMutationRpcPhase::Prepare,
+                mutation_id,
+                payload,
+            )
+            .expect("small mutation body should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_tier_mutation_rpc_body(
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Commit,
+                mutation_id,
+                payload,
+            )
+            .expect("small mutation body should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_tier_mutation_rpc_body(
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Prepare,
+                uuid!("22345678-1234-5678-9abc-def012345678"),
+                payload,
+            )
+            .expect("small mutation body should encode")
+        );
+        assert_ne!(
+            baseline,
+            canonical_tier_mutation_rpc_body(
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Prepare,
+                mutation_id,
+                b"canonical-intent-record-tampered",
+            )
+            .expect("small mutation body should encode")
+        );
+    }
+
+    #[test]
+    fn tier_mutation_v3_request_and_response_golden_bytes_are_unchanged() {
+        let mutation_id = uuid!("12345678-1234-5678-9abc-def012345678");
+        let payload = b"canonical-intent-record";
+        let request = canonical_tier_mutation_rpc_body(
+            TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            payload,
+        )
+        .expect("v3 request should encode");
+        let mut request_golden = b"rustfs-tier-mutation-rpc-v1\0".to_vec();
+        request_golden.extend_from_slice(&TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION.to_be_bytes());
+        request_golden.extend_from_slice(&7_u64.to_be_bytes());
+        request_golden.extend_from_slice(b"prepare");
+        request_golden.extend_from_slice(mutation_id.as_bytes());
+        request_golden.extend_from_slice(&u64::try_from(payload.len()).expect("payload length should fit").to_be_bytes());
+        request_golden.extend_from_slice(payload);
+        assert_eq!(request, request_golden);
+
+        let response = canonical_tier_mutation_rpc_response_body(TierMutationRpcResponseProofInput {
+            version: TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION,
+            phase: TierMutationRpcPhase::Prepare,
+            mutation_id,
+            canonical_payload: payload,
+            success: true,
+            state: TierMutationPeerState::Prepared as i32,
+            applied: true,
+            error_info: None,
+            // v3 must ignore the field so its authenticated bytes stay exact.
+            failure_class: TierMutationFailureClass::PreDispatchRejected as i32,
+        })
+        .expect("v3 response should encode");
+        let mut response_golden = b"rustfs-tier-mutation-rpc-response-v1\0".to_vec();
+        response_golden.extend_from_slice(&TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION.to_be_bytes());
+        response_golden.extend_from_slice(&7_u64.to_be_bytes());
+        response_golden.extend_from_slice(b"prepare");
+        response_golden.extend_from_slice(mutation_id.as_bytes());
+        response_golden.extend_from_slice(&u64::try_from(payload.len()).expect("payload length should fit").to_be_bytes());
+        response_golden.extend_from_slice(payload);
+        response_golden.push(1);
+        response_golden.extend_from_slice(&(TierMutationPeerState::Prepared as i32).to_be_bytes());
+        response_golden.push(1);
+        response_golden.push(0);
+        response_golden.extend_from_slice(&0_u64.to_be_bytes());
+        assert_eq!(response, response_golden);
+    }
+
+    #[test]
+    fn canonical_tier_mutation_v4_response_binds_request_result_and_failure_class() {
+        let mutation_id = uuid!("12345678-1234-5678-9abc-def012345678");
+        let payload = b"canonical-intent-record";
+        let baseline = canonical_tier_mutation_rpc_response_body(TierMutationRpcResponseProofInput {
+            version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            phase: TierMutationRpcPhase::Prepare,
+            mutation_id,
+            canonical_payload: payload,
+            success: false,
+            state: TierMutationPeerState::Unspecified as i32,
+            applied: false,
+            error_info: Some("failure"),
+            failure_class: TierMutationFailureClass::Ambiguous as i32,
+        })
+        .expect("small v4 mutation response should encode");
+
+        let cases = [
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Commit,
+                mutation_id,
+                canonical_payload: payload,
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id: uuid!("22345678-1234-5678-9abc-def012345678"),
+                canonical_payload: payload,
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: b"tampered-intent-record",
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: true,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: false,
+                state: TierMutationPeerState::Committed as i32,
+                applied: false,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: true,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("other failure"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
+            },
+            TierMutationRpcResponseProofInput {
+                version: TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: payload,
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("failure"),
+                failure_class: TierMutationFailureClass::PreDispatchRejected as i32,
+            },
+        ];
+        for case in cases {
+            assert_ne!(
+                baseline,
+                canonical_tier_mutation_rpc_response_body(case).expect("small mutation response should encode")
+            );
+        }
+    }
+}
+
+/// Whether internode metadata RPCs should send only the msgpack `_bin` payloads and leave the JSON
+/// compatibility strings empty (grpc-optimization P2-1). Shared by the client (`remote_disk`) and
+/// server (`node_service`) send paths.
+///
+/// The legacy flag alone is deliberately insufficient: emptying JSON breaks old peers that only
+/// decode the compatibility field. Operators must also set the fleet-confirmed guard after the
+/// convergence runbook proves every peer supports `_bin` and rollback.
+pub fn internode_rpc_msgpack_only() -> bool {
+    match INTERNODE_RPC_MSGPACK_ONLY_CACHE.load(Ordering::Acquire) {
+        INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE => return false,
+        INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE => return true,
+        _ => {}
+    }
+
+    let enabled = rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY,
+        rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_ONLY,
+    ) && rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED,
+        rustfs_config::DEFAULT_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED,
+    );
+    INTERNODE_RPC_MSGPACK_ONLY_CACHE.store(
+        if enabled {
+            INTERNODE_RPC_MSGPACK_ONLY_CACHE_TRUE
+        } else {
+            INTERNODE_RPC_MSGPACK_ONLY_CACHE_FALSE
+        },
+        Ordering::Release,
+    );
+    enabled
+}
+
+#[doc(hidden)]
+pub fn reset_internode_rpc_msgpack_only_cache() {
+    INTERNODE_RPC_MSGPACK_ONLY_CACHE.store(INTERNODE_RPC_MSGPACK_ONLY_CACHE_UNSET, Ordering::Release);
+}
+
+/// Consecutive-failure threshold after which an internode peer is marked offline (grpc-optimization
+/// P3). Drives the `rustfs_cluster_servers_offline_total` gauge.
+fn internode_offline_failure_threshold() -> u32 {
+    rustfs_utils::get_env_u32(
+        rustfs_config::ENV_INTERNODE_OFFLINE_FAILURE_THRESHOLD,
+        rustfs_config::DEFAULT_INTERNODE_OFFLINE_FAILURE_THRESHOLD,
+    )
+}
+
+/// Class of internode gRPC channel used to route an RPC (grpc-optimization P1).
+///
+/// - [`ChannelClass::Control`]: latency-sensitive control-plane RPCs (locks, health, small
+///   metadata). Always uses the per-peer control connection keyed by the bare address.
+/// - [`ChannelClass::Bulk`]: large `bytes`-carrying unary RPCs
+///   (`ReadAll`/`WriteAll`/`ReadMultiple`/`BatchReadVersion`). When channel isolation is enabled
+///   these are routed onto a separate per-peer bulk connection pool so a large transfer cannot
+///   head-of-line block a lock RPC on the shared HTTP/2 connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelClass {
+    Control,
+    Bulk,
+}
+
+/// A cached tonic channel paired with the physical transport generation used by its clones.
+#[derive(Clone)]
+pub struct InternodeChannel {
+    channel: Channel,
+    connection_state: Option<GrpcConnectionState>,
+}
+
+impl InternodeChannel {
+    fn tracked(channel: Channel, connection_state: GrpcConnectionState) -> Self {
+        Self {
+            channel,
+            connection_state: Some(connection_state),
+        }
+    }
+
+    fn untracked(channel: Channel) -> Self {
+        Self {
+            channel,
+            connection_state: None,
+        }
+    }
+
+    /// Return the shared state used to observe this channel's physical reconnects.
+    pub fn connection_state(&self) -> Option<GrpcConnectionState> {
+        self.connection_state.clone()
+    }
+
+    /// Snapshot the currently connected physical transport, if the channel is tracked and ready.
+    pub fn connection_snapshot(&self) -> Option<GrpcConnectionSnapshot> {
+        self.connection_state.as_ref().and_then(GrpcConnectionState::snapshot)
+    }
+
+    /// Return the underlying tonic channel without exposing its observation handle to the caller.
+    pub fn into_channel(self) -> Channel {
+        self.channel
+    }
+}
+
+impl std::fmt::Debug for InternodeChannel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InternodeChannel")
+            .field("connection", &self.connection_snapshot())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Service<HttpRequest<Body>> for InternodeChannel {
+    type Response = <Channel as Service<HttpRequest<Body>>>::Response;
+    type Error = <Channel as Service<HttpRequest<Body>>>::Error;
+    type Future = <Channel as Service<HttpRequest<Body>>>::Future;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.channel.poll_ready(context)
+    }
+
+    fn call(&mut self, request: HttpRequest<Body>) -> Self::Future {
+        self.channel.call(request)
+    }
+}
+
+struct ConnectionGenerationConnector<C> {
+    inner: C,
+    connection_state: GrpcConnectionState,
+}
+
+impl<C> ConnectionGenerationConnector<C> {
+    fn new(inner: C, connection_state: GrpcConnectionState) -> Self {
+        Self { inner, connection_state }
+    }
+}
+
+impl<C> Service<Uri> for ConnectionGenerationConnector<C>
+where
+    C: Service<Uri>,
+    C::Future: Send + 'static,
+    C::Response: Send + 'static,
+    C::Error: Send + 'static,
+{
+    type Response = C::Response;
+    type Error = C::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(context)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let future = self.inner.call(uri);
+        let connection_state = self.connection_state.clone();
+        Box::pin(async move {
+            let io = future.await?;
+            connection_state.record_connected();
+            Ok(io)
+        })
+    }
+}
+
+/// Bounded reasons that make RustFS discard a cached channel and establish another one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChannelRebuildReason {
+    RpcFailure,
+    OperationTimeout,
+    TransportFailure,
+    LockTimeout,
+    LockTransport,
+    PeerProbe,
+    TlsGenerationChanged,
+    Manual,
+}
+
+impl ChannelRebuildReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RpcFailure => "rpc_failure",
+            Self::OperationTimeout => "operation_timeout",
+            Self::TransportFailure => "transport_failure",
+            Self::LockTimeout => "lock_timeout",
+            Self::LockTransport => "lock_transport",
+            Self::PeerProbe => "peer_probe",
+            Self::TlsGenerationChanged => "tls_generation_changed",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+const CHANNEL_REBUILD_REASON_CAPACITY: usize = 1024;
+static CHANNEL_REBUILD_REASONS: LazyLock<StdMutex<HashMap<String, ChannelRebuildReason>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn mark_channel_rebuild(cache_key: &str, reason: ChannelRebuildReason) {
+    let mut reasons = CHANNEL_REBUILD_REASONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reasons.len() >= CHANNEL_REBUILD_REASON_CAPACITY
+        && !reasons.contains_key(cache_key)
+        && let Some(victim) = reasons.keys().next().cloned()
+    {
+        reasons.remove(&victim);
+    }
+    reasons.insert(cache_key.to_owned(), reason);
+}
+
+fn pending_channel_rebuild(cache_key: &str) -> Option<ChannelRebuildReason> {
+    CHANNEL_REBUILD_REASONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(cache_key)
+        .copied()
+}
+
+fn take_channel_rebuild(cache_key: &str) -> Option<ChannelRebuildReason> {
+    CHANNEL_REBUILD_REASONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(cache_key)
+}
+
+#[cfg(test)]
+fn clear_channel_rebuild(cache_key: &str, reason: ChannelRebuildReason) {
+    let mut reasons = CHANNEL_REBUILD_REASONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if reasons.get(cache_key).copied() == Some(reason) {
+        reasons.remove(cache_key);
+    }
+}
+
+fn complete_pending_rebuild_on_cache_hit(dial_addr: &str, cache_key: &str) -> bool {
+    if let Some(reason) = take_channel_rebuild(cache_key) {
+        runtime_sources::record_channel_rebuild_attempt(channel_cache_class(dial_addr, cache_key), reason.as_str(), true);
+        true
+    } else {
+        false
+    }
+}
+
+// Limits transport response futures; client RPC metrics separately cover unary body decoding.
+const INTERNODE_RPC_CONCURRENCY_LIMIT: usize = 64;
+
+/// Whether control/bulk channel isolation is enabled (env-gated, default off for safe rollout).
+fn channel_isolation_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_INTERNODE_CHANNEL_ISOLATION,
+        rustfs_config::DEFAULT_INTERNODE_CHANNEL_ISOLATION,
+    )
+}
+
+/// Number of bulk channels maintained per peer (>= 1).
+fn bulk_channel_pool_size() -> usize {
+    rustfs_utils::get_env_usize(rustfs_config::ENV_INTERNODE_BULK_CHANNELS, rustfs_config::DEFAULT_INTERNODE_BULK_CHANNELS).max(1)
+}
+
+/// Bounds peer-selection bookkeeping across topology changes. Evicting a cursor
+/// only resets its next slot; established channels keep their existing cache identity.
+const BULK_CHANNEL_CURSOR_CACHE_CAPACITY: usize = 512;
+// Cover the default pool and common tuning pools without allocating
+// from an arbitrarily large environment-configured pool size.
+const BULK_CHANNEL_CACHED_KEYS: usize = 4;
+static BULK_CHANNEL_CURSORS: LazyLock<BulkChannelCursors> = LazyLock::new(BulkChannelCursors::default);
+
+#[derive(Default)]
+struct BulkChannelCursors {
+    peers: StdRwLock<HashMap<String, Arc<BulkChannelCursor>>>,
+}
+
+impl BulkChannelCursors {
+    fn for_peer(&self, addr: &str) -> Arc<BulkChannelCursor> {
+        let cached = self
+            .peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(addr)
+            .cloned();
+        cached.unwrap_or_else(|| {
+            let mut peers = self.peers.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cursor) = peers.get(addr) {
+                return Arc::clone(cursor);
+            }
+            if peers.len() >= BULK_CHANNEL_CURSOR_CACHE_CAPACITY
+                && let Some(victim) = peers.keys().next().cloned()
+            {
+                peers.remove(&victim);
+            }
+            let cursor = Arc::new(BulkChannelCursor {
+                next: AtomicUsize::new(0),
+                keys: std::array::from_fn(|index| bulk_cache_key(addr, index)),
+            });
+            peers.insert(addr.to_owned(), Arc::clone(&cursor));
+            cursor
+        })
+    }
+}
+
+struct BulkChannelCursor {
+    next: AtomicUsize,
+    keys: [String; BULK_CHANNEL_CACHED_KEYS],
+}
+
+impl BulkChannelCursor {
+    fn next(&self, pool_size: usize) -> usize {
+        self.next.fetch_add(1, Ordering::Relaxed) % pool_size
+    }
+
+    fn cache_key(&self, addr: &str, index: usize) -> Cow<'_, str> {
+        match self.keys.get(index) {
+            Some(key) => Cow::Borrowed(key),
+            None => Cow::Owned(bulk_cache_key(addr, index)),
+        }
+    }
+}
+
+/// Connection-cache key for the `idx`-th bulk channel to `addr`. The NUL separator cannot appear
+/// in a URL, so a bulk key never collides with the control key (the bare `addr`).
+fn bulk_cache_key(addr: &str, idx: usize) -> String {
+    format!("{addr}\u{0}bulk\u{0}{idx}")
+}
+
+async fn cached_channel_for_tls_generation(dial_addr: &str, cache_key: &str) -> Option<InternodeChannel> {
+    if !dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
+        return cached_connection_with_state(cache_key)
+            .await
+            .map(|(channel, state)| match state {
+                Some(state) => InternodeChannel::tracked(channel, state),
+                None => InternodeChannel::untracked(channel),
+            });
+    }
+    // Cache readers share the generation lock. Both publication and eviction take it before
+    // the common connection cache, preserving the lock order and the generation/channel pair.
+    {
+        let generations = TLS_GENERATION_CACHE.read().await;
+        let generation = runtime_sources::outbound_tls_generation();
+        if generations.get(cache_key).copied() == Some(generation)
+            && let Some((channel, state)) = cached_connection_with_state(cache_key).await
+            && runtime_sources::outbound_tls_generation() == generation
+        {
+            return Some(match state {
+                Some(state) => InternodeChannel::tracked(channel, state),
+                None => InternodeChannel::untracked(channel),
+            });
+        }
+    }
+    let mut generations = TLS_GENERATION_CACHE.write().await;
+    let Some((channel, state)) = cached_connection_with_state(cache_key).await else {
+        generations.remove(cache_key);
+        return None;
+    };
+    if generations.get(cache_key).copied() == Some(runtime_sources::outbound_tls_generation()) {
+        return Some(match state {
+            Some(state) => InternodeChannel::tracked(channel, state),
+            None => InternodeChannel::untracked(channel),
+        });
+    }
+    if remove_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await {
+        mark_channel_rebuild(cache_key, ChannelRebuildReason::TlsGenerationChanged);
+    }
+    generations.remove(cache_key);
+    runtime_sources::record_stale_grpc_channel_tls_generation();
+    None
+}
+
+async fn cache_dialed_channel(dial_addr: &str, cache_key: &str, channel: &InternodeChannel, generation: Option<u64>) -> bool {
+    let Some(connection_state) = channel.connection_state() else {
+        return false;
+    };
+    if !dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
+        cache_connection_with_state(cache_key.to_string(), channel.channel.clone(), connection_state).await;
+        return true;
+    }
+    let mut generations = TLS_GENERATION_CACHE.write().await;
+    if generation != Some(runtime_sources::outbound_tls_generation()) {
+        runtime_sources::record_stale_grpc_channel_tls_generation();
+        return false;
+    }
+    cache_connection_with_state(cache_key.to_string(), channel.channel.clone(), connection_state).await;
+    // Publication can advance while the common cache's async lock is awaited.
+    if generation != Some(runtime_sources::outbound_tls_generation()) {
+        if remove_connection_with_log_level(cache_key, ConnectionEvictionLogLevel::Debug).await {
+            mark_channel_rebuild(cache_key, ChannelRebuildReason::TlsGenerationChanged);
+        }
+        generations.remove(cache_key);
+        runtime_sources::record_stale_grpc_channel_tls_generation();
+        return false;
+    }
+    if let Some(generation) = generation {
+        enforce_tls_generation_cache_bound(&mut generations, generation, cache_key);
+        generations.insert(cache_key.to_string(), generation);
+    }
+    true
+}
+
+fn channel_acquisition_timeout(_: tokio::time::error::Elapsed) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "internode channel acquisition deadline elapsed")
+}
+
+fn checked_rpc_window(value: Option<u32>) -> std::io::Result<Option<u32>> {
+    if value.is_some_and(|bytes| bytes > 0x7fff_ffff) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "internode HTTP/2 receive window exceeds the 31-bit flow-control limit",
+        ));
+    }
+    Ok(value.filter(|bytes| *bytes != 0))
+}
+
+fn bulk_window_override(name: &str, inherited: Option<u32>) -> Option<u32> {
+    match rustfs_utils::get_env_u32(name, inherited.unwrap_or(0)) {
+        0 => None,
+        value => Some(value),
+    }
+}
+
+fn checked_rpc_capacity(value: usize) -> std::io::Result<usize> {
+    if value > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "internode bulk admission exceeds the semaphore capacity limit",
+        ));
+    }
+    Ok(value.max(1))
+}
+
+/// Acquire a cached-or-newly-dialed channel for the given peer and channel class.
+///
+/// For [`ChannelClass::Control`] (or whenever isolation is disabled) this is exactly the legacy
+/// behavior: reuse the cached control channel keyed by `addr`, else dial a new one. For
+/// [`ChannelClass::Bulk`] with isolation enabled, a channel is round-robin selected from the
+/// per-peer bulk pool and dialed on demand, physically isolating large transfers from
+/// control-plane RPCs.
+pub async fn get_channel_for_class(addr: &str, class: ChannelClass) -> Result<Channel, Box<dyn Error>> {
+    get_internode_channel_for_class(addr, class)
+        .await
+        .map(InternodeChannel::into_channel)
+}
+
+/// Acquire a cached-or-new channel together with its physical-connection generation state.
+///
+/// # Errors
+///
+/// Returns an error when the peer URI or transport configuration is invalid, the connection
+/// deadline expires, TLS setup fails, or the initial physical connection cannot be established.
+pub async fn get_internode_channel_for_class(addr: &str, class: ChannelClass) -> Result<InternodeChannel, Box<dyn Error>> {
+    let deadline = tokio::time::Instant::now() + internode_connect_timeout();
+    tokio::time::timeout_at(deadline, async {
+        if class == ChannelClass::Control || !channel_isolation_enabled() {
+            if let Some(channel) = cached_channel_for_tls_generation(addr, addr).await {
+                return Ok(channel);
+            }
+            return build_channel_until(addr, addr, deadline, internode_rpc_timeout()).await;
+        }
+
+        let pool_size = bulk_channel_pool_size();
+        let cursor = BULK_CHANNEL_CURSORS.for_peer(addr);
+        let idx = cursor.next(pool_size);
+        let cache_key = cursor.cache_key(addr, idx);
+        if let Some(channel) = cached_channel_for_tls_generation(addr, &cache_key).await {
+            return Ok(channel);
+        }
+        build_channel_until(addr, &cache_key, deadline, internode_rpc_timeout()).await
+    })
+    .await
+    .map_err(channel_acquisition_timeout)?
+}
+
+/// Prewarms every cached channel used by a peer and channel class.
+///
+/// Control prewarm performs one dial. When isolation is enabled, bulk prewarm
+/// fills the configured per-peer pool so the first large RPC does not pay a
+/// connection setup cost. With isolation disabled, bulk resolves to the
+/// existing control cache and keeps the legacy connection count.
+pub async fn prewarm_channel_class(addr: &str, class: ChannelClass) -> Result<(), Box<dyn Error>> {
+    let count = if class == ChannelClass::Bulk && channel_isolation_enabled() {
+        bulk_channel_pool_size()
+    } else {
+        1
+    };
+
+    for _ in 0..count {
+        get_channel_for_class(addr, class).await?;
+    }
+    Ok(())
 }
 
 /// Creates a new gRPC channel with optimized keepalive settings for cluster resilience.
@@ -108,22 +3880,209 @@ fn internode_rpc_timeout() -> Duration {
 /// - Connect timeout: `DEFAULT_INTERNODE_CONNECT_TIMEOUT_SECS` (3s)
 /// - TCP keepalive: `DEFAULT_INTERNODE_TCP_KEEPALIVE_SECS` (10s)
 /// - HTTP/2 keepalive interval: `DEFAULT_INTERNODE_HTTP2_KEEPALIVE_INTERVAL_SECS` (5s)
-/// - HTTP/2 keepalive timeout: `DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS` (3s)
-/// - RPC timeout: `DEFAULT_INTERNODE_RPC_TIMEOUT_SECS` (10s)
+/// - HTTP/2 keepalive timeout: `DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS` (20s)
+/// - RPC timeout: `DEFAULT_INTERNODE_RPC_TIMEOUT_SECS` (30s)
 pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
-    debug!("Creating new gRPC channel to: {}", addr);
+    // The control channel is cached under the bare address, preserving the legacy key.
+    build_channel(addr, addr).await.map(InternodeChannel::into_channel)
+}
+
+/// Dial a new gRPC channel to `dial_addr` and cache it under `cache_key`.
+///
+/// `dial_addr` is the real peer URL used for the TCP/TLS connection and hostname verification;
+/// `cache_key` is the connection-cache key. They are identical for control channels and differ
+/// for isolated bulk channels (see [`bulk_cache_key`]), letting several physically distinct
+/// channels to the same peer be cached independently.
+async fn build_channel(dial_addr: &str, cache_key: &str) -> Result<InternodeChannel, Box<dyn Error>> {
+    let deadline = tokio::time::Instant::now() + internode_connect_timeout();
+    build_channel_until(dial_addr, cache_key, deadline, internode_rpc_timeout()).await
+}
+
+/// A separate channel deadline for slow authenticated recovery work. The cache
+/// key keeps this deadline from changing foreground lock, read, and write RPCs.
+#[derive(Debug)]
+pub enum DeleteRecoveryChannelError {
+    Connection(Box<dyn Error>),
+}
+
+impl std::fmt::Display for DeleteRecoveryChannelError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connection(error) => write!(formatter, "delete recovery channel connection failed: {error}"),
+        }
+    }
+}
+
+impl Error for DeleteRecoveryChannelError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Connection(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+pub async fn create_channel_with_timeout(addr: &str, rpc_timeout: Duration) -> Result<Channel, DeleteRecoveryChannelError> {
+    create_internode_channel_with_timeout(addr, rpc_timeout)
+        .await
+        .map(InternodeChannel::into_channel)
+}
+
+/// Create a recovery channel while retaining its physical-connection generation state.
+///
+/// # Errors
+///
+/// Returns [`DeleteRecoveryChannelError`] when the peer cannot be connected before the shared
+/// internode acquisition deadline or its transport/TLS configuration is invalid.
+pub async fn create_internode_channel_with_timeout(
+    addr: &str,
+    rpc_timeout: Duration,
+) -> Result<InternodeChannel, DeleteRecoveryChannelError> {
+    let cache_key = format!("delete-recovery:{}:{addr}", rpc_timeout.as_millis());
+    let deadline = tokio::time::Instant::now() + internode_connect_timeout();
+    build_channel_until(addr, &cache_key, deadline, rpc_timeout)
+        .await
+        .map_err(DeleteRecoveryChannelError::Connection)
+}
+
+async fn build_channel_until(
+    dial_addr: &str,
+    cache_key: &str,
+    deadline: tokio::time::Instant,
+    rpc_timeout: Duration,
+) -> Result<InternodeChannel, Box<dyn Error>> {
+    tokio::time::timeout_at(deadline, async {
+        if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
+            let _ = complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
+            return Ok(channel);
+        }
+        let slot = DialLock::for_key(cache_key);
+        let _guard = slot.mutex.lock().await;
+        loop {
+            // A successful concurrent miss has already populated this exact key.
+            if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
+                let _ = complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
+                return Ok(channel);
+            }
+            let mut rebuild_metrics =
+                ChannelRebuildMetricsGuard::new(channel_cache_class(dial_addr, cache_key), pending_channel_rebuild(cache_key));
+            let (channel, generation) = dial_channel(dial_addr, cache_key, rpc_timeout).await?;
+            if cache_dialed_channel(dial_addr, cache_key, &channel, generation).await {
+                rebuild_metrics.published(dial_addr, cache_key);
+                if let Some(channel) = cached_channel_for_tls_generation(dial_addr, cache_key).await {
+                    debug!(
+                        "Successfully created and cached gRPC channel to: {} (cache key: {})",
+                        dial_addr, cache_key
+                    );
+                    return Ok(channel);
+                }
+            }
+            // A generation published during dial cannot be returned; rebuilding
+            // shares the original deadline with lock wait and all earlier dials.
+        }
+    })
+    .await
+    .map_err(channel_acquisition_timeout)?
+}
+
+struct GrpcDialMetricsGuard {
+    started_at: Instant,
+    connected: bool,
+}
+
+impl Drop for GrpcDialMetricsGuard {
+    fn drop(&mut self) {
+        runtime_sources::record_grpc_dial_result(self.started_at.elapsed(), self.connected);
+    }
+}
+
+struct ChannelRebuildMetricsGuard {
+    channel_class: &'static str,
+    reason: Option<ChannelRebuildReason>,
+    finished: bool,
+}
+
+impl ChannelRebuildMetricsGuard {
+    fn new(channel_class: &'static str, reason: Option<ChannelRebuildReason>) -> Self {
+        Self {
+            channel_class,
+            reason,
+            finished: false,
+        }
+    }
+
+    fn published(&mut self, dial_addr: &str, cache_key: &str) {
+        let _ = complete_pending_rebuild_on_cache_hit(dial_addr, cache_key);
+        self.finished = true;
+    }
+}
+
+impl Drop for ChannelRebuildMetricsGuard {
+    fn drop(&mut self) {
+        if !self.finished
+            && let Some(reason) = self.reason
+        {
+            runtime_sources::record_channel_rebuild_attempt(self.channel_class, reason.as_str(), false);
+        }
+    }
+}
+
+fn channel_cache_class(dial_addr: &str, cache_key: &str) -> &'static str {
+    if cache_key
+        .strip_prefix(dial_addr)
+        .is_some_and(|suffix| suffix.starts_with("\0bulk\0"))
+    {
+        "bulk"
+    } else if cache_key.starts_with("delete-recovery:") {
+        "recovery"
+    } else {
+        "control"
+    }
+}
+
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+#[derive(Clone, Copy, Debug, Default)]
+struct InternodeHttp2TracingExecutor;
+
+#[cfg(feature = "diagnostic-internode-http2-ping")]
+impl hyper::rt::Executor<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> for InternodeHttp2TracingExecutor {
+    fn execute(&self, future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
+        // Match tonic's default executor: dropping the handle detaches the connection task.
+        drop(tokio::spawn(rustfs_io_metrics::internode_metrics::scope_internode_http2_client_task(
+            future,
+        )));
+    }
+}
+
+async fn dial_channel(
+    dial_addr: &str,
+    cache_key: &str,
+    rpc_timeout: Duration,
+) -> Result<(InternodeChannel, Option<u64>), Box<dyn Error>> {
+    debug!("Creating new gRPC channel to: {} (cache key: {})", dial_addr, cache_key);
     let dial_started_at = Instant::now();
     let connect_timeout = internode_connect_timeout();
     let tcp_keepalive = internode_tcp_keepalive();
     let http2_keepalive_interval = internode_http2_keep_alive_interval();
     let http2_keepalive_timeout = internode_http2_keep_alive_timeout();
-    let rpc_timeout = internode_rpc_timeout();
-
-    let mut connector = Endpoint::from_shared(addr.to_string())?
-        // Fast connection timeout for dead peer detection
-        .connect_timeout(connect_timeout)
-        // TCP-level keepalive - OS will probe connection
-        .tcp_keepalive(Some(tcp_keepalive))
+    let is_bulk = cache_key
+        .strip_prefix(dial_addr)
+        .is_some_and(|suffix| suffix.starts_with("\0bulk\0"));
+    let mut stream_window = internode_rpc_http2_stream_window();
+    let mut conn_window = internode_rpc_http2_conn_window();
+    let concurrency_limit = if is_bulk {
+        stream_window = bulk_window_override(rustfs_config::ENV_INTERNODE_BULK_HTTP2_STREAM_WINDOW_SIZE, stream_window);
+        conn_window = bulk_window_override(rustfs_config::ENV_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE, conn_window);
+        checked_rpc_capacity(rustfs_utils::get_env_usize(
+            rustfs_config::ENV_INTERNODE_BULK_CONCURRENCY_LIMIT,
+            rustfs_config::DEFAULT_INTERNODE_BULK_CONCURRENCY_LIMIT,
+        ))?
+    } else {
+        INTERNODE_RPC_CONCURRENCY_LIMIT
+    };
+    let stream_window = checked_rpc_window(stream_window)?;
+    let conn_window = checked_rpc_window(conn_window)?;
+    let mut endpoint = Endpoint::from_shared(dial_addr.to_string())?
+        .concurrency_limit(concurrency_limit)
         // HTTP/2 PING frames for application-layer health check
         .http2_keep_alive_interval(http2_keepalive_interval)
         // How long to wait for PING ACK before considering connection dead
@@ -133,92 +4092,1167 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         // Overall timeout for any RPC - fail fast on unresponsive peers
         .timeout(rpc_timeout);
 
-    let outbound_tls = load_global_outbound_tls_state().await;
-    let generation = outbound_tls.generation.0;
-    let mut stale_generation = false;
-    {
-        let generation_cache = TLS_GENERATION_CACHE.lock().await;
-        if let Some(cached_generation) = generation_cache.get(addr)
-            && *cached_generation != generation
-        {
-            stale_generation = true;
-        }
+    // Apply the selected receive-credit policy. A zero setting delegates to the linked
+    // library's defaults; isolated bulk channels can override the common RPC settings.
+    if is_bulk {
+        endpoint = endpoint.buffer_size(checked_rpc_capacity(rustfs_utils::get_env_usize(
+            rustfs_config::ENV_INTERNODE_BULK_BUFFER_SIZE,
+            rustfs_config::DEFAULT_INTERNODE_BULK_BUFFER_SIZE,
+        ))?);
     }
-    if addr.starts_with(RUSTFS_HTTPS_PREFIX) {
-        if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
-            let ca = Certificate::from_pem(cert_pem);
-            // Derive the hostname from the HTTPS URL for TLS hostname verification.
-            let domain = addr
-                .trim_start_matches(RUSTFS_HTTPS_PREFIX)
-                .split('/')
-                .next()
-                .unwrap_or("")
-                .split(':')
-                .next()
-                .unwrap_or("");
-            let tls = if !domain.is_empty() {
-                let mut cfg = ClientTlsConfig::new().ca_certificate(ca).domain_name(domain);
-                if let Some(id) = outbound_tls.mtls_identity.as_ref() {
-                    let identity = tonic::transport::Identity::from_pem(id.cert_pem.clone(), id.key_pem.clone());
-                    cfg = cfg.identity(identity);
-                }
-                cfg
-            } else {
-                // Fallback: configure TLS without explicit domain if parsing fails.
-                ClientTlsConfig::new().ca_certificate(ca)
-            };
-            connector = connector.tls_config(tls)?;
-            debug!("Configured TLS with custom root certificate for: {}", addr);
-        } else {
-            // No custom root CA published — fall back to system roots.
-            // This is the expected path when no TLS path is configured.
-            debug!("No custom root certificate configured; using system roots for TLS: {}", addr);
-            connector = connector.tls_config(ClientTlsConfig::new())?;
-        }
+    if let Some(stream_window) = stream_window {
+        endpoint = endpoint.initial_stream_window_size(stream_window);
+    }
+    if let Some(conn_window) = conn_window {
+        endpoint = endpoint.initial_connection_window_size(conn_window);
+    }
+    #[cfg(feature = "diagnostic-internode-http2-ping")]
+    {
+        endpoint = endpoint.executor(InternodeHttp2TracingExecutor);
     }
 
-    let channel = match connector.connect().await {
+    let mut dial_metrics = GrpcDialMetricsGuard {
+        started_at: dial_started_at,
+        connected: false,
+    };
+    let mut generation = None;
+    if dial_addr.starts_with(RUSTFS_HTTPS_PREFIX) {
+        let outbound_tls = runtime_sources::outbound_tls_state().await;
+        generation = Some(outbound_tls.generation.0);
+        let mut tls = if let Some(cert_pem) = outbound_tls.root_ca_pem.as_ref() {
+            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(cert_pem))
+        } else {
+            ClientTlsConfig::new().with_native_roots()
+        };
+        if let Some(id) = outbound_tls.mtls_identity.as_ref() {
+            tls = tls.identity(tonic::transport::Identity::from_pem(id.cert_pem.clone(), id.key_pem.clone()));
+        }
+        // Tonic derives certificate names and SNI from the URI, including IPv6. Native-root
+        // loading and certificate parsing run off the async workers under the same deadline.
+        endpoint = tokio::task::spawn_blocking(move || endpoint.tls_config(tls)).await??;
+    }
+
+    // Tonic invokes this connector for both the initial dial and every transparent reconnect.
+    // Mirror Endpoint's default HttpConnector options so generation observation does not change
+    // TCP behavior or the per-address connect deadline.
+    let connection_state = GrpcConnectionState::new();
+    let mut tcp_connector = HttpConnector::new();
+    tcp_connector.enforce_http(false);
+    tcp_connector.set_connect_timeout(Some(connect_timeout));
+    tcp_connector.set_keepalive(Some(tcp_keepalive));
+    tcp_connector.set_nodelay(internode_rpc_tcp_nodelay());
+    let generation_connector = ConnectionGenerationConnector::new(tcp_connector, connection_state.clone());
+    let channel = match endpoint.connect_with_connector(generation_connector).await {
         Ok(channel) => {
-            global_internode_metrics().record_dial_result(dial_started_at.elapsed(), true);
+            dial_metrics.connected = true;
+            // A successful dial marks the peer online (grpc-optimization P3). Keyed by the real
+            // peer address, so control and bulk channels to one peer share health state.
+            runtime_sources::record_peer_reachable(dial_addr);
             channel
         }
         Err(err) => {
-            global_internode_metrics().record_dial_result(dial_started_at.elapsed(), false);
+            runtime_sources::record_peer_unreachable(dial_addr, internode_offline_failure_threshold());
             return Err(err.into());
         }
     };
 
-    // Cache the new connection
-    {
-        GLOBAL_CONN_MAP.write().await.insert(addr.to_string(), channel.clone());
-    }
-    {
-        let mut generation_cache = TLS_GENERATION_CACHE.lock().await;
-        enforce_tls_generation_cache_bound(&mut generation_cache, generation, addr);
-        generation_cache.insert(addr.to_string(), generation);
-    }
-    if stale_generation {
-        record_tls_consumer_stale_generation("protos_grpc_channel");
-    }
-
-    debug!("Successfully created and cached gRPC channel to: {}", addr);
-    Ok(channel)
+    Ok((InternodeChannel::tracked(channel, connection_state), generation))
 }
 
 /// Evict a connection from the cache after a failure.
 /// This should be called when an RPC fails to ensure fresh connections are tried.
 pub async fn evict_failed_connection(addr: &str) {
-    warn!(
-        addr = %addr,
-        "Evicting cached gRPC connection after RPC failure; the next request will attempt to reconnect automatically"
-    );
-    evict_connection(addr).await;
-    TLS_GENERATION_CACHE.lock().await.remove(addr);
+    evict_failed_connection_with_reason(addr, ChannelRebuildReason::RpcFailure, ConnectionEvictionLogLevel::Warn).await;
+}
+
+#[cfg(test)]
+async fn evict_cached_channel(cache_key: &str, log_level: ConnectionEvictionLogLevel) {
+    evict_cached_channel_for_reason(cache_key, log_level, None).await;
+}
+
+async fn evict_cached_channel_for_reason(
+    cache_key: &str,
+    log_level: ConnectionEvictionLogLevel,
+    reason: Option<ChannelRebuildReason>,
+) {
+    // Match publication's lock order. Holding the generation guard across the short in-memory
+    // cache mutation prevents an older eviction from deleting a replacement's generation.
+    let mut generations = TLS_GENERATION_CACHE.write().await;
+    if remove_connection_with_log_level(cache_key, log_level).await
+        && let Some(reason) = reason
+    {
+        mark_channel_rebuild(cache_key, reason);
+    }
+    generations.remove(cache_key);
+}
+
+/// Evict a connection from the cache after a failure with an explicit log level.
+pub async fn evict_failed_connection_with_log_level(addr: &str, log_level: ConnectionEvictionLogLevel) {
+    evict_failed_connection_with_reason(addr, ChannelRebuildReason::RpcFailure, log_level).await;
+}
+
+/// Evict every cached channel for one peer and retain a bounded reason for the next dial attempt.
+pub async fn evict_failed_connection_with_reason(
+    addr: &str,
+    reason: ChannelRebuildReason,
+    log_level: ConnectionEvictionLogLevel,
+) {
+    match log_level {
+        ConnectionEvictionLogLevel::Warn => {
+            warn!(
+                addr = %addr,
+                "Evicting cached gRPC connection after RPC failure; the next request will attempt to reconnect automatically"
+            );
+        }
+        ConnectionEvictionLogLevel::Info => {
+            info!(
+                addr = %addr,
+                "Evicting cached gRPC connection after RPC failure; the next request will attempt to reconnect automatically"
+            );
+        }
+        ConnectionEvictionLogLevel::Debug => {
+            debug!(
+                addr = %addr,
+                "Evicting cached gRPC connection after RPC failure; the next request will attempt to reconnect automatically"
+            );
+        }
+    }
+
+    let cache_log_level = match log_level {
+        ConnectionEvictionLogLevel::Warn => ConnectionEvictionLogLevel::Info,
+        level => level,
+    };
+    evict_cached_channel_for_reason(addr, cache_log_level, Some(reason)).await;
+
+    // An RPC-triggered eviction is a peer-failure signal; feed it into the online/offline state so
+    // the peer flips offline after enough consecutive failures (grpc-optimization P3).
+    runtime_sources::record_peer_unreachable(addr, internode_offline_failure_threshold());
+
+    // A peer failure typically affects every channel to that peer, so also drop any isolated
+    // bulk channels rather than leaving a half-dead connection cached. Round-robin selection
+    // means the caller cannot know which bulk index it hit, so evict the whole pool.
+    if channel_isolation_enabled() {
+        for idx in 0..bulk_channel_pool_size() {
+            let cache_key = bulk_cache_key(addr, idx);
+            evict_cached_channel_for_reason(&cache_key, cache_log_level, Some(reason)).await;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message as _;
+    use std::sync::Mutex;
+
+    static TLS02_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    static INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn tracked_test_channel(channel: Channel) -> InternodeChannel {
+        let connection_state = GrpcConnectionState::new();
+        connection_state.record_connected();
+        InternodeChannel::tracked(channel, connection_state)
+    }
+
+    #[cfg(feature = "diagnostic-internode-http2-ping")]
+    mod http2_ping_observability {
+        use super::*;
+        use std::{
+            future::Future,
+            io,
+            pin::Pin,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            task::{Context, Poll},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tracing::{Event, Subscriber, field::Visit};
+        use tracing_subscriber::{Layer, Registry, layer::Context as LayerContext, layer::SubscriberExt};
+
+        const CLIENT_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        const FRAME_SETTINGS: u8 = 0x4;
+        const FRAME_PING: u8 = 0x6;
+        const FLAG_ACK: u8 = 0x1;
+        const KEEPALIVE_TIMEOUT_MESSAGE: &str = "connection keep-alive timed out";
+
+        #[derive(Clone, Copy)]
+        enum PingBehavior {
+            AckThree,
+            Ignore,
+            CloseBeforePing,
+        }
+
+        struct Frame {
+            kind: u8,
+            flags: u8,
+            payload: Vec<u8>,
+        }
+
+        async fn read_frame(stream: &mut tokio::net::TcpStream) -> io::Result<Option<Frame>> {
+            let mut header = [0_u8; 9];
+            match stream.read_exact(&mut header).await {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            let length = usize::try_from(u32::from_be_bytes([0, header[0], header[1], header[2]]))
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "HTTP/2 frame length overflow"))?;
+            if length > 64 * 1024 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpectedly large test HTTP/2 frame"));
+            }
+            let mut payload = vec![0_u8; length];
+            stream.read_exact(&mut payload).await?;
+            Ok(Some(Frame {
+                kind: header[3],
+                flags: header[4],
+                payload,
+            }))
+        }
+
+        async fn write_frame(stream: &mut tokio::net::TcpStream, kind: u8, flags: u8, payload: &[u8]) -> io::Result<()> {
+            let length = u32::try_from(payload.len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "test HTTP/2 frame is too large"))?;
+            let length_bytes = length.to_be_bytes();
+            let header = [length_bytes[1], length_bytes[2], length_bytes[3], kind, flags, 0, 0, 0, 0];
+            stream.write_all(&header).await?;
+            stream.write_all(payload).await?;
+            stream.flush().await
+        }
+
+        async fn serve_peer(
+            listener: tokio::net::TcpListener,
+            behavior: PingBehavior,
+            first_ping: tokio::sync::oneshot::Sender<()>,
+        ) -> io::Result<()> {
+            let (mut stream, _) = listener.accept().await?;
+            let mut preface = [0_u8; CLIENT_PREFACE.len()];
+            stream.read_exact(&mut preface).await?;
+            if &preface != CLIENT_PREFACE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP/2 client preface"));
+            }
+
+            let settings = read_frame(&mut stream)
+                .await?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing client SETTINGS"))?;
+            if settings.kind != FRAME_SETTINGS || settings.flags & FLAG_ACK != 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "first HTTP/2 frame was not SETTINGS"));
+            }
+            write_frame(&mut stream, FRAME_SETTINGS, 0, &[]).await?;
+            write_frame(&mut stream, FRAME_SETTINGS, FLAG_ACK, &[]).await?;
+
+            if matches!(behavior, PingBehavior::CloseBeforePing) {
+                return stream.shutdown().await;
+            }
+
+            let mut first_ping = Some(first_ping);
+            let mut acknowledged = 0_usize;
+            while let Some(frame) = read_frame(&mut stream).await? {
+                if frame.kind != FRAME_PING || frame.flags & FLAG_ACK != 0 {
+                    continue;
+                }
+                if frame.payload.len() != 8 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid HTTP/2 PING payload"));
+                }
+                if let Some(sender) = first_ping.take() {
+                    let _ = sender.send(());
+                }
+                match behavior {
+                    PingBehavior::AckThree => {
+                        write_frame(&mut stream, FRAME_PING, FLAG_ACK, &frame.payload).await?;
+                        acknowledged += 1;
+                        if acknowledged == 3 {
+                            return stream.shutdown().await;
+                        }
+                    }
+                    PingBehavior::Ignore => {}
+                    PingBehavior::CloseBeforePing => unreachable!("close behavior returns before the frame loop"),
+                }
+            }
+            Ok(())
+        }
+
+        #[derive(Default)]
+        struct TimeoutVisitor {
+            matched: bool,
+        }
+
+        impl Visit for TimeoutVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" && format!("{value:?}") == KEEPALIVE_TIMEOUT_MESSAGE {
+                    self.matched = true;
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct TimeoutLayer(Arc<AtomicUsize>);
+
+        impl<S: Subscriber> Layer<S> for TimeoutLayer {
+            fn on_event(&self, event: &Event<'_>, _context: LayerContext<'_, S>) {
+                if event.metadata().target() != "hyper::proto::h2::client"
+                    || !rustfs_io_metrics::internode_metrics::is_internode_http2_client_task()
+                {
+                    return;
+                }
+                let mut visitor = TimeoutVisitor::default();
+                event.record(&mut visitor);
+                if visitor.matched {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        struct WithDispatch {
+            future: Pin<Box<dyn Future<Output = ()> + Send>>,
+            dispatch: tracing::Dispatch,
+        }
+
+        impl Future for WithDispatch {
+            type Output = ();
+
+            fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+                let dispatch = self.dispatch.clone();
+                tracing::dispatcher::with_default(&dispatch, || self.future.as_mut().poll(context))
+            }
+        }
+
+        #[derive(Clone)]
+        struct DispatchExecutor(tracing::Dispatch);
+
+        impl hyper::rt::Executor<Pin<Box<dyn Future<Output = ()> + Send>>> for DispatchExecutor {
+            fn execute(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+                let wrapped = WithDispatch {
+                    future,
+                    dispatch: self.0.clone(),
+                };
+                drop(tokio::spawn(rustfs_io_metrics::internode_metrics::scope_internode_http2_client_task(
+                    wrapped,
+                )));
+            }
+        }
+
+        async fn connect_to_peer(
+            behavior: PingBehavior,
+            dispatch: tracing::Dispatch,
+        ) -> (
+            tonic::transport::Channel,
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::task::JoinHandle<io::Result<()>>,
+        ) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake HTTP/2 peer");
+            let addr = format!("http://{}", listener.local_addr().expect("fake peer address"));
+            let (ping_tx, ping_rx) = tokio::sync::oneshot::channel();
+            let peer = tokio::spawn(serve_peer(listener, behavior, ping_tx));
+            let channel = tonic::transport::Endpoint::from_shared(addr)
+                .expect("fake peer endpoint")
+                .http2_keep_alive_interval(Duration::from_millis(20))
+                .keep_alive_timeout(Duration::from_millis(40))
+                .keep_alive_while_idle(true)
+                .executor(DispatchExecutor(dispatch))
+                .connect()
+                .await
+                .expect("connect fake HTTP/2 peer");
+            (channel, ping_rx, peer)
+        }
+
+        #[tokio::test]
+        async fn hyper_timeout_event_distinguishes_ack_timeout_from_ack_and_close() {
+            let timeouts = Arc::new(AtomicUsize::new(0));
+            let subscriber = Registry::default().with(TimeoutLayer(Arc::clone(&timeouts)));
+            let dispatch = tracing::Dispatch::new(subscriber);
+
+            let (closed_channel, _, closed_peer) = connect_to_peer(PingBehavior::CloseBeforePing, dispatch.clone()).await;
+            tokio::time::timeout(Duration::from_secs(2), closed_peer)
+                .await
+                .expect("close-before-PING peer completes")
+                .expect("close-before-PING peer task")
+                .expect("close-before-PING peer protocol");
+            drop(closed_channel);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(timeouts.load(Ordering::Relaxed), 0, "generic connection close is not a PING timeout");
+
+            let (ack_channel, first_ack_ping, ack_peer) = connect_to_peer(PingBehavior::AckThree, dispatch.clone()).await;
+            tokio::time::timeout(Duration::from_secs(2), first_ack_ping)
+                .await
+                .expect("ACK peer observes PING")
+                .expect("ACK peer PING signal");
+            tokio::time::timeout(Duration::from_secs(2), ack_peer)
+                .await
+                .expect("ACK peer completes")
+                .expect("ACK peer task")
+                .expect("ACK peer protocol");
+            drop(ack_channel);
+            assert_eq!(timeouts.load(Ordering::Relaxed), 0, "acknowledged PING is not a timeout");
+
+            let (ignored_channel, ignored_ping, ignored_peer) = connect_to_peer(PingBehavior::Ignore, dispatch).await;
+            tokio::time::timeout(Duration::from_secs(2), ignored_ping)
+                .await
+                .expect("ignoring peer observes PING")
+                .expect("ignoring peer PING signal");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while timeouts.load(Ordering::Relaxed) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Hyper emits exact keepalive timeout event");
+            assert_eq!(timeouts.load(Ordering::Relaxed), 1, "one physical timeout emits one exact event");
+            drop(ignored_channel);
+            tokio::time::timeout(Duration::from_secs(2), ignored_peer)
+                .await
+                .expect("ignoring peer observes connection close")
+                .expect("ignoring peer task")
+                .expect("ignoring peer protocol");
+        }
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct BackgroundHealStatusRequestV1 {}
+
+    #[test]
+    fn background_heal_status_request_remains_rolling_upgrade_compatible() {
+        let current = proto_gen::node_service::BackgroundHealStatusRequest {
+            protocol_version: BACKGROUND_HEAL_STATUS_PROTOCOL_VERSION,
+        };
+        let encoded = current.encode_to_vec();
+        BackgroundHealStatusRequestV1::decode(encoded.as_slice()).expect("v1 server should ignore the version field");
+
+        let encoded = BackgroundHealStatusRequestV1 {}.encode_to_vec();
+        let decoded = proto_gen::node_service::BackgroundHealStatusRequest::decode(encoded.as_slice())
+            .expect("v2 server should accept a v1 request");
+        assert_eq!(decoded.protocol_version, 0);
+    }
+
+    use crate::compat_manifest::{CompatPayloadField, REQUEST_COMPAT_SEND_SITES, RESPONSE_COMPAT_SEND_SITES, RequestJsonPolicy};
+
+    fn proto_bin_json_fields(message_suffix: &str) -> Vec<CompatPayloadField> {
+        let proto = include_str!("node.proto");
+        let mut fields = Vec::new();
+        let mut current_message = None;
+
+        for line in proto.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("message ") {
+                current_message = rest.split_whitespace().next();
+                continue;
+            }
+            if line == "}" {
+                current_message = None;
+                continue;
+            }
+            let Some(message) = current_message else {
+                continue;
+            };
+            if line.starts_with("//") || !message.ends_with(message_suffix) || !line.contains("_bin") {
+                continue;
+            }
+            let Some(bin_field) = line.split_whitespace().find(|part| part.ends_with("_bin")) else {
+                continue;
+            };
+            let Some(json_field) = bin_field.strip_suffix("_bin") else {
+                continue;
+            };
+            fields.push(CompatPayloadField {
+                message,
+                json_field,
+                bin_field,
+            });
+        }
+
+        fields.sort();
+        fields
+    }
+
+    #[test]
+    fn format_control_canonical_body_binds_every_field_and_operation() {
+        use proto_gen::node_service::{WriteAllRequest, WriteFormatControlRequest};
+        let request = WriteFormatControlRequest {
+            disk: "http://node-a:9000/data".into(),
+            path: "format.json.bootstrap".into(),
+            data: vec![1, 2, 3].into(),
+        };
+        let canonical = canonical_write_format_control_request_body(&request).expect("canonical format control");
+        for mutate in [
+            |r: &mut WriteFormatControlRequest| r.disk = "http://node-b:9000/data".into(),
+            |r: &mut WriteFormatControlRequest| r.path = "format.json".into(),
+            |r: &mut WriteFormatControlRequest| r.data = vec![1, 2, 4].into(),
+        ] {
+            let mut changed = request.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                canonical_write_format_control_request_body(&changed).expect("changed canonical body"),
+                canonical
+            );
+        }
+        let ordinary = WriteAllRequest {
+            disk: request.disk,
+            volume: ".rustfs.sys".into(),
+            path: request.path,
+            data: request.data,
+        };
+        assert_ne!(canonical_write_all_request_body(&ordinary).expect("ordinary canonical body"), canonical);
+    }
+
+    #[test]
+    fn request_compat_send_site_manifest_covers_node_proto_bin_fields() {
+        let mut manifest_fields = REQUEST_COMPAT_SEND_SITES
+            .iter()
+            .map(|send_site| send_site.field)
+            .collect::<Vec<_>>();
+        manifest_fields.sort();
+        manifest_fields.dedup();
+
+        assert_eq!(
+            manifest_fields.len(),
+            REQUEST_COMPAT_SEND_SITES.len(),
+            "duplicate request send-site manifest entry"
+        );
+        assert_eq!(manifest_fields, proto_bin_json_fields("Request"));
+    }
+
+    #[test]
+    fn request_compat_send_site_manifest_pins_exact_json_policies() {
+        let mut policies = REQUEST_COMPAT_SEND_SITES
+            .iter()
+            .map(|send_site| (send_site.field.message, send_site.field.json_field, send_site.policy))
+            .collect::<Vec<_>>();
+        policies.sort_by_key(|(message, json_field, _)| (*message, *json_field));
+
+        assert_eq!(
+            policies,
+            [
+                (
+                    "BatchReadVersionRequest",
+                    "batch_read_version_req",
+                    RequestJsonPolicy::MsgpackOnlyEligible
+                ),
+                ("DeleteVersionRequest", "file_info", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
+                ("DeleteVersionRequest", "opts", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero),
+                ("DeleteVersionsRequest", "opts", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
+                ("DeleteVersionsRequest", "versions", RequestJsonPolicy::AlwaysDualWriteUntilFallbackZero,),
+                ("ReadMultipleRequest", "read_multiple_req", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("ReadVersionRequest", "opts", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("RenameDataRequest", "file_info", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("UpdateMetadataRequest", "file_info", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("UpdateMetadataRequest", "opts", RequestJsonPolicy::MsgpackOnlyEligible),
+                ("WriteMetadataRequest", "file_info", RequestJsonPolicy::MsgpackOnlyEligible),
+            ]
+        );
+    }
+
+    #[test]
+    fn response_compat_send_site_manifest_covers_node_proto_bin_fields() {
+        let mut manifest_fields = RESPONSE_COMPAT_SEND_SITES
+            .iter()
+            .map(|send_site| send_site.field)
+            .collect::<Vec<_>>();
+        manifest_fields.sort();
+        manifest_fields.dedup();
+
+        assert_eq!(
+            manifest_fields.len(),
+            RESPONSE_COMPAT_SEND_SITES.len(),
+            "duplicate response send-site manifest entry"
+        );
+        assert_eq!(manifest_fields, proto_bin_json_fields("Response"));
+    }
+
+    #[tokio::test]
+    async fn tls02_stale_https_control_and_bulk_cache_entries_are_evicted() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "https://tls02-stale-cache.invalid:9000";
+        let generation = rustfs_tls_runtime::load_global_outbound_tls_generation().0;
+        let stale_generation = generation.checked_add(1).unwrap_or(0);
+        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+            cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            TLS_GENERATION_CACHE.write().await.insert(key.clone(), stale_generation);
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_none(),
+                "TLS02_INVARIANT stale HTTPS cache entry cannot be returned"
+            );
+            assert!(
+                !rustfs_common::has_cached_connection(&key).await,
+                "TLS02_INVARIANT stale entry is removed from the real connection cache"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_missing_https_generation_control_and_bulk_cache_entries_are_evicted() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "https://tls02-missing-generation.invalid:9000";
+        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+            cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            TLS_GENERATION_CACHE.write().await.remove(&key);
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_none(),
+                "TLS02_INVARIANT HTTPS channel without a generation cannot be returned"
+            );
+            assert!(
+                !rustfs_common::has_cached_connection(&key).await,
+                "TLS02_INVARIANT unbound entry is removed from the real connection cache"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_delete_recovery_channels_reject_unbound_and_stale_https_cache() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve recovery peer address");
+        let addr = format!("https://{}", listener.local_addr().expect("recovery peer address"));
+        drop(listener);
+        let rpc_timeout = Duration::from_secs(20);
+        let cache_key = format!("delete-recovery:{}:{addr}", rpc_timeout.as_millis());
+        let generation = runtime_sources::outbound_tls_generation();
+        for cached_generation in [None, Some(generation.checked_add(1).unwrap_or(0))] {
+            cache_connection(cache_key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            if let Some(generation) = cached_generation {
+                TLS_GENERATION_CACHE.write().await.insert(cache_key.clone(), generation);
+            } else {
+                TLS_GENERATION_CACHE.write().await.remove(&cache_key);
+            }
+            assert!(
+                create_channel_with_timeout(&addr, rpc_timeout).await.is_err(),
+                "recovery must dial the unavailable HTTPS peer instead of returning an unbound or stale cached channel"
+            );
+            assert!(!rustfs_common::has_cached_connection(&cache_key).await);
+            assert!(!TLS_GENERATION_CACHE.write().await.contains_key(&cache_key));
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_current_https_control_and_bulk_cache_entries_are_reused() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "https://tls02-current-generation.invalid:9000";
+        let generation = rustfs_tls_runtime::load_global_outbound_tls_generation().0;
+        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+            cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            TLS_GENERATION_CACHE.write().await.insert(key.clone(), generation);
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_some(),
+                "TLS02_INVARIANT HTTPS channel at the canonical generation is reused"
+            );
+            assert!(rustfs_common::has_cached_connection(&key).await);
+            evict_connection_with_log_level(&key, ConnectionEvictionLogLevel::Debug).await;
+            TLS_GENERATION_CACHE.write().await.remove(&key);
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_http_control_and_bulk_cache_ignore_tls_generation() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "http://tls02-http-cache.invalid:9000";
+        let generation = rustfs_tls_runtime::load_global_outbound_tls_generation().0;
+        for key in [addr.to_string(), bulk_cache_key(addr, 0)] {
+            cache_connection(key.clone(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+            TLS_GENERATION_CACHE
+                .write()
+                .await
+                .insert(key.clone(), generation.checked_add(1).unwrap_or(0));
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_some(),
+                "TLS02_INVARIANT HTTP cache is independent of TLS generations"
+            );
+            TLS_GENERATION_CACHE.write().await.remove(&key);
+            assert!(
+                cached_channel_for_tls_generation(addr, &key).await.is_some(),
+                "TLS02_INVARIANT HTTP cache needs no TLS generation metadata"
+            );
+            evict_connection_with_log_level(&key, ConnectionEvictionLogLevel::Debug).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_captured_identity_is_immutable_and_late_dial_keeps_its_actual_generation() {
+        use rustfs_common::MtlsIdentityPem;
+        use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let previous = runtime_sources::outbound_tls_state().await;
+        let first_generation = previous.generation.0.checked_add(1).expect("test generation capacity");
+        let first = OutboundTlsMaterial {
+            root_ca_pem: b"root-a".to_vec(),
+            mtls_identity: Some(MtlsIdentityPem {
+                cert_pem: b"certificate-a".to_vec(),
+                key_pem: b"test-key-a".to_vec(),
+            }),
+        };
+        publish_global_outbound_tls_state(TlsGeneration(first_generation), &first).await;
+        let captured = runtime_sources::outbound_tls_state().await;
+        let second = OutboundTlsMaterial {
+            root_ca_pem: b"root-b".to_vec(),
+            mtls_identity: Some(MtlsIdentityPem {
+                cert_pem: b"certificate-b".to_vec(),
+                key_pem: b"test-key-b".to_vec(),
+            }),
+        };
+        publish_global_outbound_tls_state(TlsGeneration(first_generation + 1), &second).await;
+        let current = runtime_sources::outbound_tls_state().await;
+        let addr = "https://tls02-late-dial.invalid:9000";
+        let channel = tracked_test_channel(Endpoint::from_static("http://127.0.0.1:1").connect_lazy());
+        let cached = cache_dialed_channel(addr, addr, &channel, Some(captured.generation.0)).await;
+        let original_key = captured.mtls_identity.as_ref().expect("captured identity").key_pem.clone();
+        let current_key = current.mtls_identity.as_ref().expect("current identity").key_pem.clone();
+        let restore = OutboundTlsMaterial {
+            root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+            mtls_identity: previous.mtls_identity,
+        };
+        publish_global_outbound_tls_state(TlsGeneration(first_generation + 2), &restore).await;
+        assert_eq!(
+            original_key, b"test-key-a",
+            "TLS02_INVARIANT captured identity cannot change with publication"
+        );
+        assert_eq!(captured.root_ca_pem.as_deref(), Some(b"root-a".as_slice()));
+        assert_eq!(current_key, b"test-key-b");
+        assert!(!cached, "TLS02_INVARIANT late dial cannot be relabeled with the current generation");
+        assert!(
+            !rustfs_common::has_cached_connection(addr).await,
+            "TLS02_INVARIANT late stale dial is never cached"
+        );
+        assert!(!TLS_GENERATION_CACHE.write().await.contains_key(addr));
+    }
+
+    #[tokio::test]
+    async fn tls02_custom_ca_uses_ipv6_uri_and_rejects_wrong_certificate_names() {
+        use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+        use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+        use tonic::transport::ServerTlsConfig;
+
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let previous = runtime_sources::outbound_tls_state().await;
+        let cases = [
+            ("DNS", "127.0.0.1:0", "localhost", "localhost", true),
+            ("IPv4", "127.0.0.1:0", "127.0.0.1", "127.0.0.1", true),
+            ("IPv6", "[::1]:0", "[::1]", "::1", true),
+            ("IPv6 name mismatch", "[::1]:0", "[::1]", "localhost", false),
+        ];
+        let restore_offset = u64::try_from(cases.len() + 1).expect("bounded TLS case count");
+        let restore_generation = previous
+            .generation
+            .0
+            .checked_add(restore_offset)
+            .expect("test generation capacity");
+        let mut observations = Vec::new();
+        for (index, (case, listen_addr, dial_host, certificate_name, expected)) in cases.into_iter().enumerate() {
+            let certificate =
+                rcgen::generate_simple_self_signed(vec![certificate_name.to_owned()]).expect("ephemeral TLS test certificate");
+            let certificate_pem = certificate.cert.pem();
+            let server_tls = ServerTlsConfig::new().identity(tonic::transport::Identity::from_pem(
+                &certificate_pem,
+                certificate.signing_key.serialize_pem(),
+            ));
+            let listener = tokio::net::TcpListener::bind(listen_addr)
+                .await
+                .expect("loopback TLS listener");
+            let port = listener.local_addr().expect("TLS test server address").port();
+            let addr = format!("https://{dial_host}:{port}/data");
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&accepted);
+            let incoming = TcpListenerStream::new(listener).map(move |stream| {
+                if stream.is_ok() {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                stream
+            });
+            let mut server = tonic::transport::Server::builder()
+                .tls_config(server_tls)
+                .expect("valid TLS server configuration");
+            let server = tokio::spawn(async move {
+                server
+                    .add_routes(tonic::service::Routes::default())
+                    .serve_with_incoming(incoming)
+                    .await
+            });
+            let material = OutboundTlsMaterial {
+                root_ca_pem: certificate_pem.into_bytes(),
+                mtls_identity: None,
+            };
+            let offset = u64::try_from(index + 1).expect("bounded generation offset");
+            publish_global_outbound_tls_state(TlsGeneration(previous.generation.0 + offset), &material).await;
+            let mut results = Vec::new();
+            for key in [addr.clone(), bulk_cache_key(&addr, 0)] {
+                let (connected, reached_rpc) = match build_channel(&addr, &key).await {
+                    Ok(channel) => {
+                        let mut client = NodeServiceClient::new(channel);
+                        let response = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            client.ping(proto_gen::node_service::PingRequest::default()),
+                        )
+                        .await;
+                        // The empty router answers only after TLS and HTTP/2 reach the server.
+                        let reached_rpc = matches!(response, Ok(Err(status)) if status.code() == tonic::Code::Unimplemented);
+                        (Ok(()), reached_rpc)
+                    }
+                    Err(error) => (Err(error.to_string()), false),
+                };
+                results.push((connected, reached_rpc));
+                evict_cached_channel(&key, ConnectionEvictionLogLevel::Debug).await;
+            }
+            server.abort();
+            let _ = server.await;
+            observations.push((case, expected, results, accepted.load(Ordering::SeqCst)));
+        }
+        let restore = OutboundTlsMaterial {
+            root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+            mtls_identity: previous.mtls_identity,
+        };
+        publish_global_outbound_tls_state(TlsGeneration(restore_generation), &restore).await;
+
+        let restored = runtime_sources::outbound_tls_state().await;
+        assert_eq!(restored.root_ca_pem.as_deref().unwrap_or_default(), restore.root_ca_pem.as_slice());
+        assert_eq!(
+            restored
+                .mtls_identity
+                .as_ref()
+                .map(|identity| (&identity.cert_pem, &identity.key_pem)),
+            restore
+                .mtls_identity
+                .as_ref()
+                .map(|identity| (&identity.cert_pem, &identity.key_pem)),
+        );
+        assert!(restored.generation.0 > previous.generation.0);
+
+        for (case, expected, results, accepted) in observations {
+            for (connected, reached_rpc) in results {
+                assert_eq!(
+                    connected.is_ok(),
+                    expected,
+                    "{case} must verify the URI certificate identity: {connected:?}"
+                );
+                assert_eq!(reached_rpc, expected, "{case} must reach the RPC service only after successful TLS");
+            }
+            assert_eq!(accepted, 2, "{case} must exercise actual control and bulk connections");
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_native_roots_preserve_mtls_identity_and_private_ca_scope() {
+        use rustfs_common::MtlsIdentityPem;
+        use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+        use tonic::codegen::tokio_stream::wrappers::TcpListenerStream;
+        use tonic::transport::{Identity, ServerTlsConfig};
+
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA parameters");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().expect("CA key");
+        let ca = ca_params.self_signed(&ca_key).expect("CA certificate");
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+        let server_key = rcgen::KeyPair::generate().expect("server key");
+        let server_cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
+            .expect("server parameters")
+            .signed_by(&server_key, &issuer)
+            .expect("server certificate");
+        let mut client_params = rcgen::CertificateParams::new(vec!["client.example".into()]).expect("client parameters");
+        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let client_key = rcgen::KeyPair::generate().expect("client key");
+        let client_cert = client_params.signed_by(&client_key, &issuer).expect("client certificate");
+        let identity = MtlsIdentityPem {
+            cert_pem: client_cert.pem().into_bytes(),
+            key_pem: client_key.serialize_pem().into_bytes(),
+        };
+        let other_ca = rcgen::generate_simple_self_signed(vec!["other-ca.example".into()]).expect("other CA");
+        let directory = tempfile::tempdir().expect("native root fixture directory");
+        let roots_file = directory.path().join("roots.pem");
+        let roots_directory = directory.path().join("empty");
+        std::fs::write(&roots_file, ca.pem()).expect("native trust fixture");
+        std::fs::create_dir(&roots_directory).expect("empty native trust directory");
+
+        temp_env::async_with_vars(
+            [
+                ("SSL_CERT_FILE", roots_file.to_str()),
+                ("SSL_CERT_DIR", roots_directory.to_str()),
+                (rustfs_config::ENV_INTERNODE_CHANNEL_ISOLATION, Some("true")),
+                (rustfs_config::ENV_INTERNODE_BULK_CHANNELS, Some("1")),
+            ],
+            async {
+                let previous = runtime_sources::outbound_tls_state().await;
+                let restore_generation = previous.generation.0.checked_add(5).expect("test generation capacity");
+                let cases = [
+                    ("native server trust", false, false, false, true),
+                    ("native mTLS identity", true, true, false, true),
+                    ("required client identity", true, false, false, false),
+                    ("explicit private trust", false, false, true, false),
+                ];
+                let mut observations = Vec::new();
+                for (index, (case, require_identity, send_identity, private_root, expected)) in cases.into_iter().enumerate() {
+                    let mut tls =
+                        ServerTlsConfig::new().identity(Identity::from_pem(server_cert.pem(), server_key.serialize_pem()));
+                    if require_identity {
+                        tls = tls
+                            .client_ca_root(Certificate::from_pem(ca.pem()))
+                            .client_auth_optional(false);
+                    }
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("TLS listener");
+                    let addr = format!("https://{}", listener.local_addr().expect("TLS test address"));
+                    let mut server = tonic::transport::Server::builder()
+                        .tls_config(tls)
+                        .expect("TLS server configuration");
+                    let server = tokio::spawn(async move {
+                        server
+                            .add_routes(tonic::service::Routes::default())
+                            .serve_with_incoming(TcpListenerStream::new(listener))
+                            .await
+                    });
+                    let material = OutboundTlsMaterial {
+                        root_ca_pem: if private_root {
+                            other_ca.cert.pem().into_bytes()
+                        } else {
+                            Vec::new()
+                        },
+                        mtls_identity: send_identity.then(|| identity.clone()),
+                    };
+                    let offset = u64::try_from(index + 1).expect("bounded generation offset");
+                    publish_global_outbound_tls_state(TlsGeneration(previous.generation.0 + offset), &material).await;
+                    for class in [ChannelClass::Control, ChannelClass::Bulk] {
+                        let reached_rpc = match get_channel_for_class(&addr, class).await {
+                            Ok(channel) => {
+                                let mut client = NodeServiceClient::new(channel);
+                                let result = tokio::time::timeout(
+                                    Duration::from_secs(3),
+                                    client.ping(proto_gen::node_service::PingRequest::default()),
+                                )
+                                .await;
+                                // The empty router returns Unimplemented only after the peer completes TLS.
+                                matches!(result, Ok(Err(status)) if status.code() == tonic::Code::Unimplemented)
+                            }
+                            Err(_) => false,
+                        };
+                        observations.push((case, class, reached_rpc, expected));
+                    }
+                    evict_cached_channel(&addr, ConnectionEvictionLogLevel::Debug).await;
+                    evict_cached_channel(&bulk_cache_key(&addr, 0), ConnectionEvictionLogLevel::Debug).await;
+                    server.abort();
+                    let _ = server.await;
+                }
+                let restore = OutboundTlsMaterial {
+                    root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+                    mtls_identity: previous.mtls_identity,
+                };
+                publish_global_outbound_tls_state(TlsGeneration(restore_generation), &restore).await;
+                for (case, class, actual, expected) in observations {
+                    assert_eq!(actual, expected, "{case} on {class:?}");
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tls02_invalid_tls_configuration_records_one_failure_per_attempt() {
+        use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let previous = runtime_sources::outbound_tls_state().await;
+        let generation = previous.generation.0.checked_add(2).expect("test generation capacity");
+        publish_global_outbound_tls_state(
+            TlsGeneration(generation - 1),
+            &OutboundTlsMaterial {
+                root_ca_pem: b"invalid certificate fixture".to_vec(),
+                mtls_identity: Some(rustfs_common::MtlsIdentityPem {
+                    cert_pem: b"invalid client certificate fixture".to_vec(),
+                    key_pem: b"invalid client key fixture".to_vec(),
+                }),
+            },
+        )
+        .await;
+        let before = runtime_sources::grpc_dial_errors_total();
+        let addr = "https://127.0.0.1:1";
+        let control = build_channel(addr, addr).await;
+        let bulk = build_channel(addr, &bulk_cache_key(addr, 0)).await;
+        let recorded = runtime_sources::grpc_dial_errors_total() - before;
+        let cached = rustfs_common::has_cached_connection(addr).await;
+        let restore = OutboundTlsMaterial {
+            root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+            mtls_identity: previous.mtls_identity,
+        };
+        publish_global_outbound_tls_state(TlsGeneration(generation), &restore).await;
+        assert!(
+            control.is_err() && bulk.is_err(),
+            "malformed client identity rejects both channel classes"
+        );
+        assert!(!cached, "failed configuration leaves no cached control channel");
+        assert_eq!(recorded, 2, "each failed TLS setup contributes exactly one dial failure");
+    }
+
+    #[test]
+    fn tls02_queued_tls_configuration_obeys_acquisition_deadline() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("single blocking-worker runtime");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("connection observation listener");
+        listener.set_nonblocking(true).expect("nonblocking connection observation");
+        let addr = format!("https://{}", listener.local_addr().expect("observation address"));
+        runtime.block_on(async {
+            use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration, publish_global_outbound_tls_state};
+
+            let _test_guard = TLS02_TEST_LOCK.lock().await;
+            let previous = runtime_sources::outbound_tls_state().await;
+            let generation = previous.generation.0.checked_add(2).expect("test generation capacity");
+            let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).expect("test certificate");
+            publish_global_outbound_tls_state(
+                TlsGeneration(generation - 1),
+                &OutboundTlsMaterial {
+                    root_ca_pem: certificate.cert.pem().into_bytes(),
+                    mtls_identity: None,
+                },
+            )
+            .await;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("report occupied blocking worker");
+                release_rx.recv().expect("release occupied blocking worker");
+            });
+            started_rx.await.expect("blocking worker is occupied");
+            let errors_before = runtime_sources::grpc_dial_errors_total();
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+            let result = build_channel_until(&addr, &addr, deadline, internode_rpc_timeout()).await;
+            let dial_failures = runtime_sources::grpc_dial_errors_total() - errors_before;
+            let timed_out = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<std::io::Error>())
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut);
+            let cached = rustfs_common::has_cached_connection(&addr).await;
+            let registered = DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(&addr);
+            release_tx.send(()).expect("release blocking worker before assertions");
+            blocker.await.expect("original blocking worker joined");
+            let restore = OutboundTlsMaterial {
+                root_ca_pem: previous.root_ca_pem.unwrap_or_default(),
+                mtls_identity: previous.mtls_identity,
+            };
+            publish_global_outbound_tls_state(TlsGeneration(generation), &restore).await;
+            assert!(timed_out, "queued TLS configuration shares the original acquisition deadline");
+            assert!(!cached, "timed-out TLS setup leaves no published channel");
+            assert!(!registered, "timed-out TLS setup releases its dial registry entry");
+            assert_eq!(dial_failures, 1, "a cancelled TLS setup contributes one dial failure");
+        });
+        // Runtime retirement joins the queued certificate work before inspecting its side effects.
+        drop(runtime);
+        let accepted = listener.accept();
+        assert!(
+            matches!(accepted, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "a timed-out queued TLS configuration must retire before opening a connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls02_concurrent_control_and_bulk_misses_merge_successful_real_dials() {
+        use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let errors_before = runtime_sources::grpc_dial_errors_total();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP/2 test server");
+        let addr = format!("http://{}", listener.local_addr().expect("test server address"));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let incoming = TcpListenerStream::new(listener).map(move |stream| {
+            if stream.is_ok() {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            stream
+        });
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(incoming)
+                .await
+        });
+        for key in [addr.clone(), bulk_cache_key(&addr, 0)] {
+            let mut tasks = Vec::new();
+            for _ in 0..32 {
+                let dial_addr = addr.clone();
+                let cache_key = key.clone();
+                tasks.push(tokio::spawn(async move {
+                    build_channel(&dial_addr, &cache_key).await.map_err(|error| error.to_string())
+                }));
+            }
+            for task in tasks {
+                let channel = task.await.expect("channel acquisition task").expect("real HTTP/2 dial");
+                drop(channel);
+            }
+            assert!(rustfs_common::has_cached_connection(&key).await);
+            assert!(
+                !DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(&key),
+                "TLS02_INVARIANT completed miss groups leave no lock entries"
+            );
+        }
+        // Tonic returns its channel before the server task necessarily polls the
+        // already-established sockets out of the listener's accept queue.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let connections = accepted.load(Ordering::SeqCst);
+        let dial_failures = runtime_sources::grpc_dial_errors_total() - errors_before;
+        evict_connection_with_log_level(&addr, ConnectionEvictionLogLevel::Debug).await;
+        evict_connection_with_log_level(&bulk_cache_key(&addr, 0), ConnectionEvictionLogLevel::Debug).await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(connections, 2, "TLS02_INVARIANT 32 misses per control/bulk key dial once each");
+        assert_eq!(dial_failures, 0, "successful coalesced dials keep the error counter flat");
+    }
+
+    #[tokio::test]
+    async fn tls02_concurrent_waiters_share_bounded_total_deadlines_and_release_registry() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "http://tls02-contended-dial.invalid:9000";
+        let owner = DialLock::for_key(addr);
+        let guard = owner.mutex.lock().await;
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            tasks.push(tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+                let result = build_channel_until(addr, addr, deadline, internode_rpc_timeout()).await;
+                result.err().is_some_and(|error| {
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+                })
+            }));
+        }
+        let completed = tokio::time::timeout(Duration::from_millis(250), async {
+            for task in tasks {
+                assert!(
+                    task.await.expect("deadline waiter"),
+                    "TLS02_INVARIANT wait and rebuild share a typed timeout"
+                );
+            }
+        })
+        .await;
+        drop(guard);
+        drop(owner);
+        assert!(
+            completed.is_ok(),
+            "TLS02_INVARIANT eight waiters cannot accumulate eight connect timeouts"
+        );
+        assert!(
+            !DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(addr),
+            "TLS02_INVARIANT cancelled waiters release the lock registry"
+        );
+    }
+
+    #[test]
+    fn tls02_dial_registry_reclaims_unique_keys_and_preserves_live_lock_identity() {
+        for index in 0..1000 {
+            let key = format!("http://tls02-registry-{index}.invalid");
+            let first = DialLock::for_key(&key);
+            let second = DialLock::for_key(&key);
+            assert!(Arc::ptr_eq(&first.mutex, &second.mutex), "TLS02_INVARIANT one live lock per cache key");
+            drop(first);
+            assert!(DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(&key));
+            drop(second);
+            assert!(
+                !DIAL_LOCK_REGISTRY.lock().expect("dial registry").contains_key(&key),
+                "TLS02_INVARIANT last owner removes its own weak entry"
+            );
+        }
+    }
 
     #[test]
     fn enforce_tls_generation_cache_bound_evicts_when_retained_entries_still_full() {
@@ -229,5 +5263,613 @@ mod tests {
 
         enforce_tls_generation_cache_bound(&mut cache, 42, "new-node");
         assert_eq!(cache.len(), TLS_GENERATION_CACHE_MAX_SIZE - 1);
+    }
+
+    #[tokio::test]
+    async fn evict_failed_connection_with_log_level_removes_cached_connection() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "http://evict-failed-connection-debug-test";
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        cache_connection(addr.to_string(), channel).await;
+
+        evict_failed_connection_with_reason(addr, ChannelRebuildReason::TransportFailure, ConnectionEvictionLogLevel::Debug)
+            .await;
+
+        assert!(!rustfs_common::has_cached_connection(addr).await);
+        assert_eq!(pending_channel_rebuild(addr), Some(ChannelRebuildReason::TransportFailure));
+        clear_channel_rebuild(addr, ChannelRebuildReason::TransportFailure);
+    }
+
+    #[tokio::test]
+    async fn channel_rebuild_reason_survives_until_replacement_is_published() {
+        use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind h2 peer");
+        let addr = format!("http://{}", listener.local_addr().expect("peer address"));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        let incoming = TcpListenerStream::new(listener).map(move |stream| {
+            if stream.is_ok() {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            stream
+        });
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming(incoming)
+                .await
+        });
+
+        build_channel(&addr, &addr).await.expect("initial channel");
+        evict_failed_connection_with_reason(&addr, ChannelRebuildReason::OperationTimeout, ConnectionEvictionLogLevel::Debug)
+            .await;
+        assert_eq!(pending_channel_rebuild(&addr), Some(ChannelRebuildReason::OperationTimeout));
+        build_channel(&addr, &addr).await.expect("replacement channel");
+        assert_eq!(pending_channel_rebuild(&addr), None);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while accepted.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer accepts replacement connection");
+        evict_cached_channel(&addr, ConnectionEvictionLogLevel::Debug).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn connection_generation_advances_on_tonic_transparent_reconnect() {
+        use tonic::codegen::tokio_stream::wrappers::TcpListenerStream;
+
+        async fn serve_until_shutdown(
+            listener: std::net::TcpListener,
+            shutdown: tokio::sync::oneshot::Receiver<()>,
+        ) -> Result<(), tonic::transport::Error> {
+            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener from nonblocking socket");
+            tonic::transport::Server::builder()
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = shutdown.await;
+                })
+                .await
+        }
+
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind reconnect peer");
+        listener.set_nonblocking(true).expect("nonblocking reconnect peer");
+        let first_listener = listener.try_clone().expect("clone first reconnect listener");
+        let second_listener = listener.try_clone().expect("clone second reconnect listener");
+        let addr = format!("http://{}", listener.local_addr().expect("reconnect peer address"));
+        drop(listener);
+
+        let (first_shutdown, first_stopped) = tokio::sync::oneshot::channel();
+        let first_server = tokio::spawn(serve_until_shutdown(first_listener, first_stopped));
+        let channel = build_channel(&addr, &addr).await.expect("initial tracked channel");
+        let first = channel.connection_snapshot().expect("initial physical generation");
+        let mut client = NodeServiceClient::new(channel.clone());
+        let first_status = client
+            .ping(proto_gen::node_service::PingRequest::default())
+            .await
+            .expect_err("empty router response");
+        assert_eq!(first_status.code(), tonic::Code::Unimplemented);
+
+        first_shutdown.send(()).expect("stop first reconnect server");
+        tokio::time::timeout(Duration::from_secs(3), first_server)
+            .await
+            .expect("first reconnect server stops")
+            .expect("first reconnect server task")
+            .expect("first reconnect server result");
+
+        let (second_shutdown, second_stopped) = tokio::sync::oneshot::channel();
+        let second_server = tokio::spawn(serve_until_shutdown(second_listener, second_stopped));
+        let second_status =
+            tokio::time::timeout(Duration::from_secs(3), client.ping(proto_gen::node_service::PingRequest::default()))
+                .await
+                .expect("transparent reconnect completes")
+                .expect_err("empty replacement router response");
+        assert_eq!(second_status.code(), tonic::Code::Unimplemented);
+        let second = channel.connection_snapshot().expect("replacement physical generation");
+        assert_eq!(first.channel_id, second.channel_id);
+        assert_ne!(first.generation, second.generation);
+
+        second_shutdown.send(()).expect("stop replacement reconnect server");
+        tokio::time::timeout(Duration::from_secs(3), second_server)
+            .await
+            .expect("replacement reconnect server stops")
+            .expect("replacement reconnect server task")
+            .expect("replacement reconnect server result");
+        evict_cached_channel(&addr, ConnectionEvictionLogLevel::Debug).await;
+    }
+
+    #[tokio::test]
+    async fn overlapping_publication_consumes_pending_rebuild_reason_on_cache_hit() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "http://overlapping-rebuild-publication.invalid:9000";
+        cache_connection(addr.to_owned(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+        mark_channel_rebuild(addr, ChannelRebuildReason::TransportFailure);
+        build_channel(addr, addr).await.expect("cache hit completes pending rebuild");
+        assert_eq!(pending_channel_rebuild(addr), None);
+        evict_cached_channel(addr, ConnectionEvictionLogLevel::Debug).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_cache_hits_consume_one_rebuild_reason_once() {
+        let addr = "http://concurrent-rebuild-publication.invalid:9000";
+        mark_channel_rebuild(addr, ChannelRebuildReason::TransportFailure);
+
+        let mut hits = Vec::new();
+        for _ in 0..32 {
+            hits.push(tokio::spawn(async move { complete_pending_rebuild_on_cache_hit(addr, addr) }));
+        }
+
+        let mut completed = 0;
+        for hit in hits {
+            completed += usize::from(hit.await.expect("cache-hit attribution task"));
+        }
+        assert_eq!(completed, 1);
+        assert_eq!(pending_channel_rebuild(addr), None);
+    }
+
+    #[test]
+    fn bulk_cache_key_is_distinct_and_cannot_collide_with_control_key() {
+        let addr = "https://node-a:9000";
+        let k0 = bulk_cache_key(addr, 0);
+        let k1 = bulk_cache_key(addr, 1);
+        assert_ne!(k0, k1);
+        assert_ne!(k0, addr);
+        assert!(k0.starts_with(addr));
+        // The NUL separator cannot appear in a URL, so a bulk key never equals a real address.
+        assert!(k0.contains('\u{0}'));
+    }
+
+    #[test]
+    fn bulk_channel_pool_size_is_at_least_one() {
+        // Even without env configuration the pool size is clamped to a usable minimum.
+        assert!(bulk_channel_pool_size() >= 1);
+    }
+
+    #[test]
+    fn bulk_round_robin_is_independent_for_interleaved_peers() {
+        let cursors = BulkChannelCursors::default();
+        for round in 0..12 {
+            for peer in ["peer-a", "peer-b"] {
+                assert_eq!(cursors.for_peer(peer).next(2), round % 2, "each peer must use both slots");
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_round_robin_balances_concurrent_acquisitions() {
+        let cursors = Arc::new(BulkChannelCursors::default());
+        let tasks = (0..8)
+            .map(|_| {
+                let cursors = Arc::clone(&cursors);
+                std::thread::spawn(move || {
+                    let mut counts = [[0; 4]; 2];
+                    for _ in 0..100 {
+                        for (peer, counts) in ["peer-a", "peer-b"].into_iter().zip(&mut counts) {
+                            counts[cursors.for_peer(peer).next(4)] += 1;
+                        }
+                    }
+                    counts
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut total = [[0; 4]; 2];
+        for task in tasks {
+            for (total, counts) in total.iter_mut().zip(task.join().expect("selection worker")) {
+                for (total, count) in total.iter_mut().zip(counts) {
+                    *total += count;
+                }
+            }
+        }
+        assert_eq!(total, [[200; 4]; 2]);
+    }
+
+    #[test]
+    fn bulk_round_robin_bounds_retired_peer_bookkeeping() {
+        let cursors = BulkChannelCursors::default();
+        for index in 0..BULK_CHANNEL_CURSOR_CACHE_CAPACITY * 3 {
+            assert_eq!(cursors.for_peer(&format!("peer-{index}")).next(2), 0);
+        }
+        assert_eq!(cursors.peers.read().expect("cursor cache").len(), BULK_CHANNEL_CURSOR_CACHE_CAPACITY);
+        assert_eq!(cursors.for_peer("current-peer").next(2), 0);
+        assert_eq!(cursors.for_peer("current-peer").next(2), 1);
+    }
+
+    #[test]
+    fn bulk_pool_hits_borrow_stable_keys_and_large_pools_remain_bounded() {
+        let cursors = BulkChannelCursors::default();
+        let peer = cursors.for_peer("https://peer.example:9000");
+        let same_peer = cursors.for_peer("https://peer.example:9000");
+        assert!(Arc::ptr_eq(&peer, &same_peer));
+        for index in 0..BULK_CHANNEL_CACHED_KEYS {
+            let first = peer.cache_key("https://peer.example:9000", index);
+            let second = same_peer.cache_key("https://peer.example:9000", index);
+            assert!(matches!(first, Cow::Borrowed(_)));
+            assert_eq!(first, bulk_cache_key("https://peer.example:9000", index));
+            assert_eq!(first.as_ptr(), second.as_ptr(), "cache hits reuse the established key allocation");
+        }
+        let key = peer.cache_key("https://peer.example:9000", usize::MAX - 1);
+        assert!(matches!(key, Cow::Owned(_)));
+        assert_eq!(key, bulk_cache_key("https://peer.example:9000", usize::MAX - 1));
+        assert_eq!(peer.keys.len(), BULK_CHANNEL_CACHED_KEYS);
+        for (sequence, size) in [1, 2, 4, usize::MAX, 2].into_iter().enumerate() {
+            assert_eq!(peer.next(size), sequence % size, "pool changes preserve the peer's selection sequence");
+        }
+    }
+
+    #[test]
+    fn grpc_receive_windows_reject_overflow_and_preserve_library_default() {
+        assert_eq!(checked_rpc_window(None).expect("unset window"), None);
+        assert_eq!(checked_rpc_window(Some(0)).expect("default window"), None);
+        assert_eq!(checked_rpc_window(Some(1)).expect("minimum window"), Some(1));
+        assert_eq!(checked_rpc_window(Some(0x7fff_ffff)).expect("maximum window"), Some(0x7fff_ffff));
+        assert_eq!(
+            checked_rpc_window(Some(0x8000_0000)).expect_err("overflow window").kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn grpc_bulk_capacity_rejects_overflow_and_normalizes_zero() {
+        assert_eq!(checked_rpc_capacity(0).expect("minimum capacity"), 1);
+        assert_eq!(checked_rpc_capacity(64).expect("default concurrency"), 64);
+        assert_eq!(checked_rpc_capacity(1024).expect("default buffer"), 1024);
+        assert_eq!(
+            checked_rpc_capacity(usize::MAX).expect_err("oversized capacity").kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn grpc_bulk_windows_inherit_legacy_settings_and_allow_library_default() {
+        let name = rustfs_config::ENV_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE;
+        for (setting, expected) in [(None, Some(2097152)), (Some("0"), None), (Some("8388608"), Some(8388608))] {
+            temp_env::with_var(name, setting, || {
+                assert_eq!(
+                    checked_rpc_window(bulk_window_override(name, Some(2097152))).expect("valid bulk window"),
+                    expected
+                );
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn tls02_cache_hits_allow_concurrent_generation_readers() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "https://tls02-shared-cache.invalid:9000";
+        let generation = runtime_sources::outbound_tls_generation();
+        let channel = tracked_test_channel(Endpoint::from_static("http://127.0.0.1:1").connect_lazy());
+        assert!(cache_dialed_channel(addr, addr, &channel, Some(generation)).await);
+        let generations = TLS_GENERATION_CACHE.read().await;
+        let cached = tokio::time::timeout(Duration::from_secs(1), cached_channel_for_tls_generation(addr, addr))
+            .await
+            .expect("cache hit must not acquire an exclusive generation lock");
+        assert!(cached.is_some());
+        drop(generations);
+        evict_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
+        TLS_GENERATION_CACHE.write().await.remove(addr);
+    }
+
+    #[tokio::test]
+    async fn tls02_eviction_cannot_remove_a_replacement_generation() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "https://tls02-replacement-race.invalid:9000";
+        let generation = runtime_sources::outbound_tls_generation();
+        let channel = tracked_test_channel(Endpoint::from_static("http://127.0.0.1:1").connect_lazy());
+        assert!(cache_dialed_channel(addr, addr, &channel, Some(generation)).await);
+
+        // Pause eviction on generation metadata. It must retain the cached channel until it
+        // owns that metadata, then allow the queued replacement to publish a matching pair.
+        let generations = TLS_GENERATION_CACHE.read().await;
+        let mut eviction = Box::pin(evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug));
+        let mut replacement = Box::pin(cache_dialed_channel(addr, addr, &channel, Some(generation)));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(eviction.as_mut().poll(&mut context).is_pending());
+        assert!(replacement.as_mut().poll(&mut context).is_pending());
+        assert!(
+            rustfs_common::has_cached_connection(addr).await,
+            "eviction must acquire generation metadata before removing the channel"
+        );
+        drop(generations);
+        let (_, published) = tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(eviction, replacement) })
+            .await
+            .expect("eviction and replacement must make progress");
+        assert!(published);
+        assert!(
+            cached_channel_for_tls_generation(addr, addr).await.is_some(),
+            "replacement keeps its TLS generation"
+        );
+        evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
+    }
+
+    #[tokio::test]
+    async fn bulk_pool_interleaving_reuses_two_real_connections_per_peer() {
+        use tonic::codegen::tokio_stream::{StreamExt, wrappers::TcpListenerStream};
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_INTERNODE_CHANNEL_ISOLATION, Some("true")),
+                (rustfs_config::ENV_INTERNODE_BULK_CHANNELS, Some("2")),
+                (rustfs_config::ENV_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE, Some("8388608")),
+                (rustfs_config::ENV_INTERNODE_BULK_CONCURRENCY_LIMIT, Some("2")),
+                (rustfs_config::ENV_INTERNODE_BULK_BUFFER_SIZE, Some("4")),
+            ],
+            async {
+                let mut peers = Vec::new();
+                for _ in 0..2 {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind peer");
+                    let addr = format!("http://{}", listener.local_addr().expect("peer address"));
+                    let accepted = Arc::new(AtomicUsize::new(0));
+                    let changed = Arc::new(tokio::sync::Notify::new());
+                    let count = Arc::clone(&accepted);
+                    let notify = Arc::clone(&changed);
+                    let incoming = TcpListenerStream::new(listener).map(move |stream| {
+                        if stream.is_ok() {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            notify.notify_one();
+                        }
+                        stream
+                    });
+                    let task = tokio::spawn(async move {
+                        tonic::transport::Server::builder()
+                            .add_routes(tonic::service::Routes::default())
+                            .serve_with_incoming(incoming)
+                            .await
+                    });
+                    peers.push((addr, accepted, changed, task));
+                }
+                for _ in 0..8 {
+                    for (addr, _, _, _) in &peers {
+                        get_channel_for_class(addr, ChannelClass::Bulk).await.expect("bulk channel");
+                    }
+                }
+                for (addr, accepted, changed, task) in peers {
+                    get_channel_for_class(&addr, ChannelClass::Control)
+                        .await
+                        .expect("control channel");
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while accepted.load(Ordering::SeqCst) < 3 {
+                            changed.notified().await;
+                        }
+                    })
+                    .await
+                    .expect("server accepts all three pooled sockets");
+                    assert_eq!(accepted.load(Ordering::SeqCst), 3, "two bulk connections plus one control connection");
+                    for key in [addr.clone(), bulk_cache_key(&addr, 0), bulk_cache_key(&addr, 1)] {
+                        assert!(rustfs_common::has_cached_connection(&key).await);
+                        evict_connection_with_log_level(&key, ConnectionEvictionLogLevel::Debug).await;
+                    }
+                    task.abort();
+                    let _ = task.await;
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prewarm_channel_class_reuses_legacy_cache_when_isolation_is_disabled() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        let addr = "http://prewarm-legacy-cache.invalid:9000";
+        cache_connection(addr.to_owned(), Endpoint::from_static("http://127.0.0.1:1").connect_lazy()).await;
+
+        temp_env::async_with_vars([(rustfs_config::ENV_INTERNODE_CHANNEL_ISOLATION, Some("false"))], async {
+            prewarm_channel_class(addr, ChannelClass::Control)
+                .await
+                .expect("control prewarm cache hit");
+            prewarm_channel_class(addr, ChannelClass::Bulk)
+                .await
+                .expect("bulk prewarm reuses legacy cache");
+            assert!(rustfs_common::has_cached_connection(addr).await);
+        })
+        .await;
+
+        evict_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_bulk_window_fails_before_dial_and_control_keeps_its_settings() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        temp_env::async_with_vars(
+            [(rustfs_config::ENV_INTERNODE_BULK_HTTP2_STREAM_WINDOW_SIZE, Some("4294967295"))],
+            async {
+                let addr = "http://127.0.0.1:1";
+                let error = dial_channel(addr, &bulk_cache_key(addr, 0), Duration::from_secs(1))
+                    .await
+                    .expect_err("reject overflowing bulk window");
+                assert_eq!(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .expect("typed configuration error")
+                        .kind(),
+                    std::io::ErrorKind::InvalidInput
+                );
+                assert_eq!(
+                    checked_rpc_window(internode_rpc_http2_stream_window()).expect("control setting"),
+                    Some(1024 * 1024)
+                );
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn internode_rpc_msgpack_only_reuses_cached_env_until_reset() {
+        let _guard = INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        reset_internode_rpc_msgpack_only_cache();
+
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, Some("true")),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, Some("true")),
+            ],
+            || {
+                assert!(internode_rpc_msgpack_only());
+            },
+        );
+
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, None::<&str>),
+                (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, None::<&str>),
+            ],
+            || {
+                assert!(internode_rpc_msgpack_only(), "cached value should avoid repeated env reads");
+                reset_internode_rpc_msgpack_only_cache();
+                assert!(!internode_rpc_msgpack_only(), "reset must reload current env values");
+            },
+        );
+
+        reset_internode_rpc_msgpack_only_cache();
+    }
+
+    #[test]
+    fn internode_rpc_msgpack_only_requires_request_and_fleet_confirmation() {
+        let _guard = INTERNODE_RPC_MSGPACK_ONLY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        for (requested, fleet_confirmed, expected) in [
+            (None, None, false),
+            (Some("true"), None, false),
+            (None, Some("true"), false),
+            (Some("true"), Some("false"), false),
+            (Some("false"), Some("true"), false),
+            (Some("true"), Some("true"), true),
+        ] {
+            reset_internode_rpc_msgpack_only_cache();
+            temp_env::with_vars(
+                [
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY, requested),
+                    (rustfs_config::ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED, fleet_confirmed),
+                ],
+                || {
+                    assert_eq!(internode_rpc_msgpack_only(), expected);
+                },
+            );
+        }
+
+        reset_internode_rpc_msgpack_only_cache();
+    }
+
+    #[tokio::test]
+    async fn get_channel_for_class_bulk_reuses_control_cache_when_isolation_disabled() {
+        let _test_guard = TLS02_TEST_LOCK.lock().await;
+        // Isolation defaults off, so a Bulk request must reuse the control channel keyed by the
+        // bare address and must NOT create a separate bulk-keyed entry (zero behavior change).
+        let addr = "http://get-channel-isolation-off-test";
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        cache_connection(addr.to_string(), channel).await;
+
+        let acquired = get_channel_for_class(addr, ChannelClass::Bulk).await;
+        assert!(acquired.is_ok());
+        assert!(!rustfs_common::has_cached_connection(&bulk_cache_key(addr, 0)).await);
+
+        evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
+    }
+}
+
+#[cfg(test)]
+mod lock_release_tests {
+    use super::proto_gen::node_service::{GenerallyLockResponse, GenerallyLockResult, LockAcquireStatus, LockReleaseStatus};
+    use prost::Message;
+
+    /// The release response schema before structured outcomes were added.
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyReleaseResponse {
+        #[prost(bool, tag = "1")]
+        success: bool,
+        #[prost(string, optional, tag = "2")]
+        error_info: Option<String>,
+        #[prost(string, optional, tag = "3")]
+        lock_info: Option<String>,
+    }
+
+    #[test]
+    fn legacy_release_response_does_not_confirm_absence() {
+        let legacy = LegacyReleaseResponse {
+            success: false,
+            error_info: Some("lock not found for release".to_string()),
+            lock_info: None,
+        };
+        let encoded = legacy.encode_to_vec();
+        let response = GenerallyLockResponse::decode(encoded.as_slice()).expect("decode legacy release response");
+        let result = GenerallyLockResult::decode(encoded.as_slice()).expect("decode legacy batch entry");
+        assert!(!response.success);
+        assert_eq!(response.error_info, legacy.error_info);
+        assert_eq!(response.release_status(), LockReleaseStatus::Unspecified);
+        assert_eq!(result.release_status(), LockReleaseStatus::Unspecified);
+    }
+
+    #[test]
+    fn structured_release_results_preserve_legacy_success_and_failure() {
+        for (status, success, error) in [
+            (LockReleaseStatus::Released, true, None),
+            (LockReleaseStatus::AlreadyAbsent, false, Some("lock not found for release".to_string())),
+        ] {
+            let response = GenerallyLockResponse {
+                success,
+                error_info: error.clone(),
+                lock_info: None,
+                release_status: status.into(),
+            };
+            let result = GenerallyLockResult {
+                success,
+                error_info: error.clone(),
+                lock_info: None,
+                release_status: status.into(),
+                ..Default::default()
+            };
+            for encoded in [response.encode_to_vec(), result.encode_to_vec()] {
+                let legacy = LegacyReleaseResponse::decode(encoded.as_slice()).expect("old peer ignores additive outcome");
+                assert_eq!(legacy.success, success);
+                assert_eq!(legacy.error_info, error);
+                assert!(legacy.lock_info.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn batch_acquire_outcomes_are_additive_and_preserve_legacy_grants() {
+        for success in [false, true] {
+            let legacy = LegacyReleaseResponse {
+                success,
+                error_info: (!success).then(|| "legacy failure".to_string()),
+                lock_info: None,
+            };
+            let result = GenerallyLockResult::decode(legacy.encode_to_vec().as_slice()).expect("decode legacy acquire");
+            assert_eq!(result.success, success);
+            assert_eq!(result.acquire_status(), LockAcquireStatus::Unspecified);
+        }
+        for status in [LockAcquireStatus::RetryableNoGrant, LockAcquireStatus::RejectedNoGrant] {
+            let result = GenerallyLockResult {
+                success: false,
+                error_info: Some("not granted".to_string()),
+                acquire_status: status.into(),
+                ..Default::default()
+            };
+            let legacy = LegacyReleaseResponse::decode(result.encode_to_vec().as_slice()).expect("decode additive acquire");
+            assert!(!legacy.success);
+            assert_eq!(legacy.error_info, result.error_info);
+            let single =
+                GenerallyLockResponse::decode(result.encode_to_vec().as_slice()).expect("single schema ignores batch field");
+            assert_eq!(single.release_status(), LockReleaseStatus::Unspecified);
+        }
+    }
+
+    #[test]
+    fn batch_acquire_unknown_status_is_preserved_for_conservative_classification() {
+        let result = GenerallyLockResult {
+            acquire_status: 99,
+            ..Default::default()
+        };
+        let decoded = GenerallyLockResult::decode(result.encode_to_vec().as_slice()).expect("decode unknown enum");
+        assert_eq!(decoded.acquire_status, 99);
+        assert!(LockAcquireStatus::try_from(decoded.acquire_status).is_err());
     }
 }

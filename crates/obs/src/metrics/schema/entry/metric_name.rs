@@ -13,7 +13,6 @@
 // limitations under the License.
 
 /// The metric name is the individual name of the metric
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricName {
     // The generic metric name
@@ -175,6 +174,7 @@ pub enum MetricName {
 
     // Audit metrics
     AuditFailedMessages,
+    AuditFailedStoreLength,
     AuditTargetQueueLength,
     AuditTotalMessages,
 
@@ -221,6 +221,7 @@ pub enum MetricName {
     NotificationEventsSentTotal,
     NotificationEventsSkippedTotal,
     NotificationTargetFailedMessages,
+    NotificationTargetFailedStoreLength,
     NotificationTargetQueueLength,
     NotificationTargetTotalMessages,
 
@@ -231,6 +232,7 @@ pub enum MetricName {
     UsageVersionsCount,
     UsageDeleteMarkersCount,
     UsageBucketsCount,
+    UsageSnapshotConverged,
     UsageSizeDistribution,
     UsageVersionCountDistribution,
 
@@ -335,8 +337,16 @@ pub enum MetricName {
     ScannerLastCycleReplicationChecks,
     ScannerLastCycleUsageSaves,
     ScannerFailedCycles,
+    ScannerSupersededCycles,
     ScannerPartialCycles,
     ScannerPartialCyclesByReason,
+
+    // Compression-related metrics
+    CompressedBytesTotal,
+    OriginedBytesTotal,
+    SavedBytesTotal,
+    CompressionRatio,
+    CompressionOperationsTotal,
 
     // CPU system-related metrics
     SysCPUAvgIdle,
@@ -361,6 +371,8 @@ pub enum MetricName {
     DriveWaitingIO,
     DriveAPILatencyMicros,
     DriveHealth,
+    DriveWritesTotal,
+    DriveDeletesTotal,
 
     DriveOfflineCount,
     DriveOnlineCount,
@@ -432,7 +444,6 @@ pub enum MetricName {
 }
 
 impl MetricName {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> String {
         match self {
             Self::AuthTotal => "auth_total".to_string(),
@@ -574,6 +585,7 @@ impl MetricName {
             Self::ApiTrafficRecvBytes => "traffic_received_bytes".to_string(),
 
             Self::AuditFailedMessages => "failed_messages".to_string(),
+            Self::AuditFailedStoreLength => "failed_store_length".to_string(),
             Self::AuditTargetQueueLength => "target_queue_length".to_string(),
             Self::AuditTotalMessages => "total_messages".to_string(),
 
@@ -620,6 +632,7 @@ impl MetricName {
             Self::NotificationEventsSentTotal => "events_sent_total".to_string(),
             Self::NotificationEventsSkippedTotal => "events_skipped_total".to_string(),
             Self::NotificationTargetFailedMessages => "failed_messages".to_string(),
+            Self::NotificationTargetFailedStoreLength => "failed_store_length".to_string(),
             Self::NotificationTargetQueueLength => "target_queue_length".to_string(),
             Self::NotificationTargetTotalMessages => "total_messages".to_string(),
 
@@ -630,6 +643,7 @@ impl MetricName {
             Self::UsageVersionsCount => "versions_count".to_string(),
             Self::UsageDeleteMarkersCount => "delete_markers_count".to_string(),
             Self::UsageBucketsCount => "buckets_count".to_string(),
+            Self::UsageSnapshotConverged => "snapshot_converged".to_string(),
             Self::UsageSizeDistribution => "size_distribution".to_string(),
             Self::UsageVersionCountDistribution => "version_count_distribution".to_string(),
 
@@ -734,8 +748,16 @@ impl MetricName {
             Self::ScannerLastCycleReplicationChecks => "last_cycle_replication_checks".to_string(),
             Self::ScannerLastCycleUsageSaves => "last_cycle_usage_saves".to_string(),
             Self::ScannerFailedCycles => "failed_cycles".to_string(),
+            Self::ScannerSupersededCycles => "superseded_cycles".to_string(),
             Self::ScannerPartialCycles => "partial_cycles".to_string(),
             Self::ScannerPartialCyclesByReason => "partial_cycles_by_reason".to_string(),
+
+            // Compression-related metrics
+            Self::CompressedBytesTotal => "compressed_bytes".to_string(),
+            Self::OriginedBytesTotal => "original_bytes".to_string(),
+            Self::SavedBytesTotal => "saved_bytes".to_string(),
+            Self::CompressionRatio => "compression_ratio".to_string(),
+            Self::CompressionOperationsTotal => "compression_operation_total".to_string(),
 
             // CPU system-related metrics
             Self::SysCPUAvgIdle => "avg_idle".to_string(),
@@ -760,6 +782,8 @@ impl MetricName {
             Self::DriveWaitingIO => "waiting_io".to_string(),
             Self::DriveAPILatencyMicros => "api_latency_micros".to_string(),
             Self::DriveHealth => "health".to_string(),
+            Self::DriveWritesTotal => "writes_total".to_string(),
+            Self::DriveDeletesTotal => "deletes_total".to_string(),
 
             Self::DriveOfflineCount => "offline_count".to_string(),
             Self::DriveOnlineCount => "online_count".to_string(),

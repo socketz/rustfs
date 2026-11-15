@@ -12,27 +12,50 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod account;
+pub(crate) mod account_audit;
 pub mod account_info;
+pub mod account_permissions;
 pub mod audit;
 mod audit_runtime_config;
+pub mod batch_job;
 pub mod bucket_meta;
+pub mod bucket_recovery;
+pub mod cluster_snapshot;
 pub mod config_admin;
+pub mod diagnostics;
+pub mod durability;
+pub mod etag;
 pub mod event;
 pub mod extensions;
+pub mod gateway_key_inventory;
 pub mod group;
 pub mod heal;
 pub mod health;
 pub(crate) mod iam_error;
+pub mod idp_compat;
+pub mod ilm_transition;
+pub mod inspect_archive;
+pub mod integrity;
 pub mod is_admin;
 pub mod kms;
+pub mod kms_audit;
+pub mod kms_backup;
 pub mod kms_dynamic;
+pub mod kms_key_lifecycle;
+pub mod kms_key_metadata;
 pub mod kms_keys;
 pub mod kms_management;
-pub mod metrics;
+pub mod kms_rekey;
+pub mod mfa;
 pub mod module_switch;
 mod notify_runtime_access;
+pub mod object_data_cache;
 pub mod object_zip_download;
 pub mod oidc;
+pub mod on_demand_migration;
+pub mod plugin_attempt;
+pub mod plugin_delegation;
 pub mod plugins_catalog;
 pub mod plugins_instances;
 pub mod policies;
@@ -40,8 +63,10 @@ pub mod pools;
 pub mod profile;
 pub mod profile_admin;
 pub mod quota;
+pub mod realtime;
 pub mod rebalance;
 pub mod replication;
+pub(crate) mod s3_extension;
 pub mod scanner;
 pub mod service_account;
 pub mod site_replication;
@@ -49,17 +74,92 @@ pub mod sts;
 pub mod system;
 pub mod table_catalog;
 mod target_descriptor;
+mod target_read;
 pub mod tier;
+pub mod tls_certificate;
 pub mod tls_debug;
 pub mod trace;
+pub mod usage_prefix;
 pub mod user;
 pub mod user_iam;
 pub mod user_lifecycle;
 pub mod user_policy_binding;
 
+/// Serialize `payload` as the body of an admin JSON response.
+///
+/// Routes reached through the `/minio/admin` compat prefix carry an encrypted
+/// body; `encode_compatible_admin_payload` decides that from the path, so every
+/// handler must go through here rather than serializing directly, or a
+/// MinIO client gets plaintext where it expects ciphertext.
+pub(crate) fn owned_admin_json_response<T: serde::Serialize>(
+    path: &str,
+    secret_key: &str,
+    status: http::StatusCode,
+    payload: &T,
+) -> rustfs_s3_types::S3Result<crate::admin::operation::AdminResponse> {
+    let body = serde_json::to_vec(payload).map_err(|e| {
+        rustfs_s3_types::S3Error::with_message(rustfs_s3_types::S3ErrorCode::InternalError, format!("serialize error: {e}"))
+    })?;
+    let (body, content_type) = crate::admin::utils::encode_compatible_admin_payload(path, secret_key, body)?;
+
+    let mut header = hyper::HeaderMap::new();
+    header.insert(http::header::CONTENT_TYPE, content_type.parse().expect("valid header value"));
+    Ok(crate::admin::operation::AdminResponse::with_headers(
+        status,
+        rustfs_s3_types::Body::from(body),
+        header,
+    ))
+}
+
+pub(crate) async fn supervise_admin_mutation<T>(
+    operation: &'static str,
+    mutation: impl std::future::Future<Output = rustfs_s3_types::S3Result<T>> + Send + 'static,
+) -> rustfs_s3_types::S3Result<T>
+where
+    T: Send + 'static,
+{
+    tokio::spawn(mutation).await.map_err(|err| {
+        let outcome = if err.is_cancelled() { "cancelled" } else { "panicked" };
+        rustfs_s3_types::s3_error!(InternalError, "{} task {}", operation, outcome)
+    })?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn owned_admin_json_response_encrypts_only_on_the_compat_prefix() {
+        let payload = serde_json::json!({"users": ["alice", "bob"]});
+        let plain = serde_json::to_vec(&payload).expect("payload serializes");
+
+        let (status, headers, mut body) =
+            owned_admin_json_response("/rustfs/admin/v3/list-users", "secret", http::StatusCode::OK, &payload)
+                .expect("serializes")
+                .into_parts();
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(
+            headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(body.store_all_limited(4096).await.expect("body reads").as_ref(), plain.as_slice());
+
+        let (status, headers, mut body) =
+            owned_admin_json_response("/minio/admin/v3/list-users", "secret", http::StatusCode::OK, &payload)
+                .expect("serializes compat payload")
+                .into_parts();
+        assert_eq!(status, http::StatusCode::OK);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(
+            headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        let encrypted = body.store_all_limited(4096).await.expect("compat body reads");
+        assert_ne!(encrypted.as_ref(), plain.as_slice());
+        let decrypted = rustfs_crypto::decrypt_stream_io(b"secret", &encrypted).expect("compat payload decrypts");
+        assert_eq!(decrypted, plain);
+    }
 
     #[test]
     fn test_handler_struct_creation() {
@@ -73,10 +173,15 @@ mod tests {
         let _set_config_handler = config_admin::SetConfigHandler {};
         let _list_audit_targets = audit::ListAuditTargets {};
         let _get_module_switches = module_switch::GetModuleSwitchesHandler {};
+        let _get_cluster_snapshot = cluster_snapshot::GetClusterSnapshotHandler {};
         let _get_extension_catalog = extensions::GetExtensionCatalogHandler {};
         let _list_extension_instances = extensions::ListExtensionInstancesHandler {};
         let _get_plugin_catalog = plugins_catalog::GetPluginCatalogHandler {};
         let _create_object_zip_download = object_zip_download::CreateObjectZipDownloadHandler {};
+        let _set_on_demand_migration = on_demand_migration::SetBucketOnDemandMigrationHandler {};
+        let _get_on_demand_migration = on_demand_migration::GetBucketOnDemandMigrationHandler {};
+        let _delete_on_demand_migration = on_demand_migration::DeleteBucketOnDemandMigrationHandler {};
+        let _on_demand_migration_status = on_demand_migration::GetBucketOnDemandMigrationStatusHandler {};
         let _list_plugin_instances = plugins_instances::ListPluginInstancesHandler {};
         let _get_plugin_instance = plugins_instances::GetPluginInstanceHandler {};
         let _put_plugin_instance = plugins_instances::PutPluginInstanceHandler {};
@@ -87,17 +192,25 @@ mod tests {
         let _inspect_data_handler = system::InspectDataHandler {};
         let _storage_info_handler = system::StorageInfoHandler {};
         let _data_usage_handler = system::DataUsageInfoHandler {};
-        let _metrics_handler = metrics::MetricsHandler {};
+        let _metrics_handler = realtime::MetricsHandler {};
+        let _recover_orphaned_bucket = bucket_recovery::RecoverOrphanedBucketHandler {};
         let _profile_handler = profile_admin::ProfileHandler {};
         let _profile_status_handler = profile_admin::ProfileStatusHandler {};
         let _tls_status_handler = tls_debug::TlsStatusHandler {};
         let _heal_handler = heal::HealHandler {};
         let _bg_heal_handler = heal::BackgroundHealStatusHandler {};
+        let _replacement_recovery_status_handler = heal::ReplacementRecoveryStatusHandler {};
         let _replication_metrics_handler = replication::GetReplicationMetricsHandler {};
         let _set_remote_target_handler = replication::SetRemoteTargetHandler {};
         let _list_remote_target_handler = replication::ListRemoteTargetHandler {};
         let _remove_remote_target_handler = replication::RemoveRemoteTargetHandler {};
         let _scanner_status_handler = scanner::ScannerStatusHandler {};
+        let _scanner_cycle_state_reset_handler = scanner::ScannerCycleStateResetHandler {};
+        let _scanner_usage_state_reset_handler = scanner::ScannerUsageStateResetHandler {};
+        let _ilm_expiry_status_handler = scanner::IlmExpiryStatusHandler {};
+        let _manual_transition_handler = ilm_transition::ManualTransitionRunHandler {};
+        let _manual_transition_status_handler = ilm_transition::ManualTransitionJobStatusHandler {};
+        let _manual_transition_cancel_handler = ilm_transition::ManualTransitionJobCancelHandler {};
         let _site_replication_add_handler = site_replication::SiteReplicationAddHandler {};
         let _site_replication_info_handler = site_replication::SiteReplicationInfoHandler {};
         let _site_replication_status_handler = site_replication::SiteReplicationStatusHandler {};
@@ -105,6 +218,44 @@ mod tests {
 
         // Just verify they can be created without panicking
         // Test passes if we reach this point without panicking
+    }
+
+    #[tokio::test]
+    async fn supervised_admin_mutation_survives_waiter_cancellation() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+
+        let waiter = tokio::spawn(async move {
+            supervise_admin_mutation("test mutation", async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                let _ = completed_tx.send(());
+                Ok(())
+            })
+            .await
+        });
+
+        started_rx.await.expect("mutation started");
+        waiter.abort();
+        release_tx.send(()).expect("release mutation");
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed_rx)
+            .await
+            .expect("detached mutation should complete")
+            .expect("completion signal");
+    }
+
+    #[tokio::test]
+    async fn supervised_admin_mutation_does_not_expose_panic_payload() {
+        let error = supervise_admin_mutation::<()>("test mutation", async {
+            panic!("do-not-expose-payload");
+        })
+        .await
+        .expect_err("panicking mutation should fail");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("panicked"));
+        assert!(!rendered.contains("do-not-expose-payload"));
     }
 
     // Note: Testing the actual async handler implementations requires:

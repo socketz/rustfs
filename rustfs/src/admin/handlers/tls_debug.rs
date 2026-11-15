@@ -12,19 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::profile::authorize_profile_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
+use super::profile::authorize_profile_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
+use crate::admin::runtime_sources::current_outbound_tls_state;
 use crate::server::ADMIN_PREFIX;
 use http::StatusCode;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::Method;
 use matchit::Params;
-use rustfs_tls_runtime::{
-    OutboundOnlySnapshotArgs, TlsConsumerStatusItem, TlsDebugStatusResponse, TlsRuntimeStatusSnapshot,
-    summarize_global_outbound_tls_state,
-};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result};
+use rustfs_tls_runtime::{OutboundOnlySnapshotArgs, TlsConsumerStatusItem, TlsDebugStatusResponse, TlsRuntimeStatusSnapshot};
 
 pub fn register_tls_debug_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -43,14 +42,17 @@ const ECSTORE_TRANSITION_CLIENT_CONSUMER: &str = "ecstore_transition_client";
 
 #[async_trait::async_trait]
 impl Operation for TlsStatusHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_profile_request(&req).await?;
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        authorize_profile_envelope(req.envelope()).await?;
 
         let tls_path = rustfs_utils::get_env_opt_str(rustfs_config::ENV_RUSTFS_TLS_PATH).unwrap_or_default();
-        let outbound = summarize_global_outbound_tls_state().await;
+        let outbound = current_outbound_tls_state().await;
+        let generation = outbound.generation.0;
+        let has_root_ca = outbound.root_ca_pem.as_ref().is_some_and(|pem| !pem.is_empty());
+        let has_mtls_identity = outbound.mtls_identity.is_some();
         let status = TlsRuntimeStatusSnapshot::from_outbound_only(OutboundOnlySnapshotArgs {
             source_path: tls_path,
-            generation: outbound.generation.0,
+            generation,
             reload_enabled: rustfs_utils::get_env_bool(
                 rustfs_config::ENV_TLS_RELOAD_ENABLE,
                 rustfs_config::DEFAULT_TLS_RELOAD_ENABLE,
@@ -59,28 +61,28 @@ impl Operation for TlsStatusHandler {
             last_attempt_time: None,
             last_success_time: None,
             last_error: None,
-            has_roots: outbound.has_root_ca,
-            has_mtls_identity: outbound.has_mtls_identity,
+            has_roots: has_root_ca,
+            has_mtls_identity,
         });
         let payload = TlsDebugStatusResponse::builder(status)
             .push_consumers([
                 TlsConsumerStatusItem {
                     consumer: PROTOS_GRPC_CHANNEL_CONSUMER,
-                    generation: outbound.generation.0,
-                    has_root_ca: outbound.has_root_ca,
-                    has_mtls_identity: outbound.has_mtls_identity,
+                    generation,
+                    has_root_ca,
+                    has_mtls_identity,
                 },
                 TlsConsumerStatusItem {
                     consumer: RIO_HTTP_READER_CONSUMER,
-                    generation: outbound.generation.0,
-                    has_root_ca: outbound.has_root_ca,
-                    has_mtls_identity: outbound.has_mtls_identity,
+                    generation,
+                    has_root_ca,
+                    has_mtls_identity,
                 },
                 TlsConsumerStatusItem {
                     consumer: ECSTORE_TRANSITION_CLIENT_CONSUMER,
-                    generation: outbound.generation.0,
-                    has_root_ca: outbound.has_root_ca,
-                    has_mtls_identity: outbound.has_mtls_identity,
+                    generation,
+                    has_root_ca,
+                    has_mtls_identity,
                 },
             ])
             .build();
@@ -89,32 +91,28 @@ impl Operation for TlsStatusHandler {
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), headers))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), headers))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::TlsStatusHandler;
-    use crate::admin::router::Operation;
-    use http::{Extensions, HeaderMap, Uri};
+    use crate::admin::operation::AdminRequest;
+    use crate::admin::operation::Operation;
+    use http::{Extensions, HeaderMap};
     use hyper::Method;
     use matchit::Params;
+    use rustfs_s3_types::Body;
+    use rustfs_s3_types::S3ErrorCode;
     use rustfs_tls_runtime::{OutboundOnlySnapshotArgs, TlsConsumerStatusItem, TlsRuntimeStatusSnapshot};
-    use s3s::{Body, S3ErrorCode, S3Request};
 
-    fn build_tls_status_request() -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: Uri::from_static("/rustfs/admin/debug/tls/status"),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    fn build_tls_status_request() -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(Method::GET, "/rustfs/admin/debug/tls/status")
+            .headers(HeaderMap::new())
+            .extensions(Extensions::new())
+            .body(Body::empty())
+            .build()
     }
 
     #[tokio::test]

@@ -19,16 +19,40 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
+    use aws_sdk_s3::config::{Credentials, Region, RequestChecksumCalculation};
+    use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
-    use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart};
-    use base64::Engine;
+    use aws_sdk_s3::types::{
+        ChecksumAlgorithm, ChecksumMode, ChecksumType as SdkChecksumType, CompletedMultipartUpload, CompletedPart,
+        ServerSideEncryption,
+    };
+    use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
+    use md5::{Digest as Md5Digest, Md5};
     use rustfs_rio::{Checksum, ChecksumType as RioChecksumType};
-    use serial_test::serial;
-    use sha2::{Digest, Sha256};
+    use sha2::Sha256;
     use tracing::info;
 
     fn create_s3_client(env: &RustFSTestEnvironment) -> Client {
         env.create_s3_client()
+    }
+
+    /// Client with boto/SDK automatic checksum calculation disabled, so the ONLY
+    /// checksum on the wire is the one the test injects. Needed because the SDK's
+    /// default (crc32) would otherwise collide with the additional-algorithm header
+    /// we inject via `mutate_request` for XXHash/SHA-512/MD5 (which have no typed
+    /// SDK builder). Mirrors the boto3 `request_checksum_calculation=when_required`.
+    fn create_s3_client_no_auto_checksum(env: &RustFSTestEnvironment) -> Client {
+        let creds = Credentials::new(&env.access_key, &env.secret_key, None, None, "e2e-additional-checksum");
+        let config = aws_sdk_s3::Config::builder()
+            .credentials_provider(creds)
+            .region(Region::new("us-east-1"))
+            .endpoint_url(format!("http://{}", env.address))
+            .force_path_style(true)
+            .behavior_version_latest()
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .http_client(SmithyHttpClientBuilder::new().build_http())
+            .build();
+        Client::from_conf(config)
     }
 
     async fn create_bucket(client: &Client, bucket: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -49,13 +73,15 @@ mod tests {
     }
 
     fn content_md5_base64(body: &[u8]) -> String {
-        let digest = md5::compute(body);
-        base64::engine::general_purpose::STANDARD.encode(digest.as_slice())
+        let mut hasher = Md5::new();
+        hasher.update(body);
+        let digest = hasher.finalize();
+        base64_simd::STANDARD.encode_to_string(digest.as_slice())
     }
 
     fn checksum_sha256_base64(body: &[u8]) -> String {
         let digest = Sha256::digest(body);
-        base64::engine::general_purpose::STANDARD.encode(digest.as_slice())
+        base64_simd::STANDARD.encode_to_string(digest.as_slice())
     }
 
     fn checksum_crc64nvme_base64(body: &[u8]) -> String {
@@ -66,7 +92,6 @@ mod tests {
 
     /// PutObject with Content-MD5: upload succeeds and GetObject returns same content.
     #[tokio::test]
-    #[serial]
     async fn test_put_object_with_content_md5() {
         init_logging();
         info!("TEST: PutObject with Content-MD5");
@@ -102,7 +127,6 @@ mod tests {
 
     /// PutObject with x-amz-checksum-sha256: upload succeeds and GetObject returns same content.
     #[tokio::test]
-    #[serial]
     async fn test_put_object_with_checksum_sha256() {
         init_logging();
         info!("TEST: PutObject with x-amz-checksum-sha256");
@@ -136,10 +160,223 @@ mod tests {
         info!("PASSED: PutObject with checksum_sha256 and GetObject content match");
     }
 
+    /// Regression test for issue #4341 (part 1: verify-on-write):
+    /// PutObject with a SHA256 checksum that does NOT match the body must be
+    /// rejected (BadDigest / checksum mismatch), NOT accepted with HTTP 200.
+    #[tokio::test]
+    async fn test_put_object_rejects_mismatched_sha256() {
+        init_logging();
+        info!("TEST: PutObject rejects mismatched x-amz-checksum-sha256 (issue #4341)");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-checksum-sha256-mismatch";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let key = "obj-bad-sha256.txt";
+        let content = b"Body bytes that do NOT match the declared checksum";
+        // Checksum of a DIFFERENT payload -> deliberate mismatch.
+        let wrong_checksum = checksum_sha256_base64(b"some other payload entirely");
+
+        let result = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(content))
+            .checksum_sha256(&wrong_checksum)
+            .send()
+            .await;
+
+        let error = result.expect_err("PutObject with a mismatched SHA256 must be rejected (issue #4341)");
+        assert_eq!(
+            error.raw_response().map(|response| response.status().as_u16()),
+            Some(400),
+            "Mismatched SHA256 must return HTTP 400, got {error:?}"
+        );
+        assert_eq!(
+            error.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("BadDigest"),
+            "Mismatched SHA256 must return BadDigest, got {error:?}"
+        );
+
+        // And the object must not have been stored.
+        let error = client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect_err("Object must not exist after a rejected mismatched-checksum PutObject");
+        assert_eq!(
+            error.raw_response().map(|response| response.status().as_u16()),
+            Some(404),
+            "Rejected mismatched-checksum PutObject absence probe must return HTTP 404, got {error:?}"
+        );
+        info!("PASSED: PutObject rejects mismatched SHA256 and stores nothing");
+    }
+
+    /// Regression test for issue #4341 (part 2: retrieve-on-HEAD):
+    /// After PutObject with a correct SHA256 checksum, HeadObject with
+    /// ChecksumMode=ENABLED must return that stored base64 SHA256 digest.
+    #[tokio::test]
+    async fn test_head_object_returns_stored_sha256() {
+        init_logging();
+        info!("TEST: HeadObject returns stored SHA256 with ChecksumMode=ENABLED (issue #4341)");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-checksum-sha256-head";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let key = "obj-head-sha256.txt";
+        let content = b"Retrieve my SHA256 checksum on HEAD";
+        let checksum = checksum_sha256_base64(content);
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(content))
+            .checksum_sha256(&checksum)
+            .send()
+            .await
+            .expect("PutObject with correct SHA256 failed");
+
+        let head = client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("HeadObject failed");
+
+        assert_eq!(
+            head.checksum_sha256(),
+            Some(checksum.as_str()),
+            "HeadObject with ChecksumMode=ENABLED must return the stored base64 SHA256 (issue #4341)"
+        );
+        info!("PASSED: HeadObject returns stored SHA256 digest");
+    }
+
+    #[tokio::test]
+    async fn test_head_object_returns_sse_s3_checksum() {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server_with_env(
+            vec![],
+            &[
+                ("RUSTFS_SSE_S3_MASTER_KEY", "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI="),
+                ("RUSTFS_CONSOLE_ENABLE", "false"),
+            ],
+        )
+        .await
+        .expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-sse-s3-checksum-head";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let put = client
+            .put_object()
+            .bucket(bucket)
+            .key("encrypted.txt")
+            .body(ByteStream::from_static(b"encrypted checksum"))
+            .server_side_encryption(ServerSideEncryption::Aes256)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .expect("SSE-S3 PutObject with CRC32 failed");
+        let expected = put.checksum_crc32().expect("PutObject must return CRC32");
+
+        let head = client
+            .head_object()
+            .bucket(bucket)
+            .key("encrypted.txt")
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("SSE-S3 HeadObject failed");
+
+        assert_eq!(head.checksum_crc32(), Some(expected));
+
+        client
+            .copy_object()
+            .bucket(bucket)
+            .key("encrypted-copy.txt")
+            .copy_source(format!("{bucket}/encrypted.txt"))
+            .server_side_encryption(ServerSideEncryption::Aes256)
+            .send()
+            .await
+            .expect("SSE-S3 CopyObject failed");
+        let copy_head = client
+            .head_object()
+            .bucket(bucket)
+            .key("encrypted-copy.txt")
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("SSE-S3 copied HeadObject failed");
+
+        assert_eq!(copy_head.checksum_crc32(), Some(expected));
+
+        let multipart_key = "encrypted-multipart.txt";
+        let create = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(multipart_key)
+            .server_side_encryption(ServerSideEncryption::Aes256)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .expect("SSE-S3 CreateMultipartUpload with CRC32 failed");
+        let upload_id = create.upload_id().expect("CreateMultipartUpload must return an upload ID");
+        let part = client
+            .upload_part()
+            .bucket(bucket)
+            .key(multipart_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(b"encrypted multipart checksum"))
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .expect("SSE-S3 UploadPart with CRC32 failed");
+        let completed_part = CompletedPart::builder()
+            .part_number(1)
+            .e_tag(part.e_tag().expect("UploadPart must return an ETag"))
+            .checksum_crc32(part.checksum_crc32().expect("UploadPart must return CRC32"))
+            .build();
+        let complete = client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(multipart_key)
+            .upload_id(upload_id)
+            .multipart_upload(CompletedMultipartUpload::builder().parts(completed_part).build())
+            .send()
+            .await
+            .expect("SSE-S3 CompleteMultipartUpload with CRC32 failed");
+        let expected_multipart = complete.checksum_crc32().expect("CompleteMultipartUpload must return CRC32");
+        let multipart_head = client
+            .head_object()
+            .bucket(bucket)
+            .key(multipart_key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("SSE-S3 multipart HeadObject failed");
+
+        assert_eq!(multipart_head.checksum_crc32(), Some(expected_multipart));
+    }
+
     /// Multipart upload with checksum: CreateMultipartUpload, UploadPart(s) with checksum_sha256, CompleteMultipartUpload; then GetObject verifies content.
     /// Uses part size >= 5MB (server minimum) for two parts.
     #[tokio::test]
-    #[serial]
     async fn test_multipart_upload_with_checksum() {
         init_logging();
         info!("TEST: MultipartUpload with checksum (checksum_sha256 on parts)");
@@ -237,7 +474,6 @@ mod tests {
     /// Regression test for issue #2282:
     /// CRC64NVME full-object checksum should match between direct PutObject and multipart upload.
     #[tokio::test]
-    #[serial]
     async fn test_crc64nvme_matches_between_put_object_and_multipart_upload() {
         init_logging();
         info!("TEST: CRC64NVME matches between direct PutObject and multipart upload");
@@ -363,5 +599,318 @@ mod tests {
             Some(full_checksum.as_str()),
             "Multipart object should report the same full-object CRC64NVME as direct upload"
         );
+        assert_eq!(
+            multipart_head.checksum_type(),
+            Some(&SdkChecksumType::FullObject),
+            "Multipart object with a full-object checksum must report FULL_OBJECT"
+        );
+    }
+
+    /// Create a CRC32 FULL_OBJECT multipart upload and upload every part, returning
+    /// the upload id and the `CompletedPart` list ready for CompleteMultipartUpload.
+    async fn start_full_object_crc32_upload(
+        client: &Client,
+        bucket: &str,
+        key: &str,
+        parts: &[&Vec<u8>],
+    ) -> (String, Vec<CompletedPart>) {
+        let create_result = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .checksum_type(SdkChecksumType::FullObject)
+            .send()
+            .await
+            .expect("Failed to create multipart upload");
+        let upload_id = create_result.upload_id().expect("No upload_id").to_string();
+
+        let mut completed_parts = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            let part_number = index as i32 + 1;
+            let uploaded = client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from((*part).clone()))
+                .checksum_algorithm(ChecksumAlgorithm::Crc32)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("Failed to upload part {part_number}: {e:?}"));
+            completed_parts.push(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(uploaded.e_tag().expect("No etag for part"))
+                    .checksum_crc32(uploaded.checksum_crc32().expect("No CRC32 for part"))
+                    .build(),
+            );
+        }
+
+        (upload_id, completed_parts)
+    }
+
+    /// A multipart upload completed with a **full-object** checksum must report
+    /// `x-amz-checksum-type: FULL_OBJECT` on both GET and HEAD, the way AWS does.
+    ///
+    /// `complete_multipart_upload` used to persist the object-level checksum
+    /// record with the pre-merge checksum type, so the MULTIPART /
+    /// INCLUDES_MULTIPART flags never reached disk. `rustfs_rio::read_checksums`
+    /// only emits the FULL_OBJECT entry inside its MULTIPART branch, so these
+    /// objects came back from GET and HEAD with no checksum-type header at all.
+    /// Found while root-causing rustfs#6825.
+    #[tokio::test]
+    async fn test_full_object_multipart_reports_full_object_checksum_type() {
+        init_logging();
+        info!("TEST: full-object multipart upload round-trips x-amz-checksum-type: FULL_OBJECT");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-full-object-checksum-type";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        const PART_SIZE: usize = 5 * 1024 * 1024;
+        let part1: Vec<u8> = (0..PART_SIZE).map(|i| (i % 241) as u8).collect();
+        let part2: Vec<u8> = (0..PART_SIZE).map(|i| ((i + 29) % 241) as u8).collect();
+        let content: Vec<u8> = part1.iter().chain(part2.iter()).copied().collect();
+
+        // CRC32 with an explicit FULL_OBJECT type: the object checksum is the
+        // CRC32 of the whole object, not the composite hash of the part digests.
+        let full_object_crc32 = Checksum::new_from_data(RioChecksumType::CRC32, &content)
+            .expect("crc32 checksum")
+            .encoded;
+
+        let key = "full-object-multipart.bin";
+        let (upload_id, completed_parts) = start_full_object_crc32_upload(&client, bucket, key, &[&part1, &part2]).await;
+
+        client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+            // Restate the full-object intent and value on CompleteMultipartUpload,
+            // exactly as an AWS SDK client does: `x-amz-checksum-type: FULL_OBJECT`
+            // plus `x-amz-checksum-crc32`, with no `x-amz-checksum-algorithm`
+            // header (CompleteMultipartUpload has no such member).
+            .checksum_type(SdkChecksumType::FullObject)
+            .checksum_crc32(full_object_crc32.clone())
+            .send()
+            .await
+            .expect("Failed to complete multipart upload");
+
+        let head = client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("Failed to head object");
+        assert_eq!(
+            head.checksum_type(),
+            Some(&SdkChecksumType::FullObject),
+            "HeadObject must report x-amz-checksum-type: FULL_OBJECT"
+        );
+        assert_eq!(
+            head.checksum_crc32(),
+            Some(full_object_crc32.as_str()),
+            "HeadObject must report the full-object CRC32, with no -<parts> suffix"
+        );
+
+        let get = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("Failed to get object");
+        assert_eq!(
+            get.checksum_type(),
+            Some(&SdkChecksumType::FullObject),
+            "GetObject must report x-amz-checksum-type: FULL_OBJECT"
+        );
+        assert_eq!(
+            get.checksum_crc32(),
+            Some(full_object_crc32.as_str()),
+            "GetObject must report the full-object CRC32, with no -<parts> suffix"
+        );
+
+        let body = get.body.collect().await.expect("Failed to read body").into_bytes();
+        assert_eq!(body.as_ref(), content.as_slice(), "GetObject body must match the uploaded content");
+
+        info!("PASSED: full-object multipart reports FULL_OBJECT on GET and HEAD");
+    }
+
+    /// Declaring a checksum type on CompleteMultipartUpload that contradicts the
+    /// one recorded at CreateMultipartUpload must be rejected, and rejected as a
+    /// client error (4xx), not a server error.
+    #[tokio::test]
+    async fn test_complete_multipart_rejects_contradicting_checksum_type() {
+        init_logging();
+        info!("TEST: CompleteMultipartUpload rejects a checksum type that contradicts the upload");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-checksum-type-mismatch";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        const PART_SIZE: usize = 5 * 1024 * 1024;
+        let part1: Vec<u8> = (0..PART_SIZE).map(|i| (i % 239) as u8).collect();
+        let part2: Vec<u8> = (0..PART_SIZE).map(|i| ((i + 31) % 239) as u8).collect();
+        let content: Vec<u8> = part1.iter().chain(part2.iter()).copied().collect();
+        let full_object_crc32 = Checksum::new_from_data(RioChecksumType::CRC32, &content)
+            .expect("crc32 checksum")
+            .encoded;
+
+        let key = "checksum-type-mismatch.bin";
+        let (upload_id, completed_parts) = start_full_object_crc32_upload(&client, bucket, key, &[&part1, &part2]).await;
+
+        let err = client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+            // The upload was created as FULL_OBJECT; claiming COMPOSITE here
+            // contradicts it.
+            .checksum_type(SdkChecksumType::Composite)
+            .checksum_crc32(full_object_crc32.clone())
+            .send()
+            .await
+            .expect_err("COMPOSITE on a FULL_OBJECT upload must be rejected");
+
+        let service_err = err.into_service_error();
+        let code = service_err.meta().code().unwrap_or("<no code>").to_string();
+        let message = service_err.meta().message().unwrap_or_default().to_string();
+
+        // Before the fix the storage layer refused the combination with a generic
+        // error and the caller got `500 InternalError` -- "please try again" for a
+        // request that can only ever fail.
+        assert_eq!(
+            code, "InvalidRequest",
+            "a contradicting checksum type is a client error, got {code}: {message}"
+        );
+        assert!(
+            message.contains("FULL_OBJECT") && message.contains("COMPOSITE"),
+            "the message must name the recorded and requested types, got {message}"
+        );
+
+        // The upload is untouched by the rejected completion, so a well-formed
+        // retry on the same upload id still succeeds.
+        let listed = client
+            .list_parts()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .expect("upload must survive the rejected completion");
+        assert_eq!(listed.parts().len(), 2, "both parts must still be listed after the rejection");
+
+        info!("PASSED: contradicting checksum type rejected as InvalidRequest");
+    }
+
+    /// Integration test for the AWS 2026-04 additional checksum algorithms
+    /// (XXHash3/64/128, SHA-512, MD5). aws_sdk_s3 has no typed builder for these, so the
+    /// `x-amz-checksum-<algo>` header is injected via `mutate_request` (value computed by
+    /// rustfs-rio, which is byte-for-byte identical to awscrt). Verifies the server
+    /// verifies-on-write: a correct value is accepted and the object stored; a wrong
+    /// value is rejected with BadDigest and nothing is stored. Full HEAD/GET header
+    /// echo round-trip is additionally exercised by the boto3+awscrt e2e.
+    #[tokio::test]
+    async fn test_additional_checksums_verify_on_write() {
+        init_logging();
+        info!("TEST: additional checksums (XXHash3/64/128, SHA-512, MD5) verify-on-write");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client_no_auto_checksum(&env);
+        let bucket = "test-additional-checksums";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let content: &[u8] = b"additional-checksum verify-on-write payload for xxhash/sha512/md5";
+
+        for (ty, header) in [
+            (RioChecksumType::XXHASH3, "x-amz-checksum-xxhash3"),
+            (RioChecksumType::XXHASH64, "x-amz-checksum-xxhash64"),
+            (RioChecksumType::XXHASH128, "x-amz-checksum-xxhash128"),
+            (RioChecksumType::SHA512, "x-amz-checksum-sha512"),
+            (RioChecksumType::MD5, "x-amz-checksum-md5"),
+        ] {
+            // Correct checksum -> accepted, and the object is stored intact.
+            let good = Checksum::new_from_data(ty, content).expect("compute checksum").encoded;
+            let ok_key = format!("ok-{header}");
+            let put = client
+                .put_object()
+                .bucket(bucket)
+                .key(&ok_key)
+                .body(ByteStream::from_static(content))
+                .customize()
+                .mutate_request(move |req| {
+                    req.headers_mut().insert(header, good.clone());
+                })
+                .send()
+                .await;
+            assert!(put.is_ok(), "{header}: correct checksum must be accepted: {:?}", put.err());
+            let got = client
+                .get_object()
+                .bucket(bucket)
+                .key(&ok_key)
+                .send()
+                .await
+                .expect("GetObject");
+            let body = got.body.collect().await.expect("collect body").into_bytes();
+            assert_eq!(body.as_ref(), content, "{header}: stored body must match uploaded content");
+
+            // Wrong checksum -> rejected with BadDigest, and nothing is stored.
+            let bad = Checksum::new_from_data(ty, b"a totally different payload")
+                .expect("compute checksum")
+                .encoded;
+            let bad_key = format!("bad-{header}");
+            let put_bad = client
+                .put_object()
+                .bucket(bucket)
+                .key(&bad_key)
+                .body(ByteStream::from_static(content))
+                .customize()
+                .mutate_request(move |req| {
+                    req.headers_mut().insert(header, bad.clone());
+                })
+                .send()
+                .await;
+            let error = put_bad.expect_err("a mismatched checksum must be rejected");
+            assert_eq!(
+                error.raw_response().map(|response| response.status().as_u16()),
+                Some(400),
+                "{header}: mismatched checksum must return HTTP 400, got {error:?}"
+            );
+            assert_eq!(
+                error.as_service_error().and_then(ProvideErrorMetadata::code),
+                Some("BadDigest"),
+                "{header}: mismatched checksum must return BadDigest, got {error:?}"
+            );
+            let error = client
+                .head_object()
+                .bucket(bucket)
+                .key(&bad_key)
+                .send()
+                .await
+                .expect_err("nothing must be stored after a rejected PutObject");
+            assert_eq!(
+                error.raw_response().map(|response| response.status().as_u16()),
+                Some(404),
+                "{header}: rejected PutObject absence probe must return HTTP 404, got {error:?}"
+            );
+
+            info!("PASSED additional-checksum verify-on-write: {header}");
+        }
     }
 }

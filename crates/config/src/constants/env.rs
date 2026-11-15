@@ -30,6 +30,16 @@ pub const COMMENT_KEY: &str = "comment";
 pub const ENV_AUDIT_ENABLE: &str = "RUSTFS_AUDIT_ENABLE";
 /// Global switch for enabling the notify module.
 pub const ENV_NOTIFY_ENABLE: &str = "RUSTFS_NOTIFY_ENABLE";
+/// Maximum audit entries per second for authorization denials of authenticated callers.
+/// `0` disables denial auditing for that class of caller.
+pub const ENV_AUDIT_DENIAL_RATE: &str = "RUSTFS_AUDIT_DENIAL_RATE";
+/// Maximum audit entries per second for authorization denials of anonymous callers.
+/// `0` disables denial auditing for that class of caller.
+pub const ENV_AUDIT_DENIAL_ANONYMOUS_RATE: &str = "RUSTFS_AUDIT_DENIAL_ANONYMOUS_RATE";
+/// Default denial audit rate for authenticated callers (entries per second).
+pub const DEFAULT_AUDIT_DENIAL_RATE: u64 = 50;
+/// Default denial audit rate for anonymous callers (entries per second).
+pub const DEFAULT_AUDIT_DENIAL_ANONYMOUS_RATE: u64 = 5;
 /// Default global audit switch (disabled by default).
 pub const DEFAULT_AUDIT_ENABLE: bool = false;
 /// Default global notify switch (disabled by default).
@@ -40,6 +50,24 @@ pub const ENV_ILM_PROCESS_TIME: &str = "RUSTFS_ILM_PROCESS_TIME";
 pub const ENV_ILM_PROCESS_TIME_DEPRECATED: &str = "_RUSTFS_ILM_PROCESS_TIME";
 /// Default ILM process boundary in seconds (24h).
 pub const DEFAULT_ILM_PROCESS_TIME_SECS: i32 = 86400;
+
+/// **TEST/DEBUG ONLY** — lifecycle "day" length override, in seconds.
+///
+/// Modeled on Ceph RGW's `rgw_lc_debug_interval`. When set to a positive
+/// integer `N`, lifecycle rule evaluation treats one Days-based "day" as `N`
+/// seconds instead of [`DEFAULT_ILM_DAY_SECS`] (86400), so `Days`-based
+/// expiration/transition/noncurrent rules become exercisable in seconds under
+/// test. When unset (or set to `0`/an invalid value), behavior is byte-for-byte
+/// identical to production.
+///
+/// This accelerates data deletion and MUST NEVER be set in a production
+/// deployment. Enabling it emits a `WARN` log. It only rescales relative
+/// `Days` deadlines; absolute `Date`-based rules are unaffected.
+pub const ENV_ILM_DEBUG_DAY_SECS: &str = "RUSTFS_ILM_DEBUG_DAY_SECS";
+
+/// Number of seconds in one lifecycle "day" (86400) used as the default when
+/// [`ENV_ILM_DEBUG_DAY_SECS`] is unset.
+pub const DEFAULT_ILM_DAY_SECS: u32 = 86400;
 
 /// Medium-drawn lines separator
 /// This is used to separate words in environment variable names.
@@ -310,5 +338,7 @@ mod tests {
     fn test_global_audit_notify_switch_constants() {
         assert_eq!(ENV_AUDIT_ENABLE, "RUSTFS_AUDIT_ENABLE");
         assert_eq!(ENV_NOTIFY_ENABLE, "RUSTFS_NOTIFY_ENABLE");
+        assert_eq!(ENV_AUDIT_DENIAL_RATE, "RUSTFS_AUDIT_DENIAL_RATE");
+        assert_eq!(ENV_AUDIT_DENIAL_ANONYMOUS_RATE, "RUSTFS_AUDIT_DENIAL_ANONYMOUS_RATE");
     }
 }

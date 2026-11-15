@@ -30,7 +30,7 @@ Or point the tests at another generated root:
 
 ```powershell
 $env:RUSTFS_MINIO_FIXTURE_ROOT = '.\rustfs\tmp\minio-fixture-lab-smoke'
-cargo +1.96.0 test -p rustfs-rio-v2 --test minio_generated_fixtures -- --ignored
+cargo +1.97.1 test -p rustfs-rio-v2 --test minio_generated_fixtures -- --ignored
 ```
 
 ## Scope
@@ -52,4 +52,4 @@ It checks that:
 - KMS key ids are derived from each fixture's own `manifest.json`, so local static-KMS runs are not tied to one hard-coded key name
 - SSE-C `HEAD` responses round-trip the expected customer algorithm and customer-key MD5
 
-These tests do not yet validate full plaintext reconstruction from MinIO-written encrypted data.
+These tests do not validate full plaintext reconstruction from MinIO-written encrypted data — that lives in the reader suite at `rustfs/src/storage/minio_generated_read_test.rs`, run with `--features rio-v2` over the same fixture captures.

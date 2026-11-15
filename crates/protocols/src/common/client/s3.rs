@@ -13,75 +13,140 @@
 // limitations under the License.
 
 use async_trait::async_trait;
-use s3s::dto::*;
+use rustfs_credentials::Credentials;
+use rustfs_gateway_types::dto::*;
+
+use crate::common::gateway::{AuthorizationError, S3Action};
+use crate::common::session::SessionContext;
+
+/// Per-bucket capacity inputs for WebDAV quota reporting.
+#[cfg(feature = "webdav")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BucketCapacity {
+    /// Configured hard quota in bytes; `None` when the bucket has no quota.
+    pub quota_limit: Option<u64>,
+    /// Cached logical usage in bytes; `None` when no scanner snapshot covers
+    /// the bucket yet (fresh deploy, new bucket, or a degraded load window).
+    pub usage: Option<u64>,
+}
+
+/// Session-scoped capacity inputs for WebDAV quota reporting.
+///
+/// dav-server queries quota once per PROPFIND with no path argument, so the
+/// driver can only report a single filesystem-wide (used, total) pair; this
+/// view carries the inputs needed to compute it under the session's
+/// authorization scope.
+#[cfg(feature = "webdav")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionCapacityView {
+    /// Buckets visible to the session with their quota limits and cached usage.
+    pub buckets: Vec<BucketCapacity>,
+    /// Cluster usable capacity as `(used_bytes, total_bytes)`, the same
+    /// erasure-aware numbers the console dashboard shows. `None` when the
+    /// object store is not initialized.
+    pub cluster_usable: Option<(u64, u64)>,
+}
 
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     /// Error type for this storage backend
     type Error: std::error::Error + Send + Sync + 'static;
+    /// Authorize a protocol operation against the backend's policy domain.
+    /// Backends with resource policies must override this identity-policy fallback.
+    /// Use `authorize_list_objects` for ListObjectsV2 requests.
+    async fn authorize_operation(
+        &self,
+        session: &SessionContext,
+        action: &S3Action,
+        bucket: &str,
+        object: Option<&str>,
+    ) -> Result<(), AuthorizationError> {
+        crate::common::gateway::authorize_operation(session, action, bucket, object).await
+    }
+
+    /// Authorize listing with the exact parameters passed to `list_objects_v2`.
+    /// Backends with resource or request-condition policies must override this fallback.
+    async fn authorize_list_objects(
+        &self,
+        session: &SessionContext,
+        input: &ListObjectsV2Input,
+    ) -> Result<(), AuthorizationError> {
+        self.authorize_operation(session, &S3Action::ListBucket, input.bucket.as_str(), input.prefix.as_deref())
+            .await
+    }
+
     /// Get object content and metadata
     async fn get_object(
         &self,
         bucket: &str,
         key: &str,
-        access_key: &str,
-        secret_key: &str,
+        credentials: &Credentials,
         start_pos: Option<u64>,
     ) -> Result<GetObjectOutput, Self::Error>;
     async fn get_object_range(
         &self,
         bucket: &str,
         key: &str,
-        access_key: &str,
-        secret_key: &str,
+        credentials: &Credentials,
         start_pos: u64,
         length: u64,
     ) -> Result<GetObjectOutput, Self::Error>;
     /// Put object content with metadata
-    async fn put_object(&self, input: PutObjectInput, access_key: &str, secret_key: &str)
-    -> Result<PutObjectOutput, Self::Error>;
+    async fn put_object(&self, input: PutObjectInput, credentials: &Credentials) -> Result<PutObjectOutput, Self::Error>;
     /// Delete an object
-    async fn delete_object(
-        &self,
-        bucket: &str,
-        key: &str,
-        access_key: &str,
-        secret_key: &str,
-    ) -> Result<DeleteObjectOutput, Self::Error>;
+    async fn delete_object(&self, bucket: &str, key: &str, credentials: &Credentials) -> Result<DeleteObjectOutput, Self::Error>;
     /// Get object metadata without content
-    async fn head_object(
-        &self,
-        bucket: &str,
-        key: &str,
-        access_key: &str,
-        secret_key: &str,
-    ) -> Result<HeadObjectOutput, Self::Error>;
+    async fn head_object(&self, bucket: &str, key: &str, credentials: &Credentials) -> Result<HeadObjectOutput, Self::Error>;
     /// Check if bucket exists and get metadata
-    async fn head_bucket(&self, bucket: &str, access_key: &str, secret_key: &str) -> Result<HeadBucketOutput, Self::Error>;
+    async fn head_bucket(&self, bucket: &str, credentials: &Credentials) -> Result<HeadBucketOutput, Self::Error>;
     /// List objects in a bucket with pagination
     async fn list_objects_v2(
         &self,
         input: ListObjectsV2Input,
-        access_key: &str,
-        secret_key: &str,
+        credentials: &Credentials,
     ) -> Result<ListObjectsV2Output, Self::Error>;
-    /// List all buckets (requires authentication)
-    async fn list_buckets(&self, access_key: &str, secret_key: &str) -> Result<ListBucketsOutput, Self::Error>;
+    /// List all buckets (requires authentication).
+    async fn list_buckets(&self, credentials: &Credentials) -> Result<ListBucketsOutput, Self::Error>;
+    /// List buckets visible to the authenticated session.
+    ///
+    /// Backends that implement this must apply per-bucket authorization. The default denies the
+    /// request so existing backends cannot expose unfiltered bucket names.
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
+    async fn list_buckets_for_session(
+        &self,
+        _session_context: &SessionContext,
+        _request_headers: &http::HeaderMap,
+        _secure_transport: bool,
+    ) -> rustfs_s3_types::S3Result<ListBucketsOutput> {
+        Err(rustfs_s3_types::S3Error::with_message(
+            rustfs_s3_types::S3ErrorCode::AccessDenied,
+            "Session-aware bucket listing is not supported",
+        ))
+    }
+    /// Gather the capacity view backing WebDAV quota properties.
+    ///
+    /// `Ok(None)` means the backend cannot report capacity, in which case the
+    /// driver omits quota properties from PROPFIND responses. The default
+    /// keeps backends that predate quota reporting capacity-transparent.
+    #[cfg(feature = "webdav")]
+    async fn session_capacity_view(
+        &self,
+        _session_context: &SessionContext,
+        _request_headers: &http::HeaderMap,
+        _secure_transport: bool,
+    ) -> rustfs_s3_types::S3Result<Option<SessionCapacityView>> {
+        Ok(None)
+    }
     /// Create a new bucket
-    async fn create_bucket(&self, bucket: &str, access_key: &str, secret_key: &str) -> Result<CreateBucketOutput, Self::Error>;
+    async fn create_bucket(&self, bucket: &str, credentials: &Credentials) -> Result<CreateBucketOutput, Self::Error>;
     /// Delete a bucket (must be empty)
-    async fn delete_bucket(&self, bucket: &str, access_key: &str, secret_key: &str) -> Result<DeleteBucketOutput, Self::Error>;
+    async fn delete_bucket(&self, bucket: &str, credentials: &Credentials) -> Result<DeleteBucketOutput, Self::Error>;
     /// Server-side copy of an object from one bucket+key to another.
     /// The input carries the full S3 surface (content type, metadata map,
     /// metadata directive, storage class, SSE config, conditional-copy
     /// headers) so protocol drivers can map client-supplied metadata
     /// onto the destination object.
-    async fn copy_object(
-        &self,
-        input: CopyObjectInput,
-        access_key: &str,
-        secret_key: &str,
-    ) -> Result<CopyObjectOutput, Self::Error>;
+    async fn copy_object(&self, input: CopyObjectInput, credentials: &Credentials) -> Result<CopyObjectOutput, Self::Error>;
     /// Initiate a multipart upload. Returns an upload_id that identifies
     /// the in-progress upload for subsequent UploadPart, CompleteMultipartUpload,
     /// and AbortMultipartUpload calls. The input carries the full S3 surface
@@ -91,25 +156,18 @@ pub trait StorageBackend: Send + Sync {
     async fn create_multipart_upload(
         &self,
         input: CreateMultipartUploadInput,
-        access_key: &str,
-        secret_key: &str,
+        credentials: &Credentials,
     ) -> Result<CreateMultipartUploadOutput, Self::Error>;
     /// Upload one part of a multipart upload. The part_number must be in
     /// the range 1 to the 10 000-part S3 limit. The returned ETag
     /// identifies the part in the subsequent CompleteMultipartUpload call.
-    async fn upload_part(
-        &self,
-        input: UploadPartInput,
-        access_key: &str,
-        secret_key: &str,
-    ) -> Result<UploadPartOutput, Self::Error>;
+    async fn upload_part(&self, input: UploadPartInput, credentials: &Credentials) -> Result<UploadPartOutput, Self::Error>;
     /// Assemble the parts listed in the input into the final object.
     /// The parts list must be sorted by part_number with no duplicates.
     async fn complete_multipart_upload(
         &self,
         input: CompleteMultipartUploadInput,
-        access_key: &str,
-        secret_key: &str,
+        credentials: &Credentials,
     ) -> Result<CompleteMultipartUploadOutput, Self::Error>;
     /// Abort an in-progress multipart upload. Releases any storage
     /// associated with the upload_id. Idempotent: calling abort on an
@@ -119,8 +177,7 @@ pub trait StorageBackend: Send + Sync {
     async fn abort_multipart_upload(
         &self,
         input: AbortMultipartUploadInput,
-        access_key: &str,
-        secret_key: &str,
+        credentials: &Credentials,
     ) -> Result<AbortMultipartUploadOutput, Self::Error>;
     /// Copy a byte range from an existing object into a part of an
     /// in-progress multipart upload. Used by rename for objects larger
@@ -128,7 +185,6 @@ pub trait StorageBackend: Send + Sync {
     async fn upload_part_copy(
         &self,
         input: UploadPartCopyInput,
-        access_key: &str,
-        secret_key: &str,
+        credentials: &Credentials,
     ) -> Result<UploadPartCopyOutput, Self::Error>;
 }

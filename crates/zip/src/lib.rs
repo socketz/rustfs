@@ -12,22 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use async_compression::tokio::bufread::{BzDecoder, GzipDecoder, XzDecoder, ZlibDecoder, ZstdDecoder};
-use async_compression::tokio::write::{BzEncoder, GzipEncoder, XzEncoder, ZlibEncoder, ZstdEncoder};
-use std::collections::HashSet;
-use std::future::Future;
-use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+use async_compression::{
+    tokio::bufread::{BzDecoder, GzipDecoder, Lz4Decoder, XzDecoder, ZlibDecoder, ZstdDecoder},
+    zstd::DParameter,
+};
+use rustfs_rio::S2Decoder;
+use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use thiserror::Error;
-use tokio::fs::File;
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
-use tokio::task::spawn_blocking;
-use tokio_stream::StreamExt;
-use tokio_tar::Archive;
-use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
+
+const MAGIC_SNIFF_LEN: usize = 6;
+const TAR_HEADER_LEN: usize = 512;
+const TAR_CHECKSUM_START: usize = 148;
+const TAR_CHECKSUM_END: usize = 156;
+const SHARED_SKIPPABLE_FRAME_HEADER_LEN: usize = 8;
+const SNIFF_DISCARD_BUFFER_LEN: usize = 8 * 1024;
+const SNIFF_YIELD_AFTER_BYTES: usize = 64 * 1024;
+const SNIFF_YIELD_AFTER_FRAMES: usize = 64;
+const SNIFF_YIELD_AFTER_READY_READS: usize = 64;
+
+// XZ declares its LZMA2 dictionary size before producing decoded bytes, so the
+// decoded-size guard cannot prevent that allocation. This accepts every
+// standard xz preset (the largest needs about 65 MiB to decode) while keeping
+// one Snowball decoder well below the multi-gigabyte archive budget.
+const XZ_DECODER_MEMORY_LIMIT_BYTES: u64 = 128_u64 * 1024 * 1024;
+// Match MinIO's Snowball decoder boundary so a frame cannot reserve an
+// oversized history window before the decoded-size guard observes any bytes.
+const ZSTD_DECODER_MAX_WINDOW_LOG: u32 = 24;
 
 pub type Result<T> = std::result::Result<T, ZipError>;
 
@@ -38,51 +51,8 @@ pub enum ZipError {
         format: CompressionFormat,
         operation: &'static str,
     },
-    #[error("invalid compression level {0}: value exceeds i32::MAX")]
-    InvalidCompressionLevel(u32),
-    #[error("unsafe archive entry path: {0}")]
-    UnsafeEntryPath(String),
-    #[error("archive entry path length {length} exceeds limit {limit}: {path}")]
-    EntryPathTooLong { path: String, length: usize, limit: usize },
-    #[error("archive entry count {count} exceeds limit {limit}")]
-    EntryCountLimitExceeded { count: usize, limit: usize },
-    #[error("archive entry '{path}' size {size} exceeds limit {limit}")]
-    EntrySizeLimitExceeded { path: String, size: u64, limit: u64 },
-    #[error("archive total unpacked size {size} exceeds limit {limit}")]
-    TotalUnpackedSizeLimitExceeded { size: u64, limit: u64 },
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[error(transparent)]
-    Zip(#[from] zip::result::ZipError),
-    #[error(transparent)]
-    Join(#[from] tokio::task::JoinError),
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum CompressionCodec {
-    Gzip,
-    Bzip2,
-    Xz,
-    Zlib,
-    Zstd,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum ArchiveKind {
-    Tar,
-    Zip,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum ArchiveFormat {
-    Tar,
-    TarGzip,
-    TarBzip2,
-    TarXz,
-    TarZlib,
-    TarZstd,
-    Zip,
-    Unknown,
+    #[error("failed to inspect archive compression magic")]
+    InspectStream(#[source] io::Error),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -93,45 +63,186 @@ pub enum CompressionFormat {
     Xz,
     Zlib,
     Zstd,
+    Lz4,
+    S2,
     Tar,
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CompressionLevel {
-    Fastest,
-    Best,
-    #[default]
-    Default,
-    Level(u32),
+/// Reader returned by [`CompressionFormat::sniff`]. It replays the bounded
+/// prefix that identified the codec before continuing with the original
+/// stream. Codec-neutral leading skippable frames are consumed by `sniff` and
+/// intentionally omitted from the replayed stream.
+#[derive(Debug)]
+pub struct SniffedReader<R> {
+    inner: R,
+    prefix: Vec<u8>,
+    prefix_pos: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ZipEntry {
-    pub name: String,
-    pub size: u64,
-    pub compressed_size: u64,
-    pub is_dir: bool,
-    pub compression_method: String,
-    pub archive_kind: ArchiveKind,
-    pub format: ArchiveFormat,
-    pub unix_mode: Option<u32>,
+impl<R> AsyncRead for SniffedReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if self.prefix_pos < self.prefix.len() && buf.remaining() > 0 {
+            let to_copy = buf.remaining().min(self.prefix.len() - self.prefix_pos);
+            buf.put_slice(&self.prefix[self.prefix_pos..self.prefix_pos + to_copy]);
+            self.prefix_pos += to_copy;
+            return Poll::Ready(Ok(()));
+        }
+
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ZipExtractSummary {
-    pub entry_count: usize,
-    pub directory_count: usize,
-    pub file_count: usize,
-    pub total_unpacked_size: u64,
+fn is_shared_skippable_magic(prefix: &[u8]) -> bool {
+    prefix.len() >= 4 && (0x50..=0x5f).contains(&prefix[0]) && prefix[1..4] == [0x2a, 0x4d, 0x18]
 }
 
+#[derive(Debug, Default)]
+struct SniffYieldBudget {
+    ready_reads: usize,
+    input_bytes: usize,
+    frames: usize,
+}
+
+impl SniffYieldBudget {
+    async fn record_read(&mut self, read: usize) {
+        self.ready_reads = self.ready_reads.saturating_add(1);
+        self.input_bytes = self.input_bytes.saturating_add(read);
+        if self.ready_reads >= SNIFF_YIELD_AFTER_READY_READS || self.input_bytes >= SNIFF_YIELD_AFTER_BYTES {
+            self.yield_now().await;
+        }
+    }
+
+    async fn record_frame(&mut self) {
+        self.frames = self.frames.saturating_add(1);
+        if self.frames >= SNIFF_YIELD_AFTER_FRAMES {
+            self.yield_now().await;
+        }
+    }
+
+    async fn yield_now(&mut self) {
+        tokio::task::yield_now().await;
+        self.ready_reads = 0;
+        self.input_bytes = 0;
+        self.frames = 0;
+    }
+}
+
+async fn inspect_fill_to<R>(input: &mut R, output: &mut Vec<u8>, target_len: usize, budget: &mut SniffYieldBudget) -> Result<bool>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut scratch = [0u8; TAR_HEADER_LEN];
+    while output.len() < target_len {
+        let remaining = target_len - output.len();
+        let to_read = remaining.min(scratch.len());
+        let read = input.read(&mut scratch[..to_read]).await.map_err(ZipError::InspectStream)?;
+        if read == 0 {
+            return Ok(false);
+        }
+        output.extend_from_slice(&scratch[..read]);
+        budget.record_read(read).await;
+    }
+    Ok(true)
+}
+
+async fn inspect_discard_fully<R>(
+    input: &mut R,
+    mut remaining: u64,
+    budget: &mut SniffYieldBudget,
+    truncated_message: &'static str,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut discard = [0u8; SNIFF_DISCARD_BUFFER_LEN];
+    while remaining > 0 {
+        let to_read = usize::try_from(remaining).map_or(discard.len(), |remaining| remaining.min(discard.len()));
+        let read = input.read(&mut discard[..to_read]).await.map_err(ZipError::InspectStream)?;
+        if read == 0 {
+            return Err(ZipError::InspectStream(io::Error::new(io::ErrorKind::UnexpectedEof, truncated_message)));
+        }
+        let read_u64 =
+            u64::try_from(read).map_err(|_| ZipError::InspectStream(io::Error::other("skippable frame read size overflowed")))?;
+        remaining -= read_u64;
+        budget.record_read(read).await;
+    }
+    Ok(())
+}
+
+fn tar_octal_field(field: &[u8]) -> Option<u64> {
+    let mut value = 0u64;
+    let mut saw_digit = false;
+    let mut terminated = false;
+
+    for byte in field {
+        match *byte {
+            b'0'..=b'7' if !terminated => {
+                saw_digit = true;
+                value = value.checked_mul(8)?.checked_add(u64::from(*byte - b'0'))?;
+            }
+            b' ' if !saw_digit && !terminated => {}
+            b' ' | 0 if saw_digit || terminated => terminated = true,
+            0 => terminated = true,
+            _ => return None,
+        }
+    }
+
+    saw_digit.then_some(value)
+}
+
+fn tar_numeric_field_has_shape(field: &[u8]) -> bool {
+    if field.first().is_some_and(|byte| byte & 0x80 != 0) {
+        return true;
+    }
+    tar_octal_field(field).is_some() || field.iter().all(|byte| matches!(*byte, b' ' | 0))
+}
+
+fn is_tar_header(prefix: &[u8]) -> bool {
+    let Some(header) = prefix.get(..TAR_HEADER_LEN) else {
+        return false;
+    };
+    if header.iter().all(|byte| *byte == 0) {
+        return true;
+    }
+
+    let has_path = header[..100].iter().any(|byte| *byte != 0);
+    if !has_path
+        || ![(100, 108), (108, 116), (116, 124), (124, 136), (136, 148)]
+            .iter()
+            .all(|(start, end)| tar_numeric_field_has_shape(&header[*start..*end]))
+    {
+        return false;
+    }
+
+    let Some(expected) = tar_octal_field(&header[TAR_CHECKSUM_START..TAR_CHECKSUM_END]) else {
+        return false;
+    };
+    let actual = header[..TAR_CHECKSUM_START]
+        .iter()
+        .chain(std::iter::repeat_n(&b' ', TAR_CHECKSUM_END - TAR_CHECKSUM_START))
+        .chain(&header[TAR_CHECKSUM_END..])
+        .fold(0u64, |sum, byte| sum + u64::from(*byte));
+    actual == expected
+}
+
+/// Archive guardrails. The values are carried here so every archive caller
+/// shares one default policy; enforcement belongs to the caller, which maps a
+/// breach onto its own protocol error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchiveLimits {
     pub max_entries: usize,
     pub max_entry_size: u64,
     pub max_total_unpacked_size: u64,
+    pub max_decoded_size: u64,
     pub max_path_length: usize,
+    pub max_pax_metadata_size: u64,
+    pub max_total_pax_metadata_size: u64,
+    pub max_pax_metadata_records: usize,
+    pub max_total_pax_metadata_records: usize,
     pub validate_entry_paths: bool,
 }
 
@@ -141,107 +252,34 @@ impl Default for ArchiveLimits {
             max_entries: 100_000,
             max_entry_size: 1_073_741_824,
             max_total_unpacked_size: 10_737_418_240,
+            max_decoded_size: 11_811_160_064,
             max_path_length: 1024,
+            max_pax_metadata_size: 1_048_576,
+            max_total_pax_metadata_size: 67_108_864,
+            max_pax_metadata_records: 4_096,
+            max_total_pax_metadata_records: 100_000,
             validate_entry_paths: true,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ZipWriteOptions {
-    pub compression_level: CompressionLevel,
-    pub create_directory_entries: bool,
-}
-
-impl Default for ZipWriteOptions {
-    fn default() -> Self {
-        Self {
-            compression_level: CompressionLevel::Default,
-            create_directory_entries: false,
-        }
-    }
-}
-
-const SMALL_ZIP_EXTRACT_FAST_PATH_LIMIT: u64 = 8 * 1024;
-
-#[derive(Clone, Default)]
-struct SharedBuffer {
-    inner: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedBuffer {
-    fn into_vec(self) -> Vec<u8> {
-        self.inner.lock().expect("shared in-memory writer lock poisoned").clone()
-    }
-}
-
-impl AsyncWrite for SharedBuffer {
-    fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| io::Error::other("shared in-memory writer lock poisoned"))?;
-        inner.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
 impl CompressionFormat {
+    /// Map an archive extension onto the stream codec needed to read it.
+    /// Tar-family suffixes (`tgz`, `tbz2`, `txz`, `tzst`, ...) resolve to their
+    /// codec because the tar container itself is read from the decoded stream.
     pub fn from_extension(ext: &str) -> Self {
-        Self::from_archive_format(ArchiveFormat::from_extension(ext))
-    }
-
-    pub fn from_archive_format(format: ArchiveFormat) -> Self {
-        match format {
-            ArchiveFormat::TarGzip => CompressionFormat::Gzip,
-            ArchiveFormat::TarBzip2 => CompressionFormat::Bzip2,
-            ArchiveFormat::TarXz => CompressionFormat::Xz,
-            ArchiveFormat::TarZlib => CompressionFormat::Zlib,
-            ArchiveFormat::TarZstd => CompressionFormat::Zstd,
-            ArchiveFormat::Tar => CompressionFormat::Tar,
-            ArchiveFormat::Zip => CompressionFormat::Zip,
-            ArchiveFormat::Unknown => CompressionFormat::Unknown,
+        match ext.to_ascii_lowercase().as_str() {
+            "gz" | "gzip" | "tgz" => CompressionFormat::Gzip,
+            "bz2" | "bzip2" | "tbz" | "tbz2" => CompressionFormat::Bzip2,
+            "xz" | "txz" => CompressionFormat::Xz,
+            "zlib" | "zz" => CompressionFormat::Zlib,
+            "zst" | "zstd" | "tzst" => CompressionFormat::Zstd,
+            "lz4" | "tlz4" => CompressionFormat::Lz4,
+            "s2" | "snappy" => CompressionFormat::S2,
+            "tar" => CompressionFormat::Tar,
+            "zip" => CompressionFormat::Zip,
+            _ => CompressionFormat::Unknown,
         }
-    }
-
-    pub fn archive_format_from_path<P: AsRef<Path>>(path: P) -> ArchiveFormat {
-        ArchiveFormat::from_path(path)
-    }
-
-    pub fn archive_kind(&self) -> Option<ArchiveKind> {
-        match self {
-            CompressionFormat::Tar => Some(ArchiveKind::Tar),
-            CompressionFormat::Zip => Some(ArchiveKind::Zip),
-            CompressionFormat::Gzip
-            | CompressionFormat::Bzip2
-            | CompressionFormat::Xz
-            | CompressionFormat::Zlib
-            | CompressionFormat::Zstd
-            | CompressionFormat::Unknown => None,
-        }
-    }
-
-    pub fn compression_codec(&self) -> Option<CompressionCodec> {
-        match self {
-            CompressionFormat::Gzip => Some(CompressionCodec::Gzip),
-            CompressionFormat::Bzip2 => Some(CompressionCodec::Bzip2),
-            CompressionFormat::Xz => Some(CompressionCodec::Xz),
-            CompressionFormat::Zlib => Some(CompressionCodec::Zlib),
-            CompressionFormat::Zstd => Some(CompressionCodec::Zstd),
-            CompressionFormat::Tar | CompressionFormat::Zip | CompressionFormat::Unknown => None,
-        }
-    }
-
-    pub fn from_path<P: AsRef<Path>>(path: P) -> Self {
-        Self::from_archive_format(ArchiveFormat::from_path(path))
     }
 
     pub fn extension(&self) -> &'static str {
@@ -252,13 +290,145 @@ impl CompressionFormat {
             CompressionFormat::Xz => "xz",
             CompressionFormat::Zlib => "zlib",
             CompressionFormat::Zstd => "zst",
+            CompressionFormat::Lz4 => "lz4",
+            CompressionFormat::S2 => "s2",
             CompressionFormat::Tar => "tar",
             CompressionFormat::Unknown => "",
         }
     }
 
-    pub fn is_supported(&self) -> bool {
-        !matches!(self, CompressionFormat::Unknown)
+    /// Detect a stream codec from an unambiguous bounded prefix. Ordinary
+    /// unknown bytes are a raw TAR stream, matching MinIO Snowball behavior;
+    /// the skippable-frame magic shared by Zstd and LZ4 remains
+    /// [`CompressionFormat::Unknown`] until [`Self::sniff`] sees a later frame.
+    /// Object names and suffixes do not participate in detection.
+    ///
+    /// Zlib deliberately has no magic match here: its two-byte header can also
+    /// be the start of a valid TAR member name. Callers preserving historical
+    /// zlib-by-extension behavior must apply that compatibility fallback only
+    /// after this method returns [`CompressionFormat::Tar`].
+    /// ZIP signatures are also left as TAR because stream ZIP decoding is not
+    /// supported and those bytes are valid at the start of a TAR member name.
+    pub fn from_magic(prefix: &[u8]) -> Self {
+        if prefix.starts_with(&[0x1f, 0x8b, 0x08]) {
+            return Self::Gzip;
+        }
+        if prefix.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+            return Self::Zstd;
+        }
+        if is_shared_skippable_magic(prefix) {
+            return Self::Unknown;
+        }
+        if prefix.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+            return Self::Lz4;
+        }
+        if prefix.starts_with(&[0xff, 0x06, 0x00, 0x00]) {
+            return Self::S2;
+        }
+        if prefix.starts_with(b"BZh") {
+            return Self::Bzip2;
+        }
+        if prefix.starts_with(&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) {
+            return Self::Xz;
+        }
+        Self::Tar
+    }
+
+    /// Identify the codec and return a reader that replays the deciding prefix.
+    /// A complete, checksum-valid TAR header wins over a codec-like member-name
+    /// prefix. Leading skippable frames shared by the Zstd and LZ4 frame formats
+    /// are discarded with bounded memory until a non-skippable frame identifies
+    /// the decoder. The underlying reader still observes every discarded byte,
+    /// so callers can keep transport length and checksum accounting below this
+    /// boundary.
+    pub async fn sniff<R>(mut input: R) -> Result<(Self, SniffedReader<R>)>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut prefix = Vec::with_capacity(TAR_HEADER_LEN);
+        let mut budget = SniffYieldBudget::default();
+        let _ = inspect_fill_to(&mut input, &mut prefix, MAGIC_SNIFF_LEN, &mut budget).await?;
+        let deciding_prefix_len = prefix.len().min(MAGIC_SNIFF_LEN);
+        let initial_format = Self::from_magic(&prefix[..deciding_prefix_len]);
+        let needs_tar_disambiguation =
+            matches!(initial_format, Self::Bzip2 | Self::Lz4) || is_shared_skippable_magic(&prefix[..deciding_prefix_len]);
+        if !needs_tar_disambiguation {
+            return Ok((
+                initial_format,
+                SniffedReader {
+                    inner: input,
+                    prefix,
+                    prefix_pos: 0,
+                },
+            ));
+        }
+
+        let _ = inspect_fill_to(&mut input, &mut prefix, TAR_HEADER_LEN, &mut budget).await?;
+        if is_tar_header(&prefix) {
+            return Ok((
+                Self::Tar,
+                SniffedReader {
+                    inner: input,
+                    prefix,
+                    prefix_pos: 0,
+                },
+            ));
+        }
+
+        let mut skipped_shared_frame = false;
+
+        loop {
+            if prefix.len() < MAGIC_SNIFF_LEN {
+                let _ = inspect_fill_to(&mut input, &mut prefix, MAGIC_SNIFF_LEN, &mut budget).await?;
+            }
+            let deciding_prefix_len = prefix.len().min(MAGIC_SNIFF_LEN);
+            if !is_shared_skippable_magic(&prefix[..deciding_prefix_len]) {
+                let mut format = Self::from_magic(&prefix[..deciding_prefix_len]);
+                if skipped_shared_frame && !matches!(format, Self::Zstd | Self::Lz4) {
+                    format = Self::Unknown;
+                }
+                return Ok((
+                    format,
+                    SniffedReader {
+                        inner: input,
+                        prefix,
+                        prefix_pos: 0,
+                    },
+                ));
+            }
+
+            skipped_shared_frame = true;
+            let complete_header =
+                inspect_fill_to(&mut input, &mut prefix, SHARED_SKIPPABLE_FRAME_HEADER_LEN, &mut budget).await?;
+            if !complete_header {
+                return Err(ZipError::InspectStream(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "truncated shared Zstd/LZ4 skippable frame header",
+                )));
+            }
+            let payload_len =
+                usize::try_from(u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]])).map_err(|_| {
+                    ZipError::InspectStream(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "shared Zstd/LZ4 skippable frame length does not fit usize",
+                    ))
+                })?;
+            let buffered_payload_len = (prefix.len() - SHARED_SKIPPABLE_FRAME_HEADER_LEN).min(payload_len);
+            let buffered_frame_len = SHARED_SKIPPABLE_FRAME_HEADER_LEN
+                .checked_add(buffered_payload_len)
+                .ok_or_else(|| ZipError::InspectStream(io::Error::other("skippable frame buffered length overflowed")))?;
+            prefix.drain(..buffered_frame_len);
+            let remaining_payload_len = payload_len - buffered_payload_len;
+            inspect_discard_fully(
+                &mut input,
+                u64::try_from(remaining_payload_len)
+                    .map_err(|_| ZipError::InspectStream(io::Error::other("skippable frame remaining length exceeds u64")))?,
+                &mut budget,
+                "truncated shared Zstd/LZ4 skippable frame payload",
+            )
+            .await?;
+            budget.record_frame().await;
+        }
     }
 
     pub fn get_decoder<R>(&self, input: R) -> Result<Box<dyn AsyncRead + Send + Unpin>>
@@ -268,11 +438,37 @@ impl CompressionFormat {
         let reader = BufReader::new(input);
 
         let decoder: Box<dyn AsyncRead + Send + Unpin + 'static> = match self {
-            CompressionFormat::Gzip => Box::new(GzipDecoder::new(reader)),
-            CompressionFormat::Bzip2 => Box::new(BzDecoder::new(reader)),
-            CompressionFormat::Zlib => Box::new(ZlibDecoder::new(reader)),
-            CompressionFormat::Xz => Box::new(XzDecoder::new(reader)),
-            CompressionFormat::Zstd => Box::new(ZstdDecoder::new(reader)),
+            CompressionFormat::Gzip => {
+                let mut decoder = GzipDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::Bzip2 => {
+                let mut decoder = BzDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::Zlib => {
+                let mut decoder = ZlibDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::Xz => {
+                let mut decoder = XzDecoder::with_mem_limit(reader, XZ_DECODER_MEMORY_LIMIT_BYTES);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::Zstd => {
+                let mut decoder = ZstdDecoder::with_params(reader, &[DParameter::window_log_max(ZSTD_DECODER_MAX_WINDOW_LOG)]);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::Lz4 => {
+                let mut decoder = Lz4Decoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::S2 => Box::new(S2Decoder::new(reader)),
             CompressionFormat::Tar => Box::new(reader),
             CompressionFormat::Zip => {
                 return Err(ZipError::UnsupportedFormat {
@@ -290,616 +486,248 @@ impl CompressionFormat {
 
         Ok(decoder)
     }
-
-    fn convert_level(level: CompressionLevel) -> Result<async_compression::Level> {
-        match level {
-            CompressionLevel::Fastest => Ok(async_compression::Level::Fastest),
-            CompressionLevel::Best => Ok(async_compression::Level::Best),
-            CompressionLevel::Default => Ok(async_compression::Level::Default),
-            CompressionLevel::Level(n) => {
-                let level = i32::try_from(n).map_err(|_| ZipError::InvalidCompressionLevel(n))?;
-                Ok(async_compression::Level::Precise(level))
-            }
-        }
-    }
-
-    pub fn get_encoder<W>(&self, output: W, level: CompressionLevel) -> Result<Box<dyn AsyncWrite + Send + Unpin>>
-    where
-        W: AsyncWrite + Send + Unpin + 'static,
-    {
-        let writer = BufWriter::new(output);
-
-        let encoder: Box<dyn AsyncWrite + Send + Unpin + 'static> = match self {
-            CompressionFormat::Gzip => Box::new(GzipEncoder::with_quality(writer, Self::convert_level(level)?)),
-            CompressionFormat::Bzip2 => Box::new(BzEncoder::with_quality(writer, Self::convert_level(level)?)),
-            CompressionFormat::Zlib => Box::new(ZlibEncoder::with_quality(writer, Self::convert_level(level)?)),
-            CompressionFormat::Xz => Box::new(XzEncoder::with_quality(writer, Self::convert_level(level)?)),
-            CompressionFormat::Zstd => Box::new(ZstdEncoder::with_quality(writer, Self::convert_level(level)?)),
-            CompressionFormat::Tar => Box::new(writer),
-            CompressionFormat::Zip => {
-                return Err(ZipError::UnsupportedFormat {
-                    format: *self,
-                    operation: "stream encoding",
-                });
-            }
-            CompressionFormat::Unknown => {
-                return Err(ZipError::UnsupportedFormat {
-                    format: *self,
-                    operation: "encoding",
-                });
-            }
-        };
-
-        Ok(encoder)
-    }
-}
-
-impl ArchiveFormat {
-    pub fn from_extension(ext: &str) -> Self {
-        match ext.to_ascii_lowercase().as_str() {
-            "gz" | "gzip" | "tgz" => ArchiveFormat::TarGzip,
-            "bz2" | "bzip2" | "tbz" | "tbz2" => ArchiveFormat::TarBzip2,
-            "xz" | "txz" => ArchiveFormat::TarXz,
-            "zlib" | "zz" => ArchiveFormat::TarZlib,
-            "zst" | "zstd" | "tzst" => ArchiveFormat::TarZstd,
-            "tar" => ArchiveFormat::Tar,
-            "zip" => ArchiveFormat::Zip,
-            _ => ArchiveFormat::Unknown,
-        }
-    }
-
-    pub fn from_path<P: AsRef<Path>>(path: P) -> Self {
-        let path = path.as_ref();
-        let lower_name = path.file_name().and_then(|name| name.to_str()).map(str::to_ascii_lowercase);
-
-        if let Some(name) = lower_name {
-            if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
-                return ArchiveFormat::TarGzip;
-            }
-            if name.ends_with(".tar.bz2") || name.ends_with(".tbz") || name.ends_with(".tbz2") {
-                return ArchiveFormat::TarBzip2;
-            }
-            if name.ends_with(".tar.xz") || name.ends_with(".txz") {
-                return ArchiveFormat::TarXz;
-            }
-            if name.ends_with(".tar.zst") || name.ends_with(".tzst") {
-                return ArchiveFormat::TarZstd;
-            }
-            if name.ends_with(".tar.zlib") {
-                return ArchiveFormat::TarZlib;
-            }
-        }
-
-        path.extension()
-            .and_then(|s| s.to_str())
-            .map(Self::from_extension)
-            .unwrap_or(ArchiveFormat::Unknown)
-    }
-
-    pub fn archive_kind(&self) -> Option<ArchiveKind> {
-        match self {
-            ArchiveFormat::Tar
-            | ArchiveFormat::TarGzip
-            | ArchiveFormat::TarBzip2
-            | ArchiveFormat::TarXz
-            | ArchiveFormat::TarZlib
-            | ArchiveFormat::TarZstd => Some(ArchiveKind::Tar),
-            ArchiveFormat::Zip => Some(ArchiveKind::Zip),
-            ArchiveFormat::Unknown => None,
-        }
-    }
-
-    pub fn compression_codec(&self) -> Option<CompressionCodec> {
-        match self {
-            ArchiveFormat::TarGzip => Some(CompressionCodec::Gzip),
-            ArchiveFormat::TarBzip2 => Some(CompressionCodec::Bzip2),
-            ArchiveFormat::TarXz => Some(CompressionCodec::Xz),
-            ArchiveFormat::TarZlib => Some(CompressionCodec::Zlib),
-            ArchiveFormat::TarZstd => Some(CompressionCodec::Zstd),
-            ArchiveFormat::Tar | ArchiveFormat::Zip | ArchiveFormat::Unknown => None,
-        }
-    }
-
-    pub fn extension(&self) -> &'static str {
-        match self {
-            ArchiveFormat::Tar => "tar",
-            ArchiveFormat::TarGzip => "tar.gz",
-            ArchiveFormat::TarBzip2 => "tar.bz2",
-            ArchiveFormat::TarXz => "tar.xz",
-            ArchiveFormat::TarZlib => "tar.zlib",
-            ArchiveFormat::TarZstd => "tar.zst",
-            ArchiveFormat::Zip => "zip",
-            ArchiveFormat::Unknown => "",
-        }
-    }
-}
-
-/// Read entries from a tar-family archive stream.
-///
-/// Supported formats are:
-/// - `CompressionFormat::Tar`
-/// - `CompressionFormat::Gzip`
-/// - `CompressionFormat::Bzip2`
-/// - `CompressionFormat::Xz`
-/// - `CompressionFormat::Zlib`
-/// - `CompressionFormat::Zstd`
-///
-/// `CompressionFormat::Zip` is intentionally not supported here because ZIP
-/// requires central-directory semantics and is handled through file-based
-/// helper APIs.
-pub async fn read_archive_entries<R, F, Fut>(input: R, format: CompressionFormat, callback: F) -> Result<()>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    F: FnMut(tokio_tar::Entry<Archive<Box<dyn AsyncRead + Send + Unpin + 'static>>>) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<()>> + Send,
-{
-    read_archive_entries_with_limits(input, format, ArchiveLimits::default(), callback).await
-}
-
-pub async fn read_archive_entries_with_limits<R, F, Fut>(
-    input: R,
-    format: CompressionFormat,
-    limits: ArchiveLimits,
-    mut callback: F,
-) -> Result<()>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    F: FnMut(tokio_tar::Entry<Archive<Box<dyn AsyncRead + Send + Unpin + 'static>>>) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<()>> + Send,
-{
-    let decoder = format.get_decoder(input)?;
-    let mut ar = Archive::new(decoder);
-    let mut entries = ar.entries()?;
-    let mut entry_count = 0_usize;
-    let mut total_unpacked_size = 0_u64;
-
-    while let Some(entry) = entries.next().await {
-        let entry = entry?;
-        entry_count += 1;
-        validate_archive_entry_count(entry_count, limits)?;
-
-        let entry_path = entry.path()?.to_string_lossy().into_owned();
-        validate_archive_entry_name(&entry_path, limits)?;
-
-        let entry_size = entry.header().size()?;
-        validate_archive_entry_size(&entry_path, entry_size, limits)?;
-        total_unpacked_size = total_unpacked_size.saturating_add(entry_size);
-        validate_archive_total_size(total_unpacked_size, limits)?;
-
-        callback(entry).await?;
-    }
-
-    Ok(())
-}
-
-/// Backward-compatible wrapper for archive entry iteration.
-pub async fn decompress<R, F, Fut>(input: R, format: CompressionFormat, callback: F) -> Result<()>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    F: FnMut(tokio_tar::Entry<Archive<Box<dyn AsyncRead + Send + Unpin + 'static>>>) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<()>> + Send,
-{
-    read_archive_entries(input, format, callback).await
-}
-
-/// Explicit tar-family alias for callers that want a clearer name than
-/// `decompress()`.
-pub async fn extract_tar_entries<R, F, Fut>(input: R, format: CompressionFormat, callback: F) -> Result<()>
-where
-    R: AsyncRead + Send + Unpin + 'static,
-    F: FnMut(tokio_tar::Entry<Archive<Box<dyn AsyncRead + Send + Unpin + 'static>>>) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<()>> + Send,
-{
-    read_archive_entries(input, format, callback).await
-}
-
-fn normalize_zip_entry_name(name: &str) -> Result<String> {
-    let path = Path::new(name);
-    let mut normalized = PathBuf::new();
-
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => normalized.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(ZipError::UnsafeEntryPath(name.to_string()));
-            }
-        }
-    }
-
-    let normalized = normalized.to_string_lossy().replace('\\', "/");
-    if normalized.is_empty() {
-        return Err(ZipError::UnsafeEntryPath(name.to_string()));
-    }
-
-    Ok(normalized)
-}
-
-fn validate_archive_entry_name(name: &str, limits: ArchiveLimits) -> Result<()> {
-    if !limits.validate_entry_paths {
-        return Ok(());
-    }
-
-    let normalized = normalize_zip_entry_name(name)?;
-    let length = normalized.len();
-    if length > limits.max_path_length {
-        return Err(ZipError::EntryPathTooLong {
-            path: normalized,
-            length,
-            limit: limits.max_path_length,
-        });
-    }
-
-    Ok(())
-}
-
-fn validate_archive_entry_size(path: &str, size: u64, limits: ArchiveLimits) -> Result<()> {
-    if size > limits.max_entry_size {
-        return Err(ZipError::EntrySizeLimitExceeded {
-            path: path.to_string(),
-            size,
-            limit: limits.max_entry_size,
-        });
-    }
-
-    Ok(())
-}
-
-fn validate_archive_entry_count(count: usize, limits: ArchiveLimits) -> Result<()> {
-    if count > limits.max_entries {
-        return Err(ZipError::EntryCountLimitExceeded {
-            count,
-            limit: limits.max_entries,
-        });
-    }
-
-    Ok(())
-}
-
-fn validate_archive_total_size(total_size: u64, limits: ArchiveLimits) -> Result<()> {
-    if total_size > limits.max_total_unpacked_size {
-        return Err(ZipError::TotalUnpackedSizeLimitExceeded {
-            size: total_size,
-            limit: limits.max_total_unpacked_size,
-        });
-    }
-
-    Ok(())
-}
-
-fn zip_method_for_level(level: CompressionLevel) -> CompressionMethod {
-    match level {
-        CompressionLevel::Fastest => CompressionMethod::Stored,
-        CompressionLevel::Best | CompressionLevel::Default | CompressionLevel::Level(_) => CompressionMethod::Deflated,
-    }
-}
-
-fn parent_directories_for(path: &str) -> Vec<String> {
-    let path = Path::new(path);
-    let mut current = PathBuf::new();
-    let mut directories = Vec::new();
-
-    if let Some(parent) = path.parent() {
-        for component in parent.components() {
-            if let Component::Normal(part) = component {
-                current.push(part);
-                directories.push(format!("{}/", current.to_string_lossy().replace('\\', "/")));
-            }
-        }
-    }
-
-    directories
-}
-
-fn ensure_directory(path: &Path, created_directories: &mut HashSet<PathBuf>) -> Result<()> {
-    let path = path.to_path_buf();
-    if created_directories.insert(path.clone()) {
-        std::fs::create_dir_all(&path)?;
-    }
-
-    Ok(())
-}
-
-fn write_small_zip_entry<R: Read>(reader: &mut R, output_path: &Path, size: u64) -> Result<()> {
-    let size = usize::try_from(size).map_err(|_| io::Error::other("small zip entry size overflow"))?;
-    let mut buffer = [0_u8; SMALL_ZIP_EXTRACT_FAST_PATH_LIMIT as usize];
-    reader.read_exact(&mut buffer[..size])?;
-    std::fs::write(output_path, &buffer[..size])?;
-    Ok(())
-}
-
-pub async fn extract_zip_simple<P: AsRef<Path>, Q: AsRef<Path>>(zip_path: P, extract_to: Q) -> Result<Vec<ZipEntry>> {
-    extract_zip_with_limits(zip_path, extract_to, ArchiveLimits::default()).await
-}
-
-pub async fn extract_zip_to_path_with_limits<P: AsRef<Path>, Q: AsRef<Path>>(
-    zip_path: P,
-    extract_to: Q,
-    limits: ArchiveLimits,
-) -> Result<ZipExtractSummary> {
-    let zip_path = zip_path.as_ref().to_path_buf();
-    let extract_to = extract_to.as_ref().to_path_buf();
-
-    spawn_blocking(move || extract_zip_impl(zip_path, extract_to, limits, false).map(|(_, summary)| summary)).await?
-}
-
-pub async fn extract_zip_with_limits<P: AsRef<Path>, Q: AsRef<Path>>(
-    zip_path: P,
-    extract_to: Q,
-    limits: ArchiveLimits,
-) -> Result<Vec<ZipEntry>> {
-    let zip_path = zip_path.as_ref().to_path_buf();
-    let extract_to = extract_to.as_ref().to_path_buf();
-
-    spawn_blocking(move || extract_zip_impl(zip_path, extract_to, limits, true).map(|(entries, _)| entries.unwrap_or_default()))
-        .await?
-}
-
-fn extract_zip_impl(
-    zip_path: PathBuf,
-    extract_to: PathBuf,
-    limits: ArchiveLimits,
-    collect_entries: bool,
-) -> Result<(Option<Vec<ZipEntry>>, ZipExtractSummary)> {
-    let file = std::fs::File::open(&zip_path)?;
-    let mut archive = ZipArchive::new(file)?;
-    std::fs::create_dir_all(&extract_to)?;
-    let mut created_directories = HashSet::from([extract_to.clone()]);
-
-    let mut entries = collect_entries.then(|| Vec::with_capacity(archive.len()));
-    let mut summary = ZipExtractSummary::default();
-    for index in 0..archive.len() {
-        validate_archive_entry_count(index + 1, limits)?;
-        let mut zip_file = archive.by_index(index)?;
-        let enclosed_name = zip_file
-            .enclosed_name()
-            .ok_or_else(|| ZipError::UnsafeEntryPath(zip_file.name().to_string()))?;
-        let entry_name = enclosed_name.to_string_lossy().replace('\\', "/");
-        let is_dir = zip_file.is_dir();
-        let size = zip_file.size();
-        validate_archive_entry_name(&entry_name, limits)?;
-        validate_archive_entry_size(&entry_name, size, limits)?;
-        summary.total_unpacked_size = summary.total_unpacked_size.saturating_add(size);
-        validate_archive_total_size(summary.total_unpacked_size, limits)?;
-        let output_path = extract_to.join(&enclosed_name);
-
-        if is_dir {
-            ensure_directory(&output_path, &mut created_directories)?;
-            summary.directory_count += 1;
-        } else {
-            if let Some(parent) = output_path.parent() {
-                ensure_directory(parent, &mut created_directories)?;
-            }
-            if size <= SMALL_ZIP_EXTRACT_FAST_PATH_LIMIT {
-                write_small_zip_entry(&mut zip_file, &output_path, size)?;
-            } else {
-                let mut output = std::fs::File::create(&output_path)?;
-                std::io::copy(&mut zip_file, &mut output)?;
-            }
-            summary.file_count += 1;
-        }
-        summary.entry_count += 1;
-
-        if let Some(ref mut entries) = entries {
-            entries.push(ZipEntry {
-                name: entry_name,
-                size,
-                compressed_size: zip_file.compressed_size(),
-                is_dir,
-                compression_method: format!("{:?}", zip_file.compression()),
-                archive_kind: ArchiveKind::Zip,
-                format: ArchiveFormat::Zip,
-                unix_mode: zip_file.unix_mode(),
-            });
-        }
-    }
-
-    Ok((entries, summary))
-}
-
-pub async fn create_zip_simple<P: AsRef<Path>>(
-    zip_path: P,
-    files: Vec<(String, Vec<u8>)>,
-    compression_level: CompressionLevel,
-) -> Result<()> {
-    create_zip_with_options(
-        zip_path,
-        files,
-        ZipWriteOptions {
-            compression_level,
-            ..ZipWriteOptions::default()
-        },
-    )
-    .await
-}
-
-pub async fn create_zip_with_options<P: AsRef<Path>>(
-    zip_path: P,
-    files: Vec<(String, Vec<u8>)>,
-    options: ZipWriteOptions,
-) -> Result<()> {
-    let zip_path = zip_path.as_ref().to_path_buf();
-
-    spawn_blocking(move || -> Result<()> {
-        if let Some(parent) = zip_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let file = std::fs::File::create(&zip_path)?;
-        let mut writer = ZipWriter::new(file);
-        let file_options = SimpleFileOptions::default().compression_method(zip_method_for_level(options.compression_level));
-        let explicit_directories = files
-            .iter()
-            .filter(|(name, _)| name.ends_with('/'))
-            .map(|(name, _)| normalize_zip_entry_name(name))
-            .collect::<Result<HashSet<_>>>()?;
-        let mut written_directories = HashSet::new();
-
-        for (name, contents) in files {
-            let entry_name = normalize_zip_entry_name(&name)?;
-            if name.ends_with('/') {
-                if written_directories.insert(entry_name.clone()) {
-                    writer.add_directory(entry_name, file_options)?;
-                }
-            } else {
-                if options.create_directory_entries {
-                    for directory in parent_directories_for(&entry_name) {
-                        if !explicit_directories.contains(&directory) && written_directories.insert(directory.clone()) {
-                            writer.add_directory(directory, file_options)?;
-                        }
-                    }
-                }
-                writer.start_file(entry_name, file_options)?;
-                writer.write_all(&contents)?;
-            }
-        }
-
-        writer.finish()?;
-        Ok(())
-    })
-    .await?
-}
-
-pub struct Compressor {
-    format: CompressionFormat,
-    level: CompressionLevel,
-}
-
-impl Compressor {
-    pub fn new(format: CompressionFormat) -> Self {
-        Self {
-            format,
-            level: CompressionLevel::Default,
-        }
-    }
-
-    pub fn with_level(mut self, level: CompressionLevel) -> Self {
-        self.level = level;
-        self
-    }
-
-    pub async fn compress(&self, input: &[u8]) -> Result<Vec<u8>> {
-        let sink = SharedBuffer::default();
-        let mut encoder = self.format.get_encoder(sink.clone(), self.level)?;
-        let mut reader = input;
-
-        io::copy(&mut reader, &mut encoder).await?;
-        encoder.shutdown().await?;
-        drop(encoder);
-
-        Ok(sink.into_vec())
-    }
-
-    pub async fn decompress(&self, input: Vec<u8>) -> Result<Vec<u8>> {
-        let mut output = Vec::new();
-        let cursor = std::io::Cursor::new(input);
-        let mut decoder = self.format.get_decoder(cursor)?;
-
-        decoder.read_to_end(&mut output).await?;
-        Ok(output)
-    }
-}
-
-pub struct Decompressor {
-    format: CompressionFormat,
-}
-
-impl Decompressor {
-    pub fn new(format: CompressionFormat) -> Self {
-        Self { format }
-    }
-
-    pub fn auto_detect<P: AsRef<Path>>(path: P) -> Self {
-        Self {
-            format: CompressionFormat::from_path(path),
-        }
-    }
-
-    pub async fn decompress_file<P: AsRef<Path>>(&self, input_path: P, output_path: P) -> Result<()> {
-        let input_file = File::open(&input_path).await?;
-        let output_file = File::create(&output_path).await?;
-
-        let mut decoder = self.format.get_decoder(input_file)?;
-        let mut writer = BufWriter::new(output_file);
-
-        io::copy(&mut decoder, &mut writer).await?;
-        writer.shutdown().await?;
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_compression::{
+        Level,
+        tokio::write::{BzEncoder, GzipEncoder, Lz4Encoder, XzEncoder, ZstdEncoder},
+        zstd::CParameter,
+    };
+    use std::future::Future;
     use std::mem::size_of;
-    use tempfile::tempdir;
-    use tokio::fs;
-    use tokio::io::AsyncReadExt;
-    use tokio_tar::{Builder, Header};
-    use zip::write::FileOptions;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::{Wake, Waker};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn build_tar_bytes(files: &[(&str, &[u8])]) -> io::Result<Vec<u8>> {
-        let sink = SharedBuffer::default();
-        let handle = sink.clone();
-        let mut builder = Builder::new(sink);
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
 
-        for (path, content) in files {
-            let mut header = Header::new_gnu();
-            header.set_size(content.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, *path, &content[..]).await?;
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
         }
-
-        builder.finish().await?;
-        Ok(handle.into_vec())
     }
 
-    async fn build_compressed_tar_bytes(format: CompressionFormat, files: &[(&str, &[u8])]) -> Result<Vec<u8>> {
-        let tar_bytes = build_tar_bytes(files).await?;
-        Compressor::new(format).compress(&tar_bytes).await
+    async fn encode_xz(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = XzEncoder::with_quality(Vec::new(), Level::Fastest);
+        encoder.write_all(payload).await.expect("XZ encode should succeed");
+        encoder.shutdown().await.expect("XZ encoder shutdown should succeed");
+        encoder.into_inner()
     }
 
-    async fn build_zip_file_with_entries(path: &Path, files: &[(&str, &[u8])]) -> Result<()> {
-        let path = path.to_path_buf();
-        let files = files
-            .iter()
-            .map(|(name, content)| ((*name).to_string(), content.to_vec()))
-            .collect::<Vec<_>>();
-        spawn_blocking(move || -> Result<()> {
-            let file = std::fs::File::create(path)?;
-            let mut writer = ZipWriter::new(file);
-            let options: FileOptions<'_, ()> = FileOptions::default().compression_method(CompressionMethod::Stored);
-            for (name, content) in files {
-                writer.start_file(name, options)?;
-                writer.write_all(&content)?;
+    async fn encode_lz4(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = Lz4Encoder::new(Vec::new());
+        encoder.write_all(payload).await.expect("LZ4 encode should succeed");
+        encoder.shutdown().await.expect("LZ4 encoder shutdown should succeed");
+        encoder.into_inner()
+    }
+
+    async fn encode_zstd_with_window(payload: &[u8], window_log: u32) -> Vec<u8> {
+        let mut encoder = ZstdEncoder::with_quality_and_params(
+            Vec::new(),
+            Level::Default,
+            &[CParameter::window_log(window_log), CParameter::content_size_flag(false)],
+        );
+        encoder.write_all(payload).await.expect("Zstd encode should succeed");
+        encoder.shutdown().await.expect("Zstd encoder shutdown should succeed");
+        encoder.into_inner()
+    }
+
+    fn shared_skippable_frame(variant: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(variant <= 0x0f);
+        let payload_len = u32::try_from(payload.len()).expect("test skippable payload should fit u32");
+        let mut frame = Vec::with_capacity(SHARED_SKIPPABLE_FRAME_HEADER_LEN + payload.len());
+        frame.extend_from_slice(&[0x50 + variant, 0x2a, 0x4d, 0x18]);
+        frame.extend_from_slice(&payload_len.to_le_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn raw_tar_with_name(name: &[u8]) -> Vec<u8> {
+        assert!(!name.is_empty() && name.len() <= 100, "test TAR name must fit the legacy name field");
+
+        let mut header = [0u8; TAR_HEADER_LEN];
+        header[..name.len()].copy_from_slice(name);
+        for (start, end) in [(100, 108), (108, 116), (116, 124), (124, 136), (136, 148)] {
+            header[start..end].fill(b'0');
+            header[end - 1] = 0;
+        }
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        header[TAR_CHECKSUM_START..TAR_CHECKSUM_END].fill(b' ');
+        let checksum = header.iter().fold(0u64, |sum, byte| sum + u64::from(*byte));
+        let checksum_field = format!("{checksum:06o}\0 ");
+        assert_eq!(checksum_field.len(), TAR_CHECKSUM_END - TAR_CHECKSUM_START);
+        header[TAR_CHECKSUM_START..TAR_CHECKSUM_END].copy_from_slice(checksum_field.as_bytes());
+
+        let mut archive = header.to_vec();
+        archive.resize(TAR_HEADER_LEN * 3, 0);
+        archive
+    }
+
+    struct FragmentedReader {
+        bytes: Vec<u8>,
+        position: usize,
+        return_pending: bool,
+    }
+
+    impl FragmentedReader {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes,
+                position: 0,
+                return_pending: true,
             }
-            writer.finish()?;
-            Ok(())
-        })
-        .await??;
-        Ok(())
+        }
     }
 
-    async fn collect_archive_entries(payload: Vec<u8>, format: CompressionFormat) -> Result<Vec<(String, Vec<u8>)>> {
-        let seen = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
-        let seen_ref = Arc::clone(&seen);
-        let cursor = std::io::Cursor::new(payload);
-
-        read_archive_entries(cursor, format, move |mut entry| {
-            let seen_ref = Arc::clone(&seen_ref);
-            async move {
-                let path = entry.path()?.to_string_lossy().into_owned();
-                let mut content = Vec::new();
-                entry.read_to_end(&mut content).await?;
-                seen_ref.lock().expect("seen collection lock poisoned").push((path, content));
-                Ok(())
+    impl AsyncRead for FragmentedReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, output: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            if self.return_pending {
+                self.return_pending = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
-        })
-        .await?;
+            if self.position >= self.bytes.len() || output.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
 
-        Ok(seen.lock().expect("seen collection lock poisoned").clone())
+            let byte = self.bytes[self.position];
+            self.position += 1;
+            self.return_pending = true;
+            output.put_slice(&[byte]);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct AlwaysReadyOneByteReader {
+        bytes: Vec<u8>,
+        position: usize,
+        ready_reads: Arc<AtomicUsize>,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for AlwaysReadyOneByteReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, output: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            self.ready_reads.fetch_add(1, Ordering::Relaxed);
+            if self.position >= self.bytes.len() || output.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let byte = self.bytes[self.position];
+            self.position += 1;
+            self.bytes_read.fetch_add(1, Ordering::Relaxed);
+            output.put_slice(&[byte]);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ErrorAfterBytes {
+        bytes: Vec<u8>,
+        position: usize,
+    }
+
+    impl AsyncRead for ErrorAfterBytes {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, output: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            if self.position >= self.bytes.len() {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, "sentinel inspect failure")));
+            }
+            let available = self.bytes.len() - self.position;
+            let to_copy = available.min(output.remaining());
+            output.put_slice(&self.bytes[self.position..self.position + to_copy]);
+            self.position += to_copy;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn assert_shared_skippable_round_trip(format: CompressionFormat, encoded: Vec<u8>, frames: &[Vec<u8>]) {
+        let mut stream = Vec::new();
+        for frame in frames {
+            stream.extend_from_slice(frame);
+        }
+        stream.extend_from_slice(&encoded);
+
+        let (detected, mut sniffed) = CompressionFormat::sniff(std::io::Cursor::new(stream.clone()))
+            .await
+            .expect("shared skippable prefix should be inspected");
+        assert_eq!(detected, format);
+        let mut replayed_prefix = [0u8; MAGIC_SNIFF_LEN];
+        sniffed
+            .read_exact(&mut replayed_prefix)
+            .await
+            .expect("deciding codec prefix should replay completely");
+        assert_eq!(replayed_prefix, encoded[..MAGIC_SNIFF_LEN]);
+
+        let (detected, sniffed) = CompressionFormat::sniff(std::io::Cursor::new(stream))
+            .await
+            .expect("shared skippable prefix should be inspected for decoding");
+        let mut decoder = detected.get_decoder(sniffed).expect("detected decoder should be created");
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).await.expect("framed stream should decode");
+        assert_eq!(decoded, b"payload");
+    }
+
+    async fn assert_ready_sniff_yields(input: Vec<u8>, encoded_prefix: &[u8]) {
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(wake_counter.clone());
+        let mut sniff = Box::pin(CompressionFormat::sniff(std::io::Cursor::new(input)));
+        {
+            let mut cx = Context::from_waker(&waker);
+            assert!(sniff.as_mut().poll(&mut cx).is_pending(), "bounded inspection must yield");
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1, "yield must arrange another poll");
+
+        let (format, mut sniffed) = sniff.await.expect("inspection should resume after yielding");
+        assert_eq!(format, CompressionFormat::Lz4);
+        let mut replayed_prefix = [0u8; MAGIC_SNIFF_LEN];
+        sniffed
+            .read_exact(&mut replayed_prefix)
+            .await
+            .expect("deciding codec prefix should replay after yielding");
+        assert_eq!(replayed_prefix, encoded_prefix);
+    }
+
+    fn xz_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                let mask = 0_u32.wrapping_sub(crc & 1);
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    async fn xz_with_dictionary_property(payload: &[u8], dictionary_property: u8) -> Vec<u8> {
+        const XZ_STREAM_HEADER_LEN: usize = 12;
+
+        let mut encoded = encode_xz(payload).await;
+        assert_eq!(&encoded[..MAGIC_SNIFF_LEN], b"\xfd7zXZ\0");
+
+        let block_header_start = XZ_STREAM_HEADER_LEN;
+        let block_header_len = (usize::from(encoded[block_header_start]) + 1) * 4;
+        let block_header_crc_start = block_header_start + block_header_len - 4;
+        assert_eq!(block_header_len, 12, "default XZ fixture should use one compact LZMA2 filter header");
+        assert_eq!(
+            &encoded[block_header_start + 1..block_header_start + 4],
+            &[0x00, 0x21, 0x01],
+            "default XZ fixture should contain one LZMA2 filter with one property byte"
+        );
+
+        encoded[block_header_start + 4] = dictionary_property;
+        let block_header_crc = xz_crc32(&encoded[block_header_start..block_header_crc_start]).to_le_bytes();
+        encoded[block_header_crc_start..block_header_crc_start + 4].copy_from_slice(&block_header_crc);
+        encoded
     }
 
     #[test]
@@ -907,61 +735,60 @@ mod tests {
         assert_eq!(CompressionFormat::from_extension("gz"), CompressionFormat::Gzip);
         assert_eq!(CompressionFormat::from_extension("ZIP"), CompressionFormat::Zip);
         assert_eq!(CompressionFormat::from_extension("tzst"), CompressionFormat::Zstd);
+        assert_eq!(CompressionFormat::from_extension("s2"), CompressionFormat::S2);
         assert_eq!(CompressionFormat::from_extension("txt"), CompressionFormat::Unknown);
     }
 
     #[test]
-    fn test_archive_format_from_extension() {
-        assert_eq!(ArchiveFormat::from_extension("gz"), ArchiveFormat::TarGzip);
-        assert_eq!(ArchiveFormat::from_extension("tbz2"), ArchiveFormat::TarBzip2);
-        assert_eq!(ArchiveFormat::from_extension("txz"), ArchiveFormat::TarXz);
-        assert_eq!(ArchiveFormat::from_extension("zip"), ArchiveFormat::Zip);
-        assert_eq!(ArchiveFormat::from_extension("txt"), ArchiveFormat::Unknown);
+    fn test_compression_format_from_magic() {
+        let cases: &[(&[u8], CompressionFormat)] = &[
+            (&[0x1f, 0x8b, 0x08, 0x00], CompressionFormat::Gzip),
+            (b"BZh9", CompressionFormat::Bzip2),
+            (&[0x28, 0xb5, 0x2f, 0xfd], CompressionFormat::Zstd),
+            (&[0x50, 0x2a, 0x4d, 0x18], CompressionFormat::Unknown),
+            (&[0x04, 0x22, 0x4d, 0x18], CompressionFormat::Lz4),
+            (&[0xff, 0x06, 0x00, 0x00], CompressionFormat::S2),
+            (&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00], CompressionFormat::Xz),
+            (&[0x78, 0x9c], CompressionFormat::Tar),
+            (&[0x78, 0x5e, b'o', b'b'], CompressionFormat::Tar),
+            (b"PK\x03\x04", CompressionFormat::Tar),
+            (b"plain tar bytes", CompressionFormat::Tar),
+        ];
+
+        for (magic, expected) in cases {
+            assert_eq!(CompressionFormat::from_magic(magic), *expected, "magic={magic:02x?}");
+        }
     }
 
-    #[test]
-    fn test_compression_format_from_path_handles_compound_suffixes() {
-        assert_eq!(CompressionFormat::from_path("archive.tar.gz"), CompressionFormat::Gzip);
-        assert_eq!(CompressionFormat::from_path("archive.tgz"), CompressionFormat::Gzip);
-        assert_eq!(CompressionFormat::from_path("archive.tar.bz2"), CompressionFormat::Bzip2);
-        assert_eq!(CompressionFormat::from_path("archive.zip"), CompressionFormat::Zip);
-        assert_eq!(CompressionFormat::from_path("archive"), CompressionFormat::Unknown);
-    }
+    #[tokio::test]
+    async fn test_sniff_prefers_checksum_valid_tar_over_codec_like_member_names() {
+        let cases: &[(&[u8], CompressionFormat)] = &[
+            (b"BZh9-report.txt", CompressionFormat::Bzip2),
+            (b"\x04\x22\x4d\x18-report.txt", CompressionFormat::Lz4),
+        ];
 
-    #[test]
-    fn test_archive_format_from_path_handles_compound_suffixes() {
-        assert_eq!(ArchiveFormat::from_path("archive.tar.gz"), ArchiveFormat::TarGzip);
-        assert_eq!(ArchiveFormat::from_path("archive.tar.bz2"), ArchiveFormat::TarBzip2);
-        assert_eq!(ArchiveFormat::from_path("archive.tar.xz"), ArchiveFormat::TarXz);
-        assert_eq!(ArchiveFormat::from_path("archive.tar.zst"), ArchiveFormat::TarZstd);
-        assert_eq!(ArchiveFormat::from_path("archive.zip"), ArchiveFormat::Zip);
-        assert_eq!(ArchiveFormat::from_path("archive"), ArchiveFormat::Unknown);
-    }
+        for (name, prefix_format) in cases {
+            assert_eq!(CompressionFormat::from_magic(name), *prefix_format);
+            let archive = raw_tar_with_name(name);
+            let (format, mut sniffed) = CompressionFormat::sniff(std::io::Cursor::new(archive.clone()))
+                .await
+                .expect("checksum-valid TAR header should be inspectable");
+            assert_eq!(format, CompressionFormat::Tar, "member name prefix={name:02x?}");
 
-    #[test]
-    fn test_archive_format_and_legacy_compression_format_are_compatible() {
-        assert_eq!(CompressionFormat::from_archive_format(ArchiveFormat::TarGzip), CompressionFormat::Gzip);
-        assert_eq!(CompressionFormat::from_archive_format(ArchiveFormat::Tar), CompressionFormat::Tar);
-        assert_eq!(CompressionFormat::from_archive_format(ArchiveFormat::Zip), CompressionFormat::Zip);
-    }
+            let mut replayed = Vec::new();
+            sniffed
+                .read_to_end(&mut replayed)
+                .await
+                .expect("TAR lookahead should replay without loss");
+            assert_eq!(replayed, archive);
+        }
 
-    #[test]
-    fn test_archive_format_exposes_archive_kind_and_codec() {
-        assert_eq!(ArchiveFormat::TarGzip.archive_kind(), Some(ArchiveKind::Tar));
-        assert_eq!(ArchiveFormat::TarGzip.compression_codec(), Some(CompressionCodec::Gzip));
-        assert_eq!(ArchiveFormat::Tar.archive_kind(), Some(ArchiveKind::Tar));
-        assert_eq!(ArchiveFormat::Tar.compression_codec(), None);
-        assert_eq!(ArchiveFormat::Zip.archive_kind(), Some(ArchiveKind::Zip));
-        assert_eq!(ArchiveFormat::Zip.compression_codec(), None);
-    }
-
-    #[test]
-    fn test_legacy_compression_format_exposes_kind_and_codec() {
-        assert_eq!(CompressionFormat::Gzip.archive_kind(), None);
-        assert_eq!(CompressionFormat::Gzip.compression_codec(), Some(CompressionCodec::Gzip));
-        assert_eq!(CompressionFormat::Tar.archive_kind(), Some(ArchiveKind::Tar));
-        assert_eq!(CompressionFormat::Tar.compression_codec(), None);
-        assert_eq!(CompressionFormat::Zip.archive_kind(), Some(ArchiveKind::Zip));
+        let mut bad_checksum = raw_tar_with_name(b"BZh9-bad-checksum.txt");
+        bad_checksum[99] = b'x';
+        let (format, _) = CompressionFormat::sniff(std::io::Cursor::new(bad_checksum))
+            .await
+            .expect("malformed TAR lookahead should still permit codec detection");
+        assert_eq!(format, CompressionFormat::Bzip2, "TAR priority must require a valid checksum");
     }
 
     #[test]
@@ -970,697 +797,385 @@ mod tests {
         assert!(size_of::<Option<CompressionFormat>>() <= 16);
     }
 
-    #[test]
-    fn test_convert_level_rejects_overflow() {
-        let err = match CompressionFormat::Gzip.get_encoder(SharedBuffer::default(), CompressionLevel::Level(u32::MAX)) {
-            Ok(_) => panic!("overflow level should return an error"),
-            Err(err) => err,
-        };
-        assert!(matches!(err, ZipError::InvalidCompressionLevel(u32::MAX)));
-    }
-
-    #[test]
-    fn test_validate_archive_entry_name_rejects_absolute_path() {
-        let err = validate_archive_entry_name("/absolute.txt", ArchiveLimits::default())
-            .expect_err("absolute path should fail validation");
-        assert!(matches!(err, ZipError::UnsafeEntryPath(path) if path == "/absolute.txt"));
-    }
-
     #[tokio::test]
-    async fn test_compressor_round_trip_gzip() {
-        let input = b"hello rustfs zip ".repeat(64);
-        let compressor = Compressor::new(CompressionFormat::Gzip);
+    async fn test_get_decoder_round_trips_gzip_stream() {
+        let mut encoder = GzipEncoder::new(Vec::new());
+        encoder.write_all(b"payload").await.expect("gzip encode should succeed");
+        encoder.shutdown().await.expect("gzip encoder shutdown should succeed");
 
-        let compressed = compressor.compress(&input).await.expect("gzip compress should succeed");
-        assert!(!compressed.is_empty());
-        assert_ne!(compressed, input);
-
-        let decompressed = compressor
-            .decompress(compressed)
+        let (format, sniffed) = CompressionFormat::sniff(std::io::Cursor::new(encoder.into_inner()))
             .await
-            .expect("gzip decompress should succeed");
-        assert_eq!(decompressed, input);
+            .expect("gzip magic should be inspected");
+        assert_eq!(format, CompressionFormat::Gzip);
+        let mut decoder = format.get_decoder(sniffed).expect("gzip decoder should be created");
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).await.expect("gzip decode should succeed");
+
+        assert_eq!(decoded, b"payload");
     }
 
     #[tokio::test]
-    async fn test_compressor_round_trip_zstd() {
-        let input = b"zstd payload ".repeat(128);
-        let compressor = Compressor::new(CompressionFormat::Zstd).with_level(CompressionLevel::Best);
+    async fn test_sniff_still_recognizes_a_real_bzip2_stream() {
+        let mut encoder = BzEncoder::new(Vec::new());
+        encoder.write_all(b"payload").await.expect("Bzip2 encode should succeed");
+        encoder.shutdown().await.expect("Bzip2 encoder shutdown should succeed");
 
-        let compressed = compressor.compress(&input).await.expect("zstd compress should succeed");
-        let decompressed = compressor
-            .decompress(compressed)
+        let (format, sniffed) = CompressionFormat::sniff(std::io::Cursor::new(encoder.into_inner()))
             .await
-            .expect("zstd decompress should succeed");
-        assert_eq!(decompressed, input);
+            .expect("Bzip2 magic should be inspected after TAR lookahead");
+        assert_eq!(format, CompressionFormat::Bzip2);
+        let mut decoder = format.get_decoder(sniffed).expect("Bzip2 decoder should be created");
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).await.expect("Bzip2 decode should succeed");
+
+        assert_eq!(decoded, b"payload");
     }
 
     #[tokio::test]
-    async fn test_zip_stream_encoder_is_rejected() {
-        let err = CompressionFormat::Zip
-            .get_encoder(SharedBuffer::default(), CompressionLevel::Default)
-            .err()
-            .expect("zip stream encoder should be rejected");
+    async fn test_get_decoder_consumes_concatenated_gzip_members() {
+        async fn gzip_member(payload: &[u8]) -> Vec<u8> {
+            let mut encoder = GzipEncoder::new(Vec::new());
+            encoder.write_all(payload).await.expect("gzip encode should succeed");
+            encoder.shutdown().await.expect("gzip encoder shutdown should succeed");
+            encoder.into_inner()
+        }
+
+        let mut encoded = gzip_member(b"first-").await;
+        encoded.extend(gzip_member(b"second").await);
+        let mut decoder = CompressionFormat::Gzip
+            .get_decoder(std::io::Cursor::new(encoded))
+            .expect("gzip decoder should be created");
+        let mut decoded = Vec::new();
+
+        decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect("concatenated gzip members should decode");
+
+        assert_eq!(decoded, b"first-second");
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_round_trips_lz4_stream() {
+        let mut encoder = Lz4Encoder::new(Vec::new());
+        encoder.write_all(b"payload").await.expect("LZ4 encode should succeed");
+        encoder.shutdown().await.expect("LZ4 encoder shutdown should succeed");
+
+        let (format, sniffed) = CompressionFormat::sniff(std::io::Cursor::new(encoder.into_inner()))
+            .await
+            .expect("LZ4 magic should be inspected");
+        assert_eq!(format, CompressionFormat::Lz4);
+        let mut decoder = format.get_decoder(sniffed).expect("LZ4 decoder should be created");
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).await.expect("LZ4 decode should succeed");
+
+        assert_eq!(decoded, b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_sniff_skips_shared_frames_before_lz4_and_zstd() {
+        let lz4 = encode_lz4(b"payload").await;
+        assert_shared_skippable_round_trip(
+            CompressionFormat::Lz4,
+            lz4,
+            &[shared_skippable_frame(0, b""), shared_skippable_frame(15, b"lz4 metadata")],
+        )
+        .await;
+
+        let zstd = encode_zstd_with_window(b"payload", ZSTD_DECODER_MAX_WINDOW_LOG).await;
+        let large_metadata = vec![0x5a; SNIFF_YIELD_AFTER_BYTES + 1];
+        assert_shared_skippable_round_trip(
+            CompressionFormat::Zstd,
+            zstd,
+            &[shared_skippable_frame(3, &large_metadata), shared_skippable_frame(4, b"")],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_sniff_rejects_truncated_shared_skippable_frames() {
+        let truncated_header = [0x50, 0x2a, 0x4d, 0x18, 0x04, 0x00];
+        let err = CompressionFormat::sniff(std::io::Cursor::new(truncated_header))
+            .await
+            .expect_err("truncated shared frame header must fail");
         assert!(matches!(
             err,
-            ZipError::UnsupportedFormat {
-                format: CompressionFormat::Zip,
-                operation: "stream encoding",
-            }
+            ZipError::InspectStream(ref source) if source.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        let mut truncated_payload = shared_skippable_frame(0, b"abcd");
+        truncated_payload.truncate(truncated_payload.len() - 2);
+        let err = CompressionFormat::sniff(std::io::Cursor::new(truncated_payload))
+            .await
+            .expect_err("truncated shared frame payload must fail");
+        assert!(matches!(
+            err,
+            ZipError::InspectStream(ref source) if source.kind() == io::ErrorKind::UnexpectedEof
         ));
     }
 
     #[tokio::test]
-    async fn test_read_archive_entries_iterates_tar_gzip_entries() {
-        let gzip_bytes =
-            build_compressed_tar_bytes(CompressionFormat::Gzip, &[("nested/hello.txt", b"hello"), ("world.txt", b"world")])
-                .await
-                .expect("tar.gz build should succeed");
+    async fn test_sniff_shared_frames_handles_fragmented_pending_reads() {
+        let encoded = encode_lz4(b"payload").await;
+        let mut input = Vec::new();
+        for variant in 0..=SNIFF_YIELD_AFTER_FRAMES {
+            input.extend_from_slice(&shared_skippable_frame(u8::try_from(variant % 16).expect("variant should fit u8"), b""));
+        }
+        input.extend_from_slice(&encoded);
 
-        let seen = collect_archive_entries(gzip_bytes, CompressionFormat::Gzip)
+        let (format, sniffed) = CompressionFormat::sniff(FragmentedReader::new(input))
             .await
-            .expect("tar.gz archive iteration should succeed");
-        assert_eq!(seen.len(), 2);
-        assert_eq!(seen[0].0, "nested/hello.txt");
-        assert_eq!(seen[0].1, b"hello");
-        assert_eq!(seen[1].0, "world.txt");
-        assert_eq!(seen[1].1, b"world");
+            .expect("fragmented shared frames should be inspected");
+        assert_eq!(format, CompressionFormat::Lz4);
+        let mut decoder = format.get_decoder(sniffed).expect("LZ4 decoder should be created");
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect("fragmented stream should decode");
+        assert_eq!(decoded, b"payload");
     }
 
     #[tokio::test]
-    async fn test_read_archive_entries_iterates_tar_bzip2_entries() {
-        let payload =
-            build_compressed_tar_bytes(CompressionFormat::Bzip2, &[("nested/hello.txt", b"hello"), ("world.txt", b"world")])
-                .await
-                .expect("tar.bz2 build should succeed");
+    async fn test_sniff_shared_frames_yields_at_frame_budget_with_ready_reader() {
+        let encoded = encode_lz4(b"payload").await;
+        let mut input = Vec::new();
+        for variant in 0..SNIFF_YIELD_AFTER_FRAMES {
+            let variant = u8::try_from(variant % 16).expect("variant should fit u8");
+            input.extend_from_slice(&shared_skippable_frame(variant, b""));
+        }
+        input.extend_from_slice(&encoded);
 
-        let seen = collect_archive_entries(payload, CompressionFormat::Bzip2)
-            .await
-            .expect("tar.bz2 archive iteration should succeed");
-        assert_eq!(seen.len(), 2);
-        assert_eq!(seen[0].0, "nested/hello.txt");
-        assert_eq!(seen[1].0, "world.txt");
+        assert_ready_sniff_yields(input, &encoded[..MAGIC_SNIFF_LEN]).await;
     }
 
     #[tokio::test]
-    async fn test_read_archive_entries_iterates_tar_xz_entries() {
-        let payload =
-            build_compressed_tar_bytes(CompressionFormat::Xz, &[("nested/hello.txt", b"hello"), ("world.txt", b"world")])
-                .await
-                .expect("tar.xz build should succeed");
+    async fn test_sniff_shared_frame_yields_at_byte_budget_with_ready_reader() {
+        let encoded = encode_lz4(b"payload").await;
+        let metadata = vec![0x5a; SNIFF_YIELD_AFTER_BYTES];
+        let mut input = shared_skippable_frame(0, &metadata);
+        input.extend_from_slice(&encoded);
 
-        let seen = collect_archive_entries(payload, CompressionFormat::Xz)
-            .await
-            .expect("tar.xz archive iteration should succeed");
-        assert_eq!(seen.len(), 2);
-        assert_eq!(seen[0].0, "nested/hello.txt");
-        assert_eq!(seen[1].0, "world.txt");
+        assert_ready_sniff_yields(input, &encoded[..MAGIC_SNIFF_LEN]).await;
     }
 
     #[tokio::test]
-    async fn test_read_archive_entries_iterates_tar_zstd_entries() {
-        let payload =
-            build_compressed_tar_bytes(CompressionFormat::Zstd, &[("nested/hello.txt", b"hello"), ("world.txt", b"world")])
-                .await
-                .expect("tar.zst build should succeed");
+    async fn test_sniff_shared_frame_bounds_always_ready_one_byte_reads_per_poll() {
+        let encoded = encode_lz4(b"payload").await;
+        let metadata = vec![0x5a; TAR_HEADER_LEN * 4];
+        let mut input = shared_skippable_frame(0, &metadata);
+        input.extend_from_slice(&encoded);
 
-        let seen = collect_archive_entries(payload, CompressionFormat::Zstd)
+        let ready_reads = Arc::new(AtomicUsize::new(0));
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let reader = AlwaysReadyOneByteReader {
+            bytes: input,
+            position: 0,
+            ready_reads: ready_reads.clone(),
+            bytes_read: bytes_read.clone(),
+        };
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(wake_counter.clone());
+        let mut sniff = Box::pin(CompressionFormat::sniff(reader));
+
+        for poll_number in 0..10 {
+            let before = ready_reads.load(Ordering::Relaxed);
+            let mut cx = Context::from_waker(&waker);
+            assert!(
+                sniff.as_mut().poll(&mut cx).is_pending(),
+                "poll {poll_number} must yield at the ready-read budget"
+            );
+            let reads_this_poll = ready_reads.load(Ordering::Relaxed) - before;
+            assert_eq!(
+                reads_this_poll, SNIFF_YIELD_AFTER_READY_READS,
+                "poll {poll_number} exceeded the ready-read budget"
+            );
+        }
+        assert!(
+            bytes_read.load(Ordering::Relaxed) > TAR_HEADER_LEN,
+            "manual polls must progress beyond TAR lookahead into the shared-frame payload"
+        );
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            0,
+            "Tokio defers the wake until the scheduler runs"
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            1,
+            "repeated voluntary yields with the same waker must coalesce into one scheduled repoll"
+        );
+
+        let (format, sniffed) = sniff.await.expect("bounded inspection should eventually complete");
+        assert_eq!(format, CompressionFormat::Lz4);
+        let mut decoder = format.get_decoder(sniffed).expect("LZ4 decoder should be created");
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
             .await
-            .expect("tar.zst archive iteration should succeed");
-        assert_eq!(seen.len(), 2);
-        assert_eq!(seen[0].0, "nested/hello.txt");
-        assert_eq!(seen[1].0, "world.txt");
+            .expect("LZ4 stream should survive bounded inspection");
+        assert_eq!(decoded, b"payload");
     }
 
     #[tokio::test]
-    async fn test_extract_tar_entries_alias_matches_stream_behavior() {
-        let payload = build_compressed_tar_bytes(CompressionFormat::Gzip, &[("hello.txt", b"hello")])
+    async fn test_sniff_shared_frame_preserves_underlying_read_error() {
+        let mut bytes = shared_skippable_frame(0, b"abcd");
+        bytes.truncate(bytes.len() - 2);
+        let err = CompressionFormat::sniff(ErrorAfterBytes { bytes, position: 0 })
             .await
-            .expect("tar.gz build should succeed");
-        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let seen_ref = Arc::clone(&seen);
-
-        extract_tar_entries(std::io::Cursor::new(payload), CompressionFormat::Gzip, move |entry| {
-            let seen_ref = Arc::clone(&seen_ref);
-            async move {
-                seen_ref
-                    .lock()
-                    .expect("seen collection lock poisoned")
-                    .push(entry.path()?.to_string_lossy().into_owned());
-                Ok(())
-            }
-        })
-        .await
-        .expect("extract_tar_entries alias should succeed");
-
-        assert_eq!(seen.lock().expect("seen collection lock poisoned").as_slice(), ["hello.txt"]);
-    }
-
-    #[tokio::test]
-    async fn test_read_archive_entries_rejects_zip_streams() {
-        let err = read_archive_entries(std::io::Cursor::new(Vec::<u8>::new()), CompressionFormat::Zip, |_entry| async { Ok(()) })
-            .await
-            .expect_err("zip stream should be rejected");
+            .expect_err("underlying read failure must escape inspection");
 
         assert!(matches!(
             err,
+            ZipError::InspectStream(ref source)
+                if source.kind() == io::ErrorKind::ConnectionReset && source.to_string() == "sentinel inspect failure"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_sniff_shared_frame_without_lz4_or_zstd_successor_is_unknown() {
+        let mut input = shared_skippable_frame(0, b"metadata");
+        input.extend_from_slice(b"raw tar bytes");
+
+        let (format, mut sniffed) = CompressionFormat::sniff(std::io::Cursor::new(input))
+            .await
+            .expect("complete shared frame should be inspectable");
+        assert_eq!(format, CompressionFormat::Unknown);
+        let mut replayed = Vec::new();
+        sniffed
+            .read_to_end(&mut replayed)
+            .await
+            .expect("successor bytes should replay");
+        assert_eq!(replayed, b"raw tar bytes");
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_round_trips_xz_stream_with_memory_limit() {
+        let encoded = encode_xz(b"payload").await;
+        let (format, sniffed) = CompressionFormat::sniff(std::io::Cursor::new(encoded))
+            .await
+            .expect("XZ magic should be inspected");
+        assert_eq!(format, CompressionFormat::Xz);
+
+        let mut decoder = format.get_decoder(sniffed).expect("XZ decoder should be created");
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect("XZ decode should succeed within the memory limit");
+
+        assert_eq!(decoded, b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_rejects_xz_dictionary_over_memory_limit() {
+        const LZMA2_MAX_DICTIONARY_PROPERTY: u8 = 40;
+
+        let encoded = xz_with_dictionary_property(b"payload", LZMA2_MAX_DICTIONARY_PROPERTY).await;
+        let mut decoder = CompressionFormat::Xz
+            .get_decoder(std::io::Cursor::new(encoded))
+            .expect("XZ decoder should be created before inspecting the stream header");
+        let mut decoded = Vec::new();
+        let err = decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect_err("hostile XZ dictionary request must exceed the decoder memory limit");
+
+        assert!(decoded.is_empty(), "decoder must reject the hostile dictionary before producing output");
+        assert!(
+            err.to_string().contains("memory limit"),
+            "hostile XZ dictionary should fail at the decoder memory boundary: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_accepts_xz_64_mib_dictionary() {
+        const LZMA2_64_MIB_DICTIONARY_PROPERTY: u8 = 28;
+
+        let encoded = xz_with_dictionary_property(b"payload", LZMA2_64_MIB_DICTIONARY_PROPERTY).await;
+        let mut decoder = CompressionFormat::Xz
+            .get_decoder(std::io::Cursor::new(encoded))
+            .expect("XZ decoder should be created before inspecting the stream header");
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect("the memory limit must retain preset-9-compatible dictionary headroom");
+
+        assert_eq!(decoded, b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_accepts_zstd_window_at_limit() {
+        let encoded = encode_zstd_with_window(b"payload", ZSTD_DECODER_MAX_WINDOW_LOG).await;
+        let mut decoder = CompressionFormat::Zstd
+            .get_decoder(std::io::Cursor::new(encoded))
+            .expect("Zstd decoder should be created before inspecting the frame header");
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect("16 MiB Zstd windows must remain compatible");
+
+        assert_eq!(decoded, b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_rejects_zstd_window_over_limit() {
+        let encoded = encode_zstd_with_window(b"payload", ZSTD_DECODER_MAX_WINDOW_LOG + 1).await;
+        let mut decoder = CompressionFormat::Zstd
+            .get_decoder(std::io::Cursor::new(encoded))
+            .expect("Zstd decoder should be created before inspecting the frame header");
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect_err("Zstd windows larger than 16 MiB must be rejected");
+
+        assert!(decoded.is_empty(), "decoder must reject the oversized window before producing output");
+    }
+
+    #[tokio::test]
+    async fn test_sniff_replays_raw_tar_prefix() {
+        let input = b"ustar-prefix-and-payload".to_vec();
+        let (format, mut sniffed) = CompressionFormat::sniff(std::io::Cursor::new(input.clone()))
+            .await
+            .expect("raw TAR prefix should be inspected");
+        let mut replayed = Vec::new();
+        sniffed
+            .read_to_end(&mut replayed)
+            .await
+            .expect("sniffed prefix should replay");
+
+        assert_eq!(format, CompressionFormat::Tar);
+        assert_eq!(replayed, input);
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_rejects_zip_and_unknown_formats() {
+        let zip_err = CompressionFormat::Zip
+            .get_decoder(std::io::Cursor::new(Vec::<u8>::new()))
+            .err()
+            .expect("zip stream decoding should be rejected");
+        assert!(matches!(
+            zip_err,
             ZipError::UnsupportedFormat {
                 format: CompressionFormat::Zip,
                 operation: "stream decoding",
             }
         ));
-    }
 
-    #[tokio::test]
-    async fn test_read_archive_entries_rejects_corrupt_tar_gzip_stream() {
-        let err = read_archive_entries(
-            std::io::Cursor::new(b"not-a-valid-gzip-stream".to_vec()),
-            CompressionFormat::Gzip,
-            |_entry| async { Ok(()) },
-        )
-        .await
-        .expect_err("corrupt tar.gz stream should fail");
-
-        assert!(matches!(err, ZipError::Io(_)));
-    }
-
-    #[tokio::test]
-    async fn test_read_archive_entries_rejects_truncated_tar_gzip_stream() {
-        let payload = build_compressed_tar_bytes(CompressionFormat::Gzip, &[("hello.txt", b"hello world")])
-            .await
-            .expect("tar.gz build should succeed");
-        let truncated = payload[..payload.len() / 2].to_vec();
-
-        let err = read_archive_entries(std::io::Cursor::new(truncated), CompressionFormat::Gzip, |_entry| async { Ok(()) })
-            .await
-            .expect_err("truncated tar.gz stream should fail");
-
-        assert!(matches!(err, ZipError::Io(_)));
-    }
-
-    #[tokio::test]
-    async fn test_read_archive_entries_rejects_too_many_entries() {
-        let payload = build_compressed_tar_bytes(CompressionFormat::Gzip, &[("one.txt", b"1"), ("two.txt", b"2")])
-            .await
-            .expect("tar.gz build should succeed");
-
-        let err = read_archive_entries_with_limits(
-            std::io::Cursor::new(payload),
-            CompressionFormat::Gzip,
-            ArchiveLimits {
-                max_entries: 1,
-                ..ArchiveLimits::default()
-            },
-            |_entry| async { Ok(()) },
-        )
-        .await
-        .expect_err("entry count limit should fail");
-
-        assert!(matches!(err, ZipError::EntryCountLimitExceeded { count: 2, limit: 1 }));
-    }
-
-    #[tokio::test]
-    async fn test_read_archive_entries_rejects_oversized_entry() {
-        let payload = build_compressed_tar_bytes(CompressionFormat::Gzip, &[("big.txt", b"hello world")])
-            .await
-            .expect("tar.gz build should succeed");
-
-        let err = read_archive_entries_with_limits(
-            std::io::Cursor::new(payload),
-            CompressionFormat::Gzip,
-            ArchiveLimits {
-                max_entry_size: 4,
-                ..ArchiveLimits::default()
-            },
-            |_entry| async { Ok(()) },
-        )
-        .await
-        .expect_err("entry size limit should fail");
-
+        let unknown_err = CompressionFormat::Unknown
+            .get_decoder(std::io::Cursor::new(Vec::<u8>::new()))
+            .err()
+            .expect("unknown format decoding should be rejected");
         assert!(matches!(
-            err,
-            ZipError::EntrySizeLimitExceeded {
-                path,
-                size: 11,
-                limit: 4,
-            } if path == "big.txt"
+            unknown_err,
+            ZipError::UnsupportedFormat {
+                format: CompressionFormat::Unknown,
+                operation: "decoding",
+            }
         ));
-    }
-
-    #[tokio::test]
-    async fn test_read_archive_entries_rejects_total_unpacked_size_limit() {
-        let payload = build_compressed_tar_bytes(CompressionFormat::Gzip, &[("one.txt", b"12345"), ("two.txt", b"67890")])
-            .await
-            .expect("tar.gz build should succeed");
-
-        let err = read_archive_entries_with_limits(
-            std::io::Cursor::new(payload),
-            CompressionFormat::Gzip,
-            ArchiveLimits {
-                max_total_unpacked_size: 9,
-                ..ArchiveLimits::default()
-            },
-            |_entry| async { Ok(()) },
-        )
-        .await
-        .expect_err("total unpacked size limit should fail");
-
-        assert!(matches!(err, ZipError::TotalUnpackedSizeLimitExceeded { size: 10, limit: 9 }));
-    }
-
-    #[tokio::test]
-    async fn test_read_archive_entries_rejects_entry_path_length_limit() {
-        let payload = build_compressed_tar_bytes(CompressionFormat::Gzip, &[("nested/hello.txt", b"hello")])
-            .await
-            .expect("tar.gz build should succeed");
-
-        let err = read_archive_entries_with_limits(
-            std::io::Cursor::new(payload),
-            CompressionFormat::Gzip,
-            ArchiveLimits {
-                max_path_length: 5,
-                ..ArchiveLimits::default()
-            },
-            |_entry| async { Ok(()) },
-        )
-        .await
-        .expect_err("path length limit should fail");
-
-        assert!(matches!(
-            err,
-            ZipError::EntryPathTooLong { path, limit: 5, .. } if path == "nested/hello.txt"
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_create_and_extract_zip_round_trip() {
-        let temp = tempdir().expect("tempdir should be created");
-        let zip_path = temp.path().join("archive.zip");
-        let extract_path = temp.path().join("extract");
-
-        create_zip_simple(
-            &zip_path,
-            vec![
-                ("nested/hello.txt".to_string(), b"hello".to_vec()),
-                ("world.txt".to_string(), b"world".to_vec()),
-            ],
-            CompressionLevel::Default,
-        )
-        .await
-        .expect("zip creation should succeed");
-
-        let entries = extract_zip_simple(&zip_path, &extract_path)
-            .await
-            .expect("zip extraction should succeed");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(
-            fs::read(extract_path.join("nested/hello.txt"))
-                .await
-                .expect("nested zip entry should be extracted"),
-            b"hello"
-        );
-        assert_eq!(
-            fs::read(extract_path.join("world.txt"))
-                .await
-                .expect("root zip entry should be extracted"),
-            b"world"
-        );
-        assert!(entries.iter().all(|entry| entry.archive_kind == ArchiveKind::Zip));
-        assert!(entries.iter().all(|entry| entry.format == ArchiveFormat::Zip));
-    }
-
-    #[tokio::test]
-    async fn test_create_zip_with_directory_entries_and_extract_directory_scenarios() {
-        let temp = tempdir().expect("tempdir should be created");
-        let explicit_zip_path = temp.path().join("explicit-directories.zip");
-        let explicit_extract_path = temp.path().join("explicit-extract");
-        let auto_zip_path = temp.path().join("auto-directories.zip");
-        let auto_extract_path = temp.path().join("auto-extract");
-
-        create_zip_with_options(
-            &explicit_zip_path,
-            vec![
-                ("nested/".to_string(), Vec::new()),
-                ("nested/deeper/".to_string(), Vec::new()),
-            ],
-            ZipWriteOptions {
-                compression_level: CompressionLevel::Default,
-                create_directory_entries: false,
-            },
-        )
-        .await
-        .expect("zip creation with explicit directory entries should succeed");
-
-        let explicit_entries = extract_zip_with_limits(&explicit_zip_path, &explicit_extract_path, ArchiveLimits::default())
-            .await
-            .expect("zip extraction with explicit directory entries should succeed");
-
-        assert!(
-            explicit_entries
-                .iter()
-                .any(|entry| entry.name.trim_end_matches('/') == "nested" && entry.is_dir)
-        );
-        assert!(
-            explicit_entries
-                .iter()
-                .any(|entry| entry.name.trim_end_matches('/') == "nested/deeper" && entry.is_dir)
-        );
-        assert!(
-            fs::metadata(explicit_extract_path.join("nested"))
-                .await
-                .expect("nested directory should exist")
-                .is_dir()
-        );
-        assert!(
-            fs::metadata(explicit_extract_path.join("nested/deeper"))
-                .await
-                .expect("nested deeper directory should exist")
-                .is_dir()
-        );
-
-        create_zip_with_options(
-            &auto_zip_path,
-            vec![("nested/deeper/file.txt".to_string(), b"hello".to_vec())],
-            ZipWriteOptions {
-                compression_level: CompressionLevel::Default,
-                create_directory_entries: true,
-            },
-        )
-        .await
-        .expect("zip creation with automatic directory entries should succeed");
-
-        let entries = extract_zip_with_limits(&auto_zip_path, &auto_extract_path, ArchiveLimits::default())
-            .await
-            .expect("zip extraction with automatic directory entries should succeed");
-
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.name.trim_end_matches('/') == "nested" && entry.is_dir)
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.name.trim_end_matches('/') == "nested/deeper" && entry.is_dir)
-        );
-        assert!(
-            fs::metadata(auto_extract_path.join("nested"))
-                .await
-                .expect("nested directory should exist")
-                .is_dir()
-        );
-        assert!(
-            fs::metadata(auto_extract_path.join("nested/deeper"))
-                .await
-                .expect("nested deeper directory should exist")
-                .is_dir()
-        );
-        assert_eq!(
-            fs::read(auto_extract_path.join("nested/deeper/file.txt"))
-                .await
-                .expect("nested file should be extracted"),
-            b"hello"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_create_zip_with_lots_of_small_files_round_trip() {
-        let temp = tempdir().expect("tempdir should be created");
-        let zip_path = temp.path().join("many-small-files.zip");
-        let extract_path = temp.path().join("extract");
-        let files = (0..32)
-            .map(|index| (format!("batch/file-{index}.txt"), format!("payload-{index}").into_bytes()))
-            .collect::<Vec<_>>();
-
-        create_zip_with_options(
-            &zip_path,
-            files.clone(),
-            ZipWriteOptions {
-                compression_level: CompressionLevel::Default,
-                create_directory_entries: true,
-            },
-        )
-        .await
-        .expect("zip creation for many small files should succeed");
-
-        let entries = extract_zip_with_limits(&zip_path, &extract_path, ArchiveLimits::default())
-            .await
-            .expect("zip extraction for many small files should succeed");
-
-        assert!(entries.len() >= files.len());
-        for (path, expected) in files {
-            assert_eq!(
-                fs::read(extract_path.join(path))
-                    .await
-                    .expect("small file should be extracted"),
-                expected
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_extract_zip_to_path_with_limits_returns_summary() {
-        let temp = tempdir().expect("tempdir should be created");
-        let zip_path = temp.path().join("summary.zip");
-        let extract_path = temp.path().join("extract");
-
-        create_zip_with_options(
-            &zip_path,
-            vec![
-                ("nested/".to_string(), Vec::new()),
-                ("nested/hello.txt".to_string(), b"hello".to_vec()),
-                ("world.txt".to_string(), b"world".to_vec()),
-            ],
-            ZipWriteOptions {
-                compression_level: CompressionLevel::Default,
-                create_directory_entries: false,
-            },
-        )
-        .await
-        .expect("zip creation for summary should succeed");
-
-        let summary = extract_zip_to_path_with_limits(&zip_path, &extract_path, ArchiveLimits::default())
-            .await
-            .expect("zip extract summary should succeed");
-
-        assert_eq!(summary.entry_count, 3);
-        assert_eq!(summary.directory_count, 1);
-        assert_eq!(summary.file_count, 2);
-        assert_eq!(summary.total_unpacked_size, 10);
-        assert_eq!(
-            fs::read(extract_path.join("nested/hello.txt"))
-                .await
-                .expect("nested file should be extracted"),
-            b"hello"
-        );
-        assert_eq!(
-            fs::read(extract_path.join("world.txt"))
-                .await
-                .expect("world file should be extracted"),
-            b"world"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_zip_helper_exposes_stored_vs_deflated_metadata() {
-        let temp = tempdir().expect("tempdir should be created");
-        let stored_zip_path = temp.path().join("stored.zip");
-        let deflated_zip_path = temp.path().join("deflated.zip");
-        let stored_extract_path = temp.path().join("stored-extract");
-        let deflated_extract_path = temp.path().join("deflated-extract");
-        let payload = b"compressible-content-".repeat(64);
-
-        create_zip_with_options(
-            &stored_zip_path,
-            vec![("payload.txt".to_string(), payload.clone())],
-            ZipWriteOptions {
-                compression_level: CompressionLevel::Fastest,
-                create_directory_entries: false,
-            },
-        )
-        .await
-        .expect("stored zip creation should succeed");
-
-        create_zip_with_options(
-            &deflated_zip_path,
-            vec![("payload.txt".to_string(), payload.clone())],
-            ZipWriteOptions {
-                compression_level: CompressionLevel::Best,
-                create_directory_entries: false,
-            },
-        )
-        .await
-        .expect("deflated zip creation should succeed");
-
-        let stored_entries = extract_zip_with_limits(&stored_zip_path, &stored_extract_path, ArchiveLimits::default())
-            .await
-            .expect("stored zip extraction should succeed");
-        let deflated_entries = extract_zip_with_limits(&deflated_zip_path, &deflated_extract_path, ArchiveLimits::default())
-            .await
-            .expect("deflated zip extraction should succeed");
-
-        assert_eq!(stored_entries[0].compression_method, "Stored");
-        assert_eq!(deflated_entries[0].compression_method, "Deflated");
-        assert_eq!(
-            fs::read(stored_extract_path.join("payload.txt"))
-                .await
-                .expect("stored payload should be extracted"),
-            payload
-        );
-        assert_eq!(
-            fs::read(deflated_extract_path.join("payload.txt"))
-                .await
-                .expect("deflated payload should be extracted"),
-            payload
-        );
-        assert!(deflated_entries[0].compressed_size <= stored_entries[0].compressed_size);
-    }
-
-    #[tokio::test]
-    async fn test_create_zip_rejects_unsafe_entry_name() {
-        let temp = tempdir().expect("tempdir should be created");
-        let zip_path = temp.path().join("archive.zip");
-
-        let err = create_zip_simple(
-            &zip_path,
-            vec![("../escape.txt".to_string(), b"escape".to_vec())],
-            CompressionLevel::Default,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(err, ZipError::UnsafeEntryPath(path) if path == "../escape.txt"));
-    }
-
-    #[tokio::test]
-    async fn test_extract_zip_rejects_too_many_entries() {
-        let temp = tempdir().expect("tempdir should be created");
-        let zip_path = temp.path().join("too-many.zip");
-        let extract_path = temp.path().join("extract");
-
-        build_zip_file_with_entries(&zip_path, &[("one.txt", b"1"), ("two.txt", b"2")])
-            .await
-            .expect("zip fixture should be created");
-
-        let err = extract_zip_with_limits(
-            &zip_path,
-            &extract_path,
-            ArchiveLimits {
-                max_entries: 1,
-                ..ArchiveLimits::default()
-            },
-        )
-        .await
-        .expect_err("zip entry count limit should fail");
-
-        assert!(matches!(err, ZipError::EntryCountLimitExceeded { count: 2, limit: 1 }));
-    }
-
-    #[tokio::test]
-    async fn test_extract_zip_rejects_oversized_entry() {
-        let temp = tempdir().expect("tempdir should be created");
-        let zip_path = temp.path().join("oversized.zip");
-        let extract_path = temp.path().join("extract");
-
-        build_zip_file_with_entries(&zip_path, &[("big.txt", b"hello world")])
-            .await
-            .expect("zip fixture should be created");
-
-        let err = extract_zip_with_limits(
-            &zip_path,
-            &extract_path,
-            ArchiveLimits {
-                max_entry_size: 4,
-                ..ArchiveLimits::default()
-            },
-        )
-        .await
-        .expect_err("zip entry size limit should fail");
-
-        assert!(matches!(
-            err,
-            ZipError::EntrySizeLimitExceeded {
-                path,
-                size: 11,
-                limit: 4,
-            } if path == "big.txt"
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_extract_zip_rejects_total_unpacked_size_limit() {
-        let temp = tempdir().expect("tempdir should be created");
-        let zip_path = temp.path().join("too-large-total.zip");
-        let extract_path = temp.path().join("extract");
-
-        build_zip_file_with_entries(&zip_path, &[("one.txt", b"12345"), ("two.txt", b"67890")])
-            .await
-            .expect("zip fixture should be created");
-
-        let err = extract_zip_with_limits(
-            &zip_path,
-            &extract_path,
-            ArchiveLimits {
-                max_total_unpacked_size: 9,
-                ..ArchiveLimits::default()
-            },
-        )
-        .await
-        .expect_err("zip total size limit should fail");
-
-        assert!(matches!(err, ZipError::TotalUnpackedSizeLimitExceeded { size: 10, limit: 9 }));
-    }
-
-    #[tokio::test]
-    async fn test_extract_zip_rejects_entry_path_length_limit() {
-        let temp = tempdir().expect("tempdir should be created");
-        let zip_path = temp.path().join("long-path.zip");
-        let extract_path = temp.path().join("extract");
-
-        build_zip_file_with_entries(&zip_path, &[("nested/hello.txt", b"hello")])
-            .await
-            .expect("zip fixture should be created");
-
-        let err = extract_zip_with_limits(
-            &zip_path,
-            &extract_path,
-            ArchiveLimits {
-                max_path_length: 5,
-                ..ArchiveLimits::default()
-            },
-        )
-        .await
-        .expect_err("zip path length limit should fail");
-
-        assert!(matches!(
-            err,
-            ZipError::EntryPathTooLong { path, limit: 5, .. } if path == "nested/hello.txt"
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_decompress_file_round_trip() {
-        let temp = tempdir().expect("tempdir should be created");
-        let input_path = temp.path().join("payload.txt.gz");
-        let output_path = temp.path().join("payload.txt");
-        let compressed = Compressor::new(CompressionFormat::Gzip)
-            .compress(b"payload")
-            .await
-            .expect("gzip compress should succeed");
-        fs::write(&input_path, compressed)
-            .await
-            .expect("compressed input file should be written");
-
-        Decompressor::auto_detect(&input_path)
-            .decompress_file(&input_path, &output_path)
-            .await
-            .expect("gzip file decompress should succeed");
-
-        assert_eq!(
-            fs::read(&output_path)
-                .await
-                .expect("decompressed output file should be readable"),
-            b"payload"
-        );
     }
 }

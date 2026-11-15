@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: disk abstractions still carry staged health and direct-I/O migration paths.
+
+pub(crate) mod cleanup_runtime;
 pub mod disk_store;
 pub mod endpoint;
 pub mod error;
@@ -20,8 +23,30 @@ pub mod error_reduce;
 pub mod format;
 pub mod fs;
 pub mod health_state;
+mod io_admission;
+#[cfg(test)]
+pub(crate) mod lifecycle_test_io;
 pub mod local;
+pub mod multipart_index;
+pub mod multipart_source;
 pub mod os;
+mod usage_watch;
+
+pub(crate) use io_admission::memory as background_memory;
+pub(crate) use io_admission::remote as remote_io_admission;
+pub use io_admission::{
+    BackgroundMemoryBudget, PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler, PhysicalResourcePlan,
+    RemoteBackgroundIo, spawn_blocking_with_resource_ownership, with_background_disk_io, with_background_resource_set,
+    with_background_resource_unit, with_remote_background_io,
+};
+pub use local::pool_meta_native::{PoolMetaNativeCasCondition, PoolMetaNativeFileIdentity};
+
+#[cfg(test)]
+pub(crate) use io_admission::{DiskIoClass, test_resource_units};
+pub(crate) use io_admission::{
+    PhysicalHealBinding, acquire_context_disk_io_permit, current_disk_io_context, current_resource_unit, has_resource_io_scope,
+    with_optional_disk_io_context, with_optional_resource_unit,
+};
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
 pub const MIGRATING_META_BUCKET: &str = ".minio.sys";
@@ -29,32 +54,289 @@ pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
 pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
 pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
 pub const BUCKET_META_PREFIX: &str = "buckets";
+/// Directory under `BUCKET_META_PREFIX` that holds drive-replacement heal
+/// intents, seals and recovery proofs. It shares the bucket-metadata root with
+/// a user bucket of the same name, so bucket deletion must leave it in place.
+pub const HEAL_REPLACEMENT_RECOVERY_DIR: &str = "ahm-replacement";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
+pub(crate) const FORMAT_BOOTSTRAP_FILE: &str = "format.json.bootstrap";
+pub(crate) const FORMAT_BOOTSTRAP_DONE_FILE: &str = "format.json.bootstrap.done";
+
+/// Validate an internal format control filename for atomic publication.
+///
+/// # Errors
+/// Returns [`DiskError::MethodNotAllowed`] for every other path.
+pub fn validate_format_control_path(path: &str) -> Result<()> {
+    if matches!(path, FORMAT_CONFIG_FILE | FORMAT_BOOTSTRAP_FILE) {
+        Ok(())
+    } else {
+        Err(DiskError::MethodNotAllowed)
+    }
+}
+
+/// Per-disk marker present while an erasure-set heal is rebuilding this disk.
+/// `LocalDisk::disk_info` reports `healing = true` while the file exists.
+pub const HEALING_MARKER_PATH: &str = "healing.bin";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
+/// Original upload authority after it stops admitting active part mutations.
+pub(crate) const MULTIPART_RECOVERY_DIR: &str = ".abort-authority";
+pub(crate) const MULTIPART_COMMIT_METADATA_FILE: &str = "xl.meta.complete";
+pub const PART_TRANSACTION_NEW_META: &str = "new.meta";
+pub const PART_TRANSACTION_OLD_META: &str = "old.meta";
+pub const PART_TRANSACTION_ROLLBACK: &str = "rollback";
 
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_DISK: &str = "disk";
+const EVENT_DISK_PART_ERR_UNCLASSIFIED: &str = "disk_part_err_unclassified";
+const ENV_BATCH_READ_VERSION_SERVER_PARALLELISM: &str = "RUSTFS_BATCH_READ_VERSION_SERVER_PARALLELISM";
+const BATCH_READ_VERSION_SERVER_PARALLELISM: usize = 4;
+
+pub fn part_transaction_path(part_path: &str) -> String {
+    match part_path.rsplit_once('/') {
+        Some((parent, name)) => format!("{parent}/.{name}.rustfs-txn"),
+        None => format!(".{part_path}.rustfs-txn"),
+    }
+}
+
+use crate::cluster::rpc::RemoteDisk;
+use crate::cluster::rpc::build_internode_data_transport_from_env;
+use crate::disk::disk_store::DiskStoreRenameDataExt;
 use crate::disk::disk_store::LocalDiskWrapper;
 use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
-use crate::rpc::RemoteDisk;
-use crate::rpc::build_internode_data_transport_from_env;
 use bytes::Bytes;
 use endpoint::Endpoint;
 use error::DiskError;
 use error::{Error, Result};
+use futures::stream::{self, StreamExt};
 use local::LocalDisk;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_madmin::info_commands::DiskMetrics;
+use rustfs_rio::ChunkReaderBox;
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, path::PathBuf, sync::Arc};
+use sha2::Digest as _;
+use std::{fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
+/// Independent admission and physical ownership for one disk rename.
+#[derive(Default)]
+pub(crate) struct RenameDataGuards {
+    pub(crate) scanner_publication_lease_token: Option<Uuid>,
+    pub(crate) external_guard: Option<Arc<dyn Send + Sync>>,
+    pub(crate) namespace_owner: Option<Arc<dyn Send + Sync>>,
+}
+
+/// Local preflight evidence stays outside DiskAPI and the RPC response format.
+pub(crate) struct RenameDataObservation {
+    pub(crate) result: Result<RenameDataResp>,
+    preflight_rejection: Option<local::LocalRenamePreflightRejection>,
+}
+
+impl RenameDataObservation {
+    fn unknown(result: Result<RenameDataResp>) -> Self {
+        Self {
+            result,
+            preflight_rejection: None,
+        }
+    }
+
+    pub(crate) fn rejected_before_publication(&self) -> bool {
+        self.result.is_err() && self.preflight_rejection.is_some()
+    }
+}
+
+const QUOTA_MUTATION_FENCE_PREFIX: &str = "tmp/quota-mutation-fences/";
+pub const QUOTA_MUTATION_FENCE_METADATA_SUFFIX: &str = "quota-mutation-fence-token";
+
+pub(crate) fn quota_mutation_fence_path(bucket: &str, object: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut input = Vec::with_capacity(bucket.len() + object.len() + 1);
+    input.extend_from_slice(bucket.as_bytes());
+    input.push(0);
+    input.extend_from_slice(object.as_bytes());
+    let digest = Sha256::digest(input);
+    format!(
+        "{QUOTA_MUTATION_FENCE_PREFIX}{}",
+        hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower)
+    )
+}
+
+pub fn is_quota_mutation_fence_path(path: &str) -> bool {
+    path.strip_prefix(QUOTA_MUTATION_FENCE_PREFIX)
+        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+/// Objects admitted by the native pool metadata recovery protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolMetaNativeObject {
+    PoolBin,
+}
+
+pub const POOL_META_NATIVE_CAS_METADATA_SUFFIX: &str = PoolMetaNativeCasCondition::METADATA_SUFFIX;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolMetaNativeBackup {
+    pub directory: Uuid,
+    pub data: Bytes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolMetaNativeInspection {
+    pub disk_id: Uuid,
+    /// Present only when pool.bin.identity is co-located on this disk.
+    /// None describes placement, not a missing identity in its owning set.
+    pub identity: Option<Bytes>,
+    pub current: Option<Bytes>,
+    pub backups: Vec<PoolMetaNativeBackup>,
+}
+
+impl PoolMetaNativeInspection {
+    /// Bind a repair to the complete observed inventory, independent of listing order.
+    pub fn inventory_sha256(&self) -> Result<[u8; 32]> {
+        let mut backups = self.backups.iter().collect::<Vec<_>>();
+        backups.sort_unstable_by_key(|backup| backup.directory);
+        if backups.windows(2).any(|pair| pair[0].directory == pair[1].directory) {
+            return Err(DiskError::FileCorrupt);
+        }
+        let encoded =
+            rmp_serde::to_vec_named(&(self.disk_id, &self.identity, self.current.as_ref(), backups)).map_err(Error::other)?;
+        Ok(sha2::Sha256::digest(encoded).into())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PoolMetaNativeRecoveryRequest {
+    Probe {},
+    InspectIdentity {},
+    Inspect {
+        object: PoolMetaNativeObject,
+    },
+    Apply {
+        object: PoolMetaNativeObject,
+        expected_disk_id: Uuid,
+        expected_current_sha256: Option<[u8; 32]>,
+        expected_backup_inventory_sha256: [u8; 32],
+        replacement: Bytes,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "result", content = "value", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PoolMetaNativeRecoveryResponse {
+    Probed,
+    IdentityInspected { disk_id: Uuid, raw: Bytes },
+    Inspected(PoolMetaNativeInspection),
+    Applied,
+}
+
 pub type DiskStore = Arc<Disk>;
 
+pub trait DiskFileWriter: AsyncWrite + Send + Sync + Unpin + std::any::Any {}
+impl<T: AsyncWrite + Send + Sync + Unpin + 'static> DiskFileWriter for T {}
+
 pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
-pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
+pub type FileWriter = Box<dyn DiskFileWriter>;
+
+pub(crate) fn as_lazy_local_file_writer_mut(writer: &mut dyn DiskFileWriter) -> Option<&mut local::LazyLocalFileWriter> {
+    let any: &mut dyn std::any::Any = writer;
+    if any.is::<local::LazyLocalFileWriter>() {
+        return any.downcast_mut::<local::LazyLocalFileWriter>();
+    }
+    let slow = any.downcast_mut::<disk_store::SlowDiskWriter>()?;
+    let inner_any: &mut dyn std::any::Any = slow.inner_mut();
+    inner_any.downcast_mut::<local::LazyLocalFileWriter>()
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotLeaseToken(Uuid);
+
+impl SnapshotLeaseToken {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn from_slice(bytes: &[u8]) -> Result<Self> {
+        let uuid = Uuid::from_slice(bytes).map_err(|_| Error::other("invalid snapshot lease token"))?;
+        if uuid.is_nil() {
+            return Err(Error::other("invalid snapshot lease token"));
+        }
+        Ok(Self(uuid))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
+
+    pub(crate) fn as_uuid(self) -> Uuid {
+        self.0
+    }
+
+    #[doc(hidden)]
+    pub fn revoke_all() -> Self {
+        Self(Uuid::nil())
+    }
+
+    #[doc(hidden)]
+    pub fn is_revoke_all(self) -> bool {
+        self.0.is_nil()
+    }
+}
+
+impl Default for SnapshotLeaseToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DataDirDeleteStatus {
+    Deleted,
+    Deferred,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PartTransactionAction {
+    Commit,
+    Rollback,
+}
+
+/// Result of an owner-aware file mutation. The disk applies the mutation only
+/// while the current contents match the supplied expected value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConditionalFileUpdate {
+    Updated,
+    Missing,
+    Mismatch,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MmapCopyStageMetrics {
+    pub(crate) path: &'static str,
+    pub(crate) access_check_stage: &'static str,
+    pub(crate) path_resolve_stage: &'static str,
+    pub(crate) metadata_lookup_stage: &'static str,
+    pub(crate) metadata_validate_stage: &'static str,
+    #[cfg(unix)]
+    pub(crate) blocking_wait_stage: &'static str,
+    #[cfg(unix)]
+    pub(crate) blocking_task_stage: &'static str,
+    #[cfg(unix)]
+    pub(crate) file_open_stage: &'static str,
+    #[cfg(unix)]
+    pub(crate) mmap_map_stage: &'static str,
+    #[cfg(unix)]
+    pub(crate) mmap_copy_stage: &'static str,
+    #[cfg(unix)]
+    pub(crate) direct_read_copy_stage: &'static str,
+}
 
 #[derive(Debug)]
 pub enum Disk {
@@ -62,8 +344,353 @@ pub enum Disk {
     Remote(Box<RemoteDisk>),
 }
 
+impl Disk {
+    /// Physical ownership belongs to the node hosting the local attachment.
+    pub fn physical_admission(&self) -> Option<Arc<PhysicalDiskBinding>> {
+        match self {
+            Self::Local(disk) => Some(disk.physical_admission()),
+            Self::Remote(_) => None,
+        }
+    }
+
+    /// A read-only probe; the physical delete repeats the same leaf checks.
+    pub async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
+        match self {
+            Self::Local(disk) => disk.get_disk().is_plain_orphan_data_dir(volume, path).await,
+            Self::Remote(disk) => disk.is_plain_orphan_data_dir(volume, path).await,
+        }
+    }
+
+    pub(crate) async fn delete_versions_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<Error>> {
+        match self {
+            Self::Local(disk) => {
+                disk.delete_versions_with_namespace_owner(volume, versions, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => {
+                let _owner = namespace_owner;
+                disk.delete_versions(volume, versions, opts).await
+            }
+        }
+    }
+
+    pub(crate) async fn delete_versions_recoverable_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        mut opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<Error>> {
+        if let Err(error) = validate_delete_recovery_options(&opts) {
+            return vec![Some(error); versions.len()];
+        }
+        if versions.iter().any(|version| version.name.starts_with('/')) {
+            return vec![Some(DiskError::InvalidPath); versions.len()];
+        }
+        opts.recoverable_delete = true;
+        match self {
+            Self::Local(disk) => {
+                disk.delete_versions_with_namespace_owner(volume, versions, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => {
+                let _owner = namespace_owner;
+                disk.delete_versions_recoverable(volume, versions, opts).await
+            }
+        }
+    }
+
+    pub(crate) async fn settle_delete_transaction_with_namespace_owner(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        expected_fingerprint: DeleteRecoveryDigest,
+        action: DeleteRecoveryAction,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<DeleteRecoveryInspection> {
+        match self {
+            Self::Local(disk) => {
+                disk.settle_delete_transaction_with_namespace_owner(
+                    volume,
+                    object,
+                    transaction,
+                    expected_fingerprint,
+                    action,
+                    namespace_owner,
+                )
+                .await
+            }
+            Self::Remote(disk) => {
+                let _owner = namespace_owner;
+                disk.settle_delete_transaction(volume, object, transaction, expected_fingerprint, action)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) fn has_clean_active_multipart_source(&self, upload_or_part_path: &str, part_path: bool) -> bool {
+        match self {
+            Self::Local(disk) => disk.has_clean_active_multipart_source(upload_or_part_path, part_path),
+            Self::Remote(_) => false,
+        }
+    }
+
+    pub(crate) async fn try_publish_prepared_delete_local(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
+    ) -> Result<Option<(DeleteRecoveryJournal, bool, bool)>> {
+        match self {
+            Self::Local(disk) => {
+                disk.try_publish_prepared_delete_local(volume, object, transaction, namespace_owner, work_budget)
+                    .await
+            }
+            Self::Remote(_) => Ok(None),
+        }
+    }
+
+    pub(crate) async fn try_finish_and_finalize_prepared_delete_local(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        journal: &DeleteRecoveryJournal,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+        work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
+    ) -> Result<bool> {
+        match self {
+            Self::Local(disk) => {
+                disk.try_finish_and_finalize_prepared_delete_local(
+                    volume,
+                    object,
+                    transaction,
+                    journal,
+                    namespace_owner,
+                    work_budget,
+                )
+                .await
+            }
+            Self::Remote(_) => Ok(false),
+        }
+    }
+
+    pub(crate) async fn delete_version_recoverable_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        mut opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        validate_delete_recovery_options(&opts)?;
+        if path.starts_with('/') {
+            return Err(DiskError::InvalidPath);
+        }
+        opts.recoverable_delete = true;
+        match self {
+            Self::Local(disk) => {
+                disk.delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => {
+                disk.delete_version_recoverable(volume, path, fi, force_del_marker, opts)
+                    .await
+            }
+        }
+    }
+    pub(crate) async fn set_disk_id_state(&self, id: Option<Uuid>) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk.set_disk_id_state(id).await;
+                Ok(())
+            }
+            Disk::Remote(remote_disk) => remote_disk.set_disk_id(id).await,
+        }
+    }
+
+    pub(crate) fn local_health_tracker_epoch_for_reconnect(&self) -> Option<disk_store::ReconnectDiskHealthState> {
+        match self {
+            Disk::Local(local_disk) => Some(local_disk.health_tracker_epoch_for_reconnect()),
+            Disk::Remote(_) => None,
+        }
+    }
+
+    pub(crate) async fn delete_versions_guarded_recoverable_with_namespace_owner(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Vec<Option<DiskError>> {
+        match self {
+            Self::Local(disk) => {
+                disk.delete_versions_guarded_with_namespace_owner(volume, versions, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => {
+                let _owner = namespace_owner;
+                disk.delete_versions_guarded_recoverable(volume, versions, opts).await
+            }
+        }
+    }
+
+    pub(crate) async fn cached_disk_id(&self) -> Option<Uuid> {
+        match self {
+            Disk::Local(local_disk) => local_disk.get_current_disk_id().await,
+            Disk::Remote(remote_disk) => remote_disk.get_disk_id().await.ok().flatten(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl DiskAPI for Disk {
+    async fn list_multipart_index_roots(
+        &self,
+        bucket: &str,
+        marker: Option<&str>,
+    ) -> Result<multipart_index::MultipartIndexPage> {
+        match self {
+            Self::Local(disk) => disk.list_multipart_index_roots(bucket, marker).await,
+            Self::Remote(disk) => disk.list_multipart_index_roots(bucket, marker).await,
+        }
+    }
+
+    async fn supports_guarded_delete_versions(&self) -> Result<()> {
+        match self {
+            Self::Local(disk) => disk.supports_guarded_delete_versions().await,
+            Self::Remote(disk) => disk.supports_guarded_delete_versions().await,
+        }
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        self.delete_versions_guarded_recoverable_with_namespace_owner(volume, versions, opts, None)
+            .await
+    }
+    async fn delete_version_recoverable(
+        &self,
+        volume: &str,
+        object: &str,
+        file_info: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    ) -> Result<()> {
+        self.delete_version_recoverable_with_namespace_owner(volume, object, file_info, force_del_marker, opts, None)
+            .await
+    }
+    async fn delete_versions_recoverable(
+        &self,
+        volume: &str,
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        match self {
+            Self::Local(disk) => disk.delete_versions_recoverable(volume, versions, opts).await,
+            Self::Remote(disk) => disk.delete_versions_recoverable(volume, versions, opts).await,
+        }
+    }
+    async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> Result<bool> {
+        match self {
+            Self::Local(disk) => disk.has_delete_transaction_evidence(volume, object).await,
+            Self::Remote(disk) => disk.has_delete_transaction_evidence(volume, object).await,
+        }
+    }
+    async fn discover_delete_transactions_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        max_entries: u32,
+    ) -> Result<BoundedDeleteRecoveryDiscovery> {
+        match self {
+            Self::Local(disk) => disk.discover_delete_transactions_bounded(volume, object, max_entries).await,
+            Self::Remote(disk) => disk.discover_delete_transactions_bounded(volume, object, max_entries).await,
+        }
+    }
+    async fn discover_delete_transactions(
+        &self,
+        volume: &str,
+        object: Option<&str>,
+        cursor: Option<DeleteRecoveryCursor>,
+        limit: u32,
+    ) -> Result<DeleteRecoveryPage> {
+        match self {
+            Self::Local(disk) => disk.discover_delete_transactions(volume, object, cursor, limit).await,
+            Self::Remote(disk) => disk.discover_delete_transactions(volume, object, cursor, limit).await,
+        }
+    }
+    async fn settle_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        request: BoundedDeleteRecoverySettlement,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<BoundedDeleteRecoverySettlementReply> {
+        match self {
+            Self::Local(disk) => disk.settle_delete_transaction_bounded(volume, request, namespace_owner).await,
+            Self::Remote(disk) => disk.settle_delete_transaction_bounded(volume, request, namespace_owner).await,
+        }
+    }
+    async fn inspect_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        max_entries: u32,
+    ) -> Result<BoundedDeleteRecoveryInspection> {
+        match self {
+            Self::Local(disk) => {
+                disk.inspect_delete_transaction_bounded(volume, object, transaction, max_entries)
+                    .await
+            }
+            Self::Remote(disk) => {
+                disk.inspect_delete_transaction_bounded(volume, object, transaction, max_entries)
+                    .await
+            }
+        }
+    }
+    async fn inspect_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+    ) -> Result<DeleteRecoveryInspection> {
+        match self {
+            Self::Local(disk) => disk.inspect_delete_transaction(volume, object, transaction).await,
+            Self::Remote(disk) => disk.inspect_delete_transaction(volume, object, transaction).await,
+        }
+    }
+    async fn settle_delete_transaction(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        expected_fingerprint: DeleteRecoveryDigest,
+        action: DeleteRecoveryAction,
+    ) -> Result<DeleteRecoveryInspection> {
+        match self {
+            Self::Local(disk) => {
+                disk.settle_delete_transaction(volume, object, transaction, expected_fingerprint, action)
+                    .await
+            }
+            Self::Remote(disk) => {
+                disk.settle_delete_transaction(volume, object, transaction, expected_fingerprint, action)
+                    .await
+            }
+        }
+    }
     fn to_string(&self) -> String {
         match self {
             Disk::Local(local_disk) => local_disk.to_string(),
@@ -134,7 +761,14 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    async fn bucket_creation_witness(&self, volume: &str) -> Result<Option<os::NativeBucketCreationWitness>> {
+        match self {
+            Disk::Local(local_disk) => local_disk.bucket_creation_witness(volume).await,
+            Disk::Remote(_) => Ok(None),
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn make_volume(&self, volume: &str) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.make_volume(volume).await,
@@ -142,7 +776,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn make_volumes(&self, volumes: Vec<&str>) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.make_volumes(volumes).await,
@@ -150,7 +784,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>> {
         match self {
             Disk::Local(local_disk) => local_disk.list_volumes().await,
@@ -165,15 +799,15 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn delete_volume(&self, volume: &str) -> Result<()> {
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()> {
         match self {
-            Disk::Local(local_disk) => local_disk.delete_volume(volume).await,
-            Disk::Remote(remote_disk) => remote_disk.delete_volume(volume).await,
+            Disk::Local(local_disk) => local_disk.delete_volume(volume, force_delete).await,
+            Disk::Remote(remote_disk) => remote_disk.delete_volume(volume, force_delete).await,
         }
     }
 
-    #[tracing::instrument(skip(self, wr))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.walk_dir(opts, wr).await,
@@ -181,7 +815,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_version(
         &self,
         volume: &str,
@@ -190,13 +824,21 @@ impl DiskAPI for Disk {
         force_del_marker: bool,
         opts: DeleteOptions,
     ) -> Result<()> {
+        if let Some(scope) = crate::store::bucket_heal_scope(volume) {
+            scope.check()?;
+            if let Disk::Local(local_disk) = self {
+                return local_disk
+                    .delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, Some(scope))
+                    .await;
+            }
+        }
         match self {
             Disk::Local(local_disk) => local_disk.delete_version(volume, path, fi, force_del_marker, opts).await,
             Disk::Remote(remote_disk) => remote_disk.delete_version(volume, path, fi, force_del_marker, opts).await,
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>> {
         match self {
             Disk::Local(local_disk) => local_disk.delete_versions(volume, versions, opts).await,
@@ -204,7 +846,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.delete_paths(volume, paths).await,
@@ -212,7 +854,35 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
+        match self {
+            Disk::Local(local_disk) => local_disk.acquire_snapshot_lease(volume, path).await,
+            Disk::Remote(remote_disk) => remote_disk.acquire_snapshot_lease(volume, path).await,
+        }
+    }
+
+    async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => local_disk.release_snapshot_lease(volume, path, token).await,
+            Disk::Remote(remote_disk) => remote_disk.release_snapshot_lease(volume, path, token).await,
+        }
+    }
+
+    async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
+        match self {
+            Disk::Local(local_disk) => local_disk.renew_snapshot_lease(volume, path, token).await,
+            Disk::Remote(remote_disk) => remote_disk.renew_snapshot_lease(volume, path, token).await,
+        }
+    }
+
+    async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
+        match self {
+            Disk::Local(local_disk) => local_disk.delete_data_dir(volume, path, opts).await,
+            Disk::Remote(remote_disk) => remote_disk.delete_data_dir(volume, path, opts).await,
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn write_metadata(&self, _org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.write_metadata(_org_volume, volume, path, fi).await,
@@ -220,7 +890,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.update_metadata(volume, path, fi, opts).await,
@@ -228,7 +898,8 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
+    #[track_caller]
     async fn read_version(
         &self,
         _org_volume: &str,
@@ -237,13 +908,31 @@ impl DiskAPI for Disk {
         version_id: &str,
         opts: &ReadOptions,
     ) -> Result<FileInfo> {
+        let operation = async {
+            match self {
+                Disk::Local(local_disk) => local_disk.read_version(_org_volume, volume, path, version_id, opts).await,
+                Disk::Remote(remote_disk) => remote_disk.read_version(_org_volume, volume, path, version_id, opts).await,
+            }
+        };
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        if crate::cluster::rpc::runtime_sources::current_read_version_request_caller().is_none() {
+            let caller = crate::cluster::rpc::runtime_sources::read_version_request_caller_from_location(
+                std::panic::Location::caller().file(),
+            );
+            return crate::cluster::rpc::runtime_sources::with_read_version_request_caller(caller, operation).await;
+        }
+        operation.await
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn batch_read_version(&self, req: BatchReadVersionReq) -> Result<Vec<BatchReadVersionResp>> {
         match self {
-            Disk::Local(local_disk) => local_disk.read_version(_org_volume, volume, path, version_id, opts).await,
-            Disk::Remote(remote_disk) => remote_disk.read_version(_org_volume, volume, path, version_id, opts).await,
+            Disk::Local(local_disk) => local_disk.batch_read_version(req).await,
+            Disk::Remote(remote_disk) => remote_disk.batch_read_version(req).await,
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
         match self {
             Disk::Local(local_disk) => local_disk.read_xl(volume, path, read_data).await,
@@ -251,7 +940,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self, fi))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_data(
         &self,
         src_volume: &str,
@@ -260,13 +949,55 @@ impl DiskAPI for Disk {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp> {
+        self.rename_data_borrowed(src_volume, src_path, &fi, dst_volume, dst_path)
+            .await
+    }
+
+    async fn rename_data_with_pool_meta_cas(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
         match self {
-            Disk::Local(local_disk) => local_disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await,
-            Disk::Remote(remote_disk) => remote_disk.rename_data(src_volume, src_path, fi, dst_volume, dst_path).await,
+            Disk::Local(disk) => {
+                disk.rename_data_with_pool_meta_cas(src_volume, src_path, fi, dst_volume, dst_path)
+                    .await
+            }
+            Disk::Remote(disk) => {
+                disk.rename_data_with_pool_meta_cas(src_volume, src_path, fi, dst_volume, dst_path)
+                    .await
+            }
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    async fn undo_pool_meta_write(&self, volume: &str, path: &str, fi: FileInfo, opts: DeleteOptions) -> Result<()> {
+        match self {
+            Disk::Local(disk) => disk.undo_pool_meta_write(volume, path, fi, opts).await,
+            Disk::Remote(disk) => disk.undo_pool_meta_write(volume, path, fi, opts).await,
+        }
+    }
+
+    async fn recover_multipart_source(
+        &self,
+        request: multipart_source::MultipartSourceRequest,
+    ) -> Result<multipart_source::MultipartSourceResponse> {
+        match self {
+            Disk::Local(disk) => disk.recover_multipart_source(request).await,
+            Disk::Remote(disk) => disk.recover_multipart_source(request).await,
+        }
+    }
+
+    async fn pool_meta_native_recovery(&self, request: PoolMetaNativeRecoveryRequest) -> Result<PoolMetaNativeRecoveryResponse> {
+        match self {
+            Disk::Local(disk) => disk.pool_meta_native_recovery(request).await,
+            Disk::Remote(disk) => disk.pool_meta_native_recovery(request).await,
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn list_dir(&self, _origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>> {
         match self {
             Disk::Local(local_disk) => local_disk.list_dir(_origvolume, volume, dir_path, count).await,
@@ -274,7 +1005,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader> {
         match self {
             Disk::Local(local_disk) => local_disk.read_file(volume, path).await,
@@ -282,7 +1013,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader> {
         match self {
             Disk::Local(local_disk) => local_disk.read_file_stream(volume, path, offset, length).await,
@@ -290,15 +1021,46 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
-    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+    async fn read_file_stream_chunks(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Option<ChunkReaderBox>> {
         match self {
-            Disk::Local(local_disk) => local_disk.read_file_zero_copy(volume, path, offset, length).await,
-            Disk::Remote(remote_disk) => remote_disk.read_file_zero_copy(volume, path, offset, length).await,
+            Disk::Local(_) => Ok(None),
+            Disk::Remote(remote_disk) => remote_disk.read_file_stream_chunks(volume, path, offset, length).await,
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
+    async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        match self {
+            Disk::Local(local_disk) => local_disk.read_file_mmap_copy(volume, path, offset, length).await,
+            Disk::Remote(remote_disk) => remote_disk.read_file_mmap_copy(volume, path, offset, length).await,
+        }
+    }
+
+    async fn read_file_mmap_copy_with_metrics(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<Bytes> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .read_file_mmap_copy_with_metrics(volume, path, offset, length, metrics)
+                    .await
+            }
+            Disk::Remote(remote_disk) => remote_disk.read_file_mmap_copy(volume, path, offset, length).await,
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter> {
         match self {
             Disk::Local(local_disk) => local_disk.append_file(volume, path).await,
@@ -306,7 +1068,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn create_file(&self, _origvolume: &str, volume: &str, path: &str, _file_size: i64) -> Result<FileWriter> {
         match self {
             Disk::Local(local_disk) => local_disk.create_file(_origvolume, volume, path, _file_size).await,
@@ -314,7 +1076,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.rename_file(src_volume, src_path, dst_volume, dst_path).await,
@@ -322,7 +1084,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
         match self {
             Disk::Local(local_disk) => local_disk.read_parts(bucket, paths).await,
@@ -330,7 +1092,14 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
+        match self {
+            Disk::Local(disk) => disk.rename_file_durable(src_volume, src_path, dst_volume, dst_path).await,
+            Disk::Remote(disk) => disk.rename_file_durable(src_volume, src_path, dst_volume, dst_path).await,
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.rename_part(src_volume, src_path, dst_volume, dst_path, meta).await,
@@ -342,15 +1111,50 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    async fn prepare_part_transaction(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        dst_volume: &str,
+        dst_path: &str,
+        meta: Bytes,
+    ) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .prepare_part_transaction(src_volume, src_path, dst_volume, dst_path, meta)
+                    .await
+            }
+            Disk::Remote(remote_disk) => {
+                remote_disk
+                    .prepare_part_transaction(src_volume, src_path, dst_volume, dst_path, meta)
+                    .await
+            }
+        }
+    }
+
+    async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => local_disk.settle_part_transaction(volume, path, action).await,
+            Disk::Remote(remote_disk) => remote_disk.settle_part_transaction(volume, path, action).await,
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()> {
+        if let Some(scope) = crate::store::bucket_heal_scope(volume) {
+            scope.check()?;
+            if let Self::Local(disk) = self {
+                return disk.delete_with_namespace_owner(volume, path, opt, Some(scope)).await;
+            }
+        }
         match self {
             Disk::Local(local_disk) => local_disk.delete(volume, path, opt).await,
             Disk::Remote(remote_disk) => remote_disk.delete(volume, path, opt).await,
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         match self {
             Disk::Local(local_disk) => local_disk.verify_file(volume, path, fi).await,
@@ -358,7 +1162,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn check_parts(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp> {
         match self {
             Disk::Local(local_disk) => local_disk.check_parts(volume, path, fi).await,
@@ -366,7 +1170,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>> {
         match self {
             Disk::Local(local_disk) => local_disk.read_multiple(req).await,
@@ -374,7 +1178,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.write_all(volume, path, data).await,
@@ -382,7 +1186,34 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    async fn write_format_control(&self, path: &str, data: Bytes) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => local_disk.write_format_control(path, data).await,
+            Disk::Remote(remote_disk) => remote_disk.write_format_control(path, data).await,
+        }
+    }
+
+    async fn compare_and_update_file(
+        &self,
+        volume: &str,
+        path: &str,
+        expected: Option<Bytes>,
+        replacement: Option<Bytes>,
+    ) -> Result<ConditionalFileUpdate> {
+        match self {
+            Disk::Local(local_disk) => local_disk.compare_and_update_file(volume, path, expected, replacement).await,
+            Disk::Remote(remote_disk) => remote_disk.compare_and_update_file(volume, path, expected, replacement).await,
+        }
+    }
+
+    fn has_replacement_mount_lease(&self) -> bool {
+        match self {
+            Disk::Local(local_disk) => local_disk.has_replacement_mount_lease(),
+            Disk::Remote(remote_disk) => remote_disk.has_replacement_mount_lease(),
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes> {
         match self {
             Disk::Local(local_disk) => local_disk.read_all(volume, path).await,
@@ -390,7 +1221,7 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip_all)]
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo> {
         match self {
             Disk::Local(local_disk) => local_disk.disk_info(opts).await,
@@ -414,6 +1245,214 @@ impl DiskAPI for Disk {
 }
 
 impl Disk {
+    pub async fn delete_with_scanner_publication_lease_and_guard(
+        &self,
+        volume: &str,
+        path: &str,
+        opts: DeleteOptions,
+        scanner_publication_lease_token: Option<Uuid>,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .delete_with_publication_guard(volume, path, opts, external_guard)
+                    .await
+            }
+            Disk::Remote(remote_disk) => {
+                remote_disk
+                    .delete_with_scanner_publication_lease(volume, path, opts, scanner_publication_lease_token)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn delete_version_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        match self {
+            Self::Local(disk) => {
+                disk.delete_version_with_namespace_owner(volume, path, fi, force_del_marker, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => {
+                let result = disk.delete_version(volume, path, fi, force_del_marker, opts).await;
+                // This is sender lifetime only, not proof of a remote physical drain.
+                drop(namespace_owner);
+                result
+            }
+        }
+    }
+
+    pub(crate) async fn delete_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        match self {
+            Self::Local(disk) => disk.delete_with_namespace_owner(volume, path, opts, namespace_owner).await,
+            Self::Remote(disk) => {
+                let result = disk.delete(volume, path, opts).await;
+                drop(namespace_owner);
+                result
+            }
+        }
+    }
+
+    /// Keep local undo publication owned independently of the wrapper deadline.
+    /// Remote undo retains its existing RPC contract; this is not a remote drain proof.
+    pub(crate) async fn undo_write_with_namespace_owner(
+        &self,
+        volume: &str,
+        path: &str,
+        fi: FileInfo,
+        opts: DeleteOptions,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        match self {
+            Self::Local(disk) => {
+                disk.undo_write_with_namespace_owner(volume, path, fi, opts, namespace_owner)
+                    .await
+            }
+            Self::Remote(disk) => disk.delete_version(volume, path, fi, false, opts).await,
+        }
+    }
+
+    pub(crate) async fn rename_data_borrowed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        let Some(scope) = crate::store::bucket_heal_scope_for_object(dst_volume, dst_path) else {
+            return self
+                .rename_data_borrowed_with_fence(src_volume, src_path, fi, dst_volume, dst_path, None)
+                .await;
+        };
+        scope.check()?;
+        self.rename_data_borrowed_with_fence_and_guard(src_volume, src_path, fi, dst_volume, dst_path, None, Some(scope))
+            .await
+    }
+
+    pub(crate) async fn rename_data_borrowed_with_fence_observed(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        guards: RenameDataGuards,
+    ) -> RenameDataObservation {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .rename_data_observed_with_guards(src_volume, src_path, fi, dst_volume, dst_path, guards)
+                    .await
+            }
+            Disk::Remote(remote_disk) => RenameDataObservation::unknown(
+                remote_disk
+                    .rename_data_borrowed_with_fence(
+                        src_volume,
+                        src_path,
+                        fi,
+                        dst_volume,
+                        dst_path,
+                        guards.scanner_publication_lease_token,
+                    )
+                    .await,
+            ),
+        }
+    }
+
+    pub(crate) async fn rename_data_borrowed_with_fence(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        scanner_publication_lease_token: Option<Uuid>,
+    ) -> Result<RenameDataResp> {
+        self.rename_data_borrowed_with_fence_and_guard(
+            src_volume,
+            src_path,
+            fi,
+            dst_volume,
+            dst_path,
+            scanner_publication_lease_token,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn rename_data_borrowed_with_fence_and_guard(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        scanner_publication_lease_token: Option<Uuid>,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<RenameDataResp> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .rename_data_borrowed_with_guard(src_volume, src_path, fi, dst_volume, dst_path, external_guard)
+                    .await
+            }
+            Disk::Remote(remote_disk) => {
+                remote_disk
+                    .rename_data_borrowed_with_fence(
+                        src_volume,
+                        src_path,
+                        fi,
+                        dst_volume,
+                        dst_path,
+                        scanner_publication_lease_token,
+                    )
+                    .await
+            }
+        }
+    }
+}
+
+impl Disk {
+    /// The progress flag is derived from a verified capability scope.
+    pub async fn ns_scanner_progress_capability(
+        &self,
+    ) -> Result<Option<crate::storage_api_contracts::internode::NsScannerCapabilities>> {
+        match self {
+            Disk::Local(_) => Ok(None),
+            Disk::Remote(remote_disk) => remote_disk.ns_scanner_progress_capability().await,
+        }
+    }
+
+    pub async fn ns_scanner_server_epoch(&self) -> Result<Option<Uuid>> {
+        match self {
+            Disk::Local(_) => Ok(None),
+            Disk::Remote(remote_disk) => remote_disk.ns_scanner_server_epoch().await,
+        }
+    }
+
+    pub async fn open_ns_scanner_stream(&self, request: NsScannerOpenRequest) -> Result<FileReader> {
+        match self {
+            Disk::Remote(remote_disk) => remote_disk.open_ns_scanner_stream(request).await,
+            Disk::Local(_) => Err(Error::other("namespace scanner stream requires a remote disk")),
+        }
+    }
+
     pub fn runtime_state(&self) -> RuntimeDriveHealthState {
         match self {
             Disk::Local(local_disk) => local_disk.runtime_state(),
@@ -432,6 +1471,13 @@ impl Disk {
         match self {
             Disk::Local(local_disk) => local_disk.last_capacity_snapshot(),
             Disk::Remote(remote_disk) => remote_disk.last_capacity_snapshot(),
+        }
+    }
+
+    pub fn metrics_snapshot(&self) -> Option<DiskMetrics> {
+        match self {
+            Disk::Local(local_disk) => Some(local_disk.metrics_snapshot()),
+            Disk::Remote(_) => None,
         }
     }
 
@@ -457,6 +1503,26 @@ impl Disk {
             Disk::Remote(remote_disk) => remote_disk.force_runtime_state_for_test(state),
         }
     }
+
+    #[cfg(test)]
+    pub fn force_offline_for_test(&self) {
+        match self {
+            Disk::Local(local_disk) => local_disk.force_offline_for_test(),
+            Disk::Remote(remote_disk) => remote_disk.force_offline_for_test(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct NsScannerOpenRequest {
+    pub request_id: Uuid,
+    pub server_epoch: Uuid,
+    pub session_id: Uuid,
+    pub session_sequence: u64,
+    pub next_cycle: u64,
+    pub leader_epoch: u64,
+    pub body: Vec<u8>,
+    pub stall_timeout: Option<Duration>,
 }
 
 impl Disk {
@@ -478,15 +1544,114 @@ impl Disk {
             Disk::Remote(remote_disk) => remote_disk.enable_health_check(),
         }
     }
+
+    /// Returns the absolute filesystem path for a (volume, path) pair if this
+    /// disk is local, or `None` if it is a remote disk.
+    pub fn get_object_path_if_local(&self, volume: &str, path: &str) -> Option<crate::disk::error::Result<std::path::PathBuf>> {
+        match self {
+            Disk::Local(w) => Some(w.get_object_path_if_local(volume, path)),
+            Disk::Remote(_) => None,
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn get_object_path_for_io_if_local(
+        &self,
+        volume: &str,
+        path: &str,
+    ) -> Option<crate::disk::error::Result<std::path::PathBuf>> {
+        match self {
+            Disk::Local(w) => Some(w.get_object_path_for_io(volume, path)),
+            Disk::Remote(_) => None,
+        }
+    }
+
+    pub(crate) fn get_bucket_path_for_io_if_local(&self, volume: &str) -> Option<crate::disk::error::Result<std::path::PathBuf>> {
+        match self {
+            Disk::Local(w) => Some(w.get_bucket_path_for_io(volume)),
+            Disk::Remote(_) => None,
+        }
+    }
+
+    /// Return the descriptor-rooted mount path admitted for automatic
+    /// replacement, or `None` when the configured endpoint no longer names
+    /// that held mount instance.
+    pub fn replacement_mount_lease_root(&self) -> Option<PathBuf> {
+        match self {
+            Disk::Local(local_disk) => local_disk.replacement_mount_lease_root(),
+            Disk::Remote(_) => None,
+        }
+    }
+
+    pub async fn acquire_replacement_execution_lease(&self) -> Result<std::sync::Arc<local::ReplacementExecutionLease>> {
+        match self {
+            Self::Local(disk) => disk.get_disk().acquire_replacement_execution_lease().await,
+            Self::Remote(_) => Err(DiskError::other("replacement execution requires a local target")),
+        }
+    }
+
+    pub(crate) async fn is_blank_replacement_target(&self) -> Result<bool> {
+        let Some(root) = self.replacement_mount_lease_root() else {
+            return Ok(false);
+        };
+        let blank = local::is_blank_replacement_target(root).await?;
+        Ok(blank && self.has_replacement_mount_lease())
+    }
 }
 
 pub async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> Result<DiskStore> {
+    new_disk_with_health_tracker(
+        ep,
+        opt,
+        None,
+        #[cfg(feature = "internode-transport")]
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn new_disk_for_instance(
+    _instance: &crate::runtime::instance::InstanceContext,
+    ep: &Endpoint,
+    opt: &DiskOption,
+) -> Result<DiskStore> {
+    let disk = new_disk_with_health_tracker(
+        ep,
+        opt,
+        None,
+        #[cfg(feature = "internode-transport")]
+        Some(_instance),
+    )
+    .await?;
+    if let Disk::Local(wrapper) = disk.as_ref() {
+        wrapper.get_disk().usage_watch_binding.bind(&_instance.usage_watches);
+    }
+    Ok(disk)
+}
+
+pub(crate) async fn new_disk_with_health_tracker(
+    ep: &Endpoint,
+    opt: &DiskOption,
+    reconnect: Option<disk_store::ReconnectDiskHealthState>,
+    #[cfg(feature = "internode-transport")] instance: Option<&crate::runtime::instance::InstanceContext>,
+) -> Result<DiskStore> {
     if ep.is_local {
         let s = LocalDisk::new(ep, opt.cleanup).await?;
-        Ok(Arc::new(Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(s), opt.health_check)))))
+        Ok(Arc::new(Disk::Local(Box::new(LocalDiskWrapper::new_with_reconnect_state(
+            Arc::new(s),
+            opt.health_check,
+            reconnect,
+        )))))
     } else {
-        let data_transport = build_internode_data_transport_from_env();
-        let remote_disk = RemoteDisk::new(ep, opt, data_transport?).await?;
+        #[cfg(feature = "internode-transport")]
+        let remote_disk = match instance.and_then(|ctx| ctx.internode_data_transport()) {
+            Some(transport) => RemoteDisk::new(ep, opt, Arc::clone(transport))
+                .await?
+                .with_instance_transport(),
+            None => RemoteDisk::new(ep, opt, build_internode_data_transport_from_env()?).await?,
+        };
+        #[cfg(not(feature = "internode-transport"))]
+        let remote_disk = RemoteDisk::new(ep, opt, build_internode_data_transport_from_env()?).await?;
         Ok(Arc::new(Disk::Remote(Box::new(remote_disk))))
     }
 }
@@ -500,6 +1665,15 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     fn host_name(&self) -> String;
     fn endpoint(&self) -> Endpoint;
     async fn close(&self) -> Result<()>;
+    /// Return candidates only while this disk maintains complete boot-local coverage.
+    /// Unsupported or unready disks must never return an authoritative empty page.
+    async fn list_multipart_index_roots(
+        &self,
+        _bucket: &str,
+        _marker: Option<&str>,
+    ) -> Result<multipart_index::MultipartIndexPage> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn get_disk_id(&self) -> Result<Option<Uuid>>;
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()>;
 
@@ -511,11 +1685,21 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     // NSScanner
 
     // Volume operations.
+    /// Unknown or remote backends cannot attest process-local publication history.
+    async fn bucket_creation_witness(&self, _volume: &str) -> Result<Option<os::NativeBucketCreationWitness>> {
+        Ok(None)
+    }
+
     async fn make_volume(&self, volume: &str) -> Result<()>;
     async fn make_volumes(&self, volume: Vec<&str>) -> Result<()>;
     async fn list_volumes(&self) -> Result<Vec<VolumeInfo>>;
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo>;
-    async fn delete_volume(&self, volume: &str) -> Result<()>;
+    /// Delete a volume (bucket directory). When `force_delete` is false a
+    /// non-empty volume is refused with `VolumeNotEmpty` (non-recursive); when
+    /// true it is removed recursively. Callers on the heal/dangling path must
+    /// pass false so a misclassified bucket that still holds data cannot be
+    /// wiped (backlog#799 B1).
+    async fn delete_volume(&self, volume: &str, force_delete: bool) -> Result<()>;
 
     // Concurrent read/write pipeline w <- MetaCacheEntry
     async fn walk_dir<W: AsyncWrite + Unpin + Send>(&self, opts: WalkDirOptions, wr: &mut W) -> Result<()>;
@@ -531,8 +1715,22 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     ) -> Result<()>;
     async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, opts: DeleteOptions) -> Vec<Option<Error>>;
     async fn delete_paths(&self, volume: &str, paths: &[String]) -> Result<()>;
+    async fn acquire_snapshot_lease(&self, _volume: &str, _path: &str) -> Result<SnapshotLeaseToken> {
+        Err(Error::other("snapshot leases are not supported by this disk"))
+    }
+    async fn release_snapshot_lease(&self, _volume: &str, _path: &str, _token: SnapshotLeaseToken) -> Result<()> {
+        Err(Error::other("snapshot leases are not supported by this disk"))
+    }
+    async fn renew_snapshot_lease(&self, _volume: &str, _path: &str, _token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
+        Err(Error::other("snapshot leases are not supported by this disk"))
+    }
+    async fn delete_data_dir(&self, volume: &str, path: &str, opts: DeleteOptions) -> Result<DataDirDeleteStatus> {
+        self.delete(volume, path, opts).await?;
+        Ok(DataDirDeleteStatus::Deleted)
+    }
     async fn write_metadata(&self, org_volume: &str, volume: &str, path: &str, fi: FileInfo) -> Result<()>;
     async fn update_metadata(&self, volume: &str, path: &str, fi: FileInfo, opts: &UpdateMetadataOpts) -> Result<()>;
+    #[track_caller]
     async fn read_version(
         &self,
         org_volume: &str,
@@ -541,6 +1739,9 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         version_id: &str,
         opts: &ReadOptions,
     ) -> Result<FileInfo>;
+    async fn batch_read_version(&self, req: BatchReadVersionReq) -> Result<Vec<BatchReadVersionResp>> {
+        batch_read_version_one_by_one(self, req).await
+    }
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn rename_data(
@@ -552,24 +1753,186 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         dst_path: &str,
     ) -> Result<RenameDataResp>;
 
+    async fn rename_data_with_pool_meta_cas(
+        &self,
+        _src_volume: &str,
+        _src_path: &str,
+        _file_info: FileInfo,
+        _dst_volume: &str,
+        _dst_path: &str,
+    ) -> Result<RenameDataResp> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
+    async fn undo_pool_meta_write(&self, _volume: &str, _path: &str, _file_info: FileInfo, _opts: DeleteOptions) -> Result<()> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
+    async fn recover_multipart_source(
+        &self,
+        _request: multipart_source::MultipartSourceRequest,
+    ) -> Result<multipart_source::MultipartSourceResponse> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
+    async fn pool_meta_native_recovery(&self, _request: PoolMetaNativeRecoveryRequest) -> Result<PoolMetaNativeRecoveryResponse> {
+        Err(DiskError::UnsupportedDisk)
+    }
+
     // File operations.
     // Read every file and directory within the folder
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> Result<Vec<String>>;
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
 
-    /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
-    /// Returns Bytes that can be shared without copying.
-    /// On Unix, this uses mmap for true zero-copy access.
-    /// On other platforms, falls back to efficient read operations.
-    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes>;
+    /// Returns an owned-chunk stream when the backing transport can preserve
+    /// receive-buffer ownership. `None` retains the ordinary reader path.
+    async fn read_file_stream_chunks(
+        &self,
+        _volume: &str,
+        _path: &str,
+        _offset: usize,
+        _length: usize,
+    ) -> Result<Option<ChunkReaderBox>> {
+        Ok(None)
+    }
+
+    /// File read using mmap-then-copy on Unix or an efficient read on non-Unix.
+    async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes>;
+
+    async fn read_file_mmap_copy_with_metrics(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        _metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<Bytes> {
+        self.read_file_mmap_copy(volume, path, offset, length).await
+    }
+
+    /// Historical name for `read_file_mmap_copy`.
+    #[deprecated(
+        since = "1.0.0-beta.8",
+        note = "use read_file_mmap_copy; this path copies mmap data into owned Bytes"
+    )]
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        self.read_file_mmap_copy(volume, path, offset, length).await
+    }
 
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter>;
     // ReadFileStream
     async fn rename_file(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()>;
+    async fn rename_file_durable(&self, _src_volume: &str, _src_path: &str, _dst_volume: &str, _dst_path: &str) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn rename_part(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str, meta: Bytes) -> Result<()>;
+    async fn prepare_part_transaction(
+        &self,
+        _src_volume: &str,
+        _src_path: &str,
+        _dst_volume: &str,
+        _dst_path: &str,
+        _meta: Bytes,
+    ) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    async fn settle_part_transaction(&self, _volume: &str, _path: &str, _action: PartTransactionAction) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn delete(&self, volume: &str, path: &str, opt: DeleteOptions) -> Result<()>;
+    /// Exact-key existence owns its traversal state; unsupported peers cannot
+    /// establish the absence of recovery obligations.
+    async fn has_delete_transaction_evidence(&self, _volume: &str, _object: &str) -> Result<bool> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    async fn discover_delete_transactions(
+        &self,
+        _volume: &str,
+        _object: Option<&str>,
+        _cursor: Option<DeleteRecoveryCursor>,
+        _limit: u32,
+    ) -> Result<DeleteRecoveryPage> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    /// Bounded foreground inventory owns all traversal state until return or cancellation.
+    /// An implementation without the bounded protocol is an unsupported participant
+    /// (the same verdict a remote peer without it receives); callers must never fall
+    /// back to paginated discovery.
+    async fn discover_delete_transactions_bounded(
+        &self,
+        _volume: &str,
+        _object: &str,
+        _max_entries: u32,
+    ) -> Result<BoundedDeleteRecoveryDiscovery> {
+        Err(DiskError::UnsupportedDisk)
+    }
+    async fn inspect_delete_transaction_bounded(
+        &self,
+        _volume: &str,
+        _object: &str,
+        _transaction: Uuid,
+        _max_entries: u32,
+    ) -> Result<BoundedDeleteRecoveryInspection> {
+        Err(DiskError::UnsupportedDisk)
+    }
+    async fn settle_delete_transaction_bounded(
+        &self,
+        _volume: &str,
+        _request: BoundedDeleteRecoverySettlement,
+        _namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<BoundedDeleteRecoverySettlementReply> {
+        Err(DiskError::UnsupportedDisk)
+    }
+    /// A read-only capability check; unsupported implementations must fail closed.
+    async fn supports_guarded_delete_versions(&self) -> Result<()> {
+        Err(DiskError::GuardedDeleteUnsupported)
+    }
+    async fn delete_versions_guarded_recoverable(
+        &self,
+        _volume: &str,
+        versions: Vec<GuardedFileInfoVersions>,
+        _opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        vec![Some(DiskError::GuardedDeleteUnsupported); versions.len()]
+    }
+    async fn delete_version_recoverable(
+        &self,
+        _volume: &str,
+        _object: &str,
+        _file_info: FileInfo,
+        _force_del_marker: bool,
+        _opts: DeleteOptions,
+    ) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    async fn delete_versions_recoverable(
+        &self,
+        _volume: &str,
+        versions: Vec<FileInfoVersions>,
+        _opts: DeleteOptions,
+    ) -> Vec<Option<DiskError>> {
+        vec![Some(DiskError::MethodNotAllowed); versions.len()]
+    }
+    async fn inspect_delete_transaction(
+        &self,
+        _volume: &str,
+        _object: &str,
+        _transaction: Uuid,
+    ) -> Result<DeleteRecoveryInspection> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    async fn settle_delete_transaction(
+        &self,
+        _volume: &str,
+        _object: &str,
+        _transaction: Uuid,
+        _expected_fingerprint: DeleteRecoveryDigest,
+        _action: DeleteRecoveryAction,
+    ) -> Result<DeleteRecoveryInspection> {
+        Err(DiskError::MethodNotAllowed)
+    }
     // VerifyFile
     async fn verify_file(&self, volume: &str, path: &str, fi: &FileInfo) -> Result<CheckPartsResp>;
     // CheckParts
@@ -579,9 +1942,90 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_multiple(&self, req: ReadMultipleReq) -> Result<Vec<ReadMultipleResp>>;
     // CleanAbandonedData
     async fn write_all(&self, volume: &str, path: &str, data: Bytes) -> Result<()>;
+    /// Atomically publish a valid per-drive `FormatV3` control file in the system volume.
+    /// Deployment, topology and member UUID must agree with existing control records.
+    /// Pending intents admit equivalent plans, and retired intents reject bootstrap
+    /// republication. Success requires a durable replacement inode and parent entry.
+    /// Cancellation can leave the complete plan published. Retries revalidate the
+    /// plan under the per-disk owner before publishing it durably.
+    ///
+    /// # Errors
+    /// Returns [`DiskError::MethodNotAllowed`] for unsupported implementations,
+    /// paths or retired bootstrap intents, [`DiskError::CorruptedFormat`] for
+    /// invalid or conflicting plans, and an I/O error when publication or its
+    /// durability barrier fails.
+    async fn write_format_control(&self, _path: &str, _data: Bytes) -> Result<()> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
+    /// Atomically replace or remove a small control file only when its current
+    /// contents match `expected`. Implementations that cannot provide this
+    /// cross-process guarantee must fail closed instead of emulating it with a
+    /// read-then-write sequence.
+    async fn compare_and_update_file(
+        &self,
+        _volume: &str,
+        _path: &str,
+        _expected: Option<Bytes>,
+        _replacement: Option<Bytes>,
+    ) -> Result<ConditionalFileUpdate> {
+        Err(DiskError::MethodNotAllowed)
+    }
+    /// Whether local I/O is rooted at a held mount descriptor. Auto-replacement
+    /// refuses destructive work when this is false.
+    fn has_replacement_mount_lease(&self) -> bool {
+        false
+    }
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
     fn start_scan(&self) -> ScanGuard;
+}
+
+pub async fn batch_read_version_one_by_one<D>(disk: &D, req: BatchReadVersionReq) -> Result<Vec<BatchReadVersionResp>>
+where
+    D: DiskAPI + ?Sized,
+{
+    validate_batch_read_version_item_count(req.items.len())?;
+    let parallelism = batch_read_version_server_parallelism();
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let item_count = req.items.len();
+
+    let mut responses = stream::iter(req.items.into_iter().enumerate())
+        .map(|(index, item)| async move {
+            let read = disk.read_version(&item.org_volume, &item.volume, &item.path, &item.version_id, &req.opts);
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            let read = crate::cluster::rpc::runtime_sources::with_batch_read_version_item_context(index, item_count, read);
+            match read.await {
+                Ok(file_info) => BatchReadVersionResp {
+                    index,
+                    path: item.path,
+                    version_id: item.version_id,
+                    success: true,
+                    file_info,
+                    error: String::new(),
+                    error_code: 0,
+                },
+                Err(err) => BatchReadVersionResp {
+                    index,
+                    path: item.path,
+                    version_id: item.version_id,
+                    success: false,
+                    file_info: FileInfo::default(),
+                    error: err.to_string(),
+                    error_code: err.to_u32(),
+                },
+            }
+        })
+        .buffer_unordered(parallelism)
+        .collect::<Vec<_>>()
+        .await;
+    responses.sort_unstable_by_key(|response| response.index);
+
+    Ok(responses)
+}
+
+fn batch_read_version_server_parallelism() -> usize {
+    rustfs_utils::get_env_usize(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, BATCH_READ_VERSION_SERVER_PARALLELISM)
+        .clamp(1, BATCH_READ_VERSION_MAX_ITEMS)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -593,6 +2037,25 @@ pub struct CheckPartsResp {
 pub struct UpdateMetadataOpts {
     pub no_persistence: bool,
     pub replace_user_metadata: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_reconcile: Option<Box<TransitionStateReconcileCondition>>,
+}
+
+/// An exact-copy precondition for the single-version tier repair protocol.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransitionStateReconcileCondition {
+    pub expected_metadata_digest: String,
+    pub unchanged_metadata_digest: String,
+    pub target: rustfs_filemeta::TransitionStateReconcileTarget,
+    pub tier: String,
+    pub topology_generation: String,
+    pub verify_only: bool,
+    /// Local ownership is never accepted from the wire. A remote disk acquires
+    /// its own fleet and backend leases before entering the mutation domain.
+    #[serde(skip)]
+    pub(crate) authority:
+        Option<Arc<crate::bucket::lifecycle::legacy_transition_state_reconcile::TransitionStateReconcileAuthority>>,
 }
 
 pub struct DiskLocation {
@@ -612,6 +2075,10 @@ pub struct DiskInfoOptions {
     pub disk_id: String,
     pub metrics: bool,
     pub noop: bool,
+    /// Bypass the ordinary one-second admin cache and return a positive
+    /// acknowledgement only after a fresh capacity syscall completes.
+    #[serde(default)]
+    pub fresh_capacity: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -636,9 +2103,17 @@ pub struct DiskInfo {
     pub rotational: bool,
     pub metrics: DiskMetrics,
     pub error: String,
+    /// Older peers omit this field. Callers must treat an absent/false value as
+    /// cached or otherwise unproven capacity evidence.
+    #[serde(default)]
+    pub fresh_capacity: bool,
 }
 
 #[derive(Clone, Debug, Default)]
+#[allow(
+    dead_code,
+    reason = "MinIO-parity disk info shape with no constructor in this port (backlog#1823)"
+)]
 pub struct Info {
     pub total: u64,
     pub free: u64,
@@ -669,6 +2144,126 @@ pub struct FileInfoVersions {
     pub free_versions: Vec<FileInfo>,
 }
 
+/// The durable remote location and restore state of the observed generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentDeleteTransition {
+    pub status: String,
+    pub tier: String,
+    pub remote_object: String,
+    pub remote_version: Option<String>,
+    pub version_state: rustfs_filemeta::TransitionVersionState,
+    pub destination_id: Option<[u8; 32]>,
+    pub remote_only: bool,
+}
+
+/// The current object generation observed before a guarded batch delete.
+/// This transient value is never persisted in object metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum CurrentDeleteGeneration {
+    Absent,
+    Present {
+        version_id: Option<Uuid>,
+        data_dir: Option<Uuid>,
+        mod_time: OffsetDateTime,
+        delete_marker: bool,
+        etag: String,
+        #[serde(default)]
+        transition: Option<Box<CurrentDeleteTransition>>,
+    },
+}
+
+impl CurrentDeleteGeneration {
+    pub fn from_file_info(fi: &FileInfo) -> Result<Self> {
+        let mod_time = fi.mod_time.ok_or(DiskError::FileCorrupt)?;
+        let etag = fi.get_etag().unwrap_or_default();
+        let data_dir = fi.data_dir.filter(|id| !id.is_nil());
+        let remote_only = fi.is_remote();
+        if !fi.deleted && (etag.is_empty() || (data_dir.is_none() && !remote_only)) {
+            return Err(DiskError::FileCorrupt);
+        }
+        if remote_only && (fi.transition_tier.is_empty() || fi.transitioned_objname.is_empty()) {
+            return Err(DiskError::FileCorrupt);
+        }
+        let destination_id =
+            crate::services::tier::tier::tier_destination_id_from_metadata(&fi.metadata).map_err(|_| DiskError::FileCorrupt)?;
+        let remote_version = match fi.transition_version.as_deref() {
+            Some(value) => (!value.is_empty() && !Uuid::parse_str(value).is_ok_and(|id| id.is_nil())).then(|| value.to_owned()),
+            None => fi.transition_version_id.filter(|id| !id.is_nil()).map(|id| id.to_string()),
+        };
+        let transition = (!fi.transition_status.is_empty()
+            || !fi.transition_tier.is_empty()
+            || !fi.transitioned_objname.is_empty()
+            || remote_version.is_some()
+            || fi.transition_version_state != rustfs_filemeta::TransitionVersionState::Unknown
+            || destination_id.is_some())
+        .then(|| {
+            Box::new(CurrentDeleteTransition {
+                status: fi.transition_status.clone(),
+                tier: fi.transition_tier.clone(),
+                remote_object: fi.transitioned_objname.clone(),
+                remote_version,
+                version_state: fi.transition_version_state,
+                destination_id,
+                remote_only,
+            })
+        });
+        Ok(Self::Present {
+            version_id: fi.version_id.filter(|id| !id.is_nil()),
+            data_dir,
+            mod_time,
+            delete_marker: fi.deleted,
+            etag,
+            transition,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardedFileInfoVersions {
+    pub group: FileInfoVersions,
+    pub expected_current: CurrentDeleteGeneration,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardedDeleteVersionsPayload {
+    pub versions: Vec<GuardedFileInfoVersions>,
+    pub opts: DeleteOptions,
+    // The strict legacy decoder rejects this field before applying any change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_recovery_protocol: Option<u32>,
+}
+
+impl GuardedDeleteVersionsPayload {
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .bounded_recovery_protocol
+            .is_some_and(|version| version != BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION)
+        {
+            return Err(DiskError::UnsupportedDisk);
+        }
+        validate_delete_recovery_options(&self.opts)?;
+        if self.versions.is_empty()
+            || self.versions.len() > 1000
+            || self
+                .versions
+                .iter()
+                .try_fold(0_usize, |count, version| count.checked_add(version.group.versions.len()))
+                .is_none_or(|count| count > 1000)
+            || self
+                .versions
+                .iter()
+                .any(|version| version.group.name.starts_with('/') || version.group.versions.is_empty())
+        {
+            return Err(DiskError::InvalidPath);
+        }
+        Ok(())
+    }
+}
+
 impl FileInfoVersions {
     pub fn find_version_index(&self, v: &str) -> Option<usize> {
         if v.is_empty() {
@@ -690,6 +2285,22 @@ pub struct WalkDirOptions {
     // Do a full recursive scan.
     pub recursive: bool,
 
+    // Include entries hidden by delete markers.
+    #[serde(default)]
+    pub incl_deleted: bool,
+
+    // Skip recursive prefix visibility probes only when authoritative bucket
+    // metadata proves versioning was never enabled.
+    #[serde(default)]
+    pub skip_hidden_prefix_check: bool,
+
+    /// Bound hidden metadata read while proving a non-recursive prefix visible.
+    #[serde(default)]
+    pub hidden_entry_budget: usize,
+    /// A prefix whose visibility was not established before the preceding cut.
+    #[serde(default)]
+    pub pending_prefix: Option<String>,
+
     // ReportNotFound will return errFileNotFound if all disks reports the BaseDir cannot be found.
     pub report_notfound: bool,
 
@@ -710,6 +2321,54 @@ pub struct WalkDirOptions {
     // Skip the wrapper-level total timeout for long streaming walks.
     #[serde(default)]
     pub skip_total_timeout: bool,
+
+    // Override the wrapper-level total timeout for long background walks.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+
+    // Override the remote stream stall timeout for long background walks.
+    #[serde(default)]
+    pub stall_timeout_ms: Option<u64>,
+
+    /// Select this leaf below identifier-like directory components. The root is
+    /// `base_dir`; unrelated object metadata must not be read or returned.
+    /// Older peers ignore this additive field, so consumers must also filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_tree_leaf: Option<String>,
+}
+
+pub(crate) fn is_identifier_tree_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+pub(crate) fn is_identifier_tree_leaf(value: &str) -> bool {
+    value.len() <= 255
+        && value.contains('.')
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+pub(crate) fn identifier_tree_leaf_matches(prefix: &str, leaf: &str, object: &str) -> bool {
+    let Some(relative) = object.strip_prefix(prefix) else {
+        return false;
+    };
+    let mut components = relative.split('/');
+    components.next_back() == Some(leaf) && components.all(is_identifier_tree_component)
+}
+
+impl WalkDirOptions {
+    pub fn timeout_duration(&self) -> Option<std::time::Duration> {
+        self.timeout_ms.map(std::time::Duration::from_millis)
+    }
+
+    pub fn stall_timeout_duration(&self) -> Option<std::time::Duration> {
+        self.stall_timeout_ms.map(std::time::Duration::from_millis)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -718,10 +2377,63 @@ pub struct DiskOption {
     pub health_check: bool,
 }
 
+/// Per-disk observation of the destination key's *current* (latest) version
+/// in the dst `xl.meta` that `rename_data` reads before it commits the
+/// incoming version (rustfs/backlog#1009). Mirrors the pre-PUT
+/// `get_object_info` outcome — which the app layer previously obtained with an
+/// extra full-disk fanout — bit for bit: `Absent` iff that lookup would report
+/// object-not-found (missing xl.meta, or only hidden free versions), and
+/// `Present(size)` iff it would return `Ok` with `ObjectInfo.size == size`.
+/// Note a delete-marker latest is `Present(0)`, not `Absent`: the lookup
+/// returns markers as `Ok(size 0)` and delete-marker accounting never
+/// decrements objects_count, so `Present(0)` is what keeps usage numbers
+/// identical.
+///
+/// The parity target is the set-level (`SetDisks`) lookup. Two app-visible
+/// lookup variants deviated from it and from each other — the multi-pool
+/// `ECStore` path converts a delete-marker latest to not-found, and
+/// directory-key lookups pin the nil version — and both deviations
+/// over-incremented objects_count relative to delete-marker accounting, so
+/// the backfill standardizes on the self-consistent set-level answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OldCurrentSize {
+    /// The pre-PUT lookup would have reported object-not-found for this key.
+    Absent,
+    /// The pre-PUT lookup would have returned `Ok` with this `ObjectInfo.size`
+    /// (0 for a delete-marker latest).
+    Present(i64),
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct RenameDataResp {
+    /// Native-only source ownership result; older peers omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multipart_source: Option<Box<multipart_source::MultipartPublicationResult>>,
+    /// Dereferenced erasure data directory retained for older coordinators.
     pub old_data_dir: Option<Uuid>,
+    /// Directory containing rollback metadata. This may be synthetic and must
+    /// not be used for post-commit data cleanup.
+    #[serde(default)]
+    pub rollback_data_dir: Option<Uuid>,
+    /// Dereferenced erasure data directory that is safe to reclaim after the
+    /// rename commits. Older peers omit this field, so missing means no cleanup.
+    #[serde(default)]
+    pub cleanup_data_dir: Option<Uuid>,
     pub sign: Option<Vec<u8>>,
+    /// `None` means unknown — the disk could not determine the previous
+    /// current version (pre-#1009 peer on the wire, or an existing dst
+    /// `xl.meta` that failed to parse). Consumers must treat unknown as
+    /// "cannot vote", never as `Absent`.
+    #[serde(default)]
+    pub old_current_size: Option<OldCurrentSize>,
+    /// Whether this disk decoded enough of the overwritten current version to
+    /// decide if a transitioned source has to be returned.
+    #[serde(default)]
+    pub old_current_source_checked: bool,
+    /// Transitioned old-current source used by PUT free-version cleanup receipt.
+    /// Empty when the old current is not transitioned or no source was known.
+    #[serde(default)]
+    pub old_current_source: Option<FileInfo>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -729,7 +2441,363 @@ pub struct DeleteOptions {
     pub recursive: bool,
     pub immediate: bool,
     pub undo_write: bool,
+    #[serde(default)]
+    pub undo_delete: bool,
     pub old_data_dir: Option<Uuid>,
+    /// Full marker precondition checked under the actual metadata mutation lease.
+    /// Remote calls carrying it must use DeleteRetiredMarker, never DeleteVersion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_delete_marker: Option<rustfs_filemeta::MetaDeleteMarker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_recovery_bucket_incarnation: Option<Uuid>,
+    #[serde(default)]
+    pub recoverable_delete: bool,
+    /// Transport requirement for preparing a delete that will use bounded settlement.
+    #[serde(skip)]
+    pub requires_bounded_delete_recovery: bool,
+    /// Reclaim only plain erasure-part leaves, preserving every other entry.
+    /// Keep `recursive` false so an older peer cannot widen this operation.
+    #[serde(default)]
+    pub orphan_data_dir: bool,
+}
+
+pub const DELETE_RECOVERY_PROTOCOL_VERSION: u32 = 1;
+/// Accepted only for prepare RPCs. Legacy peers must refuse before staging a delete.
+pub const BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION: u32 = 2;
+pub(crate) fn get_delete_recovery_timeout() -> Result<std::time::Duration> {
+    let value = std::env::var("RUSTFS_DELETE_RECOVERY_TIMEOUT_SECS");
+    match value {
+        Ok(value) => parse_delete_recovery_timeout(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_delete_recovery_timeout(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(DiskError::other("invalid delete recovery timeout configuration")),
+    }
+}
+
+fn parse_delete_recovery_timeout(value: Option<&str>) -> Result<std::time::Duration> {
+    let seconds = match value {
+        None => 900,
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| (30..=86400).contains(seconds))
+            .ok_or_else(|| DiskError::other("delete recovery timeout must be an integer between 30 and 86400 seconds"))?,
+    };
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
+pub(crate) fn validate_delete_recovery_options(opts: &DeleteOptions) -> Result<()> {
+    if opts.old_data_dir.is_none_or(|id| id.is_nil())
+        || opts.undo_write
+        || opts.undo_delete
+        || opts.recursive
+        || opts.immediate
+        || opts.orphan_data_dir
+        || opts.expected_delete_marker.is_some()
+        || opts.delete_recovery_bucket_incarnation.is_some_and(|id| id.is_nil())
+    {
+        return Err(DiskError::FileCorrupt);
+    }
+    Ok(())
+}
+pub type DeleteRecoveryDigest = [u8; 32];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteTransactionId {
+    pub object: String,
+    pub transaction: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRecoveryCursor {
+    pub token: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRecoveryPage {
+    pub transactions: Vec<DeleteTransactionId>,
+    pub next: Option<DeleteRecoveryCursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRecoveryJournal {
+    pub protocol_version: u32,
+    pub volume: String,
+    pub object: String,
+    pub transaction: Uuid,
+    pub bucket_incarnation: Option<Uuid>,
+    pub original_digest: Option<DeleteRecoveryDigest>,
+    pub target_digest: Option<DeleteRecoveryDigest>,
+    pub data_dirs: Vec<Uuid>,
+    pub deleted_versions: Vec<Uuid>,
+    pub requests: Vec<FileInfo>,
+    pub original_versions: Vec<DeleteRecoveryVersionIdentity>,
+    #[serde(default)]
+    pub predecessors: Vec<Uuid>,
+}
+
+impl DeleteRecoveryJournal {
+    /// Checks source generations only; the coordinator must supply a certified
+    /// decision and the receiver must retain its namespace/incarnation fences.
+    pub(crate) fn matches_adoption_source(&self, current: &[DeleteRecoveryVersionIdentity]) -> bool {
+        if self.requests.is_empty() {
+            return false;
+        }
+        let mut originals = std::collections::HashMap::with_capacity(self.original_versions.len());
+        for version in &self.original_versions {
+            originals.entry(version.version_id.unwrap_or_default()).or_insert(version);
+        }
+        let mut locals = std::collections::HashMap::with_capacity(current.len());
+        for version in current {
+            locals.entry(version.version_id.unwrap_or_default()).or_insert(version);
+        }
+        self.requests.iter().all(|request| {
+            if request.deleted && request.mark_deleted {
+                return current.first() == self.original_versions.first();
+            }
+            let id = request.version_id.unwrap_or_default();
+            let Some(original) = originals.get(&id) else {
+                return !id.is_nil() && !locals.contains_key(&id);
+            };
+            match locals.get(&id) {
+                Some(local) => local == original,
+                None => !id.is_nil(),
+            }
+        })
+    }
+
+    /// Matches immutable local preparation intent against an independently
+    /// inspected same-transaction commit receipt. This match is not authority
+    /// by itself; the coordinator must supply the certified receipt.
+    pub(crate) fn matches_prepared_authority(&self, authority: &Self) -> bool {
+        if self.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+            || authority.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION
+            || self.transaction.is_nil()
+            || self.transaction != authority.transaction
+            || self.volume != authority.volume
+            || self.object != authority.object
+            || self.bucket_incarnation != authority.bucket_incarnation
+            || self.bucket_incarnation.is_some_and(|id| id.is_nil())
+            || self.requests.is_empty()
+            || self.requests != authority.requests
+            || self.deleted_versions.iter().collect::<std::collections::HashSet<_>>()
+                != authority.deleted_versions.iter().collect::<std::collections::HashSet<_>>()
+        {
+            return false;
+        }
+        let sources: std::collections::HashMap<_, _> = self
+            .original_versions
+            .iter()
+            .map(|version| (version.version_id.unwrap_or_default(), version))
+            .collect();
+        let certified: std::collections::HashMap<_, _> = authority
+            .original_versions
+            .iter()
+            .map(|version| (version.version_id.unwrap_or_default(), version))
+            .collect();
+        if sources.len() != self.original_versions.len() || certified.len() != authority.original_versions.len() {
+            return false;
+        }
+        self.requests.iter().all(|request| {
+            let (local, remote) = if request.deleted && request.mark_deleted {
+                (self.original_versions.first(), authority.original_versions.first())
+            } else {
+                let id = request.version_id.unwrap_or_default();
+                (sources.get(&id).copied(), certified.get(&id).copied())
+            };
+            match (local, remote) {
+                (Some(local), Some(remote)) => local == remote,
+                (None, None) => {
+                    (!(request.deleted && request.mark_deleted) && request.version_id.is_some_and(|id| !id.is_nil()))
+                        || (self.original_digest.is_none() && authority.original_digest.is_none())
+                }
+                _ => false,
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRecoveryVersionIdentity {
+    pub version_id: Option<Uuid>,
+    pub mod_time: Option<OffsetDateTime>,
+    pub data_dir: Option<Uuid>,
+    pub deleted: bool,
+    pub metadata_digest: DeleteRecoveryDigest,
+}
+
+impl DeleteRecoveryVersionIdentity {
+    pub(crate) fn from_file_info(info: FileInfo) -> error::Result<Self> {
+        local::delete_recovery::generation(info)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeleteRecoveryState {
+    Absent,
+    NewPrepared,
+    QuorumCommitted,
+    CommitFinished,
+    LegacyAmbiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteRecoveryInspection {
+    pub protocol_version: u32,
+    pub id: DeleteTransactionId,
+    pub state: DeleteRecoveryState,
+    pub journal: Option<DeleteRecoveryJournal>,
+    pub current_digest: Option<DeleteRecoveryDigest>,
+    pub current_versions: Vec<DeleteRecoveryVersionIdentity>,
+    pub backup_digest: Option<DeleteRecoveryDigest>,
+    pub rollback_data_complete: bool,
+    pub commit_data_safe: bool,
+    pub explicit_delete_safe: bool,
+    pub fingerprint: DeleteRecoveryDigest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DeleteRecoveryAction {
+    PublishCommit,
+    FinishCommit,
+    FinalizeCommit,
+    Rollback,
+    DiscardLegacy,
+    AdoptCommit { authority: Box<DeleteRecoveryJournal> },
+}
+
+/// A complete inventory or a work-limit refusal. No public discovery cursor is allocated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedDeleteRecoveryDiscovery {
+    pub transactions: Vec<DeleteTransactionId>,
+    pub visited: u32,
+    pub complete: bool,
+}
+
+/// Entries one bounded discovery call may charge on one drive. Object-scoped
+/// discovery charges each transaction-shaped (UUID) child of the key's
+/// directory once and every name that cannot be delete evidence at
+/// 1/`PLAIN_CHILDREN_PER_BUDGET_ENTRY`, so this admits a missing-key delete of a
+/// folder prefix with this many UUID-named children per drive. The request
+/// budget (`DeleteRecoveryWorkBudget`) still bounds the total across keys.
+pub const DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES: u32 = 262_144;
+pub const DELETE_RECOVERY_MAX_INSPECTION_ENTRIES: u32 = 65536;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedDeleteRecoverySettlement {
+    pub object: String,
+    pub transaction: Uuid,
+    pub expected_fingerprint: DeleteRecoveryDigest,
+    pub action: DeleteRecoveryAction,
+    pub max_entries: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum DeleteRecoverySettlementOutcome {
+    Inspected(Box<DeleteRecoveryInspection>),
+    ReceiptPublishedInspectionDeferred,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedDeleteRecoverySettlementReply {
+    pub outcome: DeleteRecoverySettlementOutcome,
+    pub visited: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedDeleteRecoveryInspection {
+    pub inspection: DeleteRecoveryInspection,
+    pub visited: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum DeleteRecoveryRpcOperation {
+    SettleBounded(BoundedDeleteRecoverySettlement),
+    InspectBounded {
+        object: String,
+        transaction: Uuid,
+        max_entries: u32,
+    },
+    DiscoverBounded {
+        object: String,
+        max_entries: u32,
+    },
+    InspectOrphanDataDir {
+        path: String,
+    },
+    Discover {
+        object: Option<String>,
+        cursor: Option<DeleteRecoveryCursor>,
+        limit: u32,
+    },
+    Inspect {
+        object: String,
+        transaction: Uuid,
+    },
+    Settle {
+        object: String,
+        transaction: Uuid,
+        expected_fingerprint: DeleteRecoveryDigest,
+        action: DeleteRecoveryAction,
+    },
+    ApplyVersion {
+        object: String,
+        file_info: Box<FileInfo>,
+        force_del_marker: bool,
+        opts: DeleteOptions,
+    },
+    ApplyVersions {
+        versions: Vec<FileInfoVersions>,
+        opts: DeleteOptions,
+    },
+    Exists {
+        object: String,
+    },
+}
+
+impl DeleteRecoveryRpcOperation {
+    /// Full metadata application and adoption share the existing mutation envelope.
+    pub fn max_wire_payload_bytes(&self) -> usize {
+        match self {
+            Self::SettleBounded(BoundedDeleteRecoverySettlement {
+                action: DeleteRecoveryAction::AdoptCommit { .. },
+                ..
+            })
+            | Self::ApplyVersion { .. }
+            | Self::ApplyVersions { .. }
+            | Self::Settle {
+                action: DeleteRecoveryAction::AdoptCommit { .. },
+                ..
+            } => rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES,
+            _ => rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum DeleteRecoveryRpcReply {
+    OrphanDataDir { plain: bool },
+    Discovered(DeleteRecoveryPage),
+    DiscoveredBounded(BoundedDeleteRecoveryDiscovery),
+    Inspected(DeleteRecoveryInspection),
+    InspectedBounded(BoundedDeleteRecoveryInspection),
+    Settled(DeleteRecoveryInspection),
+    SettledBounded(BoundedDeleteRecoverySettlementReply),
+    AppliedVersion,
+    AppliedVersions(Vec<Option<u32>>),
+    Evidence { present: bool },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -754,13 +2822,50 @@ pub struct ReadMultipleResp {
     pub mod_time: Option<OffsetDateTime>,
 }
 
+pub const BATCH_READ_VERSION_MAX_ITEMS: usize = 128;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchReadVersionItem {
+    pub org_volume: String,
+    pub volume: String,
+    pub path: String,
+    pub version_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchReadVersionReq {
+    pub items: Vec<BatchReadVersionItem>,
+    pub opts: ReadOptions,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BatchReadVersionResp {
+    pub index: usize,
+    pub path: String,
+    pub version_id: String,
+    pub success: bool,
+    pub file_info: FileInfo,
+    pub error: String,
+    #[serde(default)]
+    pub error_code: u32,
+}
+
+pub fn validate_batch_read_version_item_count(item_count: usize) -> Result<()> {
+    if item_count > BATCH_READ_VERSION_MAX_ITEMS {
+        return Err(DiskError::other(format!(
+            "batch read version item count {item_count} exceeds limit {BATCH_READ_VERSION_MAX_ITEMS}"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct VolumeInfo {
     pub name: String,
     pub created: Option<OffsetDateTime>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Default, Clone)]
+#[derive(Deserialize, Serialize, Debug, Default, Clone, Copy)]
 pub struct ReadOptions {
     pub incl_free_versions: bool,
     pub read_data: bool,
@@ -784,12 +2889,19 @@ pub fn conv_part_err_to_int(err: &Option<Error>) -> usize {
         Some(DiskError::DiskNotFound) => CHECK_PART_DISK_NOT_FOUND,
         None => CHECK_PART_SUCCESS,
         _ => {
-            tracing::warn!("conv_part_err_to_int: unknown error: {err:?}");
+            tracing::warn!(
+                event = EVENT_DISK_PART_ERR_UNCLASSIFIED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK,
+                error = ?err,
+                "Part error has no check-part code and degrades to unknown"
+            );
             CHECK_PART_UNKNOWN
         }
     }
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub fn has_part_err(part_errs: &[usize]) -> bool {
     part_errs.iter().any(|err| *err != CHECK_PART_SUCCESS)
 }
@@ -800,7 +2912,285 @@ pub fn count_part_not_success(part_errs: &[usize]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn format_control_paths_are_fixed_system_leaf_names() {
+        for path in [super::FORMAT_CONFIG_FILE, super::FORMAT_BOOTSTRAP_FILE] {
+            super::validate_format_control_path(path).expect("allowed format control leaf");
+        }
+        for path in [
+            "",
+            "../format.json",
+            "format.json/",
+            ".rustfs.sys/format.json",
+            "format.json.bootstrap.done",
+            "pool.bin",
+        ] {
+            assert!(matches!(
+                super::validate_format_control_path(path),
+                Err(super::DiskError::MethodNotAllowed)
+            ));
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn guarded_delete_generation_boxing_preserves_legacy_wire_bytes() {
+        #[derive(Serialize)]
+        struct LegacyPresent {
+            version_id: Option<Uuid>,
+            data_dir: Option<Uuid>,
+            mod_time: OffsetDateTime,
+            delete_marker: bool,
+            etag: String,
+            transition: Option<CurrentDeleteTransition>,
+        }
+
+        assert!(std::mem::size_of::<CurrentDeleteGeneration>() < std::mem::size_of::<LegacyPresent>());
+        let mut fi = FileInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            data_dir: Some(Uuid::from_u128(1)),
+            ..Default::default()
+        };
+        fi.metadata.insert("etag".into(), "opaque-etag".into());
+        let plain = CurrentDeleteGeneration::from_file_info(&fi).expect("local generation");
+        fi.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_owned();
+        fi.transition_tier = "WARM".into();
+        fi.transitioned_objname = "remote/object".into();
+        fi.transition_version = Some("remote-version".into());
+        let remote = CurrentDeleteGeneration::from_file_info(&fi).expect("transition generation");
+        for current in [CurrentDeleteGeneration::Absent, plain, remote] {
+            let (legacy_messagepack, legacy_json) = match &current {
+                CurrentDeleteGeneration::Absent => (
+                    rmp_serde::to_vec_named("Absent").expect("legacy absent MessagePack"),
+                    serde_json::to_vec("Absent").expect("legacy absent JSON"),
+                ),
+                CurrentDeleteGeneration::Present {
+                    version_id,
+                    data_dir,
+                    mod_time,
+                    delete_marker,
+                    etag,
+                    transition,
+                } => {
+                    let legacy = std::collections::BTreeMap::from([(
+                        "Present",
+                        LegacyPresent {
+                            version_id: *version_id,
+                            data_dir: *data_dir,
+                            mod_time: *mod_time,
+                            delete_marker: *delete_marker,
+                            etag: etag.clone(),
+                            transition: transition.as_deref().cloned(),
+                        },
+                    )]);
+                    (
+                        rmp_serde::to_vec_named(&legacy).expect("legacy inline MessagePack"),
+                        serde_json::to_vec(&legacy).expect("legacy inline JSON"),
+                    )
+                }
+            };
+            assert_eq!(rmp_serde::to_vec_named(&current).expect("current MessagePack"), legacy_messagepack);
+            assert_eq!(serde_json::to_vec(&current).expect("current JSON"), legacy_json);
+            assert_eq!(
+                rustfs_protos::decode_delete_recovery_payload::<CurrentDeleteGeneration>(&legacy_messagepack)
+                    .expect("existing payload remains readable"),
+                current
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_delete_generation_requires_reliable_current_identity() {
+        let mut fi = FileInfo::default();
+        assert_eq!(CurrentDeleteGeneration::from_file_info(&fi), Err(DiskError::FileCorrupt));
+        fi.mod_time = Some(OffsetDateTime::UNIX_EPOCH);
+        fi.data_dir = Some(Uuid::new_v4());
+        assert_eq!(CurrentDeleteGeneration::from_file_info(&fi), Err(DiskError::FileCorrupt));
+        fi.metadata.insert("etag".into(), "opaque-etag".into());
+        fi.version_id = Some(Uuid::nil());
+        assert!(matches!(
+            CurrentDeleteGeneration::from_file_info(&fi),
+            Ok(CurrentDeleteGeneration::Present { version_id: None, .. })
+        ));
+        fi.data_dir = Some(Uuid::nil());
+        assert_eq!(CurrentDeleteGeneration::from_file_info(&fi), Err(DiskError::FileCorrupt));
+    }
+
+    #[test]
+    fn guarded_delete_generation_accepts_remote_only_and_legacy_unversioned_identity() {
+        let mut fi = FileInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+            transition_status: rustfs_filemeta::TRANSITION_COMPLETE.to_owned(),
+            transition_tier: "WARM".into(),
+            transitioned_objname: "remote/object".into(),
+            ..Default::default()
+        };
+        fi.metadata.insert("etag".into(), "opaque-etag".into());
+        for version in [None, Some(String::new()), Some(Uuid::nil().to_string())] {
+            fi.transition_version = version;
+            for data_dir in [None, Some(Uuid::nil())] {
+                fi.data_dir = data_dir;
+                assert!(
+                    matches!(
+                        CurrentDeleteGeneration::from_file_info(&fi),
+                        Ok(CurrentDeleteGeneration::Present {
+                            data_dir: None,
+                            transition: Some(transition),
+                            ..
+                        }) if transition.remote_version.is_none()
+                            && transition.version_state == rustfs_filemeta::TransitionVersionState::Unknown
+                            && transition.destination_id.is_none()
+                            && transition.remote_only
+                    ),
+                    "legacy unversioned remote metadata remains usable"
+                );
+            }
+        }
+        fi.transition_version = None;
+        fi.transition_version_id = Some(Uuid::nil());
+        CurrentDeleteGeneration::from_file_info(&fi).expect("nil legacy remote UUID means no remote version");
+        fi.transition_status.clear();
+        assert_eq!(
+            CurrentDeleteGeneration::from_file_info(&fi),
+            Err(DiskError::FileCorrupt),
+            "local payload metadata still requires a data directory"
+        );
+        fi.transition_status = rustfs_filemeta::TRANSITION_COMPLETE.to_owned();
+        fi.transition_tier.clear();
+        assert_eq!(
+            CurrentDeleteGeneration::from_file_info(&fi),
+            Err(DiskError::FileCorrupt),
+            "remote-only identity requires its tier"
+        );
+        fi.transition_tier = "WARM".into();
+        fi.transitioned_objname.clear();
+        assert_eq!(
+            CurrentDeleteGeneration::from_file_info(&fi),
+            Err(DiskError::FileCorrupt),
+            "remote-only identity requires its remote object"
+        );
+    }
+
+    #[test]
+    fn guarded_delete_remote_transition_tuple_survives_rpc_codec() {
+        use rustfs_utils::http::metadata_compat::{SUFFIX_TRANSITION_TIER_DESTINATION_ID, insert_str};
+        let mut fi = FileInfo {
+            name: "object".into(),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+            transition_status: rustfs_filemeta::TRANSITION_COMPLETE.to_owned(),
+            transition_tier: "WARM".into(),
+            transitioned_objname: "opaque/object+name".into(),
+            transition_version: Some("opaque/version+id==".into()),
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            ..Default::default()
+        };
+        fi.metadata.insert("etag".into(), "opaque-etag".into());
+        insert_str(&mut fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, "ab".repeat(32));
+        let generation = CurrentDeleteGeneration::from_file_info(&fi).expect("capture complete remote identity");
+        let payload = GuardedDeleteVersionsPayload {
+            bounded_recovery_protocol: None,
+            versions: vec![GuardedFileInfoVersions {
+                group: FileInfoVersions {
+                    name: "object".into(),
+                    versions: vec![fi.clone()],
+                    ..Default::default()
+                },
+                expected_current: generation.clone(),
+            }],
+            opts: DeleteOptions {
+                old_data_dir: Some(Uuid::new_v4()),
+                ..Default::default()
+            },
+        };
+        let encoded = rmp_serde::to_vec_named(&payload).expect("encode remote guarded request");
+        let decoded: GuardedDeleteVersionsPayload =
+            rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode remote guarded request");
+        assert_eq!(decoded.versions[0].expected_current, generation);
+        assert!(
+            matches!(&generation, CurrentDeleteGeneration::Present { transition: Some(transition), .. }
+                if transition.status == rustfs_filemeta::TRANSITION_COMPLETE
+                    && transition.tier == "WARM"
+                    && transition.remote_object == "opaque/object+name"
+                    && transition.remote_version.as_deref() == Some("opaque/version+id==")
+                    && transition.version_state == rustfs_filemeta::TransitionVersionState::Exact
+                    && transition.destination_id == Some([0xab; 32])
+                    && transition.remote_only)
+        );
+        insert_str(&mut fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, format!("a{}", "€".repeat(21)));
+        assert_eq!(
+            CurrentDeleteGeneration::from_file_info(&fi),
+            Err(DiskError::FileCorrupt),
+            "64-byte non-ASCII backend identities are rejected without panicking"
+        );
+        insert_str(&mut fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, "ab".repeat(32));
+        fi.metadata
+            .insert(format!("x-minio-internal-{SUFFIX_TRANSITION_TIER_DESTINATION_ID}"), "cd".repeat(32));
+        assert_eq!(
+            CurrentDeleteGeneration::from_file_info(&fi),
+            Err(DiskError::FileCorrupt),
+            "conflicting backend identities fail closed"
+        );
+    }
+
+    #[test]
+    fn guarded_delete_payload_rejects_malformed_or_unbounded_batches() {
+        let group = GuardedFileInfoVersions {
+            group: FileInfoVersions {
+                name: "object".into(),
+                versions: vec![FileInfo::default()],
+                ..Default::default()
+            },
+            expected_current: CurrentDeleteGeneration::Absent,
+        };
+        let mut payload = GuardedDeleteVersionsPayload {
+            bounded_recovery_protocol: None,
+            versions: vec![group],
+            opts: DeleteOptions {
+                old_data_dir: Some(Uuid::new_v4()),
+                ..Default::default()
+            },
+        };
+        payload.validate().expect("valid guarded batch");
+        let encoded = rmp_serde::to_vec_named(&payload).expect("serialize guarded batch");
+        let decoded: GuardedDeleteVersionsPayload =
+            rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode guarded batch");
+        decoded.validate().expect("round-trip guarded batch remains valid");
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyGuardedDeletePayload {
+            #[serde(rename = "versions")]
+            _versions: Vec<GuardedFileInfoVersions>,
+            #[serde(rename = "opts")]
+            _opts: DeleteOptions,
+        }
+        rustfs_protos::decode_delete_recovery_payload::<LegacyGuardedDeletePayload>(&encoded)
+            .expect("legacy reader accepts legacy prepare");
+        payload.bounded_recovery_protocol = Some(BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION);
+        let bounded = rmp_serde::to_vec_named(&payload).expect("serialize bounded guarded prepare");
+        assert!(rustfs_protos::decode_delete_recovery_payload::<LegacyGuardedDeletePayload>(&bounded).is_err());
+        let bounded: GuardedDeleteVersionsPayload =
+            rustfs_protos::decode_delete_recovery_payload(&bounded).expect("current reader accepts bounded prepare");
+        bounded.validate().expect("valid bounded guarded prepare");
+        payload.bounded_recovery_protocol = Some(BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION + 1);
+        assert_eq!(payload.validate(), Err(DiskError::UnsupportedDisk));
+        payload.bounded_recovery_protocol = None;
+        let mut trailing = encoded;
+        trailing.push(0xc0);
+        assert!(rustfs_protos::decode_delete_recovery_payload::<GuardedDeleteVersionsPayload>(&trailing).is_err());
+        let mut unknown = serde_json::to_value(&payload).expect("serialize guarded batch to map");
+        unknown
+            .as_object_mut()
+            .expect("payload is a map")
+            .insert("unrecognized".into(), true.into());
+        assert!(serde_json::from_value::<GuardedDeleteVersionsPayload>(unknown).is_err());
+        payload.versions[0].group.versions.resize_with(1001, FileInfo::default);
+        assert_eq!(payload.validate(), Err(DiskError::InvalidPath));
+        payload.versions[0].group.versions.truncate(1);
+        payload.opts.undo_delete = true;
+        assert_eq!(payload.validate(), Err(DiskError::FileCorrupt));
+    }
+
     use endpoint::Endpoint;
     use local::LocalDisk;
     use tokio::fs;
@@ -829,6 +3219,26 @@ mod tests {
             disk_idx: Some(2),
         };
         assert!(!partial_valid_location.valid());
+    }
+
+    #[test]
+    fn batch_read_version_server_parallelism_defaults_to_conservative_four() {
+        temp_env::with_var(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, None::<&str>, || {
+            assert_eq!(batch_read_version_server_parallelism(), 4);
+        });
+    }
+
+    #[test]
+    fn batch_read_version_server_parallelism_honors_env_with_bounds() {
+        temp_env::with_var(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, Some("8"), || {
+            assert_eq!(batch_read_version_server_parallelism(), 8);
+        });
+        temp_env::with_var(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, Some("0"), || {
+            assert_eq!(batch_read_version_server_parallelism(), 1);
+        });
+        temp_env::with_var(ENV_BATCH_READ_VERSION_SERVER_PARALLELISM, Some("9999"), || {
+            assert_eq!(batch_read_version_server_parallelism(), BATCH_READ_VERSION_MAX_ITEMS);
+        });
     }
 
     /// Test FileInfoVersions find_version_index
@@ -901,23 +3311,114 @@ mod tests {
             bucket: "test-bucket".to_string(),
             base_dir: "/path/to/dir".to_string(),
             recursive: true,
+            incl_deleted: false,
+            skip_hidden_prefix_check: false,
+            hidden_entry_budget: 0,
+            pending_prefix: None,
             report_notfound: false,
             filter_prefix: Some("prefix_".to_string()),
             forward_to: Some("object/path".to_string()),
             limit: 100,
             disk_id: "disk-123".to_string(),
             skip_total_timeout: false,
+            timeout_ms: Some(10_000),
+            stall_timeout_ms: Some(20_000),
+            identifier_tree_leaf: None,
         };
 
         assert_eq!(opts.bucket, "test-bucket");
         assert_eq!(opts.base_dir, "/path/to/dir");
         assert!(opts.recursive);
+        assert!(!opts.incl_deleted);
+        assert!(!opts.skip_hidden_prefix_check);
         assert!(!opts.report_notfound);
         assert_eq!(opts.filter_prefix, Some("prefix_".to_string()));
         assert_eq!(opts.forward_to, Some("object/path".to_string()));
         assert_eq!(opts.limit, 100);
         assert_eq!(opts.disk_id, "disk-123");
         assert!(!opts.skip_total_timeout);
+        assert_eq!(opts.timeout_duration(), Some(std::time::Duration::from_secs(10)));
+        assert_eq!(opts.stall_timeout_duration(), Some(std::time::Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn test_walk_dir_options_default_hidden_prefix_check_for_old_peers() {
+        let mut encoded = serde_json::to_value(WalkDirOptions {
+            skip_hidden_prefix_check: true,
+            ..Default::default()
+        })
+        .expect("walk options should serialize");
+        encoded
+            .as_object_mut()
+            .expect("walk options should serialize as an object")
+            .remove("skip_hidden_prefix_check");
+
+        let decoded: WalkDirOptions = serde_json::from_value(encoded).expect("old peer options should deserialize");
+
+        assert!(!decoded.skip_hidden_prefix_check);
+    }
+
+    #[test]
+    fn identifier_tree_leaf_selection_preserves_nested_identifier_directories() {
+        let prefix = "catalog/namespaces/";
+        let leaf = "table-entry.json";
+        for relative in [
+            "sales/tables/orders/table-entry.json",
+            "sales/tables/orders/maintenance/tables/owner/table-entry.json",
+            "maintenance/tables/tables/table-entry.json",
+        ] {
+            assert!(identifier_tree_leaf_matches(prefix, leaf, &format!("{prefix}{relative}")));
+        }
+        for relative in [
+            "sales/tables/orders/not-table-entry.json",
+            "sales/tables/orders/table-entry.json/child",
+            "sales/report.json/tables/owner/table-entry.json",
+            "sales//tables/owner/table-entry.json",
+            "sales/../tables/owner/table-entry.json",
+        ] {
+            assert!(!identifier_tree_leaf_matches(prefix, leaf, &format!("{prefix}{relative}")));
+        }
+        assert!(!identifier_tree_leaf_matches(prefix, leaf, "other/sales/tables/orders/table-entry.json"));
+        assert!(is_identifier_tree_leaf(leaf));
+        for invalid in ["", ".", "..", "table-entry", "table/entry.json", "table\\entry.json"] {
+            assert!(!is_identifier_tree_leaf(invalid), "invalid selector {invalid}");
+        }
+    }
+
+    #[test]
+    fn identifier_tree_walk_options_are_additive_on_json_and_messagepack_maps() {
+        #[derive(serde::Deserialize)]
+        struct LegacyView {
+            bucket: String,
+            base_dir: String,
+            recursive: bool,
+        }
+        let options = WalkDirOptions {
+            bucket: "catalog".to_string(),
+            base_dir: "namespaces/".to_string(),
+            recursive: true,
+            identifier_tree_leaf: Some("table-entry.json".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_vec(&options).expect("encode current HTTP options");
+        let messagepack = rmp_serde::to_vec_named(&options).expect("encode legacy RPC map");
+        for old in [
+            serde_json::from_slice::<LegacyView>(&json).expect("old JSON readers ignore the additive field"),
+            rmp_serde::from_slice::<LegacyView>(&messagepack).expect("old MessagePack readers ignore the additive field"),
+        ] {
+            assert_eq!(old.bucket, options.bucket);
+            assert_eq!(old.base_dir, options.base_dir);
+            assert!(old.recursive);
+        }
+        let mut old = serde_json::to_value(&options).expect("encode legacy options");
+        old.as_object_mut().expect("options are a map").remove("identifier_tree_leaf");
+        let from_json: WalkDirOptions = serde_json::from_value(old.clone()).expect("decode old HTTP options");
+        let from_messagepack: WalkDirOptions =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&old).expect("encode old RPC map")).expect("decode old RPC map");
+        assert!(from_json.identifier_tree_leaf.is_none());
+        assert!(from_messagepack.identifier_tree_leaf.is_none());
+        assert_eq!(from_json.base_dir, options.base_dir);
+        assert_eq!(from_messagepack.base_dir, options.base_dir);
     }
 
     /// Test DeleteOptions structure
@@ -927,12 +3428,24 @@ mod tests {
             recursive: true,
             immediate: false,
             undo_write: true,
+            undo_delete: false,
             old_data_dir: Some(Uuid::new_v4()),
+            expected_delete_marker: None,
+            delete_recovery_bucket_incarnation: None,
+            recoverable_delete: false,
+            requires_bounded_delete_recovery: true,
+            orphan_data_dir: false,
         };
+
+        let wire = serde_json::to_value(&opts).expect("encode legacy wire options");
+        assert!(wire.get("requires_bounded_delete_recovery").is_none());
+        let decoded: DeleteOptions = serde_json::from_value(wire).expect("decode legacy wire options");
+        assert!(!decoded.requires_bounded_delete_recovery);
 
         assert!(opts.recursive);
         assert!(!opts.immediate);
         assert!(opts.undo_write);
+        assert!(!opts.undo_delete);
         assert!(opts.old_data_dir.is_some());
     }
 
@@ -981,11 +3494,40 @@ mod tests {
             disk_id: "test-disk-id".to_string(),
             metrics: true,
             noop: false,
+            fresh_capacity: true,
         };
 
         assert_eq!(opts.disk_id, "test-disk-id");
         assert!(opts.metrics);
         assert!(!opts.noop);
+        assert!(opts.fresh_capacity);
+    }
+
+    #[test]
+    fn disk_info_fresh_capacity_ack_is_additive_for_old_peers() {
+        let old_options: DiskInfoOptions =
+            serde_json::from_str(r#"{"disk_id":"disk","metrics":false,"noop":false}"#).expect("old options");
+        assert!(!old_options.fresh_capacity);
+
+        let mut old_response_json = serde_json::to_value(DiskInfo {
+            total: 10,
+            free: 4,
+            used: 6,
+            ..Default::default()
+        })
+        .expect("response fixture");
+        old_response_json
+            .as_object_mut()
+            .expect("response object")
+            .remove("fresh_capacity");
+        let old_response: DiskInfo = serde_json::from_value(old_response_json).expect("old response");
+        assert!(!old_response.fresh_capacity);
+
+        let requested = DiskInfoOptions {
+            fresh_capacity: true,
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_value(requested).expect("new options")["fresh_capacity"], true);
     }
 
     /// Test ReadMultipleReq structure
@@ -1065,12 +3607,76 @@ mod tests {
         let signature = vec![0x01, 0x02, 0x03];
 
         let resp = RenameDataResp {
+            multipart_source: None,
             old_data_dir: Some(uuid),
+            rollback_data_dir: Some(uuid),
+            cleanup_data_dir: Some(uuid),
             sign: Some(signature.clone()),
+            old_current_size: Some(OldCurrentSize::Present(42)),
+            old_current_source_checked: false,
+            old_current_source: None,
         };
 
         assert_eq!(resp.old_data_dir, Some(uuid));
+        assert_eq!(resp.rollback_data_dir, Some(uuid));
+        assert_eq!(resp.cleanup_data_dir, Some(uuid));
         assert_eq!(resp.sign, Some(signature));
+        assert_eq!(resp.old_current_size, Some(OldCurrentSize::Present(42)));
+    }
+
+    /// rustfs/backlog#1009: `old_current_size` must survive a named-msgpack
+    /// round trip (the internode RPC encoding) for every variant.
+    #[test]
+    fn test_rename_data_resp_old_current_size_msgpack_roundtrip() {
+        for old_current_size in [None, Some(OldCurrentSize::Absent), Some(OldCurrentSize::Present(1337))] {
+            let resp = RenameDataResp {
+                multipart_source: None,
+                old_data_dir: Some(Uuid::new_v4()),
+                rollback_data_dir: Some(Uuid::new_v4()),
+                cleanup_data_dir: Some(Uuid::new_v4()),
+                sign: Some(vec![0x01, 0x02, 0x03]),
+                old_current_size,
+                old_current_source_checked: false,
+                old_current_source: None,
+            };
+
+            let encoded = rmp_serde::encode::to_vec_named(&resp).expect("named msgpack should encode");
+            let decoded: RenameDataResp = rmp_serde::decode::from_slice(&encoded).expect("named msgpack should decode");
+
+            assert_eq!(decoded.old_data_dir, resp.old_data_dir);
+            assert_eq!(decoded.rollback_data_dir, resp.rollback_data_dir);
+            assert_eq!(decoded.cleanup_data_dir, resp.cleanup_data_dir);
+            assert_eq!(decoded.sign, resp.sign);
+            assert_eq!(decoded.old_current_size, resp.old_current_size);
+        }
+    }
+
+    /// rustfs/backlog#1009: a payload from a peer that predates
+    /// `old_current_size` must decode with the field defaulting to `None`
+    /// (unknown), keeping mixed-version clusters wire-compatible.
+    #[test]
+    fn test_rename_data_resp_decodes_payload_without_old_current_size() {
+        #[derive(Serialize)]
+        struct LegacyRenameDataResp {
+            old_data_dir: Option<Uuid>,
+            sign: Option<Vec<u8>>,
+        }
+
+        let legacy = LegacyRenameDataResp {
+            old_data_dir: Some(Uuid::new_v4()),
+            sign: Some(vec![0x0a, 0x0b]),
+        };
+
+        let encoded = rmp_serde::encode::to_vec_named(&legacy).expect("legacy named msgpack should encode");
+        let decoded: RenameDataResp = rmp_serde::decode::from_slice(&encoded).expect("legacy payload should decode");
+
+        assert_eq!(decoded.old_data_dir, legacy.old_data_dir);
+        assert_eq!(decoded.rollback_data_dir, None);
+        assert_eq!(decoded.cleanup_data_dir, None);
+        assert_eq!(decoded.sign, legacy.sign);
+        assert_eq!(decoded.old_current_size, None);
+        assert!(!decoded.old_current_source_checked);
+        assert!(decoded.old_current_source.is_none());
     }
 
     /// Test constants
@@ -1126,6 +3732,7 @@ mod tests {
 
         let endpoint = Endpoint::try_from(test_dir).unwrap();
         let local_disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let expected_object_path = local_disk.root.join("test-bucket/test-object");
         let disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
 
         // Test basic methods
@@ -1140,6 +3747,19 @@ mod tests {
         // Test path method
         let path = disk.path();
         assert!(path.exists());
+        let object_path = disk
+            .get_object_path_if_local("test-bucket", "test-object")
+            .expect("local disk should expose an object path")
+            .expect("object path should resolve");
+        assert_eq!(object_path, expected_object_path);
+        assert!(!object_path.starts_with("/proc/self/fd/"));
+        #[cfg(target_os = "linux")]
+        assert!(
+            disk.get_object_path_for_io_if_local("test-bucket", "test-object")
+                .expect("local disk should expose an I/O object path")
+                .expect("I/O object path should resolve")
+                .starts_with("/proc/self/fd/")
+        );
 
         // Test disk location
         let location = disk.get_disk_location();
@@ -1147,6 +3767,72 @@ mod tests {
 
         // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_disk_id_state_does_not_publish_to_the_process_registry() {
+        let local_dir = tempfile::tempdir().expect("local disk tempdir should be created");
+        let mut endpoint =
+            Endpoint::try_from(local_dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let local_disk = LocalDisk::new(&endpoint, false).await.expect("local disk should initialize");
+        let disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
+        let disk_id = Uuid::new_v4();
+
+        disk.set_disk_id_state(Some(disk_id))
+            .await
+            .expect("local wrapper state should accept a disk ID");
+
+        let Disk::Local(local_disk) = &disk else {
+            panic!("test disk should remain local");
+        };
+        assert_eq!(local_disk.get_current_disk_id().await, Some(disk_id));
+        assert!(
+            !crate::runtime::global::current_ctx()
+                .local_disk_id_map()
+                .read()
+                .await
+                .contains_key(&disk_id),
+            "state-only startup publication must not update the process disk-ID registry"
+        );
+
+        disk.set_disk_id_state(None)
+            .await
+            .expect("local wrapper state should clear a disk ID");
+        assert_eq!(local_disk.get_current_disk_id().await, None);
+    }
+
+    #[tokio::test]
+    async fn remote_disk_id_state_delegates_some_and_none() {
+        let mut endpoint = Endpoint::try_from("http://remote-server:9000/data").expect("remote endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let remote_disk = RemoteDisk::new(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+            Arc::new(crate::cluster::rpc::TcpHttpInternodeDataTransport),
+        )
+        .await
+        .expect("remote disk should initialize");
+        let disk = Disk::Remote(Box::new(remote_disk));
+        let disk_id = Uuid::new_v4();
+
+        disk.set_disk_id_state(Some(disk_id))
+            .await
+            .expect("remote state should accept a disk ID");
+        assert_eq!(disk.get_disk_id().await.expect("remote disk ID should be readable"), Some(disk_id));
+
+        disk.set_disk_id_state(None)
+            .await
+            .expect("remote state should clear a disk ID");
+        assert_eq!(disk.get_disk_id().await.expect("remote disk ID should be readable"), None);
     }
 
     #[tokio::test]
@@ -1170,7 +3856,7 @@ mod tests {
                 cleanup: false,
                 health_check: false,
             },
-            Arc::new(crate::rpc::TcpHttpInternodeDataTransport),
+            Arc::new(crate::cluster::rpc::TcpHttpInternodeDataTransport),
         )
         .await
         .unwrap();
@@ -1183,6 +3869,523 @@ mod tests {
             disk.reset_health_for_store_init_retry();
 
             assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+        }
+    }
+}
+
+#[cfg(test)]
+mod delete_recovery_timeout_tests {
+    use super::*;
+    #[test]
+    fn recovery_timeout_defaults_and_validates_range() {
+        assert_eq!(
+            parse_delete_recovery_timeout(None).expect("default timeout"),
+            std::time::Duration::from_secs(900)
+        );
+        for seconds in ["30", "900", "86400"] {
+            assert!(parse_delete_recovery_timeout(Some(seconds)).is_ok());
+        }
+        for value in ["", "invalid", "0", "2", "29", "86401", "-1", "18446744073709551616"] {
+            assert!(parse_delete_recovery_timeout(Some(value)).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod delete_recovery_wire_limit_tests {
+    use super::*;
+
+    #[test]
+    fn boxed_current_delete_transition_preserves_existing_wire_payload() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        enum PriorGeneration {
+            Present {
+                version_id: Option<Uuid>,
+                data_dir: Option<Uuid>,
+                mod_time: OffsetDateTime,
+                delete_marker: bool,
+                etag: String,
+                #[serde(default)]
+                transition: Option<CurrentDeleteTransition>,
+            },
+        }
+
+        let version_id = Some(Uuid::from_u128(1));
+        let data_dir = Some(Uuid::from_u128(2));
+        let mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1);
+        for transition in [
+            None,
+            Some(CurrentDeleteTransition {
+                status: rustfs_filemeta::TRANSITION_COMPLETE.to_owned(),
+                tier: "WARM".into(),
+                remote_object: "opaque/object+name".into(),
+                remote_version: Some("opaque/version+id==".into()),
+                version_state: rustfs_filemeta::TransitionVersionState::Exact,
+                destination_id: Some([0xab; 32]),
+                remote_only: true,
+            }),
+        ] {
+            let prior = PriorGeneration::Present {
+                version_id,
+                data_dir,
+                mod_time,
+                delete_marker: false,
+                etag: "opaque-etag".into(),
+                transition: transition.clone(),
+            };
+            let generation = CurrentDeleteGeneration::Present {
+                version_id,
+                data_dir,
+                mod_time,
+                delete_marker: false,
+                etag: "opaque-etag".into(),
+                transition: transition.map(Box::new),
+            };
+            let prior_encoded = rmp_serde::to_vec_named(&prior).expect("encode the previous unboxed generation shape");
+            let encoded = rmp_serde::to_vec_named(&generation).expect("encode boxed transition generation");
+            assert_eq!(encoded, prior_encoded);
+            let decoded: CurrentDeleteGeneration =
+                rustfs_protos::decode_delete_recovery_payload(&prior_encoded).expect("decode the previous generation payload");
+            assert_eq!(decoded, generation);
+            let prior_decoded: PriorGeneration =
+                rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode boxed transition with the previous shape");
+            assert_eq!(prior_decoded, prior);
+            if matches!(generation, CurrentDeleteGeneration::Present { transition: None, .. }) {
+                #[derive(Serialize)]
+                enum GenerationWithoutTransition {
+                    Present {
+                        version_id: Option<Uuid>,
+                        data_dir: Option<Uuid>,
+                        mod_time: OffsetDateTime,
+                        delete_marker: bool,
+                        etag: String,
+                    },
+                }
+                let legacy = GenerationWithoutTransition::Present {
+                    version_id,
+                    data_dir,
+                    mod_time,
+                    delete_marker: false,
+                    etag: "opaque-etag".into(),
+                };
+                let legacy_encoded = rmp_serde::to_vec_named(&legacy).expect("encode a generation without the transition field");
+                let legacy_decoded: CurrentDeleteGeneration =
+                    rustfs_protos::decode_delete_recovery_payload(&legacy_encoded).expect("default an omitted transition field");
+                assert_eq!(legacy_decoded, generation);
+            }
+        }
+    }
+
+    #[test]
+    fn boxed_apply_version_preserves_existing_wire_payload() {
+        #[derive(Serialize)]
+        enum PriorOperation<'a> {
+            ApplyVersion {
+                object: &'a str,
+                file_info: &'a FileInfo,
+                force_del_marker: bool,
+                opts: &'a DeleteOptions,
+            },
+        }
+        let file_info = FileInfo {
+            name: "object".into(),
+            version_id: Some(Uuid::new_v4()),
+            metadata: std::collections::HashMap::from([("metadata".into(), "value".into())]),
+            ..Default::default()
+        };
+        let opts = DeleteOptions {
+            old_data_dir: Some(Uuid::new_v4()),
+            recoverable_delete: true,
+            delete_recovery_bucket_incarnation: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let prior = PriorOperation::ApplyVersion {
+            object: "object",
+            file_info: &file_info,
+            force_del_marker: true,
+            opts: &opts,
+        };
+        let encoded = rmp_serde::to_vec_named(&prior).expect("encode the previous unboxed request shape");
+        let operation = DeleteRecoveryRpcOperation::ApplyVersion {
+            object: "object".into(),
+            file_info: Box::new(file_info.clone()),
+            force_del_marker: true,
+            opts: opts.clone(),
+        };
+        assert_eq!(rmp_serde::to_vec_named(&operation).expect("encode boxed request"), encoded);
+        assert_eq!(
+            serde_json::to_value(&operation).expect("boxed request JSON"),
+            serde_json::to_value(prior).expect("previous request JSON")
+        );
+        let decoded: DeleteRecoveryRpcOperation =
+            rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode the previous payload");
+        assert_eq!(rmp_serde::to_vec_named(&decoded).expect("re-encode decoded prior request"), encoded);
+    }
+    #[test]
+    fn adoption_and_inspection_reply_support_large_version_journals() {
+        let transaction = Uuid::new_v4();
+        let request = FileInfo {
+            metadata: std::collections::HashMap::from([("metadata".into(), "x".repeat(2048))]),
+            ..Default::default()
+        };
+        let journal = DeleteRecoveryJournal {
+            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+            volume: "bucket".into(),
+            object: "object".into(),
+            transaction,
+            bucket_incarnation: None,
+            original_digest: None,
+            target_digest: None,
+            data_dirs: Vec::new(),
+            deleted_versions: Vec::new(),
+            requests: vec![request; 1000],
+            original_versions: Vec::new(),
+            predecessors: Vec::new(),
+        };
+        let operation = DeleteRecoveryRpcOperation::Settle {
+            object: "object".into(),
+            transaction,
+            expected_fingerprint: [0; 32],
+            action: DeleteRecoveryAction::AdoptCommit {
+                authority: Box::new(journal.clone()),
+            },
+        };
+        let encoded = rmp_serde::to_vec_named(&operation).expect("encode large adoption");
+        assert!(encoded.len() > rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
+        assert!(encoded.len() < operation.max_wire_payload_bytes());
+        let decoded: DeleteRecoveryRpcOperation =
+            rustfs_protos::decode_delete_recovery_payload(&encoded).expect("large adoption can decode");
+        assert_eq!(decoded.max_wire_payload_bytes(), rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES);
+        let reply = DeleteRecoveryRpcReply::Inspected(DeleteRecoveryInspection {
+            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+            id: DeleteTransactionId {
+                object: "object".into(),
+                transaction,
+            },
+            state: DeleteRecoveryState::QuorumCommitted,
+            journal: Some(journal),
+            current_digest: None,
+            current_versions: Vec::new(),
+            backup_digest: None,
+            rollback_data_complete: false,
+            commit_data_safe: true,
+            explicit_delete_safe: false,
+            fingerprint: [0; 32],
+        });
+        let encoded = rmp_serde::to_vec_named(&reply).expect("encode large inspection");
+        assert!(encoded.len() > rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
+        assert!(rustfs_protos::decode_delete_recovery_payload::<DeleteRecoveryRpcReply>(&encoded).is_ok());
+        let inspect = DeleteRecoveryRpcOperation::Inspect {
+            object: "object".into(),
+            transaction,
+        };
+        assert_eq!(inspect.max_wire_payload_bytes(), rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod delete_recovery_adoption_tests {
+    use super::*;
+
+    #[test]
+    fn source_matching_preserves_non_null_absence_and_rejects_foreign_or_missing_null() {
+        let id = Uuid::new_v4();
+        let source = DeleteRecoveryVersionIdentity {
+            version_id: Some(id),
+            mod_time: None,
+            data_dir: None,
+            deleted: false,
+            metadata_digest: [1; 32],
+        };
+        let mut journal = DeleteRecoveryJournal {
+            protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+            volume: "bucket".into(),
+            object: "object".into(),
+            transaction: Uuid::new_v4(),
+            bucket_incarnation: None,
+            original_digest: None,
+            target_digest: None,
+            data_dirs: Vec::new(),
+            deleted_versions: vec![id],
+            requests: vec![FileInfo {
+                version_id: Some(id),
+                ..Default::default()
+            }],
+            original_versions: vec![source.clone()],
+            predecessors: Vec::new(),
+        };
+        assert!(journal.matches_adoption_source(&[]), "certified non-null removal can already be absent");
+        assert!(journal.matches_adoption_source(std::slice::from_ref(&source)));
+        let missing = Uuid::new_v4();
+        journal.requests.push(FileInfo {
+            version_id: Some(missing),
+            ..Default::default()
+        });
+        journal.original_digest = Some([3; 32]);
+        assert!(
+            journal.matches_prepared_authority(&journal),
+            "an explicit UUID absent from both prepared sources remains a no-op with original metadata"
+        );
+        assert!(journal.matches_adoption_source(&[]), "both non-null versions can remain absent");
+        assert!(
+            journal.matches_adoption_source(std::slice::from_ref(&source)),
+            "a missing non-null version in the batch remains a no-op"
+        );
+        let mut unexpected = source.clone();
+        unexpected.version_id = Some(missing);
+        let mut foreign_preparation = journal.clone();
+        foreign_preparation.original_versions.push(unexpected.clone());
+        assert!(
+            !journal.matches_prepared_authority(&foreign_preparation)
+                && !foreign_preparation.matches_prepared_authority(&journal),
+            "absence from only one prepared source cannot establish a generation"
+        );
+        assert!(
+            !journal.matches_adoption_source(&[source.clone(), unexpected]),
+            "a version absent from the authority cannot be deleted locally"
+        );
+        for version_id in [None, Some(Uuid::nil())] {
+            journal.requests.last_mut().expect("missing-version request").version_id = version_id;
+            assert!(
+                !journal.matches_prepared_authority(&journal),
+                "a missing null version with original metadata cannot establish its generation"
+            );
+            assert!(
+                !journal.matches_adoption_source(std::slice::from_ref(&source)),
+                "a missing null version cannot establish its generation"
+            );
+        }
+        journal.requests.pop();
+        let mut foreign = source.clone();
+        foreign.metadata_digest = [2; 32];
+        assert!(!journal.matches_adoption_source(std::slice::from_ref(&foreign)));
+        journal.original_versions.push(foreign.clone());
+        assert!(
+            journal.matches_adoption_source(&[source.clone(), foreign.clone()]),
+            "retain original first-match semantics"
+        );
+        assert!(!journal.matches_adoption_source(&[foreign, source]));
+        journal.requests[0].version_id = None;
+        journal.original_versions[0].version_id = None;
+        assert!(!journal.matches_adoption_source(&[]), "null absence does not establish its generation");
+        assert!(journal.matches_adoption_source(std::slice::from_ref(&journal.original_versions[0])));
+        journal.requests.clear();
+        assert!(!journal.matches_adoption_source(&journal.original_versions));
+
+        let mut marker = journal.clone();
+        marker.requests = vec![FileInfo {
+            version_id: Some(id),
+            deleted: true,
+            mark_deleted: true,
+            ..Default::default()
+        }];
+        marker.original_versions.clear();
+        marker.original_digest = Some([3; 32]);
+        assert!(
+            !marker.matches_prepared_authority(&marker),
+            "a marker with original metadata requires a source generation"
+        );
+        marker.original_digest = None;
+        assert!(
+            marker.matches_prepared_authority(&marker),
+            "marker preparation without original metadata retains the existing allowance"
+        );
+    }
+}
+
+#[cfg(test)]
+mod orphan_data_dir_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn delete_recovery_exists_roundtrips_without_cursor_ownership() {
+        let operation = DeleteRecoveryRpcOperation::Exists {
+            object: "object".to_owned(),
+        };
+        assert_eq!(
+            operation.max_wire_payload_bytes(),
+            rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES
+        );
+        let encoded = rmp_serde::to_vec_named(&operation).expect("encode exact-key existence probe");
+        assert!(matches!(
+            rustfs_protos::decode_delete_recovery_payload::<DeleteRecoveryRpcOperation>(&encoded).expect("decode existence probe"),
+            DeleteRecoveryRpcOperation::Exists { object } if object == "object"
+        ));
+        for present in [false, true] {
+            let encoded = rmp_serde::to_vec_named(&DeleteRecoveryRpcReply::Evidence { present }).expect("encode evidence reply");
+            assert!(matches!(
+                rustfs_protos::decode_delete_recovery_payload::<DeleteRecoveryRpcReply>(&encoded).expect("decode evidence reply"),
+                DeleteRecoveryRpcReply::Evidence { present: decoded } if decoded == present
+            ));
+        }
+        #[derive(Deserialize)]
+        enum OlderOperation {
+            Discover {
+                _object: Option<String>,
+                _cursor: Option<DeleteRecoveryCursor>,
+                _limit: u32,
+            },
+        }
+        assert!(
+            rustfs_protos::decode_delete_recovery_payload::<OlderOperation>(&encoded).is_err(),
+            "an older peer must reject existence probing instead of reporting absence"
+        );
+    }
+
+    #[test]
+    fn orphan_probe_roundtrips_without_mutation_options() {
+        let path = format!("object/{}", Uuid::new_v4());
+        let operation = DeleteRecoveryRpcOperation::InspectOrphanDataDir { path: path.clone() };
+        assert_eq!(
+            operation.max_wire_payload_bytes(),
+            rustfs_protos::DELETE_RECOVERY_MAX_CONTROL_PAYLOAD_BYTES
+        );
+        let encoded = rmp_serde::to_vec_named(&operation).expect("encode orphan probe");
+        let decoded: DeleteRecoveryRpcOperation = rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode probe");
+        assert!(matches!(decoded, DeleteRecoveryRpcOperation::InspectOrphanDataDir { path: decoded } if decoded == path));
+        let reply = rmp_serde::to_vec_named(&DeleteRecoveryRpcReply::OrphanDataDir { plain: true }).expect("encode probe reply");
+        assert!(matches!(
+            rustfs_protos::decode_delete_recovery_payload::<DeleteRecoveryRpcReply>(&reply).expect("decode probe reply"),
+            DeleteRecoveryRpcReply::OrphanDataDir { plain: true }
+        ));
+        #[derive(Deserialize)]
+        enum OlderOperation {
+            Inspect { _object: String, _transaction: Uuid },
+        }
+        assert!(
+            rustfs_protos::decode_delete_recovery_payload::<OlderOperation>(&encoded).is_err(),
+            "older peers must reject the additive probe"
+        );
+    }
+
+    #[test]
+    fn orphan_delete_is_nonrecursive_when_older_peer_ignores_new_option() {
+        #[derive(Deserialize)]
+        struct OlderDeleteOptions {
+            recursive: bool,
+            immediate: bool,
+        }
+        let opts = DeleteOptions {
+            orphan_data_dir: true,
+            immediate: true,
+            ..Default::default()
+        };
+        let encoded = serde_json::to_vec(&opts).expect("encode leaf deletion");
+        let old: OlderDeleteOptions = serde_json::from_slice(&encoded).expect("older options ignore additive field");
+        assert!(!old.recursive, "ignoring the new option must never broaden deletion");
+        assert!(old.immediate);
+    }
+}
+
+#[cfg(test)]
+mod pool_meta_native_inventory_tests {
+    use super::*;
+
+    fn inspection() -> PoolMetaNativeInspection {
+        PoolMetaNativeInspection {
+            disk_id: Uuid::from_u128(1),
+            identity: Some(Bytes::from_static(b"canonical-identity")),
+            current: Some(Bytes::from_static(b"current")),
+            backups: vec![
+                PoolMetaNativeBackup {
+                    directory: Uuid::from_u128(2),
+                    data: Bytes::from_static(b"before-2"),
+                },
+                PoolMetaNativeBackup {
+                    directory: Uuid::from_u128(3),
+                    data: Bytes::from_static(b"before-3"),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn pool_meta_native_inventory_binds_every_copy_and_ignores_listing_order() {
+        let baseline = inspection();
+        let digest = baseline.inventory_sha256().expect("valid inventory must hash");
+        let mut reordered = baseline.clone();
+        reordered.backups.reverse();
+        assert_eq!(digest, reordered.inventory_sha256().expect("listing order is irrelevant"));
+        for mutate in [
+            |value: &mut PoolMetaNativeInspection| value.disk_id = Uuid::from_u128(4),
+            |value: &mut PoolMetaNativeInspection| value.identity = Some(Bytes::from_static(b"changed-identity")),
+            |value: &mut PoolMetaNativeInspection| value.identity = None,
+            |value: &mut PoolMetaNativeInspection| value.identity = Some(Bytes::new()),
+            |value: &mut PoolMetaNativeInspection| value.current = None,
+            |value: &mut PoolMetaNativeInspection| value.current = Some(Bytes::from_static(b"new-current")),
+            |value: &mut PoolMetaNativeInspection| {
+                value.backups.pop();
+            },
+            |value: &mut PoolMetaNativeInspection| value.backups[0].directory = Uuid::from_u128(5),
+            |value: &mut PoolMetaNativeInspection| value.backups[0].data = Bytes::from_static(b"changed-backup"),
+        ] {
+            let mut changed = baseline.clone();
+            mutate(&mut changed);
+            assert_ne!(digest, changed.inventory_sha256().expect("changed inventory must hash"));
+        }
+    }
+
+    #[test]
+    fn pool_meta_native_inventory_rejects_duplicate_backup_directories() {
+        let mut value = inspection();
+        value.backups.push(value.backups[0].clone());
+        assert_eq!(value.inventory_sha256(), Err(DiskError::FileCorrupt));
+    }
+
+    #[test]
+    fn pool_meta_native_recovery_payload_rejects_unknown_scope_and_trailing_bytes() {
+        for request in [
+            PoolMetaNativeRecoveryRequest::Probe {},
+            PoolMetaNativeRecoveryRequest::Inspect {
+                object: PoolMetaNativeObject::PoolBin,
+            },
+            PoolMetaNativeRecoveryRequest::InspectIdentity {},
+        ] {
+            if matches!(&request, PoolMetaNativeRecoveryRequest::Probe {}) {
+                assert_eq!(
+                    serde_json::to_value(&request).expect("probe must encode"),
+                    serde_json::json!({"operation":"probe"})
+                );
+            }
+            if matches!(&request, PoolMetaNativeRecoveryRequest::InspectIdentity {}) {
+                assert_eq!(
+                    serde_json::to_value(&request).expect("identity probe must encode"),
+                    serde_json::json!({"operation":"inspect_identity"})
+                );
+            }
+            let mut encoded = rmp_serde::to_vec_named(&request).expect("request must encode");
+            let decoded: PoolMetaNativeRecoveryRequest =
+                rustfs_protos::decode_pool_meta_native_recovery_payload(&encoded).expect("valid request must decode");
+            assert_eq!(request, decoded);
+            encoded.push(0xc0);
+            assert!(
+                rustfs_protos::decode_pool_meta_native_recovery_payload::<PoolMetaNativeRecoveryRequest>(&encoded).is_err(),
+                "trailing bytes must be rejected for {request:?}",
+            );
+        }
+        let response = PoolMetaNativeRecoveryResponse::IdentityInspected {
+            disk_id: Uuid::from_u128(7),
+            raw: Bytes::from_static(b"identity-xlmeta"),
+        };
+        let encoded = rmp_serde::to_vec_named(&response).expect("identity response must encode");
+        let decoded: PoolMetaNativeRecoveryResponse =
+            rustfs_protos::decode_pool_meta_native_recovery_payload(&encoded).expect("identity response must decode");
+        assert_eq!(response, decoded);
+        for value in [
+            serde_json::json!({"operation":"inspect","object":"identity"}),
+            serde_json::json!({"operation":"inspect","object":"pool_bin","path":"other"}),
+            serde_json::json!({"operation":"probe","object":"pool_bin"}),
+            serde_json::json!({"operation":"probe","path":"other"}),
+            serde_json::json!({"operation":"inspect_identity","object":"pool_bin"}),
+            serde_json::json!({"operation":"inspect_identity","path":"pool.bin.identity"}),
+        ] {
+            let encoded = rmp_serde::to_vec_named(&value).expect("invalid request fixture must encode");
+            let decoded = rustfs_protos::decode_pool_meta_native_recovery_payload::<PoolMetaNativeRecoveryRequest>(&encoded);
+            assert!(
+                decoded.is_err(),
+                "invalid native recovery payload was accepted: {value}; decoded={decoded:?}"
+            );
         }
     }
 }

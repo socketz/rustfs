@@ -82,6 +82,14 @@ pub fn reduce_errs(errors: &[Option<Error>], ignored_errs: &[Error]) -> (usize, 
         .max_by(|(_, c1), (_, c2)| c1.cmp(c2))
         .unwrap_or((nil_error, 0));
 
+    // Guard against the empty/all-ignored case: when there is no real error and
+    // no nil value, the seeded placeholder `nil_error` must not leak out as the
+    // dominant error. Return the `None` sentinel so callers (e.g. write-quorum
+    // failure summaries and their metric labels) treat it as "no dominant error".
+    if best_count == 0 && nil_count == 0 {
+        return (0, None);
+    }
+
     // Compare nil errors with the top non-nil error and prefer the nil error
     if nil_count > best_count || (nil_count == best_count && nil_count > 0) {
         (nil_count, None)
@@ -123,6 +131,15 @@ pub fn build_write_quorum_failure_summary(
 
 fn dominant_error_label(errors: &[Option<Error>], ignored_errs: &[Error], dominant_error: Option<&Error>) -> &'static str {
     let Some(dominant_error) = dominant_error else {
+        // The reducer also returns None when every failure is ignored for
+        // quorum voting. That case contains no successful nil entry.
+        if !errors.is_empty() && errors.iter().all(Option::is_some) {
+            return if errors.iter().all(|error| error.as_ref() == Some(&Error::DiskNotFound)) {
+                "disk_not_found"
+            } else {
+                "all_ignored"
+            };
+        }
         return "nil_dominated";
     };
 
@@ -219,6 +236,78 @@ mod tests {
     }
 
     #[test]
+    fn test_write_quorum_reduction_preserves_internode_http_identity() {
+        use http::StatusCode;
+        use rustfs_rio::InternodeHttpErrorKind::{ConnectionRefused, HttpStatus, Unknown};
+
+        for (kind, retryable) in [
+            (ConnectionRefused, true),
+            (HttpStatus(StatusCode::SERVICE_UNAVAILABLE), true),
+            (HttpStatus(StatusCode::CONFLICT), true),
+            (Unknown, false),
+            (HttpStatus(StatusCode::BAD_REQUEST), false),
+        ] {
+            // Construct both producer errors independently: the reducer owns the first clone.
+            let first = Error::from(rustfs_rio::new_test_internode_http_io_error(kind));
+            let second = Error::from(rustfs_rio::new_test_internode_http_io_error(kind));
+            assert_eq!(first.internode_http_error_kind(), Some(kind));
+            assert_eq!(second.internode_http_error_kind(), Some(kind));
+            assert_eq!(first.is_retryable_internode_write_failure(), retryable);
+            let errors = [Some(first), Some(second), None];
+            let reduced = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 2)
+                .expect("two equal producer errors must dominate one successful write");
+
+            assert_eq!(Some(&reduced), errors[0].as_ref());
+            assert_eq!(
+                reduced.is_retryable_internode_write_failure(),
+                retryable,
+                "quorum reduction changed retryability for {kind:?}"
+            );
+            assert_eq!(reduced.internode_http_error_kind(), Some(kind));
+            if let HttpStatus(status) = kind {
+                assert!(reduced.is_internode_http_status(status.as_u16()));
+            }
+            let Error::Io(io_error) = &reduced else {
+                panic!("the dominant error must remain Io: {reduced:?}");
+            };
+            let source = io_error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<rustfs_rio::InternodeHttpError>())
+                .expect("quorum reduction must retain the structured internode error");
+            assert_eq!(source.context().method(), "PUT");
+            assert_eq!(source.context().target(), "/rustfs/rpc/put_file_stream");
+            assert_eq!(
+                source.context().operation(),
+                Some(rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_PUT_FILE_STREAM)
+            );
+        }
+    }
+
+    #[test]
+    fn test_clone_and_write_quorum_do_not_promote_non_retryable_errors() {
+        use http::StatusCode;
+        use rustfs_rio::InternodeHttpErrorKind::{HttpStatus, Unknown};
+
+        for original in [
+            Error::from(rustfs_rio::new_test_internode_http_io_error(Unknown)),
+            Error::from(rustfs_rio::new_test_internode_http_io_error(HttpStatus(StatusCode::BAD_REQUEST))),
+            Error::from(rustfs_rio::new_test_internode_http_io_error(HttpStatus(StatusCode::FORBIDDEN))),
+            Error::from(rustfs_rio::new_test_internode_http_io_error(HttpStatus(StatusCode::NOT_FOUND))),
+            Error::from(rustfs_rio::new_test_internode_http_io_error(HttpStatus(
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ))),
+            err_io("internode connection reset: PUT /rustfs/rpc/put_file_stream"),
+        ] {
+            assert!(!original.is_retryable_internode_write_failure());
+            let cloned = original.clone();
+            let reduced =
+                reduce_write_quorum_errs(&[Some(original)], &[], 1).expect("a non-retryable error must remain an error");
+            assert!(!cloned.is_retryable_internode_write_failure());
+            assert!(!reduced.is_retryable_internode_write_failure());
+        }
+    }
+
+    #[test]
     fn test_count_errs() {
         let e1 = err_io("a");
         let e2 = err_io("b");
@@ -279,6 +368,59 @@ mod tests {
 
         assert_eq!(summary.retryable_failures, 2);
         assert_eq!(summary.dominant_error_label, "connection_reset");
+    }
+
+    #[test]
+    fn test_reduce_errs_all_ignored_returns_none() {
+        // All disks return an ignored error (e.g. every disk offline): err_counts
+        // ends up empty and nil_count == 0. The synthetic "nil" placeholder must
+        // not leak; the function must return the (0, None) sentinel.
+        let errors = vec![
+            Some(Error::DiskNotFound),
+            Some(Error::DiskNotFound),
+            Some(Error::DiskNotFound),
+        ];
+        let (count, err) = reduce_errs(&errors, OBJECT_OP_IGNORED_ERRS);
+        assert_eq!(count, 0);
+        assert_eq!(err, None);
+    }
+
+    #[test]
+    fn test_reduce_errs_empty_slice_returns_none() {
+        // Empty slice: no errors and no nil values -> (0, None), not the placeholder.
+        let errors: Vec<Option<Error>> = vec![];
+        let ignored: Vec<Error> = vec![];
+        let (count, err) = reduce_errs(&errors, &ignored);
+        assert_eq!(count, 0);
+        assert_eq!(err, None);
+    }
+
+    #[test]
+    fn test_build_write_quorum_failure_summary_all_missing_is_disk_not_found() {
+        // Ignoring unavailable disks for quorum reduction must not imply a
+        // successful nil entry in the diagnostic label.
+        let errors = vec![
+            Some(Error::DiskNotFound),
+            Some(Error::DiskNotFound),
+            Some(Error::DiskNotFound),
+        ];
+        let summary = build_write_quorum_failure_summary(&errors, OBJECT_OP_IGNORED_ERRS, 2);
+        assert_eq!(summary.dominant_error, None);
+        assert_eq!(summary.achieved, 0);
+        assert_eq!(summary.dominant_error_label, "disk_not_found");
+    }
+
+    #[test]
+    fn test_build_write_quorum_failure_summary_all_ignored_has_no_success() {
+        let errors = [Some(Error::FaultyDisk), Some(Error::DiskNotFound)];
+        let summary = build_write_quorum_failure_summary(&errors, OBJECT_OP_IGNORED_ERRS, 2);
+        assert_eq!(summary.dominant_error, None);
+        assert_eq!(summary.achieved, 0);
+        assert_eq!(summary.dominant_error_label, "all_ignored");
+        assert_eq!(
+            reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 2),
+            Some(Error::ErasureWriteQuorum)
+        );
     }
 
     #[test]

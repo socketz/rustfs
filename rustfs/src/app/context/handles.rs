@@ -12,28 +12,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::interfaces::{
-    BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface,
-    NotifyInterface, RegionInterface, ServerConfigInterface, TierConfigInterface,
+use super::super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
+use super::super::storage_api::context::runtime::{
+    BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
+    ScannerMetricsReport, StorageClassConfig, TierConfigMgr, TransitionState,
 };
-use crate::config::{RustFSBufferConfig, get_global_buffer_config};
+use super::super::storage_api::context::{ECStore, EndpointServerPools};
+use super::interfaces::{
+    ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
+    DeploymentIdInterface, EndpointsInterface, ExpiryStateInterface, FederatedIdentityInterface,
+    FederatedIdentityRuntimeSnapshot, IamInterface, InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface,
+    LocalNodeNameInterface, LockClientInterface, LockClientsInterface, NotificationSystemInterface, NotifyInterface,
+    OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface, ReplicationPoolInterface,
+    ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface, ServerConfigInterface,
+    StorageClassInterface, TierConfigInterface, TransitionStateInterface,
+};
+use super::runtime_sources;
+use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;
-use rustfs_config::server_config::get_global_server_config;
-use rustfs_ecstore::bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
-use rustfs_ecstore::endpoints::EndpointServerPools;
-use rustfs_ecstore::global::{get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr};
-use rustfs_ecstore::tier::tier::TierConfigMgr;
-use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
-use rustfs_kms::{KmsServiceManager, get_global_kms_service_manager};
-use rustfs_notify::{EventArgs, NotificationError, notifier_global};
+use rustfs_credentials::Credentials;
+use rustfs_iam::{federation::FederatedIdentityService, oidc::OidcConfigQuery, store::object::ObjectStore, sys::IamSys};
+use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
+use rustfs_kms::KmsServiceManager;
+use rustfs_lock::LockClient;
+use rustfs_notify::{EventArgs, NotificationError};
+use rustfs_s3select_api::request::SelectObjectContentInput;
+use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_targets::{EventName, arn::TargetID};
-use std::sync::Arc;
+use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock, RwLock as StdRwLock},
+    time::SystemTime,
+};
 use tokio::sync::RwLock;
 
 /// Default IAM interface adapter.
 pub struct IamHandle {
-    #[allow(dead_code)]
     iam: Arc<IamSys<ObjectStore>>,
 }
 
@@ -49,12 +65,66 @@ impl IamInterface for IamHandle {
     }
 
     fn is_ready(&self) -> bool {
-        rustfs_iam::get().is_ok()
+        // The handle owns a fully initialized system (contexts are only built
+        // after IAM bootstrap), so readiness is a property of the held Arc —
+        // not of the process singleton (backlog#1052 S3).
+        self.iam.is_ready()
+    }
+
+    fn token_signing_key(&self) -> Option<String> {
+        runtime_sources::token_signing_key()
+    }
+}
+
+/// Default federation runtime interface adapter.
+pub struct FederatedIdentityHandle {
+    runtime: StdRwLock<Option<FederatedIdentityRuntime>>,
+}
+
+struct FederatedIdentityRuntime {
+    service: Arc<FederatedIdentityService>,
+    oidc_config_query: Arc<dyn OidcConfigQuery>,
+}
+
+impl FederatedIdentityHandle {
+    pub fn with_runtime(runtime: Option<(Arc<FederatedIdentityService>, Arc<dyn OidcConfigQuery>)>) -> Self {
+        Self {
+            runtime: StdRwLock::new(runtime.map(|(service, oidc_config_query)| FederatedIdentityRuntime {
+                service,
+                oidc_config_query,
+            })),
+        }
+    }
+}
+
+impl Default for FederatedIdentityHandle {
+    fn default() -> Self {
+        Self::with_runtime(None)
+    }
+}
+
+impl FederatedIdentityInterface for FederatedIdentityHandle {
+    fn runtime_snapshot(&self) -> Option<FederatedIdentityRuntimeSnapshot> {
+        self.runtime.read().ok().and_then(|runtime| {
+            runtime
+                .as_ref()
+                .map(|runtime| (Arc::clone(&runtime.service), Arc::clone(&runtime.oidc_config_query)))
+        })
+    }
+
+    fn publish_runtime(&self, service: Arc<FederatedIdentityService>, oidc_config_query: Arc<dyn OidcConfigQuery>) -> bool {
+        let Ok(mut published_runtime) = self.runtime.write() else {
+            return false;
+        };
+        *published_runtime = Some(FederatedIdentityRuntime {
+            service,
+            oidc_config_query,
+        });
+        true
     }
 }
 
 /// Default KMS interface adapter.
-#[allow(dead_code)]
 pub struct KmsHandle {
     kms: Arc<KmsServiceManager>,
 }
@@ -72,12 +142,34 @@ impl KmsInterface for KmsHandle {
 }
 
 /// Default KMS runtime interface adapter.
-#[derive(Default)]
-pub struct KmsRuntimeHandle;
+pub struct KmsRuntimeHandle {
+    kms: Option<Arc<KmsServiceManager>>,
+}
+
+impl KmsRuntimeHandle {
+    pub fn new(kms: Arc<KmsServiceManager>) -> Self {
+        Self { kms: Some(kms) }
+    }
+}
 
 impl KmsRuntimeInterface for KmsRuntimeHandle {
     fn service_manager(&self) -> Option<Arc<KmsServiceManager>> {
-        get_global_kms_service_manager()
+        self.kms.clone()
+    }
+}
+
+/// Default outbound TLS runtime interface adapter.
+#[derive(Default)]
+pub struct OutboundTlsRuntimeHandle;
+
+#[async_trait]
+impl OutboundTlsRuntimeInterface for OutboundTlsRuntimeHandle {
+    fn generation(&self) -> TlsGeneration {
+        runtime_sources::outbound_tls_generation()
+    }
+
+    async fn state(&self) -> GlobalPublishedOutboundTlsState {
+        runtime_sources::outbound_tls_state().await
     }
 }
 
@@ -88,7 +180,16 @@ pub struct NotifyHandle;
 #[async_trait]
 impl NotifyInterface for NotifyHandle {
     async fn notify(&self, args: EventArgs) {
-        notifier_global::notify(args).await;
+        runtime_sources::notify(args).await;
+    }
+
+    async fn validate_event_specific_rules(
+        &self,
+        bucket_name: &str,
+        region: &str,
+        event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
+    ) -> Result<(), NotificationError> {
+        runtime_sources::validate_event_specific_rules(bucket_name, region, event_rules).await
     }
 
     async fn add_event_specific_rules(
@@ -97,11 +198,21 @@ impl NotifyInterface for NotifyHandle {
         region: &str,
         event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
     ) -> Result<(), NotificationError> {
-        notifier_global::add_event_specific_rules(bucket_name, region, event_rules).await
+        runtime_sources::add_event_specific_rules(bucket_name, region, event_rules).await
     }
 
     async fn clear_bucket_notification_rules(&self, bucket_name: &str) -> Result<(), NotificationError> {
-        notifier_global::clear_bucket_notification_rules(bucket_name).await
+        runtime_sources::clear_bucket_notification_rules(bucket_name).await
+    }
+}
+
+/// Default notification system handle adapter.
+#[derive(Default)]
+pub struct NotificationSystemHandle;
+
+impl NotificationSystemInterface for NotificationSystemHandle {
+    fn handle(&self) -> Option<Arc<NotificationSys>> {
+        runtime_sources::notification_system()
     }
 }
 
@@ -111,7 +222,58 @@ pub struct BucketMetadataHandle;
 
 impl BucketMetadataInterface for BucketMetadataHandle {
     fn handle(&self) -> Option<Arc<RwLock<BucketMetadataSys>>> {
-        get_global_bucket_metadata_sys()
+        runtime_sources::bucket_metadata()
+    }
+}
+
+/// Default bucket monitor interface adapter.
+#[derive(Default)]
+pub struct BucketMonitorHandle;
+
+impl BucketMonitorInterface for BucketMonitorHandle {
+    fn handle(&self) -> Option<Arc<BucketBandwidthMonitor>> {
+        runtime_sources::bucket_monitor()
+    }
+}
+
+/// Default replication pool interface adapter.
+#[derive(Default)]
+pub struct ReplicationPoolHandle;
+
+impl ReplicationPoolInterface for ReplicationPoolHandle {
+    fn handle(&self) -> Option<Arc<DynReplicationPool>> {
+        runtime_sources::replication_pool()
+    }
+}
+
+/// Default replication statistics interface adapter.
+#[derive(Default)]
+pub struct ReplicationStatsHandle;
+
+impl ReplicationStatsInterface for ReplicationStatsHandle {
+    fn handle(&self) -> Option<Arc<ReplicationStats>> {
+        runtime_sources::replication_stats()
+    }
+}
+
+/// Default boot time interface adapter.
+#[derive(Default)]
+pub struct BootTimeHandle;
+
+impl BootTimeInterface for BootTimeHandle {
+    fn get(&self) -> Option<SystemTime> {
+        runtime_sources::boot_time()
+    }
+}
+
+/// Default scanner metrics report interface adapter.
+#[derive(Default)]
+pub struct ScannerMetricsHandle;
+
+#[async_trait]
+impl ScannerMetricsInterface for ScannerMetricsHandle {
+    async fn report(&self) -> ScannerMetricsReport {
+        runtime_sources::scanner_metrics_report().await
     }
 }
 
@@ -121,17 +283,148 @@ pub struct EndpointsHandle;
 
 impl EndpointsInterface for EndpointsHandle {
     fn handle(&self) -> Option<EndpointServerPools> {
-        get_global_endpoints_opt()
+        runtime_sources::endpoints()
     }
 }
 
-/// Default region interface adapter.
+/// Default deployment identity interface adapter.
+#[derive(Default)]
+pub struct DeploymentIdHandle;
+
+impl DeploymentIdInterface for DeploymentIdHandle {
+    fn get(&self) -> Option<String> {
+        runtime_sources::deployment_id()
+    }
+}
+
+/// Default runtime port interface adapter.
+#[derive(Default)]
+pub struct RuntimePortHandle;
+
+impl RuntimePortInterface for RuntimePortHandle {
+    fn get(&self) -> u16 {
+        runtime_sources::runtime_port()
+    }
+}
+
+/// Default lock client interface adapter.
+#[derive(Default)]
+pub struct LockClientHandle;
+
+impl LockClientInterface for LockClientHandle {
+    fn handle(&self) -> Option<Arc<dyn LockClient>> {
+        runtime_sources::lock_client()
+    }
+}
+
+/// Default lock clients interface adapter.
+#[derive(Default)]
+pub struct LockClientsHandle;
+
+impl LockClientsInterface for LockClientsHandle {
+    fn handle(&self) -> Option<HashMap<String, Arc<dyn LockClient>>> {
+        runtime_sources::lock_clients()
+    }
+}
+
+/// Default performance metrics interface adapter.
+#[derive(Default)]
+pub struct PerformanceMetricsHandle;
+
+impl PerformanceMetricsInterface for PerformanceMetricsHandle {
+    fn handle(&self) -> Arc<PerformanceMetrics> {
+        runtime_sources::performance_metrics()
+    }
+}
+
+/// Default internode metrics interface adapter.
+#[derive(Default)]
+pub struct InternodeMetricsHandle;
+
+impl InternodeMetricsInterface for InternodeMetricsHandle {
+    fn handle(&self) -> Arc<InternodeMetrics> {
+        runtime_sources::internode_metrics()
+    }
+}
+
+/// Default S3 Select database interface adapter.
+#[derive(Default)]
+pub struct S3SelectDbHandle;
+
+#[async_trait]
+impl S3SelectDbInterface for S3SelectDbHandle {
+    async fn get(
+        &self,
+        input: SelectObjectContentInput,
+        enable_debug: bool,
+    ) -> QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>> {
+        runtime_sources::s3select_db(input, enable_debug).await
+    }
+}
+
+/// Default local node name interface adapter.
+#[derive(Default)]
+pub struct LocalNodeNameHandle;
+
+#[async_trait]
+impl LocalNodeNameInterface for LocalNodeNameHandle {
+    async fn get(&self) -> String {
+        runtime_sources::local_node_name().await
+    }
+}
+
+/// Default action credentials interface adapter.
+///
+/// Holds this context's own copy of the action credentials (backlog#1052 S3).
+/// `publish` lands on the owning context *and* attempts to publish the process
+/// global; readers prefer the owned copy and fall back to the global — so
+/// ambient callers (iam, S3 auth) keep working, and two contexts that both
+/// published stay isolated even though the global remembers only the first.
+#[derive(Default)]
+pub struct ActionCredentialHandle {
+    credentials: StdRwLock<Option<Credentials>>,
+}
+
+impl ActionCredentialInterface for ActionCredentialHandle {
+    fn get(&self) -> Option<Credentials> {
+        if let Ok(guard) = self.credentials.read()
+            && let Some(credentials) = guard.as_ref()
+        {
+            return Some(credentials.clone());
+        }
+        runtime_sources::action_credentials()
+    }
+
+    fn publish(&self, credentials: Credentials) -> bool {
+        let Ok(mut guard) = self.credentials.write() else {
+            return false;
+        };
+        let already_held = guard.is_some();
+        *guard = Some(credentials.clone());
+        let global_published =
+            rustfs_credentials::init_global_action_credentials(Some(credentials.access_key), Some(credentials.secret_key))
+                .is_ok();
+        !already_held || global_published
+    }
+}
+
+impl RegionInterface for ECStore {
+    fn get(&self) -> Option<s3s::region::Region> {
+        self.region().map(Into::into)
+    }
+
+    fn additional(&self) -> Vec<s3s::region::Region> {
+        self.additional_regions().into_iter().map(Into::into).collect()
+    }
+}
+
+/// Ambient region adapter for callers without an explicit application context.
 #[derive(Default)]
 pub struct RegionHandle;
 
 impl RegionInterface for RegionHandle {
     fn get(&self) -> Option<s3s::region::Region> {
-        get_global_region()
+        runtime_sources::region()
     }
 }
 
@@ -141,17 +434,71 @@ pub struct TierConfigHandle;
 
 impl TierConfigInterface for TierConfigHandle {
     fn handle(&self) -> Arc<RwLock<TierConfigMgr>> {
-        get_global_tier_config_mgr()
+        runtime_sources::tier_config()
+    }
+}
+
+/// Default lifecycle expiry state interface adapter.
+#[derive(Default)]
+pub struct ExpiryStateHandle;
+
+impl ExpiryStateInterface for ExpiryStateHandle {
+    fn handle(&self) -> Arc<RwLock<ExpiryState>> {
+        runtime_sources::expiry_state()
+    }
+}
+
+/// Default lifecycle transition state interface adapter.
+#[derive(Default)]
+pub struct TransitionStateHandle;
+
+impl TransitionStateInterface for TransitionStateHandle {
+    fn handle(&self) -> Arc<TransitionState> {
+        runtime_sources::transition_state()
+    }
+
+    fn daily_tier_stats(&self) -> DailyAllTierStats {
+        runtime_sources::daily_tier_stats()
     }
 }
 
 /// Default server config interface adapter.
+///
+/// Holds this context's own copy of the server config (backlog#1052 S3): a
+/// `set` lands on the owning context *and* on the process global, so ambient
+/// readers (the config loader path, the scanner) keep working; a `get`
+/// prefers the owned copy and falls back to the process global while the
+/// initial load still publishes there — the single-instance legacy default.
 #[derive(Default)]
-pub struct ServerConfigHandle;
+pub struct ServerConfigHandle {
+    config: StdRwLock<Option<Config>>,
+}
 
 impl ServerConfigInterface for ServerConfigHandle {
     fn get(&self) -> Option<Config> {
-        get_global_server_config()
+        if let Ok(guard) = self.config.read()
+            && guard.is_some()
+        {
+            return guard.clone();
+        }
+        runtime_sources::server_config()
+    }
+
+    fn set(&self, config: Config) {
+        if let Ok(mut guard) = self.config.write() {
+            *guard = Some(config.clone());
+        }
+        runtime_sources::set_server_config(config);
+    }
+}
+
+/// Default storage class config interface adapter.
+#[derive(Default)]
+pub struct StorageClassHandle;
+
+impl StorageClassInterface for StorageClassHandle {
+    fn set(&self, config: StorageClassConfig) {
+        runtime_sources::set_storage_class(config);
     }
 }
 
@@ -161,7 +508,7 @@ pub struct BufferConfigHandle;
 
 impl BufferConfigInterface for BufferConfigHandle {
     fn get(&self) -> RustFSBufferConfig {
-        get_global_buffer_config().clone()
+        runtime_sources::buffer_config()
     }
 }
 
@@ -169,18 +516,114 @@ pub fn default_notify_interface() -> Arc<dyn NotifyInterface> {
     Arc::new(NotifyHandle)
 }
 
+pub(crate) fn default_object_data_cache_handle() -> Arc<crate::app::object_data_cache::ObjectDataCacheAdapter> {
+    crate::app::object_data_cache::ObjectDataCacheAdapter::disabled_arc()
+}
+
+pub fn default_notification_system_interface() -> Arc<dyn NotificationSystemInterface> {
+    Arc::new(NotificationSystemHandle)
+}
+
 pub fn default_kms_runtime_interface() -> Arc<dyn KmsRuntimeInterface> {
-    Arc::new(KmsRuntimeHandle)
+    Arc::new(KmsRuntimeHandle {
+        kms: runtime_sources::kms_service_manager(),
+    })
+}
+
+pub fn default_outbound_tls_runtime_interface() -> Arc<dyn OutboundTlsRuntimeInterface> {
+    Arc::new(OutboundTlsRuntimeHandle)
 }
 
 pub fn default_bucket_metadata_interface() -> Arc<dyn BucketMetadataInterface> {
     Arc::new(BucketMetadataHandle)
 }
 
+pub fn default_bucket_monitor_interface() -> Arc<dyn BucketMonitorInterface> {
+    Arc::new(BucketMonitorHandle)
+}
+
+pub(crate) fn default_replication_pool_interface() -> Arc<dyn ReplicationPoolInterface> {
+    Arc::new(ReplicationPoolHandle)
+}
+
+pub(crate) fn default_replication_stats_interface() -> Arc<dyn ReplicationStatsInterface> {
+    Arc::new(ReplicationStatsHandle)
+}
+
+pub fn default_boot_time_interface() -> Arc<dyn BootTimeInterface> {
+    Arc::new(BootTimeHandle)
+}
+
+pub fn default_scanner_metrics_interface() -> Arc<dyn ScannerMetricsInterface> {
+    Arc::new(ScannerMetricsHandle)
+}
+
 pub fn default_endpoints_interface() -> Arc<dyn EndpointsInterface> {
     Arc::new(EndpointsHandle)
 }
 
+pub fn default_deployment_id_interface() -> Arc<dyn DeploymentIdInterface> {
+    Arc::new(DeploymentIdHandle)
+}
+
+pub fn default_runtime_port_interface() -> Arc<dyn RuntimePortInterface> {
+    Arc::new(RuntimePortHandle)
+}
+
+pub fn default_lock_client_interface() -> Arc<dyn LockClientInterface> {
+    Arc::new(LockClientHandle)
+}
+
+pub fn default_lock_clients_interface() -> Arc<dyn LockClientsInterface> {
+    Arc::new(LockClientsHandle)
+}
+
+pub fn default_performance_metrics_interface() -> Arc<dyn PerformanceMetricsInterface> {
+    Arc::new(PerformanceMetricsHandle)
+}
+
+pub fn default_internode_metrics_interface() -> Arc<dyn InternodeMetricsInterface> {
+    Arc::new(InternodeMetricsHandle)
+}
+
+pub fn default_s3select_db_interface() -> Arc<dyn S3SelectDbInterface> {
+    Arc::new(S3SelectDbHandle)
+}
+
+pub fn default_local_node_name_interface() -> Arc<dyn LocalNodeNameInterface> {
+    Arc::new(LocalNodeNameHandle)
+}
+
+pub fn default_action_credential_interface() -> Arc<dyn ActionCredentialInterface> {
+    Arc::new(ActionCredentialHandle::default())
+}
+
+static DEFAULT_FEDERATED_IDENTITY_HANDLE: OnceLock<Arc<FederatedIdentityHandle>> = OnceLock::new();
+
+fn default_federated_identity_handle() -> Arc<FederatedIdentityHandle> {
+    DEFAULT_FEDERATED_IDENTITY_HANDLE
+        .get_or_init(|| Arc::new(FederatedIdentityHandle::default()))
+        .clone()
+}
+
+pub fn default_federated_identity_interface() -> Arc<dyn FederatedIdentityInterface> {
+    default_federated_identity_handle()
+}
+
+pub fn publish_default_federated_identity_runtime(
+    service: Arc<FederatedIdentityService>,
+    oidc_config_query: Arc<dyn OidcConfigQuery>,
+) -> bool {
+    default_federated_identity_handle().publish_runtime(service, oidc_config_query)
+}
+
+pub fn federated_identity_runtime_interface(
+    runtime: Option<(Arc<FederatedIdentityService>, Arc<dyn OidcConfigQuery>)>,
+) -> Arc<dyn FederatedIdentityInterface> {
+    Arc::new(FederatedIdentityHandle::with_runtime(runtime))
+}
+
+/// Resolve the process-default region for ambient callers.
 pub fn default_region_interface() -> Arc<dyn RegionInterface> {
     Arc::new(RegionHandle)
 }
@@ -189,10 +632,182 @@ pub fn default_tier_config_interface() -> Arc<dyn TierConfigInterface> {
     Arc::new(TierConfigHandle)
 }
 
+pub fn default_expiry_state_interface() -> Arc<dyn ExpiryStateInterface> {
+    Arc::new(ExpiryStateHandle)
+}
+
+pub fn default_transition_state_interface() -> Arc<dyn TransitionStateInterface> {
+    Arc::new(TransitionStateHandle)
+}
+
 pub fn default_server_config_interface() -> Arc<dyn ServerConfigInterface> {
-    Arc::new(ServerConfigHandle)
+    Arc::new(ServerConfigHandle::default())
+}
+
+pub fn default_storage_class_interface() -> Arc<dyn StorageClassInterface> {
+    Arc::new(StorageClassHandle)
 }
 
 pub fn default_buffer_config_interface() -> Arc<dyn BufferConfigInterface> {
     Arc::new(BufferConfigHandle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        KmsRuntimeHandle, KmsServiceManager, ServerConfigHandle, default_federated_identity_interface,
+        federated_identity_runtime_interface, publish_default_federated_identity_runtime, runtime_sources,
+    };
+    use crate::app::context::interfaces::{KmsRuntimeInterface, ServerConfigInterface};
+    use rustfs_config::server_config::Config;
+    use rustfs_iam::{
+        federation::{CoreFederatedAuthorizationMapper, FederatedIdentityService},
+        oidc::{OidcConfigQuery, OidcSys, StandardOidcAdapter},
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn test_federated_identity_runtime() -> (Arc<FederatedIdentityService>, Arc<dyn OidcConfigQuery>) {
+        let oidc = OidcSys::empty().expect("empty OIDC configuration should be valid");
+        let adapter = Arc::new(StandardOidcAdapter::new(Arc::new(oidc)));
+        let oidc_config_query = adapter.clone();
+        let mapper = CoreFederatedAuthorizationMapper::new(adapter.authorization_rules());
+        let service = Arc::new(adapter.into_service(mapper));
+        (service, oidc_config_query)
+    }
+
+    #[test]
+    fn federated_identity_handle_preserves_early_publish_and_allows_replacement() {
+        let (first, first_query) = test_federated_identity_runtime();
+        let (second, second_query) = test_federated_identity_runtime();
+        let interface = federated_identity_runtime_interface(Some((first.clone(), first_query.clone())));
+
+        assert!(
+            interface
+                .handle()
+                .as_ref()
+                .is_some_and(|resolved| Arc::ptr_eq(resolved, &first))
+        );
+
+        let resolved_query = interface.oidc_config_query().expect("initial OIDC config query");
+        assert!(Arc::ptr_eq(&resolved_query, &first_query));
+        let (resolved_service, resolved_query) = interface.runtime_snapshot().expect("initial federated identity runtime");
+        assert!(Arc::ptr_eq(&resolved_service, &first));
+        assert!(Arc::ptr_eq(&resolved_query, &first_query));
+
+        assert!(interface.publish_runtime(second.clone(), second_query.clone()));
+        assert!(
+            interface
+                .handle()
+                .as_ref()
+                .is_some_and(|resolved| Arc::ptr_eq(resolved, &second))
+        );
+        assert!(interface.oidc_config_query().is_some());
+        let (resolved_service, resolved_query) = interface.runtime_snapshot().expect("replacement federated identity runtime");
+        assert!(Arc::ptr_eq(&resolved_service, &second));
+        assert!(Arc::ptr_eq(&resolved_query, &second_query));
+    }
+
+    #[test]
+    #[serial_test::serial(federated_identity_runtime)]
+    fn default_federated_identity_handle_shares_early_publish_and_replacement() {
+        let (first, first_query) = test_federated_identity_runtime();
+        let (second, second_query) = test_federated_identity_runtime();
+
+        assert!(publish_default_federated_identity_runtime(first.clone(), first_query));
+        let interface = default_federated_identity_interface();
+        assert!(
+            interface
+                .handle()
+                .as_ref()
+                .is_some_and(|resolved| Arc::ptr_eq(resolved, &first))
+        );
+
+        assert!(publish_default_federated_identity_runtime(second.clone(), second_query));
+        assert!(
+            interface
+                .handle()
+                .as_ref()
+                .is_some_and(|resolved| Arc::ptr_eq(resolved, &second))
+        );
+    }
+
+    // backlog#1052 S3: each context's server-config handle keeps its own copy,
+    // so two handles that both published stay isolated even though the shared
+    // process global only remembers the last write.
+    #[test]
+    fn server_config_handle_prefers_its_own_copy_over_the_shared_global() {
+        let mut config_a = Config::new();
+        config_a.0.insert("handle-a-marker".to_string(), HashMap::new());
+        let mut config_b = Config::new();
+        config_b.0.insert("handle-b-marker".to_string(), HashMap::new());
+
+        let handle_a = ServerConfigHandle::default();
+        let handle_b = ServerConfigHandle::default();
+        handle_a.set(config_a.clone());
+        handle_b.set(config_b.clone());
+
+        assert_eq!(handle_a.get(), Some(config_a), "handle A must serve its own copy");
+        assert_eq!(handle_b.get(), Some(config_b), "handle B must serve its own copy");
+    }
+
+    // Before anything is published through the handle, it answers exactly like
+    // the ambient global — the single-instance legacy default.
+    #[test]
+    fn unset_server_config_handle_falls_back_to_the_ambient_global() {
+        let handle = ServerConfigHandle::default();
+        assert_eq!(handle.get(), runtime_sources::server_config());
+    }
+
+    // backlog#1052 S3: two contexts' credential handles keep their own copies,
+    // so they stay isolated even though the process global is init-once and
+    // will only remember the first publish.
+    #[test]
+    fn credential_handle_prefers_its_own_copy_over_the_shared_global() {
+        use super::ActionCredentialHandle;
+        use crate::app::context::interfaces::ActionCredentialInterface;
+        use rustfs_credentials::Credentials;
+
+        let cred_a = Credentials {
+            access_key: "handle-a-access".to_string(),
+            secret_key: "handle-a-secret".to_string(),
+            ..Default::default()
+        };
+        let cred_b = Credentials {
+            access_key: "handle-b-access".to_string(),
+            secret_key: "handle-b-secret".to_string(),
+            ..Default::default()
+        };
+
+        let handle_a = ActionCredentialHandle::default();
+        let handle_b = ActionCredentialHandle::default();
+        handle_a.publish(cred_a.clone());
+        handle_b.publish(cred_b.clone());
+
+        assert_eq!(
+            handle_a.get().map(|c| c.access_key),
+            Some(cred_a.access_key),
+            "handle A must serve its own credentials"
+        );
+        assert_eq!(
+            handle_b.get().map(|c| c.access_key),
+            Some(cred_b.access_key),
+            "handle B must serve its own credentials"
+        );
+    }
+
+    #[test]
+    fn kms_runtime_handles_keep_injected_managers_isolated() {
+        let manager_a = Arc::new(KmsServiceManager::new());
+        let manager_b = Arc::new(KmsServiceManager::new());
+        let handle_a = KmsRuntimeHandle::new(manager_a.clone());
+        let handle_b = KmsRuntimeHandle::new(manager_b.clone());
+
+        assert!(Arc::ptr_eq(&handle_a.service_manager().expect("manager A"), &manager_a));
+        assert!(Arc::ptr_eq(&handle_b.service_manager().expect("manager B"), &manager_b));
+        assert!(!Arc::ptr_eq(
+            &handle_a.service_manager().expect("manager A"),
+            &handle_b.service_manager().expect("manager B")
+        ));
+    }
 }

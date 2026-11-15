@@ -26,11 +26,12 @@ pub type NumberFunc = InnerFunc<NumberFuncValue>;
 pub struct NumberFuncValue(i64);
 
 impl NumberFunc {
-    pub fn evaluate(&self, op: impl Fn(&i64, &i64) -> bool, if_exists: bool, values: &HashMap<String, Vec<String>>) -> bool {
+    pub fn evaluate(&self, op: impl Fn(&i64, &i64) -> bool, absent: bool, values: &HashMap<String, Vec<String>>) -> bool {
         for inner in self.0.iter() {
             let v = match values.get(inner.key.name().as_str()).and_then(|x| x.first()) {
                 Some(x) => x,
-                None => return if_exists,
+                None if absent => continue,
+                None => return false,
             };
 
             let Ok(rv) = v.parse::<i64>() else {
@@ -104,6 +105,7 @@ mod tests {
         key_name::KeyName::{self, *},
         key_name::S3KeyName::*,
     };
+    use std::collections::HashMap;
     use test_case::test_case;
 
     fn new_func(name: KeyName, variable: Option<String>, value: i64) -> NumberFunc {
@@ -123,6 +125,49 @@ mod tests {
         let v: NumberFunc = serde_json::from_str(input)?;
         assert_eq!(v, expect);
         Ok(())
+    }
+
+    #[test_case(r#"{"s3:object-lock-remaining-retention-days": 30}"#; "number")]
+    #[test_case(r#"{"s3:object-lock-remaining-retention-days": "30"}"#; "string")]
+    fn remaining_retention_days_deserializes(input: &str) -> Result<(), serde_json::Error> {
+        let v: NumberFunc = serde_json::from_str(input)?;
+        assert_eq!(v, new_func(S3(S3ObjectLockRemainingRetentionDays), None, 30));
+        Ok(())
+    }
+
+    #[test_case("29", true, false, false; "below limit")]
+    #[test_case("30", true, false, true; "at limit")]
+    #[test_case("31", false, true, false; "above limit")]
+    fn remaining_retention_days_numeric_comparisons(days: &str, less_than_equals: bool, greater_than: bool, equals: bool) {
+        let limit = new_func(S3(S3ObjectLockRemainingRetentionDays), None, 30);
+        let values = HashMap::from([("object-lock-remaining-retention-days".to_string(), vec![days.to_string()])]);
+
+        assert_eq!(limit.evaluate(i64::le, false, &values), less_than_equals);
+        assert_eq!(limit.evaluate(i64::gt, false, &values), greater_than);
+        assert_eq!(limit.evaluate(i64::eq, false, &values), equals);
+    }
+
+    #[test]
+    fn absent_numeric_key_does_not_skip_other_keys() {
+        let mut function = new_func(S3(S3MaxKeys), None, 30);
+        function
+            .0
+            .extend(new_func(S3(S3ObjectLockRemainingRetentionDays), None, 30).0);
+        let values = HashMap::from([("object-lock-remaining-retention-days".to_string(), vec!["30".to_string()])]);
+        assert!(!function.evaluate(i64::ne, true, &values));
+        assert!(!function.evaluate(i64::gt, true, &values));
+        assert!(function.evaluate(i64::eq, true, &values));
+        function.0.reverse();
+        assert!(!function.evaluate(i64::ne, true, &values));
+    }
+
+    #[test]
+    fn remaining_retention_days_numeric_condition_without_value_uses_if_exists() {
+        let limit = new_func(S3(S3ObjectLockRemainingRetentionDays), None, 30);
+        let values = HashMap::new();
+
+        assert!(!limit.evaluate(i64::le, false, &values));
+        assert!(limit.evaluate(i64::le, true, &values));
     }
 
     #[test_case(r#"{"s3:max-keys":"1"}"#, new_func(S3(S3MaxKeys), None, 1); "1")]

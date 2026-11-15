@@ -18,6 +18,7 @@
 //! Queue-store mode uses the shared target store and replays the same raw JSON
 //! body through `send_raw_from_store`.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -29,8 +30,8 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, is_connectivity_error,
-        open_target_queue_store, persist_queued_payload_to_store,
+        TargetTlsState, TargetType, build_queued_payload, build_queued_payload_with_records, build_target_tls_fingerprint,
+        is_connectivity_error, open_target_queue_store, persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
@@ -42,8 +43,6 @@ use lapin::{
 use parking_lot::Mutex;
 use rustfs_config::{AMQP_TLS_CA, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY};
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -51,6 +50,10 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, instrument, warn};
 use url::Url;
+
+/// Upper bound on how long a single publish and its publisher-confirm may block
+/// before being treated as a timeout (backlog#980).
+const AMQP_PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct AMQPArgs {
@@ -239,8 +242,40 @@ fn build_publish_properties(args: &AMQPArgs) -> BasicProperties {
     properties
 }
 
+/// Returns true for AMQP broker protocol errors that indicate a permanent,
+/// non-connectivity condition (e.g. the exchange/queue does not exist, access is
+/// refused, or a precondition failed). These must not be treated as transient
+/// connectivity errors, otherwise a misconfigured target triggers an endless
+/// reconnect storm instead of surfacing a delivery failure (backlog#973).
+fn is_permanent_amqp_protocol_error(err: &lapin::Error) -> bool {
+    use lapin::protocol::{AMQPErrorKind, AMQPHardError, AMQPSoftError};
+    if let LapinErrorKind::ProtocolError(amqp_err) = err.kind() {
+        return match amqp_err.kind() {
+            // 404 NOT_FOUND (missing exchange/queue), 403 ACCESS_REFUSED,
+            // 406 PRECONDITION_FAILED.
+            AMQPErrorKind::Soft(soft) => {
+                matches!(
+                    soft,
+                    AMQPSoftError::NOTFOUND | AMQPSoftError::ACCESSREFUSED | AMQPSoftError::PRECONDITIONFAILED
+                )
+            }
+            // 530 NOT_ALLOWED, 540 NOT_IMPLEMENTED, 402 INVALID_PATH.
+            AMQPErrorKind::Hard(hard) => {
+                matches!(
+                    hard,
+                    AMQPHardError::NOTALLOWED | AMQPHardError::NOTIMPLEMENTED | AMQPHardError::INVALIDPATH
+                )
+            }
+        };
+    }
+    false
+}
+
 fn map_lapin_error(err: lapin::Error, context: &str) -> TargetError {
     let message = format!("{context}: {err}");
+    if is_permanent_amqp_protocol_error(&err) {
+        return TargetError::Request(message);
+    }
     match err.kind() {
         LapinErrorKind::IOError(io_err) if io_err.kind() == std::io::ErrorKind::TimedOut => TargetError::Timeout(message),
         LapinErrorKind::IOError(_)
@@ -258,6 +293,10 @@ fn map_lapin_error(err: lapin::Error, context: &str) -> TargetError {
 
 pub async fn connect_amqp(args: &AMQPArgs) -> Result<AMQPConnection, TargetError> {
     args.validate()?;
+    #[cfg(feature = "fips")]
+    if args.url.scheme() == "amqps" {
+        super::ensure_rustls_provider_installed()?;
+    }
     tokio::time::timeout(Duration::from_secs(5), async {
         let url = connection_url(args)?;
         // Reconnect explicitly so every new channel enables publisher confirms below.
@@ -298,7 +337,7 @@ pub struct AMQPConnection {
 
 pub struct AMQPTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: AMQPArgs,
@@ -314,7 +353,7 @@ where
 
 impl<E> AMQPTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
         Box::new(AMQPTarget::<E> {
@@ -333,6 +372,18 @@ where
     #[instrument(skip(args), fields(target_id_as_string = %id))]
     pub fn new(id: String, args: AMQPArgs) -> Result<Self, TargetError> {
         args.validate()?;
+        if args.enable && !args.mandatory {
+            // With mandatory=false the broker silently discards messages that
+            // route to no queue, and the publish is still confirmed as success.
+            // Warn so operators expecting reliable delivery know unroutable
+            // events are dropped without a trace (backlog#980).
+            warn!(
+                target_id = %id,
+                exchange = %args.exchange,
+                routing_key = %args.routing_key,
+                "AMQP target has mandatory=false: messages that route to no queue are silently dropped. Set mandatory=true for reliable delivery."
+            );
+        }
         let target_id = TargetID::new(id, ChannelTargetType::Amqp.as_str().to_string());
         let queue_store = open_target_queue_store(
             &args.queue_dir,
@@ -357,7 +408,10 @@ where
     }
 
     fn build_queued_payload(&self, event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError> {
-        build_queued_payload_with_records(event, vec![event.clone()])
+        match self.args.target_type {
+            TargetType::NotifyEvent => build_queued_payload(event),
+            TargetType::AuditLog => build_queued_payload_with_records(event, vec![event.clone()]),
+        }
     }
 
     async fn get_or_connect(&self) -> Result<Arc<AMQPConnection>, TargetError> {
@@ -418,9 +472,11 @@ where
 
     async fn send_body(&self, body: &[u8]) -> Result<(), TargetError> {
         let connection = self.get_or_connect().await?;
-        let publish = connection
-            .channel
-            .basic_publish(
+        // Bound the publish and publisher-confirm waits so a stuck broker cannot
+        // block the send path indefinitely (backlog#980).
+        let publish = match tokio::time::timeout(
+            AMQP_PUBLISH_TIMEOUT,
+            connection.channel.basic_publish(
                 self.args.exchange.clone().into(),
                 self.args.routing_key.clone().into(),
                 BasicPublishOptions {
@@ -429,14 +485,30 @@ where
                 },
                 body,
                 build_publish_properties(&self.args),
-            )
-            .await;
+            ),
+        )
+        .await
+        {
+            Ok(publish) => publish,
+            Err(_) => {
+                self.clear_connection();
+                return Err(TargetError::Timeout("AMQP publish timed out".to_string()));
+            }
+        };
 
-        let confirm = match publish {
-            Ok(confirm) => confirm.await,
+        let confirm_future = match publish {
+            Ok(confirm) => confirm,
             Err(err) => {
                 self.clear_connection();
                 return Err(map_lapin_error(err, "Failed to publish AMQP message"));
+            }
+        };
+
+        let confirm = match tokio::time::timeout(AMQP_PUBLISH_TIMEOUT, confirm_future).await {
+            Ok(confirm) => confirm,
+            Err(_) => {
+                self.clear_connection();
+                return Err(TargetError::Timeout("AMQP publisher confirm timed out".to_string()));
             }
         };
 
@@ -464,7 +536,7 @@ where
 #[async_trait]
 impl<E> ReloadableTargetTls for AMQPTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = AMQPConnection;
 
@@ -500,13 +572,18 @@ where
 #[async_trait]
 impl<E> Target<E> for AMQPTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()
     }
 
     async fn is_active(&self) -> Result<bool, TargetError> {
+        // A disabled target is never active; avoid opening a connection for it
+        // (backlog#980).
+        if !self.args.enable {
+            return Ok(false);
+        }
         let connection = self.get_or_connect().await?;
         Ok(connection.connection.status().connected() && connection.channel.status().connected())
     }
@@ -541,12 +618,14 @@ where
 
     async fn close(&self) -> Result<(), TargetError> {
         let connection = self.connection.lock().take();
-        if let Some(connection) = connection {
-            connection
-                .connection
-                .close(200, "OK".into())
-                .await
-                .map_err(|e| map_lapin_error(e, "Failed to close AMQP connection"))?;
+        // Capture any close failure but still run the remaining cleanup so a
+        // failed broker close does not leave stale TLS/adapter state behind
+        // (backlog#980).
+        let mut close_result = Ok(());
+        if let Some(connection) = connection
+            && let Err(e) = connection.connection.close(200, "OK".into()).await
+        {
+            close_result = Err(map_lapin_error(e, "Failed to close AMQP connection"));
         }
         self.tls_state.lock().reset();
         // If a TLS reload adapter is attached, reset its error tracking
@@ -555,7 +634,7 @@ where
             *adapter.runtime_state().last_error.write() = None;
         }
         info!(target_id = %self.id, "AMQP target closed");
-        Ok(())
+        close_result
     }
 
     fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
@@ -585,8 +664,11 @@ where
     }
 
     fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
-        self.delivery_counters
-            .snapshot(self.store.as_deref().map_or(0, |store| store.len() as u64))
+        self.delivery_counters.snapshot(
+            self.store.as_deref().map_or(0, |store| store.len() as u64),
+            // AMQP targets record no terminal failures and keep no failed store.
+            0,
+        )
     }
 
     fn record_final_failure(&self) {
@@ -601,6 +683,7 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
 
     fn valid_args() -> AMQPArgs {
@@ -636,6 +719,87 @@ mod tests {
             event_name: EventName::ObjectCreatedPut,
             data: json!({"ok": true}),
         })
+    }
+
+    fn notification_event() -> EntityTarget<serde_json::Value> {
+        EntityTarget {
+            object_name: "incoming%2Fclip+%252F.mp4".to_string(),
+            bucket_name: "example-bucket".to_string(),
+            event_name: EventName::ObjectCreatedPut,
+            data: json!({
+                "eventVersion": "2.0",
+                "eventSource": "aws:s3",
+                "eventName": "s3:ObjectCreated:Put",
+                "s3": {
+                    "bucket": {"name": "example-bucket"},
+                    "object": {"key": "incoming%2Fclip+%252F.mp4", "size": 42,
+                               "eTag": "example-etag", "versionId": "example-version"}
+                }
+            }),
+        }
+    }
+
+    #[test]
+    fn notification_records_contain_the_event_directly() {
+        let target = AMQPTarget::new("notification".to_string(), valid_args()).unwrap();
+        let event = notification_event();
+        let queued = target.build_queued_payload(&event).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&queued.body).unwrap();
+
+        assert_eq!(payload["Records"], json!([event.data]));
+        assert_eq!(payload["Key"], "example-bucket/incoming/clip %2F.mp4");
+        assert_eq!(payload["EventName"], "s3:ObjectCreated:Put");
+        assert_eq!(payload["Records"][0]["s3"]["object"]["key"], event.object_name);
+    }
+
+    #[test]
+    fn audit_records_preserve_the_entity_envelope() {
+        let mut args = valid_args();
+        args.target_type = TargetType::AuditLog;
+        let target = AMQPTarget::new("audit".to_string(), args).unwrap();
+        let event = test_event();
+        let queued = target.build_queued_payload(&event).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&queued.body).unwrap();
+
+        assert_eq!(payload["Records"], json!([event.as_ref()]));
+    }
+
+    #[tokio::test]
+    async fn queued_notification_preserves_the_flat_record_and_metadata() {
+        let mut args = unreachable_args();
+        args.queue_dir = temp_store_dir("record-shape").to_string_lossy().to_string();
+        let target = AMQPTarget::new("notification".to_string(), args.clone()).unwrap();
+        let event = notification_event();
+        let expected = target.build_queued_payload(&event).unwrap();
+        let unix_time_ms = || {
+            u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock should be after the Unix epoch")
+                    .as_millis(),
+            )
+            .expect("current Unix timestamp should fit in u64")
+        };
+        let before_save = unix_time_ms();
+        target.save(Arc::new(event.clone())).await.unwrap();
+        let after_save = unix_time_ms();
+        let store = target.store().unwrap();
+        let keys = store.list();
+        assert_eq!(keys.len(), 1);
+        let raw = store.get_raw(&keys[0]).unwrap();
+        let queued = QueuedPayload::decode(&raw).unwrap();
+        assert_eq!(queued.body, expected.body);
+        assert_eq!(queued.meta.event_name, expected.meta.event_name);
+        assert_eq!(queued.meta.bucket_name, expected.meta.bucket_name);
+        assert_eq!(queued.meta.object_name, expected.meta.object_name);
+        assert_eq!(queued.meta.content_type, expected.meta.content_type);
+        assert_eq!(queued.meta.payload_len, expected.meta.payload_len);
+        assert_eq!(queued.meta.dedup_id, expected.meta.dedup_id);
+        assert_eq!(queued.meta.failure, expected.meta.failure);
+        assert!((before_save..=after_save).contains(&queued.meta.queued_at_unix_ms));
+        let payload: serde_json::Value = serde_json::from_slice(&queued.body).unwrap();
+        assert_eq!(payload["Records"], json!([event.data]));
+        std::fs::remove_dir_all(args.queue_dir).unwrap();
     }
 
     fn temp_store_dir(name: &str) -> PathBuf {
@@ -751,6 +915,27 @@ mod tests {
             .expect_err("queue replay should fail without broker");
 
         assert_connect_failure(&err);
+    }
+
+    #[test]
+    fn permanent_amqp_protocol_errors_are_not_connectivity_errors() {
+        use lapin::protocol::{AMQPError, AMQPErrorKind, AMQPHardError, AMQPSoftError};
+
+        let make = |kind: AMQPErrorKind| lapin::Error::from(LapinErrorKind::ProtocolError(AMQPError::new(kind, "boom".into())));
+
+        // 404 (missing exchange/queue) is permanent: it must be a request-level
+        // error so a misconfigured target does not reconnect-storm (backlog#973).
+        let not_found = make(AMQPErrorKind::Soft(AMQPSoftError::NOTFOUND));
+        assert!(is_permanent_amqp_protocol_error(&not_found));
+        assert!(matches!(map_lapin_error(not_found, "publish"), TargetError::Request(_)));
+
+        assert!(is_permanent_amqp_protocol_error(&make(AMQPErrorKind::Soft(AMQPSoftError::ACCESSREFUSED))));
+        assert!(is_permanent_amqp_protocol_error(&make(AMQPErrorKind::Hard(AMQPHardError::NOTALLOWED))));
+
+        // A transient soft error (broker resource locked) is not treated as permanent.
+        assert!(!is_permanent_amqp_protocol_error(&make(AMQPErrorKind::Soft(
+            AMQPSoftError::RESOURCELOCKED
+        ))));
     }
 
     #[test]

@@ -15,10 +15,11 @@
 #[cfg(test)]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod tests {
-    use crate::config::{CommandResult, Config, Opt, TlsCommands};
+    use crate::config::cli::{InspectCommands, default_server_opts};
+    use crate::config::{CommandResult, Config, Opt, S3Stack, TlsCommands};
+    use crate::storage_api::config_test::DisksLayout;
     use rustfs_config::{DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, DEFAULT_OBS_ENDPOINT, RUSTFS_REGION};
     use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY};
-    use rustfs_ecstore::disks_layout::DisksLayout;
     use serial_test::serial;
     use std::env;
 
@@ -87,6 +88,96 @@ mod tests {
     }
 
     #[test]
+    fn connect_network_cli_requires_l1_consent_and_has_no_peer_override() {
+        let base = [
+            "rustfs",
+            "connect",
+            "performance",
+            "network",
+            "--state-dir",
+            "/state",
+            "--offline-key-id",
+            "key",
+            "--output",
+            "/output.zip",
+            "--organization",
+            "org",
+            "--cluster",
+            "cluster",
+            "--device",
+            "device",
+            "--run-uid",
+            "run",
+            "--artifact-uid",
+            "artifact",
+            "--consent-uid",
+            "consent",
+            "--policy-revision",
+            "1",
+            "--consent-expires-at",
+            "10",
+            "--expires-at",
+            "10",
+        ];
+        assert!(Opt::parse_command(base).is_err());
+        let approved = base.into_iter().chain(["--acknowledge-l1"]).collect::<Vec<_>>();
+        assert!(matches!(
+            Opt::parse_command(approved.clone()),
+            Ok(CommandResult::ConnectNetworkPerformance(_))
+        ));
+        assert!(Opt::parse_command(approved.into_iter().chain(["--peer-address", "example.com"])).is_err());
+    }
+
+    #[test]
+    fn connect_client_cli_selects_offline_key_only_when_requested() {
+        let base = [
+            "rustfs",
+            "connect",
+            "performance",
+            "client",
+            "--state-dir",
+            "/state",
+            "--endpoint",
+            "https://storage.example",
+            "--access-key-file",
+            "/access",
+            "--secret-key-file",
+            "/secret",
+            "--output",
+            "/output.zip",
+            "--organization",
+            "org",
+            "--cluster",
+            "cluster",
+            "--device",
+            "device",
+            "--run-uid",
+            "run",
+            "--artifact-uid",
+            "artifact",
+            "--consent-uid",
+            "consent",
+            "--policy-revision",
+            "1",
+            "--consent-expires-at",
+            "10",
+            "--expires-at",
+            "10",
+            "--operation",
+            "get",
+            "--acknowledge-l1",
+        ];
+        assert!(matches!(
+            Opt::parse_command(base),
+            Ok(CommandResult::ConnectClientPerformance(options)) if options.offline_key_id.is_none()
+        ));
+        assert!(matches!(
+            Opt::parse_command(base.into_iter().chain(["--offline-key-id", "selected"])),
+            Ok(CommandResult::ConnectClientPerformance(options)) if options.offline_key_id.as_deref() == Some("selected")
+        ));
+    }
+
+    #[test]
     #[serial]
     fn test_tls_inspect_subcommand_parses_tls_path_alias() {
         let result =
@@ -98,6 +189,76 @@ mod tests {
             },
             _ => panic!("expected TLS command result"),
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_inspect_subcommand_survives_legacy_preprocessing() {
+        let result = Opt::parse_command([
+            "rustfs",
+            "inspect",
+            "bucket-meta",
+            "--path",
+            "/data/drive-1",
+            "--bucket",
+            "example-bucket",
+        ])
+        .expect("inspect command should survive legacy preprocessing");
+
+        match result {
+            CommandResult::Inspect(opts) => match opts.command {
+                InspectCommands::BucketMeta(opts) => {
+                    assert_eq!(opts.paths, ["/data/drive-1"]);
+                    assert_eq!(opts.bucket, "example-bucket");
+                }
+            },
+            _ => panic!("expected inspect command result"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_connect_inspect_object_parses() {
+        let result = Opt::parse_command([
+            "rustfs", "connect", "inspect", "object", "--state-dir", "/state", "--output", "/tmp/inspect.zip",
+            "--organization", "organizations/019e3ae0-0000-7000-8000-000000000021", "--cluster",
+            "organizations/019e3ae0-0000-7000-8000-000000000021/clusters/019e3ae0-0000-7000-8000-000000000022",
+            "--device",
+            "organizations/019e3ae0-0000-7000-8000-000000000021/clusters/019e3ae0-0000-7000-8000-000000000022/clusterDevices/019e3ae0-0000-7000-8000-000000000023",
+            "--run-uid", "019e3ae0-0000-7000-8000-000000000024", "--artifact-uid",
+            "019e3ae0-0000-7000-8000-000000000025", "--consent-uid",
+            "019e3ae0-0000-7000-8000-000000000026", "--policy-revision", "3", "--consent-expires-at",
+            "2000000000", "--expires-at", "2000000000", "--path", "/data/drive-1", "--path", "/data/drive-2",
+            "--bucket", "customer-bucket", "--object", "private/report.bin", "--acknowledge-l3",
+        ])
+        .expect("connect inspect object should parse");
+
+        match result {
+            CommandResult::ConnectInspect(opts) => {
+                assert_eq!(
+                    opts.paths,
+                    [
+                        std::path::PathBuf::from("/data/drive-1"),
+                        std::path::PathBuf::from("/data/drive-2"),
+                    ]
+                );
+                assert_eq!(opts.bucket, "customer-bucket");
+                assert_eq!(opts.object, "private/report.bin");
+            }
+            _ => panic!("expected Connect inspect command result"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_from_non_server_commands_falls_back_without_panicking() {
+        let info_opt = Opt::parse_from(["rustfs", "info"]);
+        let tls_opt = Opt::parse_from(["rustfs", "tls", "inspect", "--path", "/tmp/certs"]);
+
+        assert!(info_opt.volumes.is_empty());
+        assert!(tls_opt.volumes.is_empty());
+        assert_eq!(info_opt.address, default_server_opts().address);
+        assert_eq!(tls_opt.address, default_server_opts().address);
     }
 
     #[test]
@@ -206,6 +367,34 @@ mod tests {
 
     #[test]
     #[serial]
+    fn root_credential_lengths_are_checked_after_resolving_key_files() {
+        let dir = tempfile::tempdir().expect("temporary credential directory");
+        let file = dir.path().join("secret");
+        let config = |access_key| {
+            Config::from_opt(Opt::parse_from([
+                "rustfs",
+                "server",
+                "--access-key",
+                access_key,
+                "--secret-key-file",
+                file.to_str().expect("temporary secret key path"),
+                "/data",
+            ]))
+        };
+
+        std::fs::write(&file, "1234567\n").expect("write short secret");
+        let err = config("root").expect_err("seven-byte secret must be rejected after trimming");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "RUSTFS_SECRET_KEY must be at least 8 bytes");
+
+        std::fs::write(&file, "12345678\n").expect("write eight-byte secret");
+        let err = config("ab").expect_err("two-byte access key must be rejected");
+        assert_eq!(err.to_string(), "RUSTFS_ACCESS_KEY must be at least 3 bytes");
+        assert!(config("abc").is_ok());
+    }
+
+    #[test]
+    #[serial]
     fn test_access_key_envs_are_used_for_bootstrap_credentials() {
         temp_env::with_vars(
             [
@@ -262,7 +451,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_volumes_and_disk_layout_parsing() {
-        use rustfs_ecstore::disks_layout::DisksLayout;
+        use crate::storage_api::config_test::DisksLayout;
 
         // Test case 1: Single volume path
         let args = vec!["rustfs", "/data/vol1"];
@@ -754,5 +943,62 @@ mod tests {
                 });
             });
         });
+    }
+
+    /// Resolves the server configuration with `RUSTFS_S3_STACK` set to `value`
+    /// (`None` removes it), so each case starts from a known environment.
+    fn config_with_s3_stack(value: Option<&str>) -> std::io::Result<Config> {
+        temp_env::with_var("RUSTFS_S3_STACK", value, || Config::from_opt(Opt::parse_from(["rustfs", "/data/vol1"])))
+    }
+
+    fn assert_s3_stack_rejected(value: &str) {
+        let err = match config_with_s3_stack(Some(value)) {
+            Ok(config) => panic!("RUSTFS_S3_STACK={value:?} must refuse startup, got {:?}", config.s3_stack),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            format!(r#"RUSTFS_S3_STACK must be "legacy" or "gateway", got "{value}""#)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_unset_selects_legacy() {
+        let config = config_with_s3_stack(None).expect("unset RUSTFS_S3_STACK should parse");
+        assert_eq!(config.s3_stack, S3Stack::Legacy);
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_legacy_selects_legacy() {
+        let config = config_with_s3_stack(Some("legacy")).expect("RUSTFS_S3_STACK=legacy should parse");
+        assert_eq!(config.s3_stack, S3Stack::Legacy);
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_gateway_selects_gateway() {
+        let config = config_with_s3_stack(Some("gateway")).expect("RUSTFS_S3_STACK=gateway should parse");
+        assert_eq!(config.s3_stack, S3Stack::Gateway);
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_rejects_capitalized_gateway() {
+        assert_s3_stack_rejected("Gateway");
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_rejects_both() {
+        assert_s3_stack_rejected("both");
+    }
+
+    #[test]
+    #[serial]
+    fn s3_stack_rejects_empty_value() {
+        assert_s3_stack_rejected("");
     }
 }

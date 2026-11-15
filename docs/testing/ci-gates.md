@@ -1,0 +1,321 @@
+# CI gate matrix
+
+**Use this when:** a check is red and you need to know whether it blocks the merge, which workflow and job produced it, and how to reproduce it locally. **Source of truth:** the live `main` ruleset (command below) for required status; `.github/workflows/<file>.yml` for triggers, `paths`, `timeout-minutes`, and cron; `.config/nextest.toml` for e2e profile filters; `.github/scheduled-validations.json` for the freshness-watchdog list; `.github/workflows/README.md` for runner placement and billing.
+
+A job blocks a merge when its exact check name is required by the live `main` ruleset, or when its result is required by the `Test and Lint` aggregate. A workflow name, a `merge_group` trigger, or an unrelated red PR check does not make a job required by itself.
+
+## Required merge checks
+
+The `main` ruleset (`6436880`) requires exactly these contexts, with `strict_required_status_checks_policy=false`:
+
+| Required context | Producer | Validation |
+|---|---|---|
+| `CLA Check` | `cla.yml` | Contributor agreement |
+| `Quick Checks` | `ci.yml` job `quick-checks` | Formatting and repository guard scripts |
+| `Test and Lint` | `ci.yml` job `required-checks` | Exact expected results for every CI validation job, including workspace checks, critical E2E, feature lanes, and event-specific full suites |
+
+Every PR enters `ci.yml`. The `classify-changes` job uses the base revision of `scripts/ci_gate.py` to select a conservative documentation-only path: root Markdown/licenses, `AGENTS.md`, Markdown under `docs/` or `.agents/skills/`, and documentation images. Unknown paths, unavailable Git history, an empty diff, or a missing base policy select the full scope for that event. Renames include their deleted source path. Documentation-only PRs still run Quick Checks and Typos; the aggregate requires the expensive jobs to be skipped exactly as selected.
+
+PRs changing only Rust sources under `crates/e2e_test/src/` and known E2E selection digests (optionally with those documentation paths) use the `e2e` scope. They keep workspace validation, the server build, E2E smoke, and both S3 lanes; independent workflows retain their path selection. Connect boundary, serial ILM, optional protocol/rio-v2, and real io_uring jobs are skipped because their sources and test inputs are unchanged. Manifests, fixtures, shared nextest configuration, scripts, production sources, and unknown paths still select `full`. A dependency on `e2e_test` from another workspace member or reachable local dependency disables this shortcut. All non-PR events retain their full selection. The structured planner enforces affected-package and Connect selection from the trusted base policy, retaining fixed core coverage and full validation for shared or unknown inputs. See [verification plans and artifacts](ci-verification-pipeline.md) for identity, rollout and queue-switch contracts.
+
+Specialized boundary, hardware and alternate-feature lanes run only on the scheduled (nightly) and manual full-validation runs: `Connect Feature Boundaries`, `io_uring Integration (real)`, and the rio-v2, Swift, SFTP and HTTP/3 feature lanes. They do not gate a merge. The nightly run reports their regressions within a day, and repeating these builds on every PR revision and merge group bought no earlier signal worth the runner occupancy (Connect alone measured 53.5 median minutes per run and occasionally set the wall). PRs, merge groups and main pushes run the default workspace and retain ILM, S3, E2E smoke, the short core contract and the debug build. The aggregate requires the specialized lanes to be skipped on pull-request, merge-group and push events and successful on scheduled and manual events. For changes to these features, dispatch `ci.yml` against the candidate branch before merging when that signal is needed, including PRs targeting `gateway/integration`: its pushes run the default workspace like main's, not the specialized lanes. Scheduled results supplement the main baseline and do not replace it.
+
+Workspace Clippy runs on every event with a selected workspace Rust job, pull requests included, in its own `Workspace Clippy` job. It runs beside `Workspace Lint and Build` instead of in front of it, because check-mode metadata and the linked test binaries share no compiler output; `scripts/ci_gate.py --check-workflow` rejects a workflow in which the archive producer or any archive consumer waits for the lint, or in which the lint leaves the aggregate. `Workspace Lint and Build` keeps its name as the archive producer: it creates the exact test archive and runs doctests; `Workspace tests` consumes the archive without rebuilding it. `cache-warm.yml` warms Clippy's check artifacts under `ci-dev` with the same invocation to reuse compatible dependency artifacts. `make pre-commit` does not run Clippy. Select local Clippy targets, features, and documentation exemptions from the root `AGENTS.md` verification tier; the workspace command below reproduces the CI lane and is not a universal pre-push requirement.
+
+Serial ILM tests run at the end of `workspace-tests` for the `full` scope, consuming the same verified archive as ordinary workspace tests. The existing ignored-test filter and `-j1` remain; `--profile default` keeps the no-retry execution and preserves the separate core CI JUnit report. Any ILM failure fails the consumer and required aggregate. Logs remain in the workspace test evidence artifact. There is no separate ILM compilation or cache restore.
+
+`required-checks` runs even after failed or skipped dependencies. `scripts/ci_gate.py verify` rejects missing jobs, unexpected jobs, failure, cancellation, and unexpected skips; optional lanes are required only on their declared events. `Workspace Clippy` is the workspace lint, `Workspace Lint and Build` and `Workspace tests` are the ordinary Rust producer and consumer, while `Test and Lint` uniquely names the aggregate. New validation jobs must update both its direct dependencies and the script contract. A report-only lane is registered in `REPORT_ONLY_JOBS` instead: it stays out of the aggregate, must keep its distinguishing environment, and must keep the steps it reruns identical to the required job it mirrors. Test this wiring and its failure cases with `python3 scripts/ci_gate.py --self-test`.
+
+The `gateway/integration` ruleset (`24663286`) requires the same three contexts with the same review rules for the s3s to gateway integration branch (rustfs/backlog#2734). It omits `required_linear_history` because `gateway-integration-sync.yml` lands `--no-ff` merge commits from `main` on that branch every weekday, and it names the `rustfs-cla-assistant` app as the bypass actor that pushes them. `ci.yml` runs on pull requests targeting either branch and on pushes to either branch; a push to `gateway/integration` also runs `e2e-full`, because the daily merge commit lands without a pull request and must be proven like a `main` push.
+
+Verify the live rule before changing merge policy:
+
+```bash
+gh api repos/rustfs/rustfs/rulesets/6436880 \
+  --jq '.rules[] | select(.type == "required_status_checks") | .parameters'
+```
+
+The aggregate requires the validation lanes already selected by `ci.yml`; this closes the gap where a failing critical lane left the required workspace check green. Independent workflows remain report-only unless separately required. Before adding a new expensive lane or moving existing PR coverage to a schedule, collect representative execution and regression evidence, establish ownership and a working scheduled replacement, and update this reference with the resulting policy. `e2e-distributed.yml` and `e2e-upgrade.yml` are that kind of replacement: the 4-node lane runs on its nightly schedule, and the single-node upgrade lane runs on its weekly Monday schedule, on version tags, and on manual dispatch. Neither is part of `Test and Lint`. Dispatch the workflow against a candidate branch when that signal is needed before merge.
+
+Superseded PR attempts are cancelled. A running main validation finishes, with only the newest pending main run retained, so frequent merges cannot continuously cancel the full baseline. Having a `merge_group` trigger does not itself require use of the merge queue.
+
+A push whose tree a successful `merge_group` run of `ci.yml` already validated does not validate it again. A merge-queue landing fast-forwards the branch to the group's commit, so `Select CI scope` looks that run up (`scripts/ci_merge_group_proof.py`, with the job's read-only Actions token) and plans mode `proven`: `Select CI scope`, `Typos` and `Quick Checks` run, every validation job is skipped, and `Test and Lint` passes only if each of them was skipped. The plan and the aggregate's summary name the proving run; a job skipped for any other reason keeps its own reason. A push that did not come through the queue, such as a direct administrator merge, has no such run, and any doubt about the lookup (no token, an API or network error, a rate limit, no matching successful run, a different tree) plans the full validation.
+
+Protocol matrix jobs finish independently when a sibling fails. Each executed protocol test step preserves its log and available JUnit under a separate, attempt-specific artifact; a skipped test step cannot upload a cached report.
+
+The four site-replication state-writer concurrency proofs reserve the available nextest slots in both local and CI profiles. This isolates their durable IO from unrelated test processes while retaining each proof's internal two-writer race, production five-second lock-acquisition limit, assertions, and zero retries.
+
+## Pull request and merge matrix
+
+"Via aggregate" means a wrong result fails the required `Test and Lint` check. "Report-only" means visible and actionable but outside both the required list and aggregate. Budgets are each job's `timeout-minutes` in the named workflow and are not copied here.
+
+| Event | Check name | Workflow / job | Merge status | Reproduce |
+|---|---|---|---|---|
+| PR, non-doc change | `Quick Checks` | `ci.yml` `quick-checks` | Required | `make pre-commit` |
+| PR, non-doc change, and every non-PR event | `Workspace Clippy`, `Workspace Lint and Build`, `Workspace tests` | `ci.yml` `workspace-clippy` / `workspace-lint-and-build` / `workspace-tests` | Via aggregate | `cargo clippy --all-targets -- -D warnings`; `cargo nextest run --profile ci --all --exclude e2e_test`; `cargo test --all --exclude e2e_test --doc`; migration evidence check described below |
+| PR, non-doc change | `Typos` | `ci.yml` `typos` | Via aggregate | `typos` |
+| Full selection | `Workspace tests` (serial ILM step) | `ci.yml` `workspace-tests` | Via aggregate | exact `Run ignored ILM integration tests serially` command in the job |
+| Nightly schedule, manual dispatch | `Test and Lint (rio-v2)`, `Test and Lint (swift)`, `Test and Lint (sftp)`, `Test and Lint (http3)` | `ci.yml` `test-and-lint-rio-v2`, `test-and-lint-protocols` | Via aggregate on these events; skipped on PRs, merge groups and main pushes | `cargo nextest run` with the job's `--features` |
+| Full selection, every event | `Test and Lint (gateway-stack)` | `ci.yml` `test-and-lint-gateway-stack` | Via aggregate | `cargo clippy -p rustfs --all-targets --features gateway-stack -- -D warnings`; `cargo nextest run -p rustfs --features gateway-stack` with the job's filter |
+| Nightly schedule, manual dispatch, full selection | `Connect Feature Boundaries` | `ci.yml` `connect-feature-boundaries` | Via aggregate on these events; skipped on PRs, merge groups and main pushes | `cargo test -p rustfs --test connect_registration --features connect-e2e-short-credentials`; `scripts/check_connect_release_boundary.py`: `cargo check -p rustfs --release` with `connect-e2e-short-credentials` and with `gateway-stack` must each fail at its guard; `scripts/check_offline_enrollment_e2e.sh` |
+| PR, non-doc change | `Build RustFS Debug Binary` | `ci.yml` `build-rustfs-debug-binary` | Via aggregate; prerequisite for black-box jobs | `python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks` (binary plus its `rustfs.e2e.json` sidecar) |
+| Nightly schedule, manual dispatch, full selection | `io_uring Integration (real)` | `ci.yml` `uring-integration` | Via aggregate on these events; skipped on PRs, merge groups and main pushes | `cargo test -p rustfs-ecstore --lib uring_ -- --test-threads=1 --nocapture` |
+| PR, non-doc change | `End-to-End Tests` | `ci.yml` `e2e-tests` | Via aggregate | `python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke -p e2e_test`, then `./scripts/e2e-run.sh ./target/debug/rustfs <data-dir>` under the same wrapper; membership guards `scripts/check_test_wiring.py --check-profile e2e-smoke <listing.json>` and `scripts/check_security_smoke_count.sh check <listing.json>` |
+| PR, non-doc change | `Core contract` | `ci.yml` `core-contract` | Via aggregate | existing write/read, anonymous denial and restart-byte tests via `core-contract` profile and the E2E archive |
+| Push to `main` or `gateway/integration`, merge group, nightly schedule, manual dispatch; PR only when it changes a gateway-stack input (`GATEWAY_SMOKE_PATHS` or a `rustfs-gateway*` pin, `scripts/ci_gate.py`) | `e2e-smoke (gateway, report-only until T2.10)` | `ci.yml` `e2e-tests-gateway` | Report-only until rustfs/backlog#2734 T2.10 makes it required; `continue-on-error`, outside the aggregate; skipped, never green, on PRs that touch no gateway-stack input. At T2.10, when the lane becomes required, it must run on every pull request again — delete this selection, do not extend it | `RUSTFS_S3_STACK=gateway python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-smoke -p e2e_test`; `scripts/ci_gate.py` keeps its archive and run steps identical to `e2e-tests`, which sets `RUSTFS_S3_STACK=legacy` on this branch |
+| PR, non-doc change | `S3 Implemented Tests` | `ci.yml` `s3-implemented-tests` | Via aggregate | build `rustfs`, then `scripts/s3-tests/run.sh` with the job's `DEPLOY_MODE` / `TEST_MODE` / `MAXFAIL` env |
+| PR, non-doc change | `S3 Lifecycle Behavior Tests` | `ci.yml` `s3-lifecycle-behavior-tests` | Via aggregate | `scripts/s3-tests/run.sh` with the job's accelerated-scanner env |
+| PR touching `paths` in `audit.yml` | `Cargo Deny`, `Workflow Pin Report`, `Dependency Review` | `audit.yml` `cargo-deny`, `workflow-pin-report`, `dependency-review` | Report-only | `cargo deny check`; `scripts/security/check_workflow_pins.sh` |
+| PR touching `paths` in `nix.yml` | `Nix Build & Check` | `nix.yml` `nix-validation` | Report-only | `nix flake check` |
+| PR touching `paths` in `fuzz.yml` | `Build Fuzz Harness`, `Smoke / <target>` | `fuzz.yml` `fuzz-build`, `pr-fuzz-smoke` | Report-only | `MAX_TOTAL_TIME=60 ./scripts/fuzz/run.sh` |
+| PR touching `paths` in `windows-filesystem.yml` | `Rename Safety`, `Startup Smoke` | `windows-filesystem.yml` `rename-safety`, `startup-smoke` | Report-only | the `cargo test -p rustfs-ecstore --lib <filter>` commands in the job, on Windows; `cargo build --locked -p rustfs --bin rustfs`, then `rustfs.exe --version` and a single-volume server polled on `/health/ready` |
+| PR touching `paths` in `coverage.yml` | `Workspace line coverage` | `coverage.yml` `coverage` | Report-only | `make coverage`; `python3 scripts/check_security_coverage.py target/llvm-cov/coverage.json` |
+| PR touching `paths` in `oidc-keycloak.yml` | `OIDC Keycloak live gate` | `oidc-keycloak.yml` `oidc-keycloak-live` | Report-only | `cargo build --locked -p rustfs --bin rustfs`, then `bash scripts/test/oidc_keycloak_live.sh ./target/debug/rustfs` |
+| PR touching `paths` in `targets-integration.yml` | `PostgreSQL, MySQL, AMQP, and NATS` | `targets-integration.yml` `targets-live` | Report-only | start the containers as in the job, export the `RUSTFS_TEST_*` DSNs, then the job's `cargo test --locked -p rustfs-targets --test <name> -- --ignored --test-threads=1` commands |
+| PR, documentation-only selection | `Quick Checks`, `Typos`, `Test and Lint` | `ci.yml` `quick-checks`, `typos`, `required-checks` | Required directly or via aggregate | Quick Checks commands; `python3 scripts/ci_gate.py --self-test` |
+| `merge_group`; push to `main` or `gateway/integration` that no successful `merge_group` run of the same tree proved | `End-to-End Tests (full merge gate)` | `ci.yml` `e2e-full` | Via aggregate on these events; skipped on a proven push, whose evidence is the proving run | `python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-full -p e2e_test` (CI adds `--binary "$RUSTFS_E2E_STARTUP_CAS_BINARY"` for the downloaded binary and sidecar) |
+
+e2e filters live in `.config/nextest.toml`; extend a profile instead of adding a second selector. Before a profile runs, `scripts/check_test_wiring.py` compares its listing to the committed digest in `.config/e2e-<profile>-selection.txt`, so a silent test drop fails closed.
+
+Architecture migration rules run once in the required Quick Checks job. Migration proofs reuse the successful workspace run: `scripts/check_migration_gate_count.sh evidence <core-listing.json> <junit.xml>` checks the unchanged name selection and committed floor, and requires exactly one successful execution without retries for each proof. Missing, filtered, skipped, failed, or duplicate evidence fails the gate. Local `check` and `run` modes remain available. Upgrade compatibility builds one current server and shares its binary and provenance sidecar with one test runner. That runner verifies the pinned previous release checksum once, reuses the compiled harness, and executes every existing upgrade case in a separate process. Failed cases do not stop the remaining cases; any failure fails the job. Logs and G09 evidence retain per-case subdirectories in the aggregate artifacts. `scripts/test_upgrade_workflow.py` checks case membership and failure propagation.
+
+Scanner usage and heal rebuild coverage are intentionally split by risk and cost. `data_usage_test` runs in the PR `e2e-smoke` lane so changes that affect authoritative scanner usage publication, quota-visible usage, or admin usage snapshots get an end-to-end signal before merge review. `heal_erasure_disk_rebuild_test` runs in `e2e-full` so core erasure heal rebuild regressions are caught no later than the merge queue or `main` push lane; it also remains in `e2e-nightly` with the serialized cluster fault-domain suites for scheduled soak signal.
+
+The E2E producer builds the hooks binary and harness archive once. Smoke, full and core consumers verify their identity and execution membership. The two S3 lanes depend directly on that producer and run alongside E2E. Runtime consumers retain the producer checkout path because existing fixtures embed compile-time paths. Shared test archives and debug binaries keep one name per run and the archive identity binds the run, not the attempt: "Re-run failed jobs" reuses the earlier attempt's producer output, and a full rerun overwrites it before any consumer starts.
+
+## Scheduled validation
+
+Scheduled lanes never block a PR. Their workflow-local gate fails the run. The versioned `.github/scheduled-validations.json` registry maps workflow responsibility, cadence, failure ownership, live-state policy and suite requirements. Hosted watchdog and freshness monitors derive their expected set from it; disabled or paused entries remain visible without claiming success or enabling them. Attempts and completed successes have separate freshness checks. See [periodic validation orchestration](validation-orchestration.md) for single-suite selection, complete-chain evidence, shared-fleet quarantine and recovery.
+
+| Workflow (cadence) | Jobs | Verdict and artifacts | Registry monitor | Reproduce |
+|---|---|---|---|---|
+| `ci.yml` (nightly) | full matrix, including the schedule/dispatch-only rio-v2 jobs `build-rustfs-debug-binary-rio-v2` and `e2e-tests-rio-v2` | strict aggregate; the full E2E lane runs on dispatch, merge groups, and main pushes that no merge group proved | yes | dispatch `ci.yml` |
+| `cache-warm.yml` (every six hours, plus main pushes that change `Cargo.lock`, `rust-toolchain.toml` or the setup action) | `warm-ci-dev`, `warm-ci-feat-rio`, `warm-ci-feat-proto`, `warm-ci-uring` | no verdict; sole writer of the `rust-cache` keys that `ci.yml` restores | yes | dispatch `cache-warm.yml` |
+| `build.yml` (nightly Linux, weekly desktop) | `build-rustfs` over the `prepare-platform-matrix` subset for the firing cron: four Linux targets at 01:13 UTC, and macOS aarch64 plus Windows x86_64 at Sunday 16:17 UTC | build/package integrity | yes | dispatch `build.yml` with an exact platform set |
+| `e2e-replication-nightly.yml` (nightly) | `repl-nightly`, `cluster-nightly`, `protocols-nightly` | three independent gates; JUnit, membership listing, server logs | yes | `python3 scripts/e2e_binary.py build --bins`, then `python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-repl-nightly -p e2e_test`; `--features e2e-test-hooks` on both steps with `--profile e2e-nightly`; `--features ftps,webdav,sftp` on both steps with `-j 1 --profile e2e-protocols` |
+| `dual-stack-nightly.yml` (nightly) | `build`, `leg` (`e2e-smoke` and `e2e-full`, each on the legacy and, once a gateway start is proven, the gateway stack), `summary` | report-only both-stack diff of the two profiles only `ci.yml` runs; the other e2e profiles carry the same `stack` dimension in their own workflows. A gateway binary that refuses to start skips the gateway legs and the summary says why; the gateway legs are report-only until T2.10 | yes | `python3 scripts/dual_stack.py summary --help`; dispatch `dual-stack-nightly.yml` |
+| `e2e-distributed.yml` (nightly) | `distributed` | fail-closed 4-node 4-disk S3, durability, replication, movement, fault, and direct/rolling upgrade gate; JUnit, membership listing, per-node server logs | yes | download the pinned previous release as in the workflow, export `RUSTFS_UPGRADE_SOURCE_BINARY`, run `python3 scripts/e2e_binary.py build --bins --features e2e-test-hooks`, then `python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo nextest run --profile e2e-distributed -p e2e_test` |
+| `e2e-s3tests.yml` (weekly) | `s3tests` (single and distributed, four shards each), `upstream-head-canary` | compatibility gate; report, JUnit, node IDs, server logs | yes | `scripts/s3-tests/run.sh` against an existing single or distributed target |
+| `fuzz.yml` (nightly) | `nightly-fuzz-corpus` per target | gate; corpus and crash artifacts | yes (disabled) | `MAX_TOTAL_TIME=<seconds> ./scripts/fuzz/run.sh` |
+| `minio-interop.yml` (nightly) | `minio-interop` | EC + SSE read-parity gate | yes, with `never_ran_grace_until` | pinned Docker fixture steps in the workflow |
+| `on-demand-migration-interop.yml` (nightly) | `minio-source`, `cloud-source` (`aws`, `r2`, `gcs`) | report-only provider interop; one JSON report per provider naming cases, timings and source request counts, plus JUnit and MinIO logs. A cloud provider whose `ODM_INTEROP_*` secrets are absent is skipped with a summary note, not failed | yes | start the pinned MinIO container as in the job, export the `RUSTFS_ODM_INTEROP_*` variables, run `python3 scripts/e2e_binary.py build --bins`, then `python3 scripts/e2e_binary.py run -- cargo nextest run --profile e2e-odm-interop -p e2e_test` |
+| `nightly-gnu.yml` (nightly) | `build`, `kms-vault-lane`, `kms-vault-ha-failover` | build, live Vault, and HA failover gates | yes | commands and pinned Vault images in the workflow |
+| `audit.yml` (nightly) | `cargo-deny`, `workflow-pin-report` | dependency and workflow-pin gates | yes | `cargo deny check`; `scripts/security/check_workflow_pins.sh` |
+| `mint.yml` (weekly) | `image`, `mint` (legacy and gateway), `compare` | report-only by design; per-suite PASS/FAIL/NA and raw `log.json` per stack. The image is built once. `compare` holds the gate that every case legacy passes is present and passing on gateway and prints the cases that break it; the gateway leg and `compare` are report-only until T2.10 | yes | pinned Docker sequence in the workflow; `python3 scripts/mint_stack_diff.py <legacy-leg-dir> <gateway-leg-dir>` |
+| `coverage.yml` (weekly) | `coverage` | report-only trend; lcov and JSON artifact | yes (disabled) | `make coverage` |
+| `runner-hygiene.yml` (monthly) | `check-ephemerality` | runner ephemerality | yes | dispatch |
+| `e2e-upgrade.yml` (weekly, and on version tags) | `upgrade` (serial cases sharing one harness build) | upgrade and rollback gate; server logs | yes | `python3 scripts/e2e_binary.py build`, then the job's `python3 scripts/e2e_binary.py run -- cargo test --locked -p e2e_test` commands with `RUSTFS_UPGRADE_SOURCE_BINARY` pointing at the pinned previous release (`UPGRADE_SOURCE_VERSION`) |
+| `reference-parity.yml` (nightly, and on PRs that change the lane's own files) | `plan`, `build-candidate`, `s3tests` (one job per target in `.config/reference-parity-targets.toml`), `compare` | report-only parity gate: fails on any per-node-id s3-tests difference between a branch candidate and the release pinned in `.config/reference-binary.toml` that `.config/reference-parity-tolerated.txt` does not list, and on a stale tolerated entry; per-target JUnit, logs and `diff.md`/`diff.json` | yes | `DEPLOY_MODE=binary RUSTFS_BINARY=<binary> MAXFAIL=0 XDIST=4 ./scripts/s3-tests/run.sh` once per target, then `python3 scripts/s3-tests/reference_parity.py compare` as in the `compare` job |
+| `gateway-acceptance.yml` (nightly) | `plan`, `build-candidate`, `build-gateway-tools`, `acceptance` (one job per S3 stack), `compare` | the rustfs/gateway conformance corpus (`--profile rustfs`) and client matrix (`--external`), both checked out at the rev `Cargo.toml` pins. Each stack must be observed in the server's own `server_starting` log event (`scripts/dual_stack.py stack`). Legacy stack: the corpus run is a reference that is never judged (it must serve, stay up and complete); the matrix is the baseline and fails on a `fail` or `sut-unregistered` cell or a client that could not be installed. Gateway stack, report-only until T2.10: fails on a conformance failure without a `.config/conformance-rulings.toml` row, on a ruled case failing differently, on a stale row, on a skip on the server's own answer, and on any matrix cell that passes on legacy but not on gateway. Per-stack `report.json`, `matrix.json` and logs, and a legacy-vs-gateway diff | yes | start the candidate with `RUSTFS_S3_STACK=<stack>`, then the job's `rustfs-gateway-conformance run` and `ci/compat/run_matrix.sh --external` commands, then `python3 scripts/check_conformance_rulings.py` and `python3 scripts/compat_matrix_report.py check` |
+| `oidc-keycloak.yml` (weekly) | `oidc-keycloak-live` | live OIDC gate | yes | see the PR row |
+| `targets-integration.yml` (nightly) | `targets-live` | live target gate; container logs | yes (disabled) | see the PR row |
+| `gateway-integration-sync.yml` (weekdays) | `sync` | merges `main` into `gateway/integration` as a `--no-ff` merge commit; a conflicting merge is aborted and opens a `sync/<source>-<date>` pull request listing the conflicting files, which keeps the run green; a rejected push or missing pull request fails it | yes | dispatch, optionally with `source_ref` |
+| `scheduled-validation-freshness.yml` (nightly) | `check-freshness` | fails on missing or stale attempts or completed successes | n/a | dispatch |
+
+Manual `workflow_dispatch` runs are debugging evidence and do not open scheduled-failure issues.
+
+## Packaged functional acceptance
+
+`rustfs-functional-chain.yml` calls selected packaged-build suites in one Actions run, using the registry's plan and the existing immutable candidate manifest. Shared-fleet suites remain serial and retain their lock through cleanup; the isolated performance fleet can run alongside them. A failed suite does not prevent later selected suites from gathering evidence, but required failures, cancellation, missing or foreign evidence fail the aggregate. The old repository-dispatch relay is removed; manual single-suite workflows end after their own suite.
+
+Functional-chain health runs on a hosted runner independently of the lab fleet. It verifies the full plan, exact candidate/attempt, current expected source SHA and completion freshness. A subset or stale candidate cannot satisfy full-chain health. Cleanup failure or interruption leaves a persistent node marker and blocks subsequent mutation until the documented recovery procedure completes. These code paths require live acceptance runs before the operational rollout can be declared complete.
+
+
+## Release validation
+
+Post-merge and tag-driven; not a substitute for a PR gate. Every public publication exit consumes the release certification described here; this certification path is separate from the reusable CI artifact contract in [verification plans](ci-verification-pipeline.md), whose archives expire after one day and are never used as release certification.
+
+The versioned plan is `.config/release-validation-plan.json` (`schema_version=1`): release types, target OS/arch/ABI, supported features, a fixed harness SHA per lane, required case IDs, environment capabilities, timeouts, applicability conditions, and an explicit `upgrade_sources` list carrying the real artifact digests of the supported N-1/N-2 sources plus a stated rollback basis — compatibility and rollback are never invented or defaulted. `scripts/release/release_gate.py validate` expands and freezes `plan_sha256` and the required case set before reading results, then binds that plan, a `candidate.json` (product 40-character SHA, version, release profile, features, immutable deliverable locations with SHA256 and wrapped-binary SHA256, image digest) and the shared G01 evidence-envelope set (rustfs/backlog#2658) of one parent candidate batch, and writes machine JSON, JUnit and a summary. Within a batch the unique key is `(lane, platform{os,arch,abi}, case_id)`; the top-level run/attempt is the parent batch and the nested workflow run/attempt is the child workflow identity, and both are validated separately (workflow SHA and product build SHA are bound independently and need not be equal). Missing, duplicate or extra cases, stale attempts, wrong digests, wrong platforms, wrong harness SHAs, zero tests, cancellation, timeout, untrusted sources and any non-PASS required item block with classified errors; only a complete legal success returns 0. `verify-promotion` re-checks the exact bytes about to be published against the passed list and fails on a swapped package or an edited plan after verification. preview, prerelease and stable all require an explicit plan; preview may use the plan's smaller pre-declared set but never bypasses artifact identity and startup checks. development artifacts are explicitly uncertified and never touch official or latest channels.
+
+| Trigger | Workflow / job | Result |
+|---|---|---|
+| Nightly Linux schedule, weekly desktop schedule, or dispatch | `build.yml` `build-rustfs` (development build of that schedule's platform subset, or the dispatch platform list) | build artifacts and the uncertified dev download channel; no release publication |
+| Valid release or preview tag | `build.yml` `build-rustfs`, `release-certification`, `create-release`, `upload-release-assets`, `publish-release`, `promote-release-artifacts` | staged binaries, draft release, checksummed assets, then certified publish and promotion of the same bytes |
+| Successful non-preview release-tag build (`workflow_run`) | `docker.yml` `release-certification`, `build-docker`, `scan-docker-image` | multi-architecture images staged, verified against the certification and promoted, plus vulnerability report |
+| Successful release-tag build (`workflow_run`) | `package.yml` `release-certification`, `package`, `promote-packages` | DEB/RPM packages with wrapped-binary verification, staged then promoted with checksums |
+| Successful non-preview release-tag build (`workflow_run`) | `helm-package.yml` `release-certification`, `build-helm-package`, `publish-helm-package` | versioned chart and repository index, only over a certified image promotion record |
+| Final tag's release published | `build.yml` `cleanup-preview-releases` | deletes every `<target>-preview.<N>` Release for that target; the tags are kept |
+
+Publication exits and their gate:
+
+| Exit | Writer | Certification consumed |
+|---|---|---|
+| GitHub Release draft → public | `build.yml` `publish-release` | `release-certification` success and per-asset `verify-promotion` |
+| Official R2 binary path `artifacts/rustfs/release/` | `build.yml` `promote-release-artifacts` | `release-certification` plus `verify-promotion`; the build job itself only writes `artifacts/rustfs/staging/<run>/<attempt>/` |
+| `latest.json` version pointer | `build.yml` `update-latest-version` | transitively through `publish-release` |
+| Image channels (Docker Hub, GHCR, Quay tags) | `docker.yml` `build-docker` promotion step | certified input digests, staged image binary identity and `verify-promotion`, then promotion of the same digest with `imagetools create` |
+| Official R2 package paths `packages/release` and `packages/latest` | `package.yml` `promote-packages` | `release-certification` and wrapped-binary `verify-promotion`; the package job only stages |
+| GitHub release package assets | `package.yml` `package` | `release-certification` and wrapped-binary `verify-promotion` before upload |
+| Helm chart repository (`rustfs/helm` push) | `helm-package.yml` `publish-helm-package` | `release-certification` plus the Docker workflow's image-promotion record bound to the same candidate |
+
+Downstream workflows fail closed when the trusted certification is absent: a manual dispatch without certification fails and pushes no official tag. Only results from the trusted verification sources listed in the plan (currently the `rustfs/s3chaos` `release-gate.yml` envelope runs) carry release authority; a PR-uploaded JSON set cannot certify a release. Retries reuse the same candidate, only the staged bytes are promoted (no rebuild-after-verify), and no downstream step re-resolves a mutable `latest`.
+
+Use an exact preview tag for an end-to-end release rehearsal. Manual dispatches are backfill/debug paths and do not prove the automatic `workflow_run` chain. The committed fixtures under `testdata/release-gate/` and the commands below are contract rehearsals of this orchestration; they are explicitly not product release evidence and not live verifier results.
+
+```bash
+python3 -m unittest discover -s scripts/release -p 'test_release_gate.py'
+python3 scripts/release/release_gate.py validate --plan testdata/release-gate/plan.json --candidate testdata/release-gate/candidate.json --results testdata/release-gate/pass --output target/release-gate-check
+bash scripts/security/check_preview_release_workflow.sh
+```
+
+## Change checklist
+
+Update this file in the same PR when a job or check name changes, a workflow gains or loses a `pull_request` or `schedule` trigger, required contexts or strict/merge-queue policy change, report-only vs gating semantics change, or `.github/scheduled-validations.json` membership changes. Do not copy timeouts, crons, or test counts here.
+
+## ECStore invariant selection
+
+The existing `ci.yml` `workspace-tests` job runs the ordinary ECStore and filemeta tests. After that run, `scripts/check_test_wiring.py --check-core` checks the same nextest profile and package selection against `.config/ecstore-required-tests.json`. Every named test must exist, match the filter, and be non-ignored; the job also requires a nonempty JUnit report. This checks membership without running the tests twice. `core-test-listing.json`, JUnit, and the run log are retained in the existing `artifacts/workspace` evidence directory.
+
+The manifest records a minimum set of invariants: write quorum, metadata rollback, stale-writer lock loss, plaintext Range content, multipart cancellation, hiding uncommitted LIST versions, real MinIO metadata, corrupt part arrays, and the shared on-demand-migration source-backend contract for each provider dialect (S3, Azure, native GCS). The three contract entries live in the `rustfs` suite and reach the lane through that package's default features, so dropping `gcs` from `rustfs`'s defaults fails this check instead of silently deselecting the GCS contract (rustfs/backlog#2323). Renaming or moving a required test must update the manifest in the same change after checking the compiled listing. Extend this list as new deterministic regressions land; it is not a claim that all storage invariants are covered.
+
+The checked-in MinIO corpus is pinned by file SHA256 and its documented source release. The static wiring guard and the CI selection check both reject missing or changed fixtures. These are metadata fixtures, not a legacy shard-body corpus or proof of crash durability. Optional `legacy_bitrot_read_test` runs may still skip when their external corpus is absent; they do not satisfy a required compatibility lane. Real encrypted fixture reads remain in `minio-interop.yml`, and multi-node fault schedules remain in the existing nightly cluster lane. In-process reopen tests do not establish power-loss durability.
+
+Run `python3 scripts/check_test_wiring.py --self-test` to exercise the negative cases: removed/ignored/filtered tests, malformed listing, absent fixtures, and wrong fixture hashes. Do not update hashes merely to silence the guard; a fixture change needs source/provenance and compatibility review.
+## Scanner/Heal Evidence Receipts
+
+The existing `scripts/check_test_wiring.py` also validates Scanner/Heal case evidence registered in `.config/scanner-heal-required-tests.json`. It records already-built binaries and checks existing nextest output; it does not build, run tests, deploy servers, inject faults, or start another CI lane.
+
+The registered cases are emitted by existing E2E tests. The original `background-target-restart` / `background-target-crash` cases run in `e2e-nightly` on a four-node, one-drive-per-node topology. The `ec84-target-drive-restart` case runs in `e2e-distributed` on a three-node, four-drive EC8+4 topology. When `RUSTFS_SCANNER_HEAL_RUN_DIR` is set, the producer checks the actual server and test-executable hashes against `run.json`, pins the same server binary for all node starts, and writes its oracle only after the real assertions pass. The artifact contains the actual pre/post target PIDs, per-node S3 listings, expected and downloaded complete-body hashes/lengths, and target-disk `VersionShardCensus` fingerprints. Existing baseline objects must match their pre-fault physical manifests; the object created during the outage has no pre-fault target shard and is checked for complete physical parts and exact S3 content.
+
+These cases are still restart-focused evidence slices. They are not power-loss validation, an all-version inventory, or proof of scanner enumeration, exact MRF disposition, legacy migration, multi-pool/multi-set release coverage, or rollback. The schema 2 registry separates the implemented single-set restart lane from structured release lanes for authority coverage, checkpoint/crash, status and outcome, MRF responsibility, mixed-version rollback, scheduler pressure, maintenance producers, and EC8+4 multi-set coverage. All G01-G14/P1-P4 and R-E/R-D/R-L release requirements stay `pending` until their actual feature-specific oracles, measurements and required topologies exist. Missing cases cannot be supplied by synthetic W20 results. W20's bounded JSON and file-hash helpers are reused; its ABBA performance contracts remain in `docs/operations/scanner-benchmark-runbook.md`. Measured ABBA manifests must also carry the runbook's `release_evidence` contract. The runner rejects reports that cannot bind the exact 3x4 EC8+4 topology, multi-pool/multi-set shape, distributed same-window metrics endpoints, restart/crash modes, mixed-version reader/writer/rollback participation, and allocation/flamegraph/RSS/save-frequency profile artifact plan. Synthetic runs and manifests missing that contract remain harness-only evidence.
+
+### Recording One Case
+
+Use a committed source tree, independently built current binaries, sufficient free disk space, and a task-owned artifact directory that does not yet exist. Set `SERVER_BINARY` and `TEST_BINARY` to those exact executable paths. The begin command requires the server's embedded `--version` commit to match the clean checkout and its embedded Git status to be clean. The E2E crate's build script embeds its build-time Git revision/dirty state, lockfile Git blob, enabled crate features, target, profile and encoded Rust flags. It tracks the crate/dependency trees, Cargo inputs and Git HEAD/ref/index, including `common.rs` restart logic. The producer checks this compiled identity against the receipt; it does not copy a current source revision into an older test binary's identity. The E2E uses its existing temporary cluster directories and cleanup. `CARGO_TARGET_DIR` controls compilation output; nextest's default report store remains the workspace's `target/nextest`. Prefer the registry-aware runner for concrete cases:
+
+```bash
+scripts/run_scanner_heal_evidence_case.sh --case background-target-restart
+scripts/run_scanner_heal_evidence_case.sh --case ec84-target-drive-restart
+```
+
+Set `RUSTFS_E2E_EXPECTED_FEATURES` to the actual intended e2e crate feature set, including `default` for a default-feature build, comma-separated for extra features, or empty for `--no-default-features`. It is mandatory when beginning a run. Crate features are distinct from the spawned server's build features.
+
+Do not replace a nonzero command exit with zero. Missing JUnit or an oracle emission failure also fails acceptance. Each retry needs a new run directory; the producer refuses to overwrite an existing oracle. Keep failed-run logs and artifacts. The receipt pins source revision, actual binary hashes, run identity, start/finish times, and the artifact hashes. `listing.json`, `junit.xml`, and each oracle are limited to 1 MiB; object evidence has the fixture's 9..65 object bound. Credentials are not included in the receipt.
+
+The checker binds nextest's flattened suite `binary-id`/`binary-path` to the actual test executable and requires the JUnit testcase's embedded execution timestamp to fall inside the receipt window (with millisecond precision). Copying an old JUnit file and refreshing its mtime does not make it new evidence. Schema versions, topology counts, PIDs, EC geometry and shard indices require actual integers: booleans and fractional values are rejected, and an index must fit the physical data-plus-parity geometry.
+
+The checker rejects unselected/ignored tests, zero/duplicate JUnit cases, failures, skipped tests, retry/flaky records, stale or changed artifacts, different builds or run IDs, unchanged process IDs, wrong topology, missing shard parts, and mismatched S3 content/listings. The raw oracle JSON is emitted by the real E2E producer, not accepted from an adapter copying expectations.
+
+`--check-scanner-heal "$RUN_DIR" release` checks available case evidence and returns nonzero for every pending release requirement. A focused case pass does not approve release. In particular, R-E requires fixed-budget real restarts without an unbudgeted final sweep, R-D requires the full manager/event/ledger disposition chain, and R-L requires source-conflict and crash/retirement evidence. Reader-only or unit fixtures cannot substitute for these. The external `rustfs/auto-testing` functional workflows propagate suite failures. Their workflow status does not establish this registry's required case coverage, build provenance, or object-level oracles.
+
+For automation, `--check-scanner-heal-release "$RUN_DIR"` emits one compact JSON decision and exits nonzero while blocked. `verified_cases` contains only cases that pass the complete receipt, build provenance, nextest/JUnit and real oracle checks; `rejected_cases` names registered cases that do not, and `pending_gates` names the unimplemented release requirements and `pending_lanes` names the structured release lanes that still need real evidence. Schema 1 is deliberately marked `release_schema_capable: false` because it models only the single-version, unversioned-object restart/crash cases. Schema 2 can describe the wider release matrix, but approval still requires every registered case to verify and every required gate to leave `pending` only after a future checker can bind it to real feature-specific evidence. The current checker hard-rejects missing structured requirements and pending gates mapped to an implemented lane, so clearing pending text cannot become approval. A focused run, synthetic harness, compile-only result, skipped/retried test, ordinary CI success, or unregistered mixed-version, rollback, EC8+4 or performance claim therefore cannot become a release approval. For high-risk rollback gates, `evidence_fields` records the specific proof fields that a future real-evidence checker must bind before a pending gate can move out of the blocked set. G03 keeps scoped ACK tied to durable root publication, ACK request identity, participating peer capability snapshots, and mixed-peer fallback oracles; G09 keeps mixed-version reader, writer, and rollback payload evidence explicit. These fields are part of the release contract, not evidence by themselves.
+
+The upgrade compatibility E2E can emit raw G09 JSON artifacts when `RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR` points at a fresh, task-owned directory. The rolling mixed-version test writes `G09-mixed_version_reader_evidence.json` and `G09-mixed_version_writer_evidence.json` after the old/new reader and writer assertions pass. The bucket-metadata rollback test writes `G09-rollback_payload_evidence.json` after the current -> previous -> current round trip has read back the known bucket configuration and objects. These artifacts are measured inputs for a later release bundle; the bundle must still record their relative paths, hashes, command provenance, timestamps, roles, participating revisions, and case lists before `--check-scanner-heal-release-bundle` can validate them.
+
+For a release-candidate or PR-head Linux x86_64 host, run the full raw G09 artifact pass with:
+
+```bash
+scripts/run_scanner_heal_g09_upgrade_evidence.sh
+```
+
+The script mirrors the pinned previous-release asset used by the upgrade workflow, builds the current checkout, runs the mixed-version and rollback E2E lanes, and fails unless all three raw G09 artifacts are measured, revision-bound, and role-bound. Use `--source-binary` for a custom previous-release binary on another platform, or `--test mixed-version|rollback` while narrowing a failure. It performs a free-space preflight before building so a saturated validation host fails before producing partial evidence.
+
+Operator-collected G01 root/quota authority evidence can be packaged with:
+
+```bash
+scripts/run_scanner_heal_authority_evidence.py \
+  --root-authority-json /path/to/root-authority.json \
+  --quota-authority-json /path/to/quota-authority.json \
+  --out-dir /path/to/authority-descriptor
+```
+
+The producer rejects fixture, dry-run, synthetic, stale-revision, incomplete root authority, and incomplete quota authority inputs before writing `release-bundle-authority.json`. The descriptor validates only G01; it still needs the full bundle assembler and the remaining release lanes before a release can be approved.
+
+Operator-collected G03 scoped ACK evidence can be packaged with:
+
+```bash
+scripts/python_bin.sh scripts/run_scanner_heal_scoped_ack_evidence.py \
+  --proof-json /path/to/scoped-ack-proof.json \
+  --out-dir /path/to/scoped-ack-descriptor
+```
+
+The producer requires durable root publication, exact request identity, participating peer capability, mixed-peer fallback, and mixed-version provenance before writing `release-bundle-scoped-ack.json`.
+
+The W16 recovery-intent and quota-authority lanes can emit raw G04/G12 JSON artifacts with:
+
+```bash
+scripts/run_scanner_heal_w16_recovery_evidence.sh
+```
+
+The runner builds the current checkout, runs the scanner recovery-intent and disabled-startup crash-boundary tests, runs the scanner quota reset-preservation tests, and runs the distributed hard-quota admission E2E. A full run writes `release-bundle-w16.json` and validates the G04 and G12 gates with `--check-scanner-heal-release-bundle-gate`. Use `--test g04|g12` while narrowing a failure; a single gate descriptor still does not approve the complete release bundle.
+
+The W13 durable MRF replay lanes can emit raw G07/G08/P4 JSON artifacts with:
+
+```bash
+scripts/run_scanner_heal_w13_mrf_evidence.sh
+```
+
+The runner builds the current checkout, runs the ignored MRF evidence test, and writes `release-bundle-w13.json` for `--check-scanner-heal-release-bundle-gate`. Use `--test g07|g08|p4` while narrowing a failure. G08 disk-full evidence must run against a real fillable filesystem: on Linux as root the runner mounts a small tmpfs automatically, otherwise pass `--enospc-root` pointing at a pre-mounted small filesystem. P4 is release evidence only when it completes the default two-hour soak; `--allow-short-soak` is diagnostic and skips P4 bundle gate validation.
+
+Already collected W13 raw MRF artifacts can be re-packaged and checked without rerunning the Rust test with:
+
+```bash
+scripts/python_bin.sh scripts/run_scanner_heal_mrf_evidence.py \
+  --run-dir /path/to/scanner-heal-w13-evidence-run
+```
+
+The producer rejects fixture, dry-run, synthetic, stale-revision, incomplete MRF responsibility, missing disk-full ENOSPC observations, and short P4 cleanup soaks before writing `release-bundle-w13.json`.
+
+Legacy rollback evidence for R-L is assembled from a measured proof JSON:
+
+```bash
+scripts/python_bin.sh scripts/run_scanner_heal_legacy_rollback_evidence.py \
+  --proof-json /path/to/legacy-rollback-proof.json \
+  --out-dir /path/to/legacy-rollback-descriptor
+```
+
+When the real release lanes have produced their dedicated artifacts, validate the complete hard-gate bundle with:
+
+```bash
+scripts/python_bin.sh scripts/check_test_wiring.py \
+  --check-scanner-heal-release-bundle /path/to/release-evidence.json
+```
+
+For a single Linux handoff checklist that keeps the measured runners in a stable order, generate the Scanner/Heal Linux evidence plan:
+
+```bash
+scripts/python_bin.sh scripts/run_scanner_heal_linux_evidence_plan.py \
+  --write-plan --out-dir /path/to/plan-dir
+```
+
+The plan is only an execution manifest. Its `evidence_type` is `plan_only`, and it cannot satisfy any Gxx/Wxx/Rxx gate. Use `--run-preflight` only for the lightweight registry and runner self-tests before starting a long Linux run. After or during a Linux run, check which planned artifacts are still missing without approving the release bundle:
+
+```bash
+scripts/python_bin.sh scripts/run_scanner_heal_linux_evidence_plan.py \
+  --status-root /path/to/run-root --format json
+```
+
+The status command exits nonzero while evidence is missing or malformed and keeps `release_approved: false`; use its `pending_gates` and `next_step` fields for issue writeback and failure triage.
+
+Lane descriptors can be assembled into that bundle with:
+
+```bash
+scripts/python_bin.sh scripts/check_test_wiring.py \
+  --assemble-scanner-heal-release-bundle \
+  /path/to/release-bundle-g14.json \
+  /path/to/release-bundle-w16.json \
+  /path/to/assembled-release-bundle
+```
+
+The final argument is the new output directory. Every preceding argument is a measured descriptor, and each descriptor gate must keep its own passing status, lane identity, measured evidence type, complete required fields, relative artifact paths, and matching SHA256 hashes. The assembler may verify only the lanes already present; a partial assembled bundle remains blocked until all release gates are supplied.
+
+The bundle checker is intentionally stricter than the case checker. It requires schema 2 registry metadata, `evidence: measured`, the current checkout revision, all G01-G14/P1-P4/R-E/R-D/R-L gates, per-gate `status: pass`, lane identity, relative artifact paths, matching SHA256 hashes, and non-empty summaries. It also binds each evidence field to its own run provenance: `source_revision`, `run_id`, `measurement_window_id`, timezone-qualified `started_at` and `finished_at`, command arguments, and artifact format. The field `source_revision` must match the bundle revision, and measured performance duration cannot exceed the recorded run window. When an evidence or profile artifact declares a JSON format, the checker also opens that artifact and requires its payload to repeat the same measured `source_revision`, `run_id`, `measurement_window_id`, gate and field identity; profile sub-artifacts must additionally name their artifact kind. Updating only the outer bundle hash cannot turn a stale JSON summary into current release evidence.
+
+The hard evidence shape remains claim-specific: mixed-version gates must name at least two participating versions, crash/durable replay gates must include crash-boundary evidence, G14 must record EC8+4 with at least three nodes and four drives per node plus multi-set and multi-pool evidence, performance gates need measured durations, P3's pressure run needs at least two hours, and P1 needs a symbolized profile summary with resolved samples. Every G14 field and every performance gate's fields must also share one `measurement_window_id`, so EC8+4, multi-set/multi-pool, ABBA, throughput, and profiling artifacts cannot be stitched together from unrelated runs. P1 `profile_evidence` must bind every required profile artifact kind (`allocation-profile`, `flamegraph`, `rss-samples`, and `save-frequency`) with a relative path, artifact format, non-empty file, matching SHA256, and descriptor-level `source_revision`, `run_id`, and `measurement_window_id` values that match the parent profile evidence. JSON profile artifact wrappers must also carry a bundled raw profile path with matching raw SHA256 and byte count plus the relevant allocation, RSS, sample, or save-frequency cost counters. Missing, synthetic, stale, tampered, undersized, cross-run, or topology-mismatched evidence returns a compact blocked or invalid JSON result and a nonzero exit.
+
+The status-and-outcome raw collector normalizes live observations into the three measured raw JSON artifacts for G05, G06, and R-D. The descriptor producer then consumes those artifacts. The inputs must all carry schema 1, measured evidence, matching `source_revision`, a shared `run_id`, a shared `measurement_window_id`, matching `started_at`/`finished_at` timestamps, and non-empty command provenance. The collector and producer reject synthetic input, missing required cases, and command-line run/window/time overrides that would relabel raw artifacts from another status-and-outcome run.
+
+The scheduler-pressure lane must also carry the numbers needed to close W09, W10, and W11: bounded deferred item/byte/age limits, zero duplicate tasks, pressure pacing engagement, recovery and lock-hold timings, fixed offered load, foreground p95/p99 latency, throughput, error count, attempt-cost samples, and completed heal object counts.
+
+This command validates the evidence package; it does not create evidence. A handwritten JSON file, a synthetic harness pass, a single focused case, or a local unit fixture still cannot satisfy the distributed, mixed-version, crash-restart, durable MRF replay, EC8+4, ABBA, or profiling gates.
+
+Run parser/receipt regressions with `scripts/python_bin.sh scripts/check_test_wiring.py --self-test`. Those fixtures validate the checker only and produce no runtime or performance evidence.
+
+For local bundle-shape dry runs, generate a task-owned fixture directory with:
+
+```bash
+scripts/python_bin.sh scripts/check_test_wiring.py \
+  --write-scanner-heal-release-bundle-fixture /path/to/fixture-dir
+```
+
+The generated file is marked `fixture_only` and is intentionally rejected by the release bundle checker. Use it to rehearse field names, artifact paths, hashes, profile artifact membership, mixed-version roles, and same-window provenance before copying the shape into a real measured bundle. It is not ABBA, profile, mixed-version, crash-restart, or release approval evidence.

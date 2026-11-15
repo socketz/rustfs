@@ -12,24 +12,52 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Concurrency manager for coordinating concurrent GetObject requests.
+//! Concurrency manager for coordinating concurrent GetObject and PutObject requests.
 
 use super::io_schedule::{
     IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoSchedulerConfig, IoStrategy,
     get_advanced_buffer_size,
 };
-use super::request_guard::GetObjectGuard;
-use rustfs_concurrency::GetObjectQueueSnapshot;
+use super::request_guard::{GetObjectGuard, PutObjectGuard};
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+use rustfs_concurrency::{
+    AdmissionState, GetObjectQueueSnapshot, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot,
+    WorkloadAdmissionSnapshotProvider, WorkloadClass,
+};
 use rustfs_config::{KI_B, MI_B};
 use rustfs_io_core::BytesPool;
 use rustfs_io_core::io_profile::{AccessPattern, IoPatternDetector, StorageMedia, detect_storage_media};
 use rustfs_io_metrics::bandwidth::{BandwidthMonitor, BandwidthSnapshot};
-use rustfs_io_metrics::global_metrics::get_global_metrics;
 use rustfs_io_metrics::{MetricsCollector, PerformanceMetrics};
+use std::future::{Future, poll_fn};
+use std::pin::pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::task::Poll;
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
+
+const DERIVED_LARGE_PUT_ADMISSION_LIMIT_MAX: usize = 32;
+// The automatically sized pool keeps the large-write limit, but splits each
+// slot so short multipart bodies do not occupy the same budget as long writes.
+// At stock settings this admits at most 32 large/unknown writes or 256 parts of
+// up to 8 MiB, sharing one FIFO budget. Explicit request-count limits stay exact.
+const AUTO_FOREGROUND_WRITE_PERMITS_PER_SLOT: u16 = 8;
+const MULTIPART_ADMISSION_UNIT_BYTES: u64 = 8 * 1024 * 1024;
+// A queued multipart part holds a connection but no user-space body buffer on
+// HTTP/1 (only whatever unread body the client already pushed into the kernel
+// receive buffer); on HTTP/2 it holds up to the per-stream flow-control window
+// in process memory. Either way the queue can be several times deeper than the
+// permit pool. Sixteen uploads sending sixteen parts each through one node
+// fits inside the derived depth of 32 * 16.
+const DERIVED_MULTIPART_ADMISSION_MAX_PENDING_FACTOR: usize = 16;
+// Framed S2 alone can retain one encoded and one decoded block of roughly
+// 4 MiB each, while other codecs have their own larger windows. Four keeps
+// useful request parallelism without scaling codec memory and CPU with clients.
+const SNOWBALL_ARCHIVE_DECODER_LIMIT: usize = 4;
+pub(crate) const SNOWBALL_MEMBER_COMMIT_LIMIT: usize = 32;
+pub(crate) const SNOWBALL_STAGING_BYTES_LIMIT: usize = 4 * MI_B;
 
 /// Global concurrency manager instance
 pub(crate) static CONCURRENCY_MANAGER: LazyLock<ConcurrencyManager> = LazyLock::new(ConcurrencyManager::new);
@@ -38,10 +66,17 @@ pub(crate) static CONCURRENCY_MANAGER: LazyLock<ConcurrencyManager> = LazyLock::
 pub struct ConcurrencyManager {
     /// Semaphore to limit concurrent disk reads
     disk_read_semaphore: Arc<Semaphore>,
+    disk_read_waiters: Arc<AdmissionWaiters>,
+    /// Bounded overflow lane for GETs that time out waiting on the primary
+    /// disk-read permit pool. Admitting from this lane instead of reading
+    /// without any permit gives a hard upper bound on concurrent disk-active
+    /// reads (`primary cap + degraded cap`); when it is also full a GET is
+    /// rejected with `SlowDown` rather than proceeding unbounded.
+    degraded_read_semaphore: Arc<Semaphore>,
     /// I/O load metrics for adaptive strategy calculation
     io_metrics: Arc<Mutex<IoLoadMetrics>>,
     /// I/O priority queue for request scheduling
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     priority_queue: Arc<IoPriorityQueue<()>>,
     /// Bytes pool for buffer allocation and reuse
     bytes_pool: Arc<BytesPool>,
@@ -56,6 +91,16 @@ pub struct ConcurrencyManager {
     bandwidth_monitor: Arc<Mutex<BandwidthMonitor>>,
     /// Metrics collector for I/O latency tracking (P50, P95, P99)
     metrics_collector: Arc<MetricsCollector>,
+    /// Foreground write admission policy, resolved once at startup.
+    foreground_write_admission_policy: ForegroundWriteAdmissionPolicy,
+    /// Bounds active Snowball archive inspection and decoding across requests.
+    snowball_archive_decoder_semaphore: Arc<Semaphore>,
+    /// Snowball members are internal PUTs, so they use a separate global gate
+    /// from preparation through the independently owned post-commit tail.
+    snowball_member_commit_semaphore: Arc<Semaphore>,
+    /// Bounds the owned member bodies and metadata retained between TAR parsing
+    /// and storage commit across all extract requests.
+    snowball_staging_bytes_semaphore: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for ConcurrencyManager {
@@ -84,7 +129,461 @@ impl std::fmt::Debug for ConcurrencyManager {
             .finish()
     }
 }
-#[allow(dead_code)]
+/// Outcome of [`ConcurrencyManager::admit_disk_read`].
+///
+/// `Primary`/`Degraded` both carry an owned permit that must be held for the
+/// full body transfer; `Rejected` means the hard concurrency cap was reached and
+/// the caller must fail the GET with `SlowDown`/503 instead of reading without a
+/// permit.
+#[derive(Debug)]
+pub enum DiskReadAdmission {
+    /// Admitted from the primary disk-read permit pool.
+    Primary(tokio::sync::OwnedSemaphorePermit),
+    /// Admitted from the bounded degraded overflow lane after the primary pool
+    /// stayed saturated past the configured wait.
+    Degraded(tokio::sync::OwnedSemaphorePermit),
+    /// Disk-read throttling is disabled (primary cap configured to `0`): the GET
+    /// proceeds without an admission token. This is the only permit-less path
+    /// and is an explicit operator opt-out, not a saturation bypass.
+    Unbounded,
+    /// Hard concurrency cap reached; the caller must reject with `SlowDown`.
+    Rejected,
+}
+
+/// Outcome of foreground write request admission.
+#[derive(Debug)]
+pub enum ForegroundWriteAdmission {
+    /// Foreground write admission is disabled; proceed on the legacy path.
+    Disabled,
+    /// Request is admitted and must hold the permit until the store write
+    /// returns or the request fails before mutation.
+    Admitted(tokio::sync::OwnedSemaphorePermit),
+    /// The selected foreground write admission gate stayed full until the configured wait timeout.
+    Rejected,
+}
+
+#[derive(Clone)]
+struct ForegroundWriteAdmissionGate {
+    semaphore: Arc<Semaphore>,
+    limit: usize,
+    wait_timeout: Duration,
+    /// Requests currently waiting in the bounded multipart queue.
+    pending: Arc<AtomicUsize>,
+    waiters: Arc<AdmissionWaiters>,
+}
+
+/// Counts acquisition futures only after they actually wait. The ready path
+/// adds no atomic work; one stack-owned observation survives repeated polls and
+/// is released on acquisition, close, timeout or cancellation. This does not
+/// change the semaphore's FIFO queue or reserve admission capacity.
+#[derive(Default)]
+struct AdmissionWaiters {
+    pending: AtomicUsize,
+    overflowed: AtomicBool,
+}
+
+struct AdmissionWaiter<'a> {
+    owner: &'a AdmissionWaiters,
+    counted: bool,
+}
+
+impl AdmissionWaiters {
+    fn snapshot(&self) -> Option<usize> {
+        let pending = self.pending.load(Ordering::Acquire);
+        (!self.overflowed.load(Ordering::Acquire)).then_some(pending)
+    }
+
+    fn enter(&self) -> AdmissionWaiter<'_> {
+        let counted = self
+            .pending
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| pending.checked_add(1))
+            .is_ok();
+        if !counted {
+            self.overflowed.store(true, Ordering::Release);
+        }
+        AdmissionWaiter { owner: self, counted }
+    }
+
+    async fn observe<F: Future>(&self, future: F) -> F::Output {
+        let mut future = pin!(future);
+        let mut waiting = None;
+        poll_fn(|cx| match future.as_mut().poll(cx) {
+            Poll::Ready(output) => {
+                drop(waiting.take());
+                Poll::Ready(output)
+            }
+            Poll::Pending => {
+                waiting.get_or_insert_with(|| self.enter());
+                Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
+impl Drop for AdmissionWaiter<'_> {
+    fn drop(&mut self) {
+        if self.counted {
+            self.owner.pending.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Reservation of one slot in the bounded multipart wait queue; released on
+/// drop so a cancelled or timed-out waiter never leaks queue depth.
+struct PendingSlot(Arc<AtomicUsize>);
+
+impl PendingSlot {
+    fn reserve(pending: &Arc<AtomicUsize>, max_pending: usize) -> Option<Self> {
+        if pending.fetch_add(1, Ordering::AcqRel) >= max_pending {
+            pending.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self(pending.clone()))
+    }
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl ForegroundWriteAdmissionGate {
+    fn new(limit: usize, wait_timeout: Duration) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(limit)),
+            limit,
+            wait_timeout,
+            pending: Arc::new(AtomicUsize::new(0)),
+            waiters: Arc::new(AdmissionWaiters::default()),
+        }
+    }
+
+    fn active(&self) -> usize {
+        self.limit.saturating_sub(self.semaphore.available_permits())
+    }
+
+    /// Admit through the same permit pool as [`Self::admit`], but let the
+    /// request wait in a bounded queue for `wait_timeout` instead of failing
+    /// on the gate's own short wait. A full queue rejects immediately.
+    async fn admit_queued(
+        &self,
+        wait_timeout: Duration,
+        max_pending: usize,
+        permits: u32,
+    ) -> Result<ForegroundWriteAdmission, tokio::sync::AcquireError> {
+        match self.semaphore.clone().try_acquire_many_owned(permits) {
+            Ok(permit) => return Ok(ForegroundWriteAdmission::Admitted(permit)),
+            Err(tokio::sync::TryAcquireError::Closed) => return Ok(ForegroundWriteAdmission::Rejected),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {}
+        }
+        if wait_timeout.is_zero() {
+            return Ok(ForegroundWriteAdmission::Rejected);
+        }
+        let Some(_slot) = PendingSlot::reserve(&self.pending, max_pending) else {
+            return Ok(ForegroundWriteAdmission::Rejected);
+        };
+        match tokio::time::timeout(wait_timeout, self.waiters.observe(self.semaphore.clone().acquire_many_owned(permits))).await {
+            Ok(permit) => Ok(ForegroundWriteAdmission::Admitted(permit?)),
+            Err(_) => Ok(ForegroundWriteAdmission::Rejected),
+        }
+    }
+
+    async fn admit(&self, permits: u32) -> Result<ForegroundWriteAdmission, tokio::sync::AcquireError> {
+        if self.wait_timeout.is_zero() {
+            return Ok(self.try_admit(permits));
+        }
+
+        match tokio::time::timeout(
+            self.wait_timeout,
+            self.waiters.observe(self.semaphore.clone().acquire_many_owned(permits)),
+        )
+        .await
+        {
+            Ok(permit) => Ok(ForegroundWriteAdmission::Admitted(permit?)),
+            Err(_) => Ok(ForegroundWriteAdmission::Rejected),
+        }
+    }
+
+    fn try_admit(&self, permits: u32) -> ForegroundWriteAdmission {
+        match self.semaphore.clone().try_acquire_many_owned(permits) {
+            Ok(permit) => ForegroundWriteAdmission::Admitted(permit),
+            Err(_) => ForegroundWriteAdmission::Rejected,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ForegroundWriteAdmissionPolicy {
+    /// Strict admission was explicitly enabled with limit `0`.
+    Disabled,
+    /// No hard PUT gate is configured; foreground write snapshots use the
+    /// existing active request counter as a soft pressure signal.
+    LegacyCounterOnly,
+    /// Explicit all foreground write admission gate.
+    Strict(ForegroundWriteAdmissionGate),
+    /// Default foreground write admission gate for pressure-heavy writes.
+    Large {
+        gate: ForegroundWriteAdmissionGate,
+        large_request_permits: u32,
+        put_object_min_size_bytes: usize,
+        multipart_part_min_size_bytes: usize,
+        multipart_wait_timeout: Duration,
+        multipart_max_pending: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ForegroundWriteAdmissionKind {
+    PutObject,
+    MultipartPart,
+}
+
+impl ForegroundWriteAdmissionPolicy {
+    fn from_env(max_disk_reads: usize) -> Self {
+        let strict_enabled = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_ENABLE,
+            rustfs_config::DEFAULT_PUT_FOREGROUND_ADMISSION_ENABLE,
+        );
+        if strict_enabled {
+            let strict_limit = rustfs_utils::get_env_usize(
+                rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_LIMIT,
+                rustfs_config::DEFAULT_PUT_FOREGROUND_ADMISSION_LIMIT,
+            );
+            let strict_wait_timeout = Duration::from_millis(rustfs_utils::get_env_u64(
+                rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS,
+                rustfs_config::DEFAULT_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS,
+            ));
+            return if strict_limit == 0 {
+                Self::Disabled
+            } else {
+                Self::Strict(ForegroundWriteAdmissionGate::new(strict_limit, strict_wait_timeout))
+            };
+        }
+
+        let large_enabled = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE,
+        );
+        if !large_enabled {
+            return Self::LegacyCounterOnly;
+        }
+
+        let configured_limit = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT,
+        );
+        let large_limit = derive_large_put_admission_limit(configured_limit, max_disk_reads);
+        let large_request_permits = if configured_limit == 0 {
+            AUTO_FOREGROUND_WRITE_PERMITS_PER_SLOT
+        } else {
+            1
+        };
+        // The derived limit is clamped to 32; an explicit limit uses one permit.
+        let permit_limit = large_limit * usize::from(large_request_permits);
+        let put_object_min_size_bytes = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+        );
+        let multipart_part_min_size_bytes = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+            rustfs_config::DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+        );
+        let wait_timeout = Duration::from_millis(rustfs_utils::get_env_u64(
+            rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS,
+        ));
+        let multipart_wait_timeout = Duration::from_millis(rustfs_utils::get_env_u64(
+            rustfs_config::ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS,
+            rustfs_config::DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS,
+        ));
+        let multipart_max_pending = derive_multipart_admission_max_pending(
+            rustfs_utils::get_env_usize(
+                rustfs_config::ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING,
+                rustfs_config::DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING,
+            ),
+            large_limit,
+        );
+
+        Self::Large {
+            gate: ForegroundWriteAdmissionGate::new(permit_limit, wait_timeout),
+            large_request_permits: u32::from(large_request_permits),
+            put_object_min_size_bytes,
+            multipart_part_min_size_bytes,
+            multipart_wait_timeout,
+            multipart_max_pending,
+        }
+    }
+
+    #[cfg(test)]
+    fn multipart_wait_timeout_for_test(&self) -> Option<Duration> {
+        match self {
+            Self::Large {
+                multipart_wait_timeout, ..
+            } => Some(*multipart_wait_timeout),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn strict_for_test(enabled: bool, limit: usize, wait_timeout: Duration) -> Self {
+        if enabled {
+            if limit == 0 {
+                Self::Disabled
+            } else {
+                Self::Strict(ForegroundWriteAdmissionGate::new(limit, wait_timeout))
+            }
+        } else {
+            Self::LegacyCounterOnly
+        }
+    }
+
+    #[cfg(test)]
+    fn large_for_test(enabled: bool, limit: usize, min_size_bytes: usize, wait_timeout: Duration) -> Self {
+        Self::large_with_multipart_queue_for_test(enabled, limit, min_size_bytes, wait_timeout, wait_timeout, 0)
+    }
+
+    #[cfg(test)]
+    fn large_with_multipart_queue_for_test(
+        enabled: bool,
+        limit: usize,
+        min_size_bytes: usize,
+        wait_timeout: Duration,
+        multipart_wait_timeout: Duration,
+        multipart_max_pending: usize,
+    ) -> Self {
+        if enabled && limit > 0 {
+            Self::Large {
+                gate: ForegroundWriteAdmissionGate::new(limit, wait_timeout),
+                large_request_permits: 1,
+                put_object_min_size_bytes: min_size_bytes,
+                multipart_part_min_size_bytes: 0,
+                multipart_wait_timeout,
+                multipart_max_pending: derive_multipart_admission_max_pending(multipart_max_pending, limit),
+            }
+        } else {
+            Self::LegacyCounterOnly
+        }
+    }
+
+    async fn admit(
+        &self,
+        kind: ForegroundWriteAdmissionKind,
+        size: i64,
+    ) -> Result<ForegroundWriteAdmission, tokio::sync::AcquireError> {
+        match self {
+            Self::Disabled | Self::LegacyCounterOnly => Ok(ForegroundWriteAdmission::Disabled),
+            Self::Strict(gate) => gate.admit(1).await,
+            Self::Large {
+                gate,
+                large_request_permits,
+                put_object_min_size_bytes,
+                multipart_part_min_size_bytes,
+                multipart_wait_timeout,
+                multipart_max_pending,
+            } => match kind {
+                ForegroundWriteAdmissionKind::PutObject if should_gate_foreground_write(size, *put_object_min_size_bytes) => {
+                    gate.admit(*large_request_permits).await
+                }
+                ForegroundWriteAdmissionKind::MultipartPart
+                    if should_gate_foreground_write(size, *multipart_part_min_size_bytes) =>
+                {
+                    gate.admit_queued(
+                        *multipart_wait_timeout,
+                        *multipart_max_pending,
+                        multipart_admission_permits(size, *large_request_permits),
+                    )
+                    .await
+                }
+                _ => Ok(ForegroundWriteAdmission::Disabled),
+            },
+        }
+    }
+
+    fn snapshot(&self, legacy_limit: usize) -> WorkloadAdmissionSnapshot {
+        match self {
+            Self::Disabled => put_admission_snapshot(0, Some(0), 0, None),
+            Self::LegacyCounterOnly => put_admission_snapshot(PutObjectGuard::concurrent_count(), Some(0), legacy_limit, None),
+            Self::Strict(gate) => put_admission_snapshot(
+                gate.active(),
+                gate.waiters.snapshot(),
+                gate.limit,
+                Some("foreground write admission permits exhausted"),
+            ),
+            Self::Large { gate, .. } => put_admission_snapshot(
+                gate.active(),
+                gate.waiters.snapshot(),
+                gate.limit,
+                Some("large foreground write admission permits exhausted"),
+            ),
+        }
+    }
+}
+
+fn put_admission_snapshot(
+    active: usize,
+    queued: Option<usize>,
+    limit: usize,
+    hard_gate_reason: Option<&'static str>,
+) -> WorkloadAdmissionSnapshot {
+    let state = if limit == 0 {
+        AdmissionState::Disabled
+    } else if active >= limit {
+        AdmissionState::Saturated
+    } else {
+        AdmissionState::Open
+    };
+
+    let admission =
+        WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, state).with_counts(Some(active), queued, Some(limit));
+
+    match state {
+        AdmissionState::Disabled => admission.with_reason("foreground write admission disabled"),
+        AdmissionState::Saturated => {
+            admission.with_reason(hard_gate_reason.unwrap_or("foreground write concurrency reached local pressure limit"))
+        }
+        _ => admission,
+    }
+}
+
+fn derive_multipart_admission_max_pending(configured_max_pending: usize, limit: usize) -> usize {
+    if configured_max_pending > 0 {
+        return configured_max_pending;
+    }
+    limit.saturating_mul(DERIVED_MULTIPART_ADMISSION_MAX_PENDING_FACTOR)
+}
+
+fn multipart_admission_permits(size: i64, large_request_permits: u32) -> u32 {
+    let Ok(size) = u64::try_from(size) else {
+        return large_request_permits;
+    };
+    u32::try_from(size.div_ceil(MULTIPART_ADMISSION_UNIT_BYTES))
+        .unwrap_or(large_request_permits)
+        .clamp(1, large_request_permits)
+}
+
+fn derive_large_put_admission_limit(configured_limit: usize, max_disk_reads: usize) -> usize {
+    if configured_limit > 0 {
+        return configured_limit;
+    }
+
+    let scheduler_base = if max_disk_reads == 0 {
+        rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS
+    } else {
+        max_disk_reads
+    };
+    scheduler_base.div_ceil(2).clamp(1, DERIVED_LARGE_PUT_ADMISSION_LIMIT_MAX)
+}
+
+fn should_gate_foreground_write(size: i64, min_size_bytes: usize) -> bool {
+    if min_size_bytes == 0 || size < 0 {
+        return true;
+    }
+
+    usize::try_from(size).is_ok_and(|size| size >= min_size_bytes)
+}
+
 impl ConcurrencyManager {
     /// Create a new concurrency manager with default settings
     ///
@@ -95,6 +594,17 @@ impl ConcurrencyManager {
         let scheduler_config = IoSchedulerConfig::from_env();
 
         let max_disk_reads = scheduler_config.max_concurrent_reads;
+
+        // Bounded degraded admission lane. A configured `0` mirrors the primary
+        // cap, so the absolute hard cap on concurrent disk-active reads defaults
+        // to twice the primary disk-read concurrency.
+        let degraded_read_cap = {
+            let configured = rustfs_utils::get_env_usize(
+                rustfs_config::ENV_OBJECT_DISK_DEGRADED_READ_CAP,
+                rustfs_config::DEFAULT_OBJECT_DISK_DEGRADED_READ_CAP,
+            );
+            if configured == 0 { max_disk_reads } else { configured }
+        };
 
         // Detect storage media
         let storage_media =
@@ -115,17 +625,20 @@ impl ConcurrencyManager {
 
         // Use global performance metrics instance for consistent metrics tracking
         // This allows AutoTuner and other components to access the same metrics data
-        let performance_metrics = get_global_metrics();
+        let performance_metrics = runtime_sources::current_performance_metrics();
 
         // Initialize metrics collector for I/O latency tracking
         // Keep 1000 samples for P95/P99 calculation
         let metrics_collector = Arc::new(MetricsCollector::new(performance_metrics, 1000));
+        let foreground_write_admission_policy = ForegroundWriteAdmissionPolicy::from_env(max_disk_reads);
 
         // Build queue config directly from scheduler config.
         let queue_config = IoPriorityQueueConfig::from_scheduler_config(&scheduler_config);
 
         Self {
             disk_read_semaphore: Arc::new(Semaphore::new(max_disk_reads)),
+            disk_read_waiters: Arc::new(AdmissionWaiters::default()),
+            degraded_read_semaphore: Arc::new(Semaphore::new(degraded_read_cap)),
             io_metrics: Arc::new(Mutex::new(IoLoadMetrics::new(scheduler_config.load_sample_window))),
             priority_queue: Arc::new(IoPriorityQueue::new(queue_config)),
             bytes_pool: Arc::new(BytesPool::new_tiered()),
@@ -134,12 +647,78 @@ impl ConcurrencyManager {
             pattern_detector,
             bandwidth_monitor,
             metrics_collector,
+            foreground_write_admission_policy,
+            snowball_archive_decoder_semaphore: Arc::new(Semaphore::new(SNOWBALL_ARCHIVE_DECODER_LIMIT)),
+            snowball_member_commit_semaphore: Arc::new(Semaphore::new(SNOWBALL_MEMBER_COMMIT_LIMIT)),
+            snowball_staging_bytes_semaphore: Arc::new(Semaphore::new(SNOWBALL_STAGING_BYTES_LIMIT)),
         }
+    }
+
+    /// Build a manager with explicit disk-read admission caps for tests.
+    ///
+    /// Overrides only the primary/degraded semaphores and the snapshot cap so
+    /// admission behavior can be exercised deterministically under a paused
+    /// virtual clock, without depending on process-wide environment variables.
+    #[cfg(test)]
+    pub(crate) fn with_disk_read_caps_for_test(primary: usize, degraded: usize) -> Self {
+        let mut manager = Self::new();
+        manager.disk_read_semaphore = Arc::new(Semaphore::new(primary));
+        manager.degraded_read_semaphore = Arc::new(Semaphore::new(degraded));
+        manager.scheduler_config.max_concurrent_reads = primary;
+        manager
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_disk_read_admission_for_test(&self) {
+        self.disk_read_semaphore.close();
+        self.degraded_read_semaphore.close();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_put_admission_for_test(enabled: bool, limit: usize, wait_timeout: Duration) -> Self {
+        let mut manager = Self::new();
+        manager.foreground_write_admission_policy = ForegroundWriteAdmissionPolicy::strict_for_test(enabled, limit, wait_timeout);
+        manager
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_multipart_admission_queue_for_test(
+        limit: usize,
+        multipart_wait_timeout: Duration,
+        multipart_max_pending: usize,
+    ) -> Self {
+        let mut manager = Self::new();
+        manager.foreground_write_admission_policy = ForegroundWriteAdmissionPolicy::large_with_multipart_queue_for_test(
+            true,
+            limit,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+            Duration::ZERO,
+            multipart_wait_timeout,
+            multipart_max_pending,
+        );
+        manager
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_large_put_admission_for_test(
+        enabled: bool,
+        limit: usize,
+        min_size_bytes: usize,
+        wait_timeout: Duration,
+    ) -> Self {
+        let mut manager = Self::new();
+        manager.foreground_write_admission_policy =
+            ForegroundWriteAdmissionPolicy::large_for_test(enabled, limit, min_size_bytes, wait_timeout);
+        manager
     }
 
     /// Track a GetObject request
     pub fn track_request() -> GetObjectGuard {
         GetObjectGuard::new()
+    }
+
+    pub fn track_put_request() -> PutObjectGuard {
+        PutObjectGuard::new()
     }
 
     /// Get the bytes pool for buffer allocation
@@ -159,7 +738,147 @@ impl ConcurrencyManager {
     /// This ensures we don't overwhelm the disk subsystem with too many
     /// concurrent reads, which can cause performance degradation.
     pub async fn acquire_disk_read_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, tokio::sync::AcquireError> {
-        self.disk_read_semaphore.acquire().await
+        self.disk_read_waiters.observe(self.disk_read_semaphore.acquire()).await
+    }
+
+    /// Acquire an owned permit to perform a disk read operation.
+    ///
+    /// Use this when the permit must outlive the borrow of the manager, such as
+    /// response body streams that continue after the S3 handler returns.
+    pub async fn acquire_owned_disk_read_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        self.disk_read_waiters
+            .observe(self.disk_read_semaphore.clone().acquire_owned())
+            .await
+    }
+
+    /// Admit a GET disk read under a hard concurrency cap.
+    ///
+    /// The permit is held for the whole response body transfer, so this is the
+    /// single admission boundary that bounds concurrent disk-active reads:
+    ///
+    /// - `primary_wait == 0` waits on the primary permit pool indefinitely and
+    ///   always yields a [`DiskReadAdmission::Primary`] permit (no degrade, no
+    ///   reject); this preserves the "wait forever" opt-out.
+    /// - Otherwise it waits up to `primary_wait` for a primary permit. On
+    ///   timeout it takes one permit from the bounded degraded overflow lane
+    ///   without blocking. If that lane is also full the request is
+    ///   [`DiskReadAdmission::Rejected`] — it must surface as `SlowDown`/503
+    ///   rather than reading without any admission token.
+    ///
+    /// Total GETs holding a permit therefore never exceed
+    /// `primary_cap + degraded_cap`.
+    pub async fn admit_disk_read(&self, primary_wait: Duration) -> Result<DiskReadAdmission, tokio::sync::AcquireError> {
+        // Primary cap of 0 means disk-read throttling is disabled (matches the
+        // `AdmissionState::Disabled` snapshot semantics). Serve without an
+        // admission token rather than rejecting every GET; this preserves the
+        // pre-existing "permits disabled" behavior and is the only permit-less
+        // path.
+        if self.scheduler_config.max_concurrent_reads == 0 {
+            return Ok(DiskReadAdmission::Unbounded);
+        }
+
+        if primary_wait.is_zero() {
+            let permit = self.acquire_owned_disk_read_permit().await?;
+            return Ok(DiskReadAdmission::Primary(permit));
+        }
+
+        match tokio::time::timeout(primary_wait, self.acquire_owned_disk_read_permit()).await {
+            Ok(permit) => Ok(DiskReadAdmission::Primary(permit?)),
+            Err(_) => {
+                // Primary pool saturated within the wait window. Do not read
+                // without a permit; fall through to the bounded degraded lane,
+                // and reject once the hard cap is reached.
+                match self.degraded_read_semaphore.clone().try_acquire_owned() {
+                    Ok(permit) => Ok(DiskReadAdmission::Degraded(permit)),
+                    // NoPermits => hard cap reached; Closed never happens for a
+                    // semaphore we never close. Either way, reject rather than
+                    // bypass admission.
+                    Err(_) => Ok(DiskReadAdmission::Rejected),
+                }
+            }
+        }
+    }
+
+    /// Admit a foreground PutObject request under the configured write gate.
+    ///
+    /// The strict experimental gate applies to every PUT only when explicitly
+    /// enabled. Otherwise the default-on large-object gate protects sustained
+    /// erasure/RPC pressure while keeping small PUTs on the legacy path.
+    pub async fn admit_put_object(&self, size: i64) -> Result<ForegroundWriteAdmission, tokio::sync::AcquireError> {
+        self.foreground_write_admission_policy
+            .admit(ForegroundWriteAdmissionKind::PutObject, size)
+            .await
+    }
+
+    /// Admit a Snowball member through the foreground PUT policy using the
+    /// member's logical size. The outer archive has a separate preflight, while
+    /// every member shares the ordinary PUT gate and its wait/rejection policy.
+    pub(crate) async fn admit_snowball_foreground_write(
+        &self,
+        member_size: i64,
+    ) -> Result<ForegroundWriteAdmission, tokio::sync::AcquireError> {
+        self.foreground_write_admission_policy
+            .admit(ForegroundWriteAdmissionKind::PutObject, member_size)
+            .await
+    }
+
+    /// Try to acquire one global Snowball archive decoder slot.
+    pub(crate) fn try_acquire_snowball_archive_decoder(&self) -> Option<OwnedSemaphorePermit> {
+        self.snowball_archive_decoder_semaphore.clone().try_acquire_owned().ok()
+    }
+
+    /// Acquire one global Snowball member lifecycle slot.
+    pub(crate) async fn acquire_snowball_member_commit(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        self.snowball_member_commit_semaphore.clone().acquire_owned().await
+    }
+
+    /// Try to acquire one global Snowball member lifecycle slot.
+    pub(crate) fn try_acquire_snowball_member_commit(&self) -> Option<OwnedSemaphorePermit> {
+        self.snowball_member_commit_semaphore.clone().try_acquire_owned().ok()
+    }
+
+    /// Try to reserve prepared-member bytes without waiting.
+    ///
+    /// A producer holding a non-empty micro-batch must use this method and
+    /// flush before waiting, otherwise several archives can each retain part of
+    /// the global budget while waiting forever for the remainder.
+    pub(crate) fn try_acquire_snowball_staging_bytes(&self, bytes: u32) -> Option<OwnedSemaphorePermit> {
+        self.snowball_staging_bytes_semaphore
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .ok()
+    }
+
+    /// Admit a multipart UploadPart request under the configured write gate.
+    ///
+    /// Multipart workloads can saturate memory and internode write streams with
+    /// many moderate-sized parts, so they use an operation-specific threshold
+    /// while sharing the same foreground write permit pool.
+    pub async fn admit_multipart_part(&self, size: i64) -> Result<ForegroundWriteAdmission, tokio::sync::AcquireError> {
+        self.foreground_write_admission_policy
+            .admit(ForegroundWriteAdmissionKind::MultipartPart, size)
+            .await
+    }
+
+    /// Admit a copy part through the UploadPart pool using its resolved logical length.
+    /// Copy holds source metadata and bucket locks here, so it must never queue
+    /// behind a writer that may need those locks. Saturation returns SlowDown.
+    pub fn try_admit_multipart_part_copy(&self, size: i64) -> ForegroundWriteAdmission {
+        match &self.foreground_write_admission_policy {
+            ForegroundWriteAdmissionPolicy::Disabled | ForegroundWriteAdmissionPolicy::LegacyCounterOnly => {
+                ForegroundWriteAdmission::Disabled
+            }
+            ForegroundWriteAdmissionPolicy::Strict(gate) => gate.try_admit(1),
+            ForegroundWriteAdmissionPolicy::Large {
+                gate,
+                large_request_permits,
+                multipart_part_min_size_bytes,
+                ..
+            } if should_gate_foreground_write(size, *multipart_part_min_size_bytes) => {
+                gate.try_admit(multipart_admission_permits(size, *large_request_permits))
+            }
+            _ => ForegroundWriteAdmission::Disabled,
+        }
     }
 
     // ============================================
@@ -228,7 +947,7 @@ impl ConcurrencyManager {
     ///
     /// Arc-wrapped PerformanceMetrics instance
     pub fn performance_metrics(&self) -> Arc<PerformanceMetrics> {
-        get_global_metrics()
+        runtime_sources::current_performance_metrics()
     }
 
     /// Calculate an adaptive I/O strategy based on disk permit wait time.
@@ -521,10 +1240,7 @@ impl ConcurrencyManager {
     ///
     /// Returns information about permit usage and waiting requests.
     pub fn io_queue_status(&self) -> IoQueueStatus {
-        let snapshot = GetObjectQueueSnapshot::from_available_permits(
-            self.scheduler_config.max_concurrent_reads,
-            self.disk_read_semaphore.available_permits(),
-        );
+        let snapshot = self.get_object_queue_snapshot();
 
         IoQueueStatus {
             total_permits: snapshot.total_permits,
@@ -537,6 +1253,60 @@ impl ConcurrencyManager {
             low_priority_processed: 0,
             starvation_events: 0,
         }
+    }
+
+    /// Get a read-only snapshot of local GetObject disk-read admission.
+    pub fn get_object_queue_snapshot(&self) -> GetObjectQueueSnapshot {
+        GetObjectQueueSnapshot::from_available_permits(
+            self.scheduler_config.max_concurrent_reads,
+            self.disk_read_semaphore.available_permits(),
+        )
+    }
+
+    /// Get a read-only workload admission snapshot for foreground reads.
+    pub fn get_object_admission_snapshot(&self) -> WorkloadAdmissionSnapshot {
+        let snapshot = self.get_object_queue_snapshot();
+        let state = if snapshot.total_permits == 0 {
+            AdmissionState::Disabled
+        } else if snapshot.permits_available() == 0 {
+            AdmissionState::Saturated
+        } else {
+            AdmissionState::Open
+        };
+
+        let admission = WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundRead, state).with_counts(
+            Some(snapshot.permits_in_use),
+            self.disk_read_waiters.snapshot(),
+            Some(snapshot.total_permits),
+        );
+
+        match state {
+            AdmissionState::Disabled => admission.with_reason("disk read permits disabled"),
+            AdmissionState::Saturated => admission.with_reason("all disk read permits are in use"),
+            _ => admission,
+        }
+    }
+
+    /// Get a read-only workload admission snapshot for foreground writes.
+    pub fn put_object_admission_snapshot(&self) -> WorkloadAdmissionSnapshot {
+        self.foreground_write_admission_policy
+            .snapshot(self.scheduler_config.max_concurrent_reads)
+    }
+
+    /// Get a read-only workload admission registry snapshot for local storage concurrency.
+    pub fn workload_admission_registry_snapshot(&self) -> WorkloadAdmissionRegistrySnapshot {
+        let entries = WorkloadClass::REQUIRED
+            .iter()
+            .copied()
+            .map(|class| match class {
+                WorkloadClass::ForegroundRead => self.get_object_admission_snapshot(),
+                WorkloadClass::ForegroundWrite => self.put_object_admission_snapshot(),
+                class => WorkloadAdmissionSnapshot::new(class, AdmissionState::Unknown)
+                    .with_reason("not exposed by storage concurrency manager"),
+            })
+            .collect();
+
+        WorkloadAdmissionRegistrySnapshot::new(entries)
     }
 
     /// Acquire a disk read permit with priority awareness.
@@ -564,12 +1334,18 @@ impl ConcurrencyManager {
             "Acquiring disk read permit"
         );
 
-        self.disk_read_semaphore.acquire().await
+        self.acquire_disk_read_permit().await
     }
 
     /// Get the global concurrency manager instance.
     pub fn global() -> &'static Self {
         &CONCURRENCY_MANAGER
+    }
+}
+
+impl WorkloadAdmissionSnapshotProvider for ConcurrencyManager {
+    fn workload_admission_snapshot(&self) -> WorkloadAdmissionRegistrySnapshot {
+        self.workload_admission_registry_snapshot()
     }
 }
 
@@ -584,9 +1360,156 @@ impl Default for ConcurrencyManager {
 // ============================================
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod integration_tests {
-    use super::*;
+    use super::super::io_schedule::{IoLoadLevel, IoPriority};
+    use super::super::request_guard::GetObjectGuard;
+    use super::{
+        ConcurrencyManager, ForegroundWriteAdmission, ForegroundWriteAdmissionGate, ForegroundWriteAdmissionPolicy,
+        SNOWBALL_ARCHIVE_DECODER_LIMIT, SNOWBALL_MEMBER_COMMIT_LIMIT, SNOWBALL_STAGING_BYTES_LIMIT,
+        derive_large_put_admission_limit, derive_multipart_admission_max_pending,
+    };
+    use crate::storage::storage_api::concurrency_consumer::PutObjectGuard;
+    use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
+    use rustfs_io_core::io_profile::{AccessPattern, StorageMedia};
     use serial_test::serial;
+    use std::time::Duration;
+
+    #[test]
+    fn test_snowball_gates_are_global_bounded_and_reusable() {
+        let manager = ConcurrencyManager::new();
+        let clone = manager.clone();
+
+        let decoder_permits = manager
+            .snowball_archive_decoder_semaphore
+            .clone()
+            .try_acquire_many_owned(
+                u32::try_from(SNOWBALL_ARCHIVE_DECODER_LIMIT).expect("Snowball decoder limit must fit into u32"),
+            )
+            .expect("the exact Snowball decoder limit must be available");
+        assert!(
+            clone.try_acquire_snowball_archive_decoder().is_none(),
+            "a cloned manager must share the global decoder gate"
+        );
+        drop(decoder_permits);
+        assert!(clone.try_acquire_snowball_archive_decoder().is_some());
+
+        let commit_permits = manager
+            .snowball_member_commit_semaphore
+            .clone()
+            .try_acquire_many_owned(u32::try_from(SNOWBALL_MEMBER_COMMIT_LIMIT).expect("Snowball commit limit must fit into u32"))
+            .expect("the exact Snowball commit limit must be available");
+        assert!(
+            clone.snowball_member_commit_semaphore.clone().try_acquire_owned().is_err(),
+            "a cloned manager must share the global commit gate"
+        );
+        drop(commit_permits);
+        assert!(clone.snowball_member_commit_semaphore.clone().try_acquire_owned().is_ok());
+
+        let staging_bytes = u32::try_from(SNOWBALL_STAGING_BYTES_LIMIT).expect("Snowball staging limit must fit into u32");
+        let staging_permit = manager
+            .try_acquire_snowball_staging_bytes(staging_bytes)
+            .expect("the exact Snowball staging budget must be available");
+        assert!(
+            clone.try_acquire_snowball_staging_bytes(1).is_none(),
+            "a cloned manager must share the global staging budget"
+        );
+        drop(staging_permit);
+        assert!(clone.try_acquire_snowball_staging_bytes(1).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_snowball_members_share_the_strict_foreground_put_gate() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 2, Duration::ZERO);
+        let outer = match manager
+            .admit_put_object(1)
+            .await
+            .expect("strict outer admission must remain open")
+        {
+            ForegroundWriteAdmission::Admitted(permit) => permit,
+            outcome => panic!("strict outer admission must return a permit: {outcome:?}"),
+        };
+        let member = match manager
+            .admit_snowball_foreground_write(1)
+            .await
+            .expect("strict member admission must remain open")
+        {
+            ForegroundWriteAdmission::Admitted(permit) => permit,
+            outcome => panic!("strict member admission must return a permit: {outcome:?}"),
+        };
+        assert!(
+            matches!(
+                manager
+                    .admit_snowball_foreground_write(1)
+                    .await
+                    .expect("strict member admission must remain open"),
+                ForegroundWriteAdmission::Rejected
+            ),
+            "a saturated Snowball member admission must preserve the zero-wait rejection policy"
+        );
+        assert!(
+            matches!(
+                manager.admit_put_object(1).await.expect("strict gate must remain usable"),
+                ForegroundWriteAdmission::Rejected
+            ),
+            "outer PUTs and Snowball members must exhaust the same strict gate"
+        );
+
+        drop(outer);
+        let replacement = match manager
+            .admit_snowball_foreground_write(1)
+            .await
+            .expect("released strict capacity must be reusable")
+        {
+            ForegroundWriteAdmission::Admitted(permit) => permit,
+            outcome => panic!("strict replacement admission must return a permit: {outcome:?}"),
+        };
+        drop((member, replacement));
+    }
+
+    #[tokio::test]
+    async fn test_snowball_members_use_their_size_for_the_large_foreground_put_gate() {
+        let min_size = 16 * 1024 * 1024;
+        let manager = ConcurrencyManager::with_large_put_admission_for_test(true, 1, min_size, Duration::ZERO);
+
+        assert!(matches!(
+            manager
+                .admit_put_object((min_size - 1) as i64)
+                .await
+                .expect("small outer archive admission must remain open"),
+            ForegroundWriteAdmission::Disabled
+        ));
+        let large_member = match manager
+            .admit_snowball_foreground_write(min_size as i64)
+            .await
+            .expect("large Snowball member admission must remain open")
+        {
+            ForegroundWriteAdmission::Admitted(permit) => permit,
+            outcome => panic!("large Snowball member must consume the large PUT gate: {outcome:?}"),
+        };
+        assert!(matches!(
+            manager
+                .admit_snowball_foreground_write(min_size as i64)
+                .await
+                .expect("saturated Snowball member admission must remain open"),
+            ForegroundWriteAdmission::Rejected
+        ));
+        assert!(matches!(
+            manager
+                .admit_put_object(min_size as i64)
+                .await
+                .expect("ordinary large PUT admission must remain open"),
+            ForegroundWriteAdmission::Rejected
+        ));
+        assert!(matches!(
+            manager
+                .admit_snowball_foreground_write((min_size - 1) as i64)
+                .await
+                .expect("small Snowball member admission must remain open"),
+            ForegroundWriteAdmission::Disabled
+        ));
+        drop(large_member);
+    }
 
     #[tokio::test]
     #[serial]
@@ -615,6 +1538,780 @@ mod integration_tests {
         assert_eq!(status.high_priority_waiting, 0);
         assert_eq!(status.normal_priority_waiting, 0);
         assert_eq!(status.low_priority_waiting, 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_workload_admission_snapshot_tracks_disk_read_permits() {
+        let manager = ConcurrencyManager::new();
+        let initial = manager.get_object_admission_snapshot();
+
+        assert_eq!(initial.class, WorkloadClass::ForegroundRead);
+        assert_eq!(initial.state, AdmissionState::Open);
+        assert_eq!(initial.active, Some(0));
+        assert_eq!(initial.queued, Some(0));
+        assert_eq!(initial.limit, Some(manager.scheduler_config().max_concurrent_reads));
+
+        let permit = manager.acquire_disk_read_permit().await;
+        assert!(permit.is_ok());
+        let _permit = permit.ok();
+        let snapshot = manager.get_object_admission_snapshot();
+
+        assert_eq!(snapshot.active, Some(1));
+        assert_eq!(snapshot.limit, Some(manager.scheduler_config().max_concurrent_reads));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_owned_disk_read_permit_tracks_queue_snapshot() {
+        let manager = ConcurrencyManager::new();
+
+        let permit = manager
+            .acquire_owned_disk_read_permit()
+            .await
+            .expect("owned disk read permit should be acquired");
+        let snapshot = manager.get_object_admission_snapshot();
+
+        assert_eq!(snapshot.active, Some(1));
+        assert_eq!(snapshot.limit, Some(manager.scheduler_config().max_concurrent_reads));
+
+        drop(permit);
+        assert_eq!(manager.get_object_admission_snapshot().active, Some(0));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_workload_admission_snapshot_tracks_put_requests() {
+        crate::storage::concurrency::reset_active_put_requests();
+        let manager = ConcurrencyManager::with_put_admission_for_test(false, 0, Duration::ZERO);
+        let initial = manager.put_object_admission_snapshot();
+
+        assert_eq!(initial.class, WorkloadClass::ForegroundWrite);
+        assert_eq!(initial.state, AdmissionState::Open);
+        assert_eq!(initial.active, Some(0));
+        assert_eq!(initial.queued, Some(0));
+        assert_eq!(initial.limit, Some(manager.scheduler_config().max_concurrent_reads));
+
+        let guard = PutObjectGuard::new();
+        let snapshot = manager.put_object_admission_snapshot();
+
+        assert_eq!(snapshot.active, Some(1));
+        assert_eq!(snapshot.limit, Some(manager.scheduler_config().max_concurrent_reads));
+        drop(guard);
+        crate::storage::concurrency::reset_active_put_requests();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_put_admission_disabled_does_not_touch_gate() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(false, 1, Duration::ZERO);
+
+        let admission = manager
+            .admit_put_object(1024)
+            .await
+            .expect("disabled put admission must not close");
+
+        assert!(matches!(admission, ForegroundWriteAdmission::Disabled));
+        assert_eq!(manager.put_object_admission_snapshot().state, AdmissionState::Open);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_strict_put_admission_zero_limit_disables_large_gate() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 0, Duration::ZERO);
+
+        let admission = manager
+            .admit_put_object(32 * 1024 * 1024)
+            .await
+            .expect("strict zero-limit put admission must not close");
+
+        assert!(matches!(admission, ForegroundWriteAdmission::Disabled));
+        assert_eq!(manager.put_object_admission_snapshot().state, AdmissionState::Disabled);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_put_admission_rejects_when_limit_full() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::ZERO);
+
+        let first = manager
+            .admit_put_object(1024)
+            .await
+            .expect("first put admission should acquire");
+        assert!(matches!(first, ForegroundWriteAdmission::Admitted(_)));
+        assert_eq!(manager.put_object_admission_snapshot().state, AdmissionState::Saturated);
+
+        let second = manager
+            .admit_put_object(1024)
+            .await
+            .expect("full put admission gate should reject, not close");
+        assert!(matches!(second, ForegroundWriteAdmission::Rejected));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_put_admission_reuses_released_permit() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::ZERO);
+
+        let first = manager
+            .admit_put_object(1024)
+            .await
+            .expect("first put admission should acquire");
+        drop(first);
+
+        let second = manager
+            .admit_put_object(1024)
+            .await
+            .expect("released put admission permit should be reusable");
+        assert!(matches!(second, ForegroundWriteAdmission::Admitted(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_put_admission_wait_timeout_rejects() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::from_secs(5));
+        let held = manager
+            .admit_put_object(1024)
+            .await
+            .expect("first put admission should acquire");
+        let waiter_manager = manager.clone();
+
+        let waiter = tokio::spawn(async move { waiter_manager.admit_put_object(1024).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        let admission = waiter
+            .await
+            .expect("put admission waiter task must not panic")
+            .expect("put admission gate must stay open");
+        assert!(matches!(admission, ForegroundWriteAdmission::Rejected));
+        drop(held);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_large_put_admission_bypasses_small_puts() {
+        let min_size = rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES;
+        let manager = ConcurrencyManager::with_large_put_admission_for_test(true, 1, min_size, Duration::ZERO);
+
+        let held = manager
+            .admit_put_object(min_size as i64)
+            .await
+            .expect("large put admission should acquire");
+        assert!(matches!(held, ForegroundWriteAdmission::Admitted(_)));
+
+        let small = manager
+            .admit_put_object((min_size - 1) as i64)
+            .await
+            .expect("small put should bypass large admission");
+        assert!(matches!(small, ForegroundWriteAdmission::Disabled));
+
+        let large = manager
+            .admit_put_object(min_size as i64)
+            .await
+            .expect("second large put should reject when the gate is full");
+        assert!(matches!(large, ForegroundWriteAdmission::Rejected));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_large_put_admission_gates_unknown_size() {
+        let manager = ConcurrencyManager::with_large_put_admission_for_test(true, 1, 32 * 1024 * 1024, Duration::ZERO);
+
+        let held = manager
+            .admit_put_object(-1)
+            .await
+            .expect("unknown-size put admission should acquire");
+        assert!(matches!(held, ForegroundWriteAdmission::Admitted(_)));
+
+        let second = manager
+            .admit_put_object(-1)
+            .await
+            .expect("unknown-size put admission should reject when the gate is full");
+        assert!(matches!(second, ForegroundWriteAdmission::Rejected));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_large_put_admission_gates_multipart_parts_by_default() {
+        let min_size = rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES;
+        let manager = ConcurrencyManager::with_large_put_admission_for_test(true, 1, min_size, Duration::ZERO);
+
+        let held = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("first multipart part admission should acquire");
+        assert!(matches!(held, ForegroundWriteAdmission::Admitted(_)));
+
+        let direct_small_put = manager
+            .admit_put_object((min_size - 1) as i64)
+            .await
+            .expect("small direct put should bypass the large put threshold");
+        assert!(matches!(direct_small_put, ForegroundWriteAdmission::Disabled));
+
+        let second_part = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("full multipart admission gate should reject, not close");
+        assert!(matches!(second_part, ForegroundWriteAdmission::Rejected));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_large_put_snapshot_tracks_gate() {
+        let manager = ConcurrencyManager::with_large_put_admission_for_test(true, 2, 32 * 1024 * 1024, Duration::ZERO);
+        let first = manager
+            .admit_put_object(32 * 1024 * 1024)
+            .await
+            .expect("first large put admission should acquire");
+        let initial = manager.put_object_admission_snapshot();
+
+        assert_eq!(initial.class, WorkloadClass::ForegroundWrite);
+        assert_eq!(initial.state, AdmissionState::Open);
+        assert_eq!(initial.active, Some(1));
+        assert_eq!(initial.limit, Some(2));
+
+        let second = manager
+            .admit_put_object(32 * 1024 * 1024)
+            .await
+            .expect("second large put admission should acquire");
+        let saturated = manager.put_object_admission_snapshot();
+
+        assert_eq!(saturated.state, AdmissionState::Saturated);
+        assert_eq!(saturated.active, Some(2));
+        assert_eq!(saturated.limit, Some(2));
+        drop((first, second));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_multipart_part_waits_for_released_permit() {
+        let manager = ConcurrencyManager::with_multipart_admission_queue_for_test(1, Duration::from_secs(30), 0);
+        let held = manager
+            .admit_multipart_part(8 * 1024 * 1024)
+            .await
+            .expect("first multipart part admission should acquire");
+        assert!(matches!(held, ForegroundWriteAdmission::Admitted(_)));
+
+        let waiter_manager = manager.clone();
+        let waiter = tokio::spawn(async move { waiter_manager.admit_multipart_part(8 * 1024 * 1024).await });
+        tokio::task::yield_now().await;
+        assert_eq!(manager.put_object_admission_snapshot().queued, Some(1));
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        drop(held);
+
+        let admission = waiter
+            .await
+            .expect("multipart admission waiter task must not panic")
+            .expect("multipart admission gate must stay open");
+        assert!(matches!(admission, ForegroundWriteAdmission::Admitted(_)));
+        assert_eq!(manager.put_object_admission_snapshot().queued, Some(0));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_multipart_copy_never_queues_with_source_locks() {
+        for (manager, expected_queued) in [
+            (
+                ConcurrencyManager::with_multipart_admission_queue_for_test(1, Duration::from_secs(30), 4),
+                Some(0),
+            ),
+            (ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::from_secs(30)), Some(0)),
+        ] {
+            let held = manager
+                .admit_multipart_part(32 * 1024 * 1024)
+                .await
+                .expect("hold write budget");
+            assert!(matches!(
+                manager.try_admit_multipart_part_copy(32 * 1024 * 1024),
+                ForegroundWriteAdmission::Rejected
+            ));
+            assert_eq!(manager.put_object_admission_snapshot().queued, expected_queued);
+            drop(held);
+            let copy = manager.try_admit_multipart_part_copy(32 * 1024 * 1024);
+            assert!(matches!(copy, ForegroundWriteAdmission::Admitted(_)));
+            assert!(matches!(manager.try_admit_multipart_part_copy(1), ForegroundWriteAdmission::Rejected));
+            drop(copy);
+            assert!(matches!(manager.try_admit_multipart_part_copy(1), ForegroundWriteAdmission::Admitted(_)));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_concurrency_manager_multipart_copy_uses_logical_size_threshold_and_weight() {
+        let mut manager = ConcurrencyManager::new();
+        manager.foreground_write_admission_policy = ForegroundWriteAdmissionPolicy::Large {
+            gate: ForegroundWriteAdmissionGate::new(4, Duration::from_secs(30)),
+            large_request_permits: 4,
+            put_object_min_size_bytes: 32 * 1024 * 1024,
+            multipart_part_min_size_bytes: 8 * 1024 * 1024,
+            multipart_wait_timeout: Duration::from_secs(30),
+            multipart_max_pending: 4,
+        };
+        assert!(matches!(
+            manager.try_admit_multipart_part_copy(8 * 1024 * 1024 - 1),
+            ForegroundWriteAdmission::Disabled
+        ));
+        let small = manager.try_admit_multipart_part_copy(8 * 1024 * 1024);
+        assert_eq!(manager.put_object_admission_snapshot().active, Some(1));
+        assert!(matches!(
+            manager.try_admit_multipart_part_copy(32 * 1024 * 1024),
+            ForegroundWriteAdmission::Rejected
+        ));
+        drop(small);
+        let full = manager.try_admit_multipart_part_copy(32 * 1024 * 1024);
+        assert!(matches!(full, ForegroundWriteAdmission::Admitted(_)));
+        assert_eq!(manager.put_object_admission_snapshot().active, Some(4));
+        drop(full);
+        assert_eq!(manager.put_object_admission_snapshot().active, Some(0));
+        let unknown = manager.try_admit_multipart_part_copy(-1);
+        assert!(matches!(unknown, ForegroundWriteAdmission::Admitted(_)));
+        assert_eq!(manager.put_object_admission_snapshot().active, Some(4));
+        drop(unknown);
+        for enabled in [false, true] {
+            let disabled = ConcurrencyManager::with_put_admission_for_test(enabled, 0, Duration::ZERO);
+            assert!(matches!(
+                disabled.try_admit_multipart_part_copy(32 * 1024 * 1024),
+                ForegroundWriteAdmission::Disabled
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_multipart_part_rejects_after_queue_wait_timeout() {
+        let manager = ConcurrencyManager::with_multipart_admission_queue_for_test(1, Duration::from_secs(30), 0);
+        let held = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("first multipart part admission should acquire");
+
+        let waiter_manager = manager.clone();
+        let waiter = tokio::spawn(async move { waiter_manager.admit_multipart_part(1024).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(30)).await;
+
+        let admission = waiter
+            .await
+            .expect("multipart admission waiter task must not panic")
+            .expect("multipart admission gate must stay open");
+        assert!(matches!(admission, ForegroundWriteAdmission::Rejected));
+        assert_eq!(manager.put_object_admission_snapshot().queued, Some(0));
+        drop(held);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_multipart_part_rejects_immediately_when_queue_is_full() {
+        let manager = ConcurrencyManager::with_multipart_admission_queue_for_test(1, Duration::from_secs(30), 1);
+        let held = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("first multipart part admission should acquire");
+
+        let waiter_manager = manager.clone();
+        let queued = tokio::spawn(async move { waiter_manager.admit_multipart_part(1024).await });
+        tokio::task::yield_now().await;
+        assert_eq!(manager.put_object_admission_snapshot().queued, Some(1));
+
+        let overflow = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("full multipart queue should reject, not close");
+        assert!(matches!(overflow, ForegroundWriteAdmission::Rejected));
+
+        drop(held);
+        let admission = queued
+            .await
+            .expect("queued multipart part task must not panic")
+            .expect("multipart admission gate must stay open");
+        assert!(matches!(admission, ForegroundWriteAdmission::Admitted(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_cancelled_multipart_waiter_releases_queue_slot() {
+        let manager = ConcurrencyManager::with_multipart_admission_queue_for_test(1, Duration::from_secs(30), 1);
+        let held = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("first multipart part admission should acquire");
+
+        let waiter_manager = manager.clone();
+        let queued = tokio::spawn(async move { waiter_manager.admit_multipart_part(1024).await });
+        tokio::task::yield_now().await;
+        assert_eq!(manager.put_object_admission_snapshot().queued, Some(1));
+        queued.abort();
+        let _ = queued.await;
+
+        assert_eq!(manager.put_object_admission_snapshot().queued, Some(0));
+        drop(held);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_multipart_part_zero_wait_rejects_without_queueing() {
+        let manager = ConcurrencyManager::with_multipart_admission_queue_for_test(1, Duration::ZERO, 4);
+        let held = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("first multipart part admission should acquire");
+
+        let rejected = manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("zero multipart wait should reject, not close");
+        assert!(matches!(rejected, ForegroundWriteAdmission::Rejected));
+        assert_eq!(manager.put_object_admission_snapshot().queued, Some(0));
+        drop(held);
+    }
+
+    #[test]
+    #[serial]
+    fn test_concurrency_manager_multipart_wait_default_stays_below_sdk_write_timeouts() {
+        let unset = [
+            (rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_ENABLE, None::<&str>),
+            (rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE, None),
+            (rustfs_config::ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS, None),
+        ];
+        temp_env::with_vars(unset, || {
+            let policy = ForegroundWriteAdmissionPolicy::from_env(64);
+            // A queued part stalls the client's socket write for the whole wait, so the
+            // default must answer with `SlowDown` before mainstream SDK write timeouts.
+            assert_eq!(policy.multipart_wait_timeout_for_test(), Some(Duration::from_secs(10)));
+        });
+
+        let overridden = [
+            (rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_ENABLE, None::<&str>),
+            (rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE, None),
+            (rustfs_config::ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS, Some("60000")),
+        ];
+        temp_env::with_vars(overridden, || {
+            let policy = ForegroundWriteAdmissionPolicy::from_env(64);
+            // The bound applies to the default only; operators may still raise the wait.
+            assert_eq!(policy.multipart_wait_timeout_for_test(), Some(Duration::from_secs(60)));
+        });
+    }
+
+    fn automatic_write_policy(configured_limit: Option<&str>, disk_read_limit: usize) -> ForegroundWriteAdmissionPolicy {
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_PUT_FOREGROUND_ADMISSION_ENABLE, Some("false")),
+                (rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE, Some("true")),
+                (rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT, configured_limit),
+                (rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES, None),
+                (rustfs_config::ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES, None),
+                (rustfs_config::ENV_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS, Some("0")),
+                (rustfs_config::ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS, None),
+                (rustfs_config::ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING, None),
+            ],
+            || ForegroundWriteAdmissionPolicy::from_env(disk_read_limit),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_auto_admission_completes_bounded_multipart_bursts() {
+        use super::ForegroundWriteAdmissionKind::MultipartPart;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for concurrency in [128, 256, 384] {
+            let policy = Arc::new(automatic_write_policy(None, 64));
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..concurrency {
+                let (policy, active, peak) = (policy.clone(), active.clone(), peak.clone());
+                tasks.spawn(async move {
+                    let admission = policy.admit(MultipartPart, 8 * 1024 * 1024).await.expect("gate stays open");
+                    let ForegroundWriteAdmission::Admitted(permit) = admission else {
+                        return false;
+                    };
+                    peak.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    // A bounded transfer may occupy a permit for several seconds.
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    drop(permit);
+                    true
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                assert!(result.expect("upload task joins"), "{concurrency}-part burst must finish without a retry");
+            }
+            assert!(peak.load(Ordering::SeqCst) <= 256, "small parts retain a hard concurrency bound");
+            assert_eq!(policy.snapshot(64).active, Some(0));
+            assert_eq!(policy.snapshot(64).queued, Some(0));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_auto_admission_preserves_large_and_unknown_write_bound() {
+        use super::ForegroundWriteAdmissionKind::{MultipartPart, PutObject};
+
+        for (kind, size) in [
+            (PutObject, 1024 * 1024 * 1024),
+            (MultipartPart, -1),
+            (MultipartPart, 64 * 1024 * 1024),
+        ] {
+            let policy = automatic_write_policy(None, 64);
+            let mut held = Vec::new();
+            for _ in 0..32 {
+                let admission = policy.admit(kind, size).await.expect("gate stays open");
+                assert!(matches!(admission, ForegroundWriteAdmission::Admitted(_)));
+                held.push(admission);
+            }
+            assert!(matches!(
+                policy.admit(kind, size).await.expect("gate stays open"),
+                ForegroundWriteAdmission::Rejected
+            ));
+            assert_eq!(policy.snapshot(64).queued, Some(0));
+            drop(held);
+            assert_eq!(policy.snapshot(64).active, Some(0));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_auto_admission_shares_budget_between_write_sizes() {
+        use super::ForegroundWriteAdmissionKind::{MultipartPart, PutObject};
+
+        let policy = automatic_write_policy(None, 64);
+        let mut large = Vec::new();
+        for _ in 0..31 {
+            large.push(
+                policy
+                    .admit(PutObject, 1024 * 1024 * 1024)
+                    .await
+                    .expect("large write admitted"),
+            );
+        }
+        let mut small = Vec::new();
+        for _ in 0..8 {
+            let admission = policy.admit(MultipartPart, 8 * 1024 * 1024).await.expect("gate stays open");
+            assert!(matches!(admission, ForegroundWriteAdmission::Admitted(_)));
+            small.push(admission);
+        }
+        assert!(matches!(
+            policy.admit(MultipartPart, 1).await.expect("gate stays open"),
+            ForegroundWriteAdmission::Rejected
+        ));
+        assert!(matches!(
+            policy.admit(PutObject, 1024 * 1024 * 1024).await.expect("gate stays open"),
+            ForegroundWriteAdmission::Rejected
+        ));
+        drop(small);
+        let last_large = policy
+            .admit(PutObject, 1024 * 1024 * 1024)
+            .await
+            .expect("released units are reusable");
+        assert!(matches!(last_large, ForegroundWriteAdmission::Admitted(_)));
+        drop((last_large, large));
+        assert_eq!(policy.snapshot(64).active, Some(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_auto_admission_keeps_explicit_request_limit() {
+        use super::ForegroundWriteAdmissionKind::{MultipartPart, PutObject};
+
+        let policy = automatic_write_policy(Some("2"), 64);
+        let first = policy.admit(MultipartPart, 1).await.expect("first small part admitted");
+        let second = policy
+            .admit(PutObject, 1024 * 1024 * 1024)
+            .await
+            .expect("large write admitted");
+        assert!(matches!(first, ForegroundWriteAdmission::Admitted(_)));
+        assert!(matches!(second, ForegroundWriteAdmission::Admitted(_)));
+        assert_eq!(policy.snapshot(64).limit, Some(2));
+        assert!(matches!(
+            policy.admit(MultipartPart, 1).await.expect("gate stays open"),
+            ForegroundWriteAdmission::Rejected
+        ));
+        drop((first, second));
+        assert_eq!(policy.snapshot(64).active, Some(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_auto_admission_cancellation_releases_partial_reservation() {
+        use super::ForegroundWriteAdmissionKind::MultipartPart;
+        use std::sync::Arc;
+
+        let policy = Arc::new(automatic_write_policy(None, 1));
+        let held = policy
+            .admit(MultipartPart, 8 * 1024 * 1024)
+            .await
+            .expect("small part admitted");
+        let large_policy = policy.clone();
+        let large = tokio::spawn(async move { large_policy.admit(MultipartPart, -1).await });
+        tokio::task::yield_now().await;
+        assert_eq!(policy.snapshot(1).queued, Some(1));
+        let small_policy = policy.clone();
+        let small = tokio::spawn(async move { small_policy.admit(MultipartPart, 8 * 1024 * 1024).await });
+        tokio::task::yield_now().await;
+        assert!(!small.is_finished(), "a small part cannot steal a queued large request's reservation");
+        large.abort();
+        assert!(large.await.expect_err("large waiter cancelled").is_cancelled());
+        let resumed = small.await.expect("small waiter joins").expect("gate stays open");
+        assert!(matches!(resumed, ForegroundWriteAdmission::Admitted(_)));
+        assert_eq!(policy.snapshot(1).active, Some(2));
+        assert_eq!(policy.snapshot(1).queued, Some(0));
+        drop((resumed, held));
+        let whole = policy
+            .admit(MultipartPart, -1)
+            .await
+            .expect("all reserved units were returned");
+        assert!(matches!(whole, ForegroundWriteAdmission::Admitted(_)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_auto_admission_rounds_sizes_up_and_recovers_after_timeout() {
+        use super::ForegroundWriteAdmissionKind::MultipartPart;
+
+        for (size, admitted) in [
+            (0, 8),
+            (1, 8),
+            (8 * 1024 * 1024, 8),
+            (8 * 1024 * 1024 + 1, 4),
+            (16 * 1024 * 1024 + 1, 2),
+            (64 * 1024 * 1024, 1),
+            (i64::MAX, 1),
+            (-1, 1),
+        ] {
+            let policy = automatic_write_policy(None, 1);
+            let mut held = Vec::new();
+            for _ in 0..admitted {
+                let admission = policy.admit(MultipartPart, size).await.expect("gate stays open");
+                assert!(matches!(admission, ForegroundWriteAdmission::Admitted(_)), "size {size}");
+                held.push(admission);
+            }
+            assert!(matches!(
+                policy.admit(MultipartPart, size).await.expect("gate stays open"),
+                ForegroundWriteAdmission::Rejected
+            ));
+            assert_eq!(policy.snapshot(1).queued, Some(0));
+            drop(held);
+            assert_eq!(policy.snapshot(1).active, Some(0), "timeout must return any partial reservation");
+            assert!(matches!(
+                policy.admit(MultipartPart, -1).await.expect("all units reusable"),
+                ForegroundWriteAdmission::Admitted(_)
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_auto_admission_does_not_starve_queued_large_parts() {
+        use super::ForegroundWriteAdmissionKind::MultipartPart;
+        use std::sync::Arc;
+
+        let policy = Arc::new(automatic_write_policy(None, 1));
+        let held = policy.admit(MultipartPart, 1).await.expect("small part admitted");
+        let large_policy = policy.clone();
+        let large = tokio::spawn(async move { large_policy.admit(MultipartPart, -1).await });
+        tokio::task::yield_now().await;
+        let small_policy = policy.clone();
+        let small = tokio::spawn(async move { small_policy.admit(MultipartPart, 1).await });
+        tokio::task::yield_now().await;
+        assert_eq!(policy.snapshot(1).queued, Some(2));
+        drop(held);
+        let large_admission = large.await.expect("large waiter joins").expect("gate stays open");
+        assert!(matches!(large_admission, ForegroundWriteAdmission::Admitted(_)));
+        assert!(
+            !small.is_finished(),
+            "the large waiter owns the entire budget before the later small waiter"
+        );
+        drop(large_admission);
+        assert!(matches!(
+            small.await.expect("small waiter joins").expect("gate stays open"),
+            ForegroundWriteAdmission::Admitted(_)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_concurrency_manager_auto_admission_keeps_queue_bound_in_requests() {
+        use super::ForegroundWriteAdmissionKind::MultipartPart;
+        use std::sync::Arc;
+
+        let policy = Arc::new(automatic_write_policy(None, 1));
+        let held = policy.admit(MultipartPart, -1).await.expect("large part fills the budget");
+        let started = tokio::time::Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..17 {
+            let policy = policy.clone();
+            tasks.spawn(async move { policy.admit(MultipartPart, 1).await });
+        }
+        let overflow = tasks
+            .join_next()
+            .await
+            .expect("overflow waiter completes")
+            .expect("waiter joins")
+            .expect("gate stays open");
+        assert!(matches!(overflow, ForegroundWriteAdmission::Rejected));
+        assert_eq!(
+            tokio::time::Instant::now(),
+            started,
+            "a full queue rejects without waiting for its deadline"
+        );
+        assert_eq!(policy.snapshot(1).queued, Some(16), "unit subdivision does not expand the queue");
+        drop(held);
+        while let Some(result) = tasks.join_next().await {
+            assert!(matches!(
+                result.expect("waiter joins").expect("gate stays open"),
+                ForegroundWriteAdmission::Admitted(_)
+            ));
+        }
+        assert_eq!(policy.snapshot(1).active, Some(0));
+        assert_eq!(policy.snapshot(1).queued, Some(0));
+    }
+
+    #[test]
+    fn test_concurrency_manager_derives_multipart_admission_max_pending_from_limit() {
+        assert_eq!(derive_multipart_admission_max_pending(7, 32), 7);
+        assert_eq!(derive_multipart_admission_max_pending(0, 32), 512);
+        assert_eq!(derive_multipart_admission_max_pending(0, 1), 16);
+    }
+
+    #[test]
+    fn test_concurrency_manager_derives_large_put_admission_limit_from_scheduler_cap() {
+        assert_eq!(derive_large_put_admission_limit(7, 64), 7);
+        assert_eq!(derive_large_put_admission_limit(0, 64), 32);
+        assert_eq!(derive_large_put_admission_limit(0, 8), 4);
+        assert_eq!(derive_large_put_admission_limit(0, 1), 1);
+        assert_eq!(derive_large_put_admission_limit(0, 0), 32);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_workload_admission_registry_covers_required_classes() {
+        let manager = ConcurrencyManager::new();
+        let registry = manager.workload_admission_registry_snapshot();
+        let provider: &dyn WorkloadAdmissionSnapshotProvider = &manager;
+        let trait_registry = provider.workload_admission_snapshot();
+
+        assert_eq!(registry.entries(), trait_registry.entries());
+        assert_eq!(registry.entries().len(), WorkloadClass::REQUIRED.len());
+        for class in WorkloadClass::REQUIRED {
+            assert!(registry.get(class).is_some(), "missing workload class {class}");
+        }
+
+        assert_eq!(
+            registry.get(WorkloadClass::ForegroundRead).map(|snapshot| snapshot.state),
+            Some(AdmissionState::Open)
+        );
+        assert_eq!(
+            registry.get(WorkloadClass::ForegroundWrite).map(|snapshot| snapshot.state),
+            Some(AdmissionState::Open)
+        );
+        assert_eq!(
+            registry.get(WorkloadClass::Scanner).map(|snapshot| snapshot.state),
+            Some(AdmissionState::Unknown)
+        );
     }
 
     #[tokio::test]
@@ -804,13 +2501,12 @@ mod integration_tests {
             StorageMedia::Hdd => config.hdd_buffer_cap,
             StorageMedia::Unknown => config.ssd_buffer_cap,
         };
-        let expected_max = media_cap.min(MI_B);
 
-        // Large base buffer should be constrained by storage cap first, then global clamp.
-        assert_eq!(
-            strategy.buffer_size, expected_max,
-            "Buffer should be capped by media profile and global clamp"
-        );
+        // Large base buffer should be constrained by the storage media cap.
+        // The final safety clamp is [32KiB, media_cap.max(MI_B)], so it never
+        // lowers the result below the media cap (e.g. NVMe's 2MiB cap stays
+        // effective even though the global floor clamp is 1MiB).
+        assert_eq!(strategy.buffer_size, media_cap, "Buffer should be capped by the storage media profile");
     }
 
     #[tokio::test]
@@ -851,5 +2547,331 @@ mod integration_tests {
 
         assert_eq!(small_file_strategy.priority, IoPriority::High);
         assert_eq!(large_file_strategy.priority, IoPriority::Low);
+    }
+
+    // ============================================
+    // Bounded disk-read admission (backlog#1317)
+    // ============================================
+
+    use super::DiskReadAdmission;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[tokio::test]
+    async fn admission_queue_counts_all_read_paths_without_changing_fifo() {
+        let manager = ConcurrencyManager::with_disk_read_caps_for_test(1, 1);
+        let clone = manager.clone();
+        let held = manager.acquire_owned_disk_read_permit().await.unwrap();
+        let mut borrowed = Box::pin(manager.acquire_disk_read_permit());
+        assert_eq!(
+            manager.get_object_admission_snapshot().queued,
+            Some(0),
+            "an unpolled future has not queued"
+        );
+        assert!(futures::poll!(borrowed.as_mut()).is_pending());
+        assert!(futures::poll!(borrowed.as_mut()).is_pending());
+        assert_eq!(manager.get_object_admission_snapshot().queued, Some(1), "repeated polls count once");
+        let mut owned = Box::pin(clone.acquire_owned_disk_read_permit());
+        let mut priority = Box::pin(manager.acquire_priority_permit(IoPriority::High));
+        let mut primary = Box::pin(manager.admit_disk_read(Duration::ZERO));
+        let mut timed = Box::pin(manager.admit_disk_read(Duration::from_secs(30)));
+        assert!(futures::poll!(owned.as_mut()).is_pending());
+        assert!(futures::poll!(priority.as_mut()).is_pending());
+        assert!(futures::poll!(primary.as_mut()).is_pending());
+        assert!(futures::poll!(timed.as_mut()).is_pending());
+        assert_eq!(clone.get_object_admission_snapshot().queued, Some(5));
+        drop(owned);
+        assert_eq!(manager.get_object_admission_snapshot().queued, Some(4), "cancellation removes one waiter");
+        drop(held);
+        assert!(
+            futures::poll!(priority.as_mut()).is_pending(),
+            "priority must not steal the oldest reservation"
+        );
+        let first = borrowed.await.unwrap();
+        assert_eq!(manager.get_object_admission_snapshot().queued, Some(3));
+        drop(first);
+        let second = priority.await.unwrap();
+        assert_eq!(manager.get_object_admission_snapshot().queued, Some(2));
+        drop(second);
+        let third = primary.await.unwrap();
+        assert!(matches!(third, DiskReadAdmission::Primary(_)));
+        assert_eq!(manager.get_object_admission_snapshot().queued, Some(1));
+        drop(third);
+        let fourth = timed.await.unwrap();
+        assert!(matches!(fourth, DiskReadAdmission::Primary(_)));
+        assert_eq!(manager.get_object_admission_snapshot().queued, Some(0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_queue_read_timeout_degradation_and_close_release_observations() {
+        let manager = ConcurrencyManager::with_disk_read_caps_for_test(1, 1);
+        let _held = manager.acquire_owned_disk_read_permit().await.unwrap();
+        let mut timed = Box::pin(manager.admit_disk_read(Duration::from_millis(100)));
+        assert!(futures::poll!(timed.as_mut()).is_pending());
+        assert_eq!(manager.get_object_admission_snapshot().queued, Some(1));
+        tokio::time::advance(Duration::from_millis(101)).await;
+        let degraded = timed.await.unwrap();
+        assert!(matches!(degraded, DiskReadAdmission::Degraded(_)));
+        assert_eq!(manager.get_object_admission_snapshot().queued, Some(0));
+        assert!(matches!(
+            manager.admit_disk_read(Duration::from_millis(100)).await.unwrap(),
+            DiskReadAdmission::Rejected
+        ));
+        assert_eq!(manager.get_object_admission_snapshot().queued, Some(0));
+        let mut waiting = Box::pin(manager.admit_disk_read(Duration::ZERO));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        assert_eq!(manager.get_object_admission_snapshot().queued, Some(1));
+        manager.close_disk_read_admission_for_test();
+        assert!(waiting.await.is_err());
+        assert!(manager.acquire_owned_disk_read_permit().await.is_err());
+        assert_eq!(manager.get_object_admission_snapshot().queued, Some(0));
+    }
+
+    #[tokio::test]
+    async fn admission_queue_overflow_stays_unknown_and_ready_path_does_not_count() {
+        let manager = ConcurrencyManager::with_disk_read_caps_for_test(1, 0);
+        let waiters = &manager.disk_read_waiters;
+        waiters.pending.store(usize::MAX - 1, AtomicOrdering::Release);
+        let ready = manager.acquire_owned_disk_read_permit().await.unwrap();
+        assert_eq!(waiters.snapshot(), Some(usize::MAX - 1));
+        let mut first = Box::pin(manager.acquire_owned_disk_read_permit());
+        let mut overflow = Box::pin(manager.acquire_disk_read_permit());
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert_eq!(waiters.snapshot(), Some(usize::MAX));
+        assert!(futures::poll!(overflow.as_mut()).is_pending());
+        assert_eq!(manager.get_object_admission_snapshot().queued, None);
+        drop(first);
+        assert_eq!(waiters.pending.load(AtomicOrdering::Acquire), usize::MAX - 1);
+        drop(overflow);
+        assert_eq!(
+            waiters.pending.load(AtomicOrdering::Acquire),
+            usize::MAX - 1,
+            "uncounted waiters must not decrement"
+        );
+        waiters.pending.store(0, AtomicOrdering::Release);
+        drop(ready);
+        assert!(manager.acquire_disk_read_permit().await.is_ok());
+        assert_eq!(
+            manager.get_object_admission_snapshot().queued,
+            None,
+            "overflow cannot become an idle observation"
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_queue_counts_ordinary_and_multipart_writes_in_both_policies() {
+        let mut large = ConcurrencyManager::new();
+        large.foreground_write_admission_policy = ForegroundWriteAdmissionPolicy::large_with_multipart_queue_for_test(
+            true,
+            1,
+            1,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            1,
+        );
+        for manager in [
+            ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::from_secs(30)),
+            large,
+        ] {
+            let clone = manager.clone();
+            let size = 32 * 1024 * 1024;
+            let held = manager.admit_put_object(size).await.unwrap();
+            assert!(matches!(held, ForegroundWriteAdmission::Admitted(_)));
+            let mut put = Box::pin(manager.admit_put_object(size));
+            let mut part = Box::pin(clone.admit_multipart_part(size));
+            assert_eq!(manager.put_object_admission_snapshot().queued, Some(0));
+            assert!(futures::poll!(put.as_mut()).is_pending());
+            assert!(futures::poll!(put.as_mut()).is_pending());
+            assert!(futures::poll!(part.as_mut()).is_pending());
+            assert_eq!(clone.put_object_admission_snapshot().queued, Some(2));
+            if matches!(manager.foreground_write_admission_policy, ForegroundWriteAdmissionPolicy::Large { .. }) {
+                assert!(matches!(
+                    manager.admit_multipart_part(size).await.unwrap(),
+                    ForegroundWriteAdmission::Rejected
+                ));
+                assert_eq!(
+                    manager.put_object_admission_snapshot().queued,
+                    Some(2),
+                    "a full multipart queue still rejects immediately"
+                );
+            }
+            drop(put);
+            assert_eq!(manager.put_object_admission_snapshot().queued, Some(1));
+            drop(held);
+            assert!(matches!(part.await.unwrap(), ForegroundWriteAdmission::Admitted(_)));
+            assert_eq!(manager.put_object_admission_snapshot().queued, Some(0));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_queue_write_timeout_close_and_cancel_release_observations() {
+        for queued in [false, true] {
+            let gate = ForegroundWriteAdmissionGate::new(1, Duration::from_millis(100));
+            let _held = gate.admit(1).await.unwrap();
+            let acquire = || async {
+                if queued {
+                    gate.admit_queued(Duration::from_millis(100), 1, 1).await
+                } else {
+                    gate.admit(1).await
+                }
+            };
+            let mut timed = Box::pin(acquire());
+            assert!(futures::poll!(timed.as_mut()).is_pending());
+            assert_eq!(gate.waiters.snapshot(), Some(1));
+            tokio::time::advance(Duration::from_millis(101)).await;
+            assert!(matches!(timed.await.unwrap(), ForegroundWriteAdmission::Rejected));
+            assert_eq!(gate.waiters.snapshot(), Some(0));
+            assert_eq!(gate.pending.load(AtomicOrdering::Acquire), 0);
+            let mut cancelled = Box::pin(acquire());
+            assert!(futures::poll!(cancelled.as_mut()).is_pending());
+            drop(cancelled);
+            assert_eq!(gate.waiters.snapshot(), Some(0));
+            assert_eq!(gate.pending.load(AtomicOrdering::Acquire), 0);
+            let mut closed = Box::pin(acquire());
+            assert!(futures::poll!(closed.as_mut()).is_pending());
+            gate.semaphore.close();
+            assert!(closed.await.is_err());
+            assert_eq!(gate.waiters.snapshot(), Some(0));
+            assert_eq!(gate.pending.load(AtomicOrdering::Acquire), 0);
+        }
+    }
+
+    /// Primary pool saturation degrades into the bounded lane, and the hard cap
+    /// rejects with `Rejected` instead of admitting a permit-less read. Dropping
+    /// a permit frees the token so the next admission succeeds again.
+    #[tokio::test(start_paused = true)]
+    async fn test_admit_disk_read_degrades_then_hard_rejects() {
+        let manager = ConcurrencyManager::with_disk_read_caps_for_test(1, 1);
+
+        // Primary permit granted immediately.
+        let primary = match manager.admit_disk_read(Duration::from_millis(100)).await.unwrap() {
+            DiskReadAdmission::Primary(permit) => permit,
+            other => panic!("expected primary admission, got {other:?}"),
+        };
+
+        // Primary pool saturated: next admission waits out the primary timeout
+        // and falls through to the bounded degraded lane.
+        let degraded = match manager.admit_disk_read(Duration::from_millis(100)).await.unwrap() {
+            DiskReadAdmission::Degraded(permit) => permit,
+            other => panic!("expected degraded admission, got {other:?}"),
+        };
+
+        // Both lanes full: hard cap reached, must reject rather than bypass.
+        match manager.admit_disk_read(Duration::from_millis(100)).await.unwrap() {
+            DiskReadAdmission::Rejected => {}
+            other => panic!("expected hard rejection, got {other:?}"),
+        }
+
+        // Releasing the degraded permit re-opens exactly one degraded slot.
+        drop(degraded);
+        match manager.admit_disk_read(Duration::from_millis(100)).await.unwrap() {
+            DiskReadAdmission::Degraded(_permit) => {}
+            other => panic!("expected degraded admission after release, got {other:?}"),
+        }
+
+        // Releasing the primary permit re-opens the primary lane immediately
+        // (no timeout wait), proving EOF/drop returns the token.
+        drop(primary);
+        match manager.admit_disk_read(Duration::from_millis(100)).await.unwrap() {
+            DiskReadAdmission::Primary(_permit) => {}
+            other => panic!("expected primary admission after release, got {other:?}"),
+        }
+    }
+
+    /// With max primary = 1 and degraded = 1, 100 concurrent GETs never hold
+    /// more than `1 + 1` admission tokens simultaneously. Reverting the hard cap
+    /// (unbounded bypass) would let this exceed 2 and fail the test.
+    #[tokio::test(start_paused = true)]
+    async fn test_admit_disk_read_hard_caps_concurrent_admissions() {
+        let manager = std::sync::Arc::new(ConcurrencyManager::with_disk_read_caps_for_test(1, 1));
+        let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let admitted = std::sync::Arc::new(AtomicUsize::new(0));
+        let rejected = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let manager = manager.clone();
+            let in_flight = in_flight.clone();
+            let max_in_flight = max_in_flight.clone();
+            let admitted = admitted.clone();
+            let rejected = rejected.clone();
+            handles.push(tokio::spawn(async move {
+                match manager.admit_disk_read(Duration::from_millis(50)).await.unwrap() {
+                    DiskReadAdmission::Primary(permit) | DiskReadAdmission::Degraded(permit) => {
+                        let current = in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                        max_in_flight.fetch_max(current, AtomicOrdering::SeqCst);
+                        admitted.fetch_add(1, AtomicOrdering::SeqCst);
+                        // Hold the admission token across an await point, as the
+                        // real body transfer does, then release it.
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+                        drop(permit);
+                    }
+                    DiskReadAdmission::Rejected => {
+                        rejected.fetch_add(1, AtomicOrdering::SeqCst);
+                    }
+                    DiskReadAdmission::Unbounded => {
+                        unreachable!("throttling is enabled (primary cap = 1) in this test");
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // The invariant the hard cap guarantees: never more than
+        // primary + degraded = 2 GETs admitted at once.
+        assert!(
+            max_in_flight.load(AtomicOrdering::SeqCst) <= 2,
+            "max concurrent admissions {} exceeded the hard cap of 2",
+            max_in_flight.load(AtomicOrdering::SeqCst)
+        );
+        // Every request is accounted for: admitted or explicitly rejected, never
+        // a permit-less bypass.
+        assert_eq!(admitted.load(AtomicOrdering::SeqCst) + rejected.load(AtomicOrdering::SeqCst), 100);
+        assert!(
+            rejected.load(AtomicOrdering::SeqCst) > 0,
+            "expected some hard rejections under saturation"
+        );
+    }
+
+    /// A primary cap of 0 (throttling disabled) serves every GET without an
+    /// admission token instead of rejecting them, preserving the pre-existing
+    /// "disk read permits disabled" behavior.
+    #[tokio::test(start_paused = true)]
+    async fn test_admit_disk_read_disabled_cap_is_unbounded() {
+        let manager = ConcurrencyManager::with_disk_read_caps_for_test(0, 0);
+        for _ in 0..10 {
+            match manager.admit_disk_read(Duration::from_millis(50)).await.unwrap() {
+                DiskReadAdmission::Unbounded => {}
+                other => panic!("expected unbounded admission when throttling disabled, got {other:?}"),
+            }
+        }
+    }
+
+    /// `primary_wait == 0` preserves the wait-forever opt-out: it always yields
+    /// a primary permit and never degrades or rejects.
+    #[tokio::test]
+    async fn test_admit_disk_read_zero_wait_waits_on_primary() {
+        let manager = ConcurrencyManager::with_disk_read_caps_for_test(1, 1);
+        let held = match manager.admit_disk_read(Duration::ZERO).await.unwrap() {
+            DiskReadAdmission::Primary(permit) => permit,
+            other => panic!("expected primary admission, got {other:?}"),
+        };
+
+        // A second zero-wait admission blocks on the primary pool rather than
+        // degrading; it completes only once the first permit is released.
+        let manager2 = manager.clone();
+        let waiter = tokio::spawn(async move { manager2.admit_disk_read(Duration::ZERO).await.unwrap() });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "zero-wait admission must block on the primary lane");
+
+        drop(held);
+        match waiter.await.unwrap() {
+            DiskReadAdmission::Primary(_permit) => {}
+            other => panic!("expected primary admission after release, got {other:?}"),
+        }
     }
 }

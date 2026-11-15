@@ -1,0 +1,229 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::sync::Arc;
+
+use rustfs_gateway_types::persistence::PersistedLifecycleConfiguration;
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+use crate::bucket::metadata::BucketMetadata;
+use crate::bucket::metadata_sys::{self, ObjectLockConfigState};
+use crate::error::{Error, Result};
+
+#[derive(Debug)]
+pub(crate) struct LifecycleExpiryConfigs {
+    pub(crate) lifecycle: Option<Arc<PersistedLifecycleConfiguration>>,
+    pub(crate) object_lock: Option<Arc<ObjectLockConfiguration>>,
+    pub(crate) bucket_incarnation_id: Uuid,
+    pub(crate) table_bucket_enabled: bool,
+}
+
+async fn get_authoritative_metadata(
+    api: &crate::store::ECStore,
+    bucket: &str,
+    bucket_incarnation_id: Uuid,
+) -> Result<Arc<BucketMetadata>> {
+    let sys = metadata_sys::bucket_metadata_sys_of(&api.ctx)?;
+    let sys = sys.read().await.clone();
+    let metadata = sys.get_authoritative_metadata(bucket).await?;
+    if !metadata.bucket_incarnation_sidecar || metadata.bucket_incarnation_id != bucket_incarnation_id {
+        return Err(Error::other(format!("bucket lifecycle metadata is not authoritative: {bucket}")));
+    }
+    Ok(metadata)
+}
+
+pub(crate) async fn lifecycle_expiry_allowed(
+    api: &crate::store::ECStore,
+    bucket: &str,
+    bucket_incarnation_id: Uuid,
+) -> Result<bool> {
+    Ok(!get_authoritative_metadata(api, bucket, bucket_incarnation_id)
+        .await?
+        .table_bucket_enabled())
+}
+
+/// `get_expiry_configs_for_options` takes the lifecycle rules from this same
+/// cached entry and reads the bucket incarnation only to validate it, so a
+/// cached entry without any lifecycle document cannot produce an expiry.
+/// Uncached, fabricated and creation-pending buckets keep the full path.
+pub(crate) async fn cached_metadata_may_have_lifecycle(api: &crate::store::ECStore, bucket: &str) -> bool {
+    let Ok(sys) = metadata_sys::bucket_metadata_sys_of(&api.ctx) else {
+        return true;
+    };
+    let sys = sys.read().await.clone();
+    match sys.get(bucket).await {
+        Ok(metadata) => {
+            metadata.needs_bucket_creation_commit()
+                || metadata.lifecycle_config.is_some()
+                || !metadata.lifecycle_config_xml.is_empty()
+        }
+        Err(_) => true,
+    }
+}
+
+pub(crate) async fn get_expiry_configs(api: &crate::store::ECStore, bucket: &str) -> Result<LifecycleExpiryConfigs> {
+    get_expiry_configs_for_options(api, bucket, &crate::object_api::ObjectOptions::default()).await
+}
+
+pub(crate) async fn get_expiry_configs_for_options(
+    api: &crate::store::ECStore,
+    bucket: &str,
+    opts: &crate::object_api::ObjectOptions,
+) -> Result<LifecycleExpiryConfigs> {
+    let bucket_incarnation_id = metadata_sys::get_bucket_incarnation_id_for_options_in(&api.ctx, bucket, opts).await?;
+    let metadata = get_authoritative_metadata(api, bucket, bucket_incarnation_id).await?;
+    let table_bucket_enabled = metadata.table_bucket_enabled();
+
+    let lifecycle = if metadata.lifecycle_config.is_none() && !metadata.lifecycle_config_xml.is_empty() {
+        return Err(Error::other("persisted bucket lifecycle configuration is invalid"));
+    } else {
+        metadata
+            .lifecycle_config
+            .clone()
+            .filter(|config| !config.rules.is_empty())
+            .map(Arc::new)
+    };
+    if lifecycle.is_none() {
+        return Ok(LifecycleExpiryConfigs {
+            lifecycle: None,
+            object_lock: None,
+            bucket_incarnation_id,
+            table_bucket_enabled,
+        });
+    }
+    let object_lock = match metadata_sys::object_lock_config_state_from_authoritative_metadata(&metadata)? {
+        ObjectLockConfigState::Configured { config, .. } => Some(Arc::new(config)),
+        ObjectLockConfigState::ConfirmedAbsent => None,
+        ObjectLockConfigState::Fabricated => {
+            return Err(Error::other(format!("bucket Object Lock metadata is not authoritative: {bucket}")));
+        }
+    };
+
+    Ok(LifecycleExpiryConfigs {
+        lifecycle,
+        object_lock,
+        bucket_incarnation_id,
+        table_bucket_enabled,
+    })
+}
+
+pub(crate) async fn get_lifecycle_config(bucket: &str) -> Result<(PersistedLifecycleConfiguration, OffsetDateTime)> {
+    metadata_sys::get_lifecycle_config(bucket).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bucket::metadata::BucketMetadata;
+    use crate::bucket::metadata_sys::{self, test_support::isolated_store_over_temp_disks};
+    use crate::storage_api_contracts::bucket::MakeBucketOptions;
+    use rustfs_gateway_types::persistence::{PersistedLifecycleExpiration, PersistedLifecycleRule};
+    use serial_test::serial;
+
+    fn lifecycle_config() -> PersistedLifecycleConfiguration {
+        PersistedLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![PersistedLifecycleRule {
+                status: "Enabled".to_owned(),
+                expiration: Some(PersistedLifecycleExpiration {
+                    days: Some(1),
+                    ..Default::default()
+                }),
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("expire".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn expiry_configs_are_resolved_from_the_owning_store() {
+        let (_dirs_a, store_a) = isolated_store_over_temp_disks().await;
+        let (_dirs_b, store_b) = isolated_store_over_temp_disks().await;
+        let bucket = "same-name-expiry-config";
+        store_a
+            .peer_sys
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .unwrap();
+        store_b
+            .peer_sys
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .unwrap();
+        metadata_sys::init_bucket_metadata_sys(store_a.clone(), vec![bucket.to_string()]).await;
+        metadata_sys::init_bucket_metadata_sys(store_b.clone(), vec![bucket.to_string()]).await;
+
+        let mut metadata = BucketMetadata::new(bucket);
+        let lifecycle = lifecycle_config();
+        metadata.lifecycle_config_xml = crate::bucket::utils::serialize(&lifecycle).unwrap();
+        metadata.lifecycle_config = Some(lifecycle);
+        metadata.table_bucket_config_json = br#"{"enabled":true}"#.to_vec();
+        metadata_sys::set_new_bucket_metadata_in(&store_a.ctx, metadata)
+            .await
+            .unwrap();
+        metadata_sys::set_new_bucket_metadata_in(&store_b.ctx, BucketMetadata::new(bucket))
+            .await
+            .unwrap();
+
+        let configs = get_expiry_configs(&store_a, bucket).await.unwrap();
+        assert!(configs.lifecycle.is_some());
+        assert!(configs.table_bucket_enabled);
+        assert!(
+            !lifecycle_expiry_allowed(&store_a, bucket, configs.bucket_incarnation_id)
+                .await
+                .unwrap()
+        );
+        assert!(get_expiry_configs(&store_b, bucket).await.unwrap().lifecycle.is_none());
+
+        let snapshot = store_a.object_lock_config_snapshot(bucket).await.unwrap();
+        assert_eq!(
+            snapshot.validated_bucket_incarnation_for(store_a.id, bucket, Some(configs.bucket_incarnation_id)),
+            Some(configs.bucket_incarnation_id)
+        );
+        assert_eq!(
+            snapshot.validated_bucket_incarnation_for(store_a.id, bucket, Some(uuid::Uuid::new_v4())),
+            None
+        );
+        assert_eq!(snapshot.validated_bucket_incarnation_for(store_b.id, bucket, None), None);
+        let opts = crate::object_api::ObjectOptions {
+            object_lock_config_snapshot: Some(snapshot.clone()),
+            expected_bucket_incarnation_id: Some(configs.bucket_incarnation_id),
+            ..Default::default()
+        };
+        assert_eq!(
+            get_expiry_configs_for_options(&store_a, bucket, &opts)
+                .await
+                .unwrap()
+                .bucket_incarnation_id,
+            configs.bucket_incarnation_id
+        );
+        let unguarded = crate::object_api::ObjectLockConfigSnapshot::for_store_bucket(
+            store_a.id,
+            bucket,
+            configs.bucket_incarnation_id,
+            time::OffsetDateTime::UNIX_EPOCH,
+            metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+        );
+        assert_eq!(unguarded.validated_bucket_incarnation_for(store_a.id, bucket, None), None);
+    }
+}

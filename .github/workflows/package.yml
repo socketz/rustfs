@@ -1,0 +1,53 @@
+# Copyright 2026 RustFS Team
+# SPDX-License-Identifier: Apache-2.0
+name: Build candidate packages
+on:
+  workflow_call:
+    inputs:
+      candidate_manifest:
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux-x86_64-musl, linux-aarch64-musl, linux-x86_64-gnu, linux-aarch64-gnu]
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          ref: ${{ fromJson(inputs.candidate_manifest).source_sha }}
+          persist-credentials: false
+      - name: Reuse completed package set
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_MANIFEST: ${{ inputs.candidate_manifest }}
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/release/deliver.py reuse --kind packages --target "$TARGET"
+      - name: Install packaging tools
+        if: steps.reuse.outputs.reused != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm fakeroot cpio
+          sudo gem install fpm --version 1.17.0 --no-document
+      - name: Package accepted executable and verify contents
+        if: steps.reuse.outputs.reused != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_MANIFEST: ${{ inputs.candidate_manifest }}
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/release/deliver.py package --target "$TARGET" --output delivery
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.reuse.outputs.reused != 'true'
+        with:
+          name: packages-${{ matrix.target }}
+          path: delivery/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

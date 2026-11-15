@@ -12,672 +12,660 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::site_replication_reconcile::spawn_site_replication_reconcile_task;
+use crate::storage_api::startup::services::{ECStore, EndpointServerPools, ServerContextSlot, StorageAdminApi};
 use crate::{
     config::Config,
-    init::{
-        add_bucket_notification_configuration, init_auto_tuner, init_buffer_profile_system, init_kms_system, init_update_check,
-        print_server_info,
+    connect::{
+        CoarseNodeSummary, HeartbeatConfig, HeartbeatError, HeartbeatRuntime, InventoryError, InventoryFlag, InventoryRuntime,
+        InventorySchedule, InventorySnapshot, LocalTraceCaptureRuntime, runtime::heartbeat_failure_reason,
+        spawn_heartbeat_runtime, spawn_inventory_runtime, spawn_local_trace_capture_runtime,
     },
-    server::{
-        ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
-        start_audit_system, stop_audit_system, wait_for_shutdown,
-    },
-    startup_iam::{IamBootstrapDisposition, bootstrap_or_defer_iam_init, publish_ready_for_iam_bootstrap},
-    startup_protocols::{ProtocolShutdownSenders, init_protocol_shutdown_senders},
+    init::{init_buffer_profile_system, init_kms_system},
+    server::ServiceStateManager,
+    startup_audit::init_audit_runtime,
+    startup_auth::init_auth_integrations,
+    startup_background::init_background_service_runtime,
+    startup_bucket_metadata::{init_bucket_metadata_runtime, init_embedded_bucket_metadata_runtime},
+    startup_deadlock::init_deadlock_detector_runtime,
+    startup_embedded_optional::init_embedded_optional_service_runtime,
+    startup_iam::{IamBootstrapDisposition, init_embedded_iam_runtime, init_iam_runtime},
+    startup_notification::{init_embedded_notification_runtime, init_notification_runtime},
+    startup_observability::init_observability_runtime,
+    startup_optional_runtime_sidecars::{OptionalRuntimeServices, init_optional_runtime_services},
 };
-use futures_util::future::join_all;
-use rustfs_audit::AuditResult;
 use rustfs_common::GlobalReadiness;
-use rustfs_ecstore::{
-    bucket::{
-        metadata_sys::init_bucket_metadata_sys,
-        migration::{try_migrate_bucket_metadata, try_migrate_iam_config},
-        replication::get_global_replication_pool,
-    },
-    endpoints::EndpointServerPools,
-    global::shutdown_background_services,
-    notification_sys::new_global_notification_sys,
-    store::ECStore,
-    store_api::BucketOperations,
-};
-use rustfs_heal::{
-    create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
-};
-use rustfs_iam::init_oidc_sys;
-use rustfs_obs::init_metrics_runtime;
-use rustfs_scanner::init_data_scanner;
-use rustfs_storage_api::BucketOptions;
-use rustfs_utils::get_env_bool_with_aliases;
-use std::{
-    future::Future,
-    io::{Error, Result},
-    sync::Arc,
-};
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use std::{collections::BTreeSet, io::Result, sync::Arc};
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
-const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
-const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
-const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
-const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
-const LOG_COMPONENT_MAIN: &str = "main";
-const LOG_SUBSYSTEM_STARTUP: &str = "startup";
-const LOG_SUBSYSTEM_AUTH: &str = "auth";
-const EVENT_AUDIT_SYSTEM_STATE: &str = "audit_system_state";
-const EVENT_PROTOCOL_SYSTEM_STATE: &str = "protocol_system_state";
-const EVENT_DEADLOCK_DETECTOR_STATE: &str = "deadlock_detector_state";
-const EVENT_KEYSTONE_AUTH_INITIALIZED: &str = "keystone_auth_initialized";
-const EVENT_KEYSTONE_AUTH_INITIALIZATION_FAILED: &str = "keystone_auth_initialization_failed";
-const EVENT_OIDC_INITIALIZATION_FAILED: &str = "oidc_initialization_failed";
-const EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED: &str = "notification_system_initialization_failed";
-const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
-const EVENT_SERVER_READY: &str = "server_ready";
-const EVENT_SHUTDOWN_SIGNAL_RECEIVED: &str = "shutdown_signal_received";
-const EVENT_BACKGROUND_SERVICE_SHUTDOWN: &str = "background_service_shutdown";
-const EVENT_EVENT_NOTIFIER_SHUTDOWN: &str = "event_notifier_shutdown";
-const EVENT_PROFILING_SHUTDOWN: &str = "profiling_shutdown";
-const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
+const EVENT_DRIVE_UNAVAILABLE: &str = "drive_unavailable";
+const LOG_COMPONENT_CONNECT: &str = "connect";
+const LOG_SUBSYSTEM_INVENTORY: &str = "inventory";
 
-pub struct StartupServiceRuntime {
-    pub protocol_shutdowns: ProtocolShutdownSenders,
-    pub iam_bootstrap: IamBootstrapDisposition,
-    pub enable_scanner: bool,
+pub(crate) struct StartupServiceRuntime {
+    pub(crate) table_maintenance: Option<crate::table_catalog::PeriodicMaintenanceRuntime>,
+    pub(crate) oidc_recovery: Option<AbortOnDropHandle<()>>,
+    pub(crate) optional_runtimes: OptionalRuntimeServices,
+    pub(crate) heartbeat: Option<HeartbeatRuntime>,
+    pub(crate) inventory: Option<InventoryRuntime>,
+    pub(crate) local_trace_capture: Option<LocalTraceCaptureRuntime>,
+    pub(crate) iam_bootstrap: IamBootstrapDisposition,
+    pub(crate) enable_scanner: bool,
 }
 
-pub struct StartupRuntimeLifecycle {
-    pub server_address: String,
-    pub state_manager: Arc<ServiceStateManager>,
-    pub s3_shutdown_tx: Option<ShutdownHandle>,
-    pub console_shutdown_tx: Option<ShutdownHandle>,
-    pub service_runtime: StartupServiceRuntime,
-    pub store: Arc<ECStore>,
-    pub shutdown_token: CancellationToken,
-    pub readiness: Arc<GlobalReadiness>,
+pub(crate) struct EmbeddedStartupServiceRuntime {
+    pub(crate) iam_bootstrap: IamBootstrapDisposition,
 }
 
-pub async fn init_startup_runtime_services(
+pub(crate) async fn init_embedded_startup_runtime_services(
+    config: &Config,
+    endpoint_pools: EndpointServerPools,
+    store: Arc<ECStore>,
+    ctx: CancellationToken,
+    readiness: Arc<GlobalReadiness>,
+    server_ctx: Arc<ServerContextSlot>,
+) -> Result<EmbeddedStartupServiceRuntime> {
+    init_embedded_optional_service_runtime(config, store.clone()).await;
+    let buckets = init_embedded_bucket_metadata_runtime(store.clone(), &ctx).await?;
+    let iam_bootstrap = init_embedded_iam_runtime(store, ctx, readiness, server_ctx)
+        .await
+        .map_err(|err| std::io::Error::other(format!("IAM bootstrap setup: {err}")))?;
+    init_embedded_notification_runtime(endpoint_pools, buckets).await;
+
+    Ok(EmbeddedStartupServiceRuntime { iam_bootstrap })
+}
+
+pub(crate) async fn init_startup_runtime_services(
     config: &Config,
     endpoint_pools: EndpointServerPools,
     store: Arc<ECStore>,
     ctx: CancellationToken,
     readiness: Arc<GlobalReadiness>,
     state_manager: Arc<ServiceStateManager>,
+    server_ctx: Arc<ServerContextSlot>,
 ) -> Result<StartupServiceRuntime> {
-    init_kms_system(config).await?;
+    let maintenance_config = crate::table_catalog::PeriodicMaintenanceConfig::from_env().map_err(std::io::Error::other)?;
+    init_kms_system(config, store.clone()).await?;
 
-    let protocol_shutdowns = init_protocol_shutdown_senders().await?;
+    let optional_runtimes = init_optional_runtime_services(server_ctx.clone()).await?;
+    let heartbeat_config = HeartbeatConfig::from_env().map_err(std::io::Error::other)?;
+    let local_trace_capture = heartbeat_config
+        .as_ref()
+        .and_then(HeartbeatConfig::state_root)
+        .map(|state_root| spawn_local_trace_capture_runtime(state_root, &ctx))
+        .transpose()
+        .map_err(std::io::Error::other)?;
+    let heartbeat_nodes = heartbeat_config.as_ref().map(|_| endpoint_pools.get_nodes().len());
+    let inventory_drives = heartbeat_config
+        .as_ref()
+        .map(|_| endpoint_pools.as_ref().iter().map(|pool| pool.endpoints.as_ref().len()).sum());
 
     init_buffer_profile_system(config);
-    init_audit_runtime().await;
     init_deadlock_detector_runtime();
 
     let buckets = init_bucket_metadata_runtime(store.clone(), ctx.clone()).await?;
-    let iam_bootstrap = init_iam_runtime(store.clone(), ctx.clone(), readiness, state_manager).await?;
-    init_auth_integrations().await?;
+    let iam_bootstrap = init_iam_runtime(store.clone(), ctx.clone(), readiness, state_manager, server_ctx.clone()).await?;
+
+    // Audit initialization requires the AppContext (server config + object store)
+    // which is published by ensure_startup_after_iam inside init_iam_runtime.
+    init_audit_runtime().await;
+    // Unconditional: deferred IAM recovers in the background and has no callback into this
+    // scheduler, so gating on the inline disposition would leave a recovered node with
+    // self-pointing replication rules until the next restart. The task waits for IAM and
+    // bucket metadata itself, and its first pass runs off this path.
+    spawn_site_replication_reconcile_task(ctx.clone());
+    let oidc_recovery = init_auth_integrations(ctx.child_token()).await?;
     init_notification_runtime(endpoint_pools, buckets).await?;
     let enable_scanner = init_background_service_runtime(store.clone()).await?;
-    init_observability_runtime(ctx.clone()).await;
+    init_observability_runtime(store.clone(), ctx.clone()).await;
+    let heartbeat = start_heartbeat_runtime(heartbeat_config.clone(), heartbeat_nodes, &ctx)?;
+    let inventory = start_inventory_runtime(heartbeat_config, heartbeat_nodes, inventory_drives, store, &ctx)?;
+
+    let table_maintenance =
+        maintenance_config.map(|config| crate::table_catalog::PeriodicMaintenanceRuntime::spawn(config, server_ctx, &ctx));
 
     Ok(StartupServiceRuntime {
-        protocol_shutdowns,
+        table_maintenance,
+        oidc_recovery,
+        optional_runtimes,
+        heartbeat,
+        inventory,
+        local_trace_capture,
         iam_bootstrap,
         enable_scanner,
     })
 }
 
-pub async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifecycle) -> Result<()> {
-    let StartupRuntimeLifecycle {
-        server_address,
-        state_manager,
-        s3_shutdown_tx,
-        console_shutdown_tx,
-        service_runtime,
-        store,
-        shutdown_token,
-        readiness,
-    } = lifecycle;
-    let StartupServiceRuntime {
-        protocol_shutdowns,
-        iam_bootstrap,
-        enable_scanner,
-    } = service_runtime;
-
-    info!(
-        target: "rustfs::main::run",
-        event = EVENT_SERVER_READY,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        version = %crate::version::get_version(),
-        server_address = %server_address,
-        started_at = %jiff::Zoned::now(),
-        iam_bootstrap = ?iam_bootstrap,
-        "RustFS server ready"
-    );
-    publish_ready_for_iam_bootstrap(iam_bootstrap, readiness.as_ref(), Some(state_manager.as_ref())).await?;
-    rustfs_common::set_global_init_time_now().await;
-
-    if enable_scanner {
-        init_data_scanner(shutdown_token.clone(), store).await;
+fn start_heartbeat_runtime(
+    config: Option<HeartbeatConfig>,
+    node_count: Option<usize>,
+    shutdown: &CancellationToken,
+) -> Result<Option<HeartbeatRuntime>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    if !config.transport_enabled() {
+        return Ok(None);
     }
-
-    let shutdown_signal = wait_for_shutdown().await;
-    handle_shutdown(
-        &state_manager,
-        shutdown_signal,
-        s3_shutdown_tx,
-        console_shutdown_tx,
-        protocol_shutdowns,
-        shutdown_token,
-    )
-    .await;
-
-    info!(
-        target: "rustfs::main::run",
-        event = EVENT_SERVER_SHUTDOWN_STATE,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        state = ?state_manager.current_state(),
-        result = "stopped",
-        "RustFS server stopped"
-    );
-    Ok(())
+    let summary = u16::try_from(node_count.unwrap_or_default())
+        .ok()
+        .and_then(|total| CoarseNodeSummary::new(total, 0, 0).ok())
+        .ok_or_else(|| std::io::Error::other("Connect heartbeat node count is outside protocol bounds"))?;
+    spawn_heartbeat_runtime(Some(config), shutdown, move || summary).map_err(startup_heartbeat_error)
 }
 
-async fn init_audit_runtime() {
-    match init_event_notifier_and_audit().await {
-        Ok(()) => info!(
-            target: "rustfs::main::run",
-            event = EVENT_AUDIT_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            state = "started",
-            "Audit runtime started"
-        ),
-        Err(e) => error!(
-            target: "rustfs::main::run",
-            event = EVENT_AUDIT_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            state = "start_failed",
-            error = %e,
-            "Audit runtime failed to start"
-        ),
-    }
+fn startup_heartbeat_error(error: HeartbeatError) -> std::io::Error {
+    std::io::Error::other(heartbeat_failure_reason(&error))
 }
 
-fn init_deadlock_detector_runtime() {
-    let detector = crate::storage::deadlock_detector::get_deadlock_detector();
-    if detector.is_enabled() {
-        detector.start();
-        info!(
-            target: "rustfs::main::run",
-            event = EVENT_DEADLOCK_DETECTOR_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            state = "started",
-            "Deadlock detector started"
-        );
-    } else {
-        info!(
-            target: "rustfs::main::run",
-            event = EVENT_DEADLOCK_DETECTOR_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            state = "disabled",
-            "Deadlock detector disabled"
-        );
-    }
-}
-
-async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: CancellationToken) -> Result<Vec<String>> {
-    let buckets_list = store
-        .list_bucket(&BucketOptions {
-            no_metadata: true,
-            ..Default::default()
-        })
-        .await
-        .map_err(Error::other)?;
-
-    let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
-
-    try_migrate_bucket_metadata(store.clone()).await;
-
-    if let Some(pool) = get_global_replication_pool() {
-        pool.init_resync(ctx, buckets.clone()).await?;
-    }
-
-    try_migrate_iam_config(store.clone()).await;
-    init_bucket_metadata_sys(store, buckets.clone()).await;
-
-    Ok(buckets)
-}
-
-async fn init_iam_runtime(
+fn start_inventory_runtime(
+    config: Option<HeartbeatConfig>,
+    node_count: Option<usize>,
+    expected_drive_count: Option<usize>,
     store: Arc<ECStore>,
-    ctx: CancellationToken,
-    readiness: Arc<GlobalReadiness>,
-    state_manager: Arc<ServiceStateManager>,
-) -> Result<IamBootstrapDisposition> {
-    let kms_interface = rustfs_kms::get_global_kms_service_manager().unwrap_or_else(rustfs_kms::init_global_kms_service_manager);
-    bootstrap_or_defer_iam_init(store, kms_interface, readiness, Some(state_manager), Some(ctx)).await
-}
-
-async fn init_auth_integrations() -> Result<()> {
-    let keystone_config = rustfs_keystone::KeystoneConfig::from_env().map_err(Error::other)?;
-    if keystone_config.enable {
-        match crate::auth_keystone::init_keystone_auth(keystone_config).await {
-            Ok(_) => info!(
-                event = EVENT_KEYSTONE_AUTH_INITIALIZED,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_AUTH,
-                "Initialized Keystone authentication"
-            ),
-            Err(e) => {
-                error!(
-                    event = EVENT_KEYSTONE_AUTH_INITIALIZATION_FAILED,
-                    component = LOG_COMPONENT_MAIN,
-                    subsystem = LOG_SUBSYSTEM_AUTH,
-                    error = %e,
-                    "Failed to initialize Keystone authentication"
-                );
-            }
+    shutdown: &CancellationToken,
+) -> Result<Option<InventoryRuntime>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let node_count = node_count.unwrap_or_default();
+    let expected_drive_count = expected_drive_count.unwrap_or_default();
+    spawn_inventory_runtime(Some(config), InventorySchedule::default(), shutdown, move || {
+        let store = store.clone();
+        async move {
+            let info = StorageAdminApi::storage_info(store.as_ref()).await;
+            inventory_snapshot(node_count, expected_drive_count, info)
         }
-    }
-
-    if let Err(e) = init_oidc_sys().await {
-        warn!(
-            event = EVENT_OIDC_INITIALIZATION_FAILED,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_AUTH,
-            error = %e,
-            "OIDC initialization failed; continuing without OIDC providers"
-        );
-    }
-
-    Ok(())
-}
-
-async fn init_notification_runtime(endpoint_pools: EndpointServerPools, buckets: Vec<String>) -> Result<()> {
-    add_bucket_notification_configuration(buckets).await;
-
-    init_notification_system(endpoint_pools).await.map_err(|err| {
-        error!(
-            event = EVENT_NOTIFICATION_SYSTEM_INITIALIZATION_FAILED,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            error = ?err,
-            "Failed to initialize notification system"
-        );
-        Error::other(err)
     })
+    .map_err(std::io::Error::other)
 }
 
-async fn init_background_service_runtime(store: Arc<ECStore>) -> Result<bool> {
-    let _ = create_ahm_services_cancel_token();
-
-    let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
-    let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
-
-    info!(
-        target: "rustfs::main::run",
-        event = EVENT_BACKGROUND_SERVICES_CONFIGURED,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        enable_scanner = enable_scanner,
-        enable_heal = enable_heal,
-        "Background services configured"
-    );
-
-    if enable_heal || enable_scanner {
-        let heal_storage = Arc::new(ECStoreHealStorage::new(store));
-        init_heal_manager(heal_storage, None).await?;
+fn inventory_snapshot(
+    node_count: usize,
+    expected_drive_count: usize,
+    info: rustfs_madmin::StorageInfo,
+) -> std::result::Result<InventorySnapshot, InventoryError> {
+    let drive_count = inventory_topology_slot_count(&info, expected_drive_count)?;
+    let (total, free) = inventory_capacity(&info)?;
+    let mut flags = Vec::with_capacity(3);
+    if info.disks.iter().any(|disk| !inventory_disk_is_healthy(disk)) {
+        flags.push(InventoryFlag::ClusterDegraded);
     }
-
-    if !enable_heal && !enable_scanner {
-        debug!(
-            target: "rustfs::main::run",
-            event = EVENT_BACKGROUND_SERVICES_CONFIGURED,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            enable_scanner = false,
-            enable_heal = false,
-            ahm_state = "skipped",
-            reason = "disabled",
-            "Background services disabled"
+    let offline_drive_count = info.disks.iter().filter(|disk| inventory_disk_is_offline(disk)).count();
+    if offline_drive_count > 0 {
+        tracing::warn!(
+            target: "rustfs::connect::inventory",
+            event = EVENT_DRIVE_UNAVAILABLE,
+            component = LOG_COMPONENT_CONNECT,
+            subsystem = LOG_SUBSYSTEM_INVENTORY,
+            offline_drive_count,
+            "Connect inventory detected unavailable drives"
         );
+        flags.push(InventoryFlag::DriveOffline);
     }
-
-    Ok(enable_scanner)
+    if info.disks.iter().any(|disk| disk.healing) {
+        flags.push(InventoryFlag::ClusterHealing);
+    }
+    InventorySnapshot::current(node_count, drive_count, total, free, flags)
 }
 
-async fn init_observability_runtime(ctx: CancellationToken) {
-    print_server_info();
-    init_update_check();
-    crate::allocator_reclaim::init_allocator_reclaim(ctx.clone());
-
-    if rustfs_obs::observability_metric_enabled() {
-        init_metrics_runtime(ctx.clone());
-        crate::memory_observability::init_memory_observability(ctx.clone());
-        init_auto_tuner(ctx).await;
+fn inventory_topology_slot_count(
+    info: &rustfs_madmin::StorageInfo,
+    expected_drive_count: usize,
+) -> std::result::Result<usize, InventoryError> {
+    let total_sets = &info.backend.total_sets;
+    let drives_per_set = &info.backend.drives_per_set;
+    let geometry_drive_count = if total_sets.is_empty()
+        || total_sets.len() != drives_per_set.len()
+        || total_sets.contains(&0)
+        || drives_per_set.contains(&0)
+    {
+        None
+    } else {
+        total_sets
+            .iter()
+            .zip(drives_per_set)
+            .try_fold(0_usize, |total, (&sets, &drives)| {
+                sets.checked_mul(drives).and_then(|pool| total.checked_add(pool))
+            })
+    };
+    if geometry_drive_count != Some(expected_drive_count) {
+        return Err(InventoryError::SnapshotIncomplete {
+            expected: expected_drive_count,
+            observed: 0,
+        });
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackgroundShutdownStep {
-    DataScanner,
-    Ahm,
-}
-
-fn background_shutdown_steps(enable_scanner: bool, enable_heal: bool) -> Vec<BackgroundShutdownStep> {
-    let mut steps = Vec::with_capacity(2);
-    if enable_scanner {
-        steps.push(BackgroundShutdownStep::DataScanner);
-    }
-    if enable_heal || enable_scanner {
-        steps.push(BackgroundShutdownStep::Ahm);
-    }
-    steps
-}
-
-async fn handle_shutdown(
-    state_manager: &ServiceStateManager,
-    shutdown_signal: ShutdownSignal,
-    s3_shutdown_handle: Option<ShutdownHandle>,
-    console_shutdown_handle: Option<ShutdownHandle>,
-    protocols: ProtocolShutdownSenders,
-    ctx: CancellationToken,
-) {
-    let ProtocolShutdownSenders {
-        ftp: ftp_shutdown_tx,
-        ftps: ftps_shutdown_tx,
-        webdav: webdav_shutdown_tx,
-        sftp: sftp_shutdown_tx,
-    } = protocols;
-    ctx.cancel();
-
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        event = EVENT_SHUTDOWN_SIGNAL_RECEIVED,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        signal = shutdown_signal.log_label(),
-        "Shutdown signal received"
-    );
-    state_manager.update(ServiceState::Stopping);
-
-    let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
-    let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
-
-    let background_steps = background_shutdown_steps(enable_scanner, enable_heal);
-    for step in &background_steps {
-        match step {
-            BackgroundShutdownStep::DataScanner => {
-                info!(
-                    target: "rustfs::main::handle_shutdown",
-                    event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-                    component = LOG_COMPONENT_MAIN,
-                    subsystem = LOG_SUBSYSTEM_STARTUP,
-                    service = "data_scanner",
-                    state = "stopping",
-                    "Background service shutdown started"
-                );
-                shutdown_background_services();
+    let mut slots = BTreeSet::new();
+    let mut invalid = false;
+    for disk in &info.disks {
+        let key = match (
+            usize::try_from(disk.pool_index),
+            usize::try_from(disk.set_index),
+            usize::try_from(disk.disk_index),
+        ) {
+            (Ok(pool_index), Ok(set_index), Ok(disk_index)) => (pool_index, set_index, disk_index),
+            _ => {
+                invalid = true;
+                continue;
             }
-            BackgroundShutdownStep::Ahm => {
-                info!(
-                    target: "rustfs::main::handle_shutdown",
-                    event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-                    component = LOG_COMPONENT_MAIN,
-                    subsystem = LOG_SUBSYSTEM_STARTUP,
-                    service = "ahm",
-                    state = "stopping",
-                    "Background service shutdown started"
-                );
-                shutdown_ahm_services();
+        };
+        if key.0 >= total_sets.len() || key.1 >= total_sets[key.0] || key.2 >= drives_per_set[key.0] {
+            invalid = true;
+            continue;
+        }
+        if !slots.insert(key) {
+            invalid = true;
+        }
+    }
+    if invalid || slots.len() != expected_drive_count {
+        return Err(InventoryError::SnapshotIncomplete {
+            expected: expected_drive_count,
+            observed: slots.len(),
+        });
+    }
+    Ok(slots.len())
+}
+
+fn inventory_disk_is_healthy(disk: &rustfs_madmin::Disk) -> bool {
+    let disk_state_is_healthy = ["ok", rustfs_madmin::ITEM_ONLINE, "unformatted"]
+        .iter()
+        .any(|state| disk.state.eq_ignore_ascii_case(state));
+    let runtime_state_is_healthy = disk.runtime_state.as_deref().is_none_or(|runtime_state| {
+        [rustfs_madmin::ITEM_ONLINE, "returning"]
+            .iter()
+            .any(|state| runtime_state.eq_ignore_ascii_case(state))
+    });
+    disk_state_is_healthy && runtime_state_is_healthy
+}
+
+fn inventory_disk_is_offline(disk: &rustfs_madmin::Disk) -> bool {
+    [rustfs_madmin::ITEM_OFFLINE, "missing", "disk not found"]
+        .iter()
+        .any(|state| disk.state.eq_ignore_ascii_case(state))
+        || disk.runtime_state.as_deref().is_some_and(|runtime_state| {
+            [rustfs_madmin::ITEM_OFFLINE, "missing"]
+                .iter()
+                .any(|state| runtime_state.eq_ignore_ascii_case(state))
+        })
+}
+
+fn inventory_capacity(info: &rustfs_madmin::StorageInfo) -> std::result::Result<(u64, u64), InventoryError> {
+    let configured_data_widths = (!info.backend.standard_sc_data.is_empty()).then_some(info.backend.standard_sc_data.as_slice());
+    aggregate_inventory_capacity(&info.disks, configured_data_widths)
+}
+
+fn aggregate_inventory_capacity(
+    disks: &[rustfs_madmin::Disk],
+    data_widths: Option<&[usize]>,
+) -> std::result::Result<(u64, u64), InventoryError> {
+    let mut seen = BTreeSet::new();
+    let mut indexed = Vec::with_capacity(disks.len());
+    for disk in disks {
+        let key = match (
+            usize::try_from(disk.pool_index),
+            usize::try_from(disk.set_index),
+            usize::try_from(disk.disk_index),
+        ) {
+            (Ok(pool_index), Ok(set_index), Ok(disk_index)) => (pool_index, set_index, disk_index),
+            _ => {
+                return Err(InventoryError::SnapshotIncomplete {
+                    expected: disks.len(),
+                    observed: indexed.len(),
+                });
             }
+        };
+        if seen.insert(key) {
+            indexed.push((key, disk));
         }
     }
 
-    if background_steps.is_empty() {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            service = "ahm",
-            state = "skipped",
-            reason = "disabled",
-            "Background service shutdown skipped"
-        );
+    let usable_widths = data_widths.filter(|widths| {
+        indexed
+            .iter()
+            .all(|((pool_index, _, _), _)| widths.get(*pool_index).is_some_and(|width| *width > 0))
+    });
+    let mut total = 0_u64;
+    let mut free = 0_u64;
+    let mut included = 0;
+    for ((pool_index, _, disk_index), disk) in indexed {
+        let include = match usable_widths {
+            Some(widths) => disk_index < widths[pool_index],
+            None => {
+                let state = disk.state.trim().to_ascii_lowercase();
+                !state.contains("offline") && !state.contains("not found")
+            }
+        };
+        if !include {
+            continue;
+        }
+        included += 1;
+        total = total.checked_add(disk.total_space).ok_or(InventoryError::Capacity)?;
+        free = free.checked_add(disk.available_space).ok_or(InventoryError::Capacity)?;
     }
-
-    let mut protocol_shutdowns = Vec::new();
-    if let Some(ftp_shutdown_tx) = ftp_shutdown_tx {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_PROTOCOL_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            protocol = "ftp",
-            state = "stopping",
-            "Protocol runtime stopping"
-        );
-        protocol_shutdowns.push(ftp_shutdown_tx.shutdown());
+    if !disks.is_empty() && included == 0 {
+        return Err(InventoryError::SnapshotIncomplete {
+            expected: disks.len(),
+            observed: 0,
+        });
     }
-
-    if let Some(ftps_shutdown_tx) = ftps_shutdown_tx {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_PROTOCOL_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            protocol = "ftps",
-            state = "stopping",
-            "Protocol runtime stopping"
-        );
-        protocol_shutdowns.push(ftps_shutdown_tx.shutdown());
-    }
-
-    if let Some(webdav_shutdown_tx) = webdav_shutdown_tx {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_PROTOCOL_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            protocol = "webdav",
-            state = "stopping",
-            "Protocol runtime stopping"
-        );
-        protocol_shutdowns.push(webdav_shutdown_tx.shutdown());
-    }
-
-    if let Some(sftp_shutdown_tx) = sftp_shutdown_tx {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_PROTOCOL_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            protocol = "sftp",
-            state = "stopping",
-            "Protocol runtime stopping"
-        );
-        protocol_shutdowns.push(sftp_shutdown_tx.shutdown());
-    }
-
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        event = EVENT_EVENT_NOTIFIER_SHUTDOWN,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        state = "stopping",
-        "Event notifier shutdown started"
-    );
-    shutdown_event_notifier().await;
-
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        event = EVENT_AUDIT_SYSTEM_STATE,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        state = "stopping",
-        "Audit runtime stopping"
-    );
-    match stop_audit_system().await {
-        Ok(_) => info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_AUDIT_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            state = "stopped",
-            "Audit runtime stopped"
-        ),
-        Err(e) => error!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_AUDIT_SYSTEM_STATE,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            state = "stop_failed",
-            error = %e,
-            "Audit runtime failed to stop"
-        ),
-    }
-
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        event = EVENT_PROFILING_SHUTDOWN,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        state = "stopping",
-        "Profiling shutdown started"
-    );
-    crate::profiling::shutdown_profiling();
-
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        event = EVENT_SERVER_SHUTDOWN_STATE,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        state = "stopping",
-        "RustFS server stopping"
-    );
-    if let Some(s3_shutdown_handle) = s3_shutdown_handle {
-        s3_shutdown_handle.shutdown().await;
-    }
-    if let Some(console_shutdown_handle) = console_shutdown_handle {
-        console_shutdown_handle.shutdown().await;
-    }
-    join_all(protocol_shutdowns).await;
-
-    state_manager.update(ServiceState::Stopped);
-    info!(
-        target: "rustfs::main::handle_shutdown",
-        event = EVENT_SERVER_SHUTDOWN_STATE,
-        component = LOG_COMPONENT_MAIN,
-        subsystem = LOG_SUBSYSTEM_STARTUP,
-        state = "stopped",
-        "RustFS server stopped"
-    );
-}
-
-pub async fn init_event_notifier_and_audit() -> AuditResult<()> {
-    init_event_notifier_and_audit_with(init_event_notifier, start_audit_system).await
-}
-
-async fn init_event_notifier_and_audit_with<NotifyFn, NotifyFuture, AuditFn, AuditFuture>(
-    notify: NotifyFn,
-    start_audit: AuditFn,
-) -> AuditResult<()>
-where
-    NotifyFn: FnOnce() -> NotifyFuture,
-    NotifyFuture: Future<Output = ()>,
-    AuditFn: FnOnce() -> AuditFuture,
-    AuditFuture: Future<Output = AuditResult<()>>,
-{
-    notify().await;
-    start_audit().await
-}
-
-pub async fn init_notification_system(endpoint_pools: EndpointServerPools) -> rustfs_ecstore::error::Result<()> {
-    init_notification_system_with(|| new_global_notification_sys(endpoint_pools)).await
-}
-
-async fn init_notification_system_with<InitFn, InitFuture>(init_notification: InitFn) -> rustfs_ecstore::error::Result<()>
-where
-    InitFn: FnOnce() -> InitFuture,
-    InitFuture: Future<Output = rustfs_ecstore::error::Result<()>>,
-{
-    init_notification().await
+    Ok((total, free))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BackgroundShutdownStep, background_shutdown_steps, init_event_notifier_and_audit_with, init_notification_system_with,
-    };
-    use rustfs_audit::AuditError;
-    use std::sync::{Arc, Mutex};
+    use super::*;
 
-    #[tokio::test]
-    async fn event_notifier_runs_before_successful_audit_start() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let notify_events = events.clone();
-        let audit_events = events.clone();
-        let result = init_event_notifier_and_audit_with(
-            move || async move {
-                notify_events.lock().unwrap_or_else(|err| err.into_inner()).push("notify");
-            },
-            move || async move {
-                audit_events.lock().unwrap_or_else(|err| err.into_inner()).push("audit");
-                Ok(())
-            },
-        )
-        .await;
+    #[test]
+    fn heartbeat_startup_errors_expose_only_stable_codes() {
+        let error = startup_heartbeat_error(HeartbeatError::StateIo {
+            path: std::path::PathBuf::from("/private/connect/canary/state.json"),
+            source: std::io::Error::other("private-source-canary"),
+        });
 
-        assert!(result.is_ok());
-        let events = events.lock().unwrap_or_else(|err| err.into_inner()).clone();
-        assert_eq!(events, ["notify", "audit"]);
+        assert_eq!(error.to_string(), "connect_heartbeat_state_io");
     }
 
-    #[tokio::test]
-    async fn event_notifier_runs_before_failed_audit_result() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let notify_events = events.clone();
-        let audit_events = events.clone();
-
-        let result = init_event_notifier_and_audit_with(
-            move || async move {
-                notify_events.lock().unwrap_or_else(|err| err.into_inner()).push("notify");
-            },
-            move || async move {
-                audit_events.lock().unwrap_or_else(|err| err.into_inner()).push("audit");
-                Err(AuditError::ConfigNotLoaded)
-            },
-        )
-        .await;
-
-        assert!(result.is_err());
-        let events = events.lock().unwrap_or_else(|err| err.into_inner()).clone();
-        assert_eq!(events, ["notify", "audit"]);
+    fn disk(state: &str, runtime_state: Option<&str>, disk_index: i32) -> rustfs_madmin::Disk {
+        rustfs_madmin::Disk {
+            state: state.to_owned(),
+            runtime_state: runtime_state.map(str::to_owned),
+            pool_index: 0,
+            set_index: 0,
+            disk_index,
+            total_space: 100,
+            available_space: 40,
+            ..Default::default()
+        }
     }
 
-    #[tokio::test]
-    async fn notification_system_returns_source_error() {
-        let result = init_notification_system_with(|| async { Err(rustfs_ecstore::error::Error::FaultyDisk) }).await;
-
-        assert!(result.is_err());
+    fn info(disks: Vec<rustfs_madmin::Disk>) -> rustfs_madmin::StorageInfo {
+        let drive_count = disks.len();
+        rustfs_madmin::StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![drive_count],
+                total_sets: vec![1],
+                drives_per_set: vec![drive_count],
+                ..Default::default()
+            },
+            disks,
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn background_shutdown_plan_keeps_scanner_before_ahm() {
+    fn inventory_rejects_a_partial_startup_storage_snapshot() {
+        let mut info = info(vec![disk("ok", Some("online"), 0)]);
+        info.backend.standard_sc_data = vec![2];
+        info.backend.drives_per_set = vec![2];
+
+        assert!(matches!(
+            inventory_snapshot(2, 2, info),
+            Err(InventoryError::SnapshotIncomplete {
+                expected: 2,
+                observed: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn inventory_rejects_duplicate_or_invalid_topology_slots() {
+        let valid = disk("ok", Some("online"), 0);
+        let duplicate = valid.clone();
+        assert!(matches!(
+            inventory_snapshot(1, 2, info(vec![valid.clone(), duplicate])),
+            Err(InventoryError::SnapshotIncomplete {
+                expected: 2,
+                observed: 1
+            })
+        ));
+
+        let invalid = disk("ok", Some("online"), -1);
+        assert!(matches!(
+            inventory_snapshot(1, 2, info(vec![valid, invalid])),
+            Err(InventoryError::SnapshotIncomplete {
+                expected: 2,
+                observed: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn inventory_rejects_slots_outside_the_configured_geometry() {
+        for (pool_index, set_index, disk_index) in [(0, 99, 0), (1, 0, 0), (0, 0, 2)] {
+            let valid = disk("ok", Some("online"), 0);
+            let mut invalid = disk("ok", Some("online"), disk_index);
+            invalid.pool_index = pool_index;
+            invalid.set_index = set_index;
+            let mut info = info(vec![valid, invalid]);
+            info.backend.total_sets = vec![1];
+            info.backend.drives_per_set = vec![2];
+
+            assert!(matches!(
+                inventory_snapshot(1, 2, info),
+                Err(InventoryError::SnapshotIncomplete {
+                    expected: 2,
+                    observed: 1
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn inventory_rejects_invalid_or_overflowing_geometry() {
+        for (total_sets, drives_per_set) in [
+            (Vec::new(), Vec::new()),
+            (vec![1], Vec::new()),
+            (Vec::new(), vec![1]),
+            (vec![1, 1], vec![1]),
+            (vec![0], vec![1]),
+            (vec![1], vec![0]),
+            (vec![1], vec![2]),
+            (vec![usize::MAX], vec![2]),
+            (vec![usize::MAX, 1], vec![1, 1]),
+        ] {
+            let mut info = info(vec![disk("ok", Some("online"), 0)]);
+            info.backend.total_sets = total_sets;
+            info.backend.drives_per_set = drives_per_set;
+
+            assert!(matches!(
+                inventory_snapshot(1, 1, info),
+                Err(InventoryError::SnapshotIncomplete {
+                    expected: 1,
+                    observed: 0
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn inventory_marks_a_missing_drive_as_offline() {
+        let info = info(vec![disk("ok", None, 0), disk("disk not found", None, 1)]);
+
         assert_eq!(
-            background_shutdown_steps(true, true),
-            vec![BackgroundShutdownStep::DataScanner, BackgroundShutdownStep::Ahm]
+            inventory_snapshot(1, 2, info).expect("complete inventory should encode"),
+            InventorySnapshot::current(1, 2, 200, 80, [InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline])
+                .expect("expected inventory should encode")
         );
+    }
+
+    #[test]
+    fn inventory_health_uses_the_readiness_allow_list() {
+        let healthy = info(vec![
+            disk("ok", None, 0),
+            disk(rustfs_madmin::ITEM_ONLINE, Some("online"), 1),
+            disk("unformatted", Some("returning"), 2),
+        ]);
         assert_eq!(
-            background_shutdown_steps(true, false),
-            vec![BackgroundShutdownStep::DataScanner, BackgroundShutdownStep::Ahm]
+            inventory_snapshot(1, 3, healthy).expect("healthy inventory should encode"),
+            InventorySnapshot::current(1, 3, 300, 120, []).expect("expected inventory should encode")
         );
-        assert_eq!(background_shutdown_steps(false, true), vec![BackgroundShutdownStep::Ahm]);
-        assert!(background_shutdown_steps(false, false).is_empty());
+
+        for (state, runtime_state, offline) in [
+            ("unknown", None, false),
+            ("disk io error", Some("online"), false),
+            ("ok", Some("suspect"), false),
+            (rustfs_madmin::ITEM_OFFLINE, Some("offline"), true),
+        ] {
+            let flags = if offline {
+                vec![InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline]
+            } else {
+                vec![InventoryFlag::ClusterDegraded]
+            };
+            assert_eq!(
+                inventory_snapshot(1, 1, info(vec![disk(state, runtime_state, 0)])).expect("degraded inventory should encode"),
+                InventorySnapshot::current(1, 1, 100, 40, flags).expect("expected inventory should encode"),
+                "state={state}, runtime_state={runtime_state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_logs_offline_drive_count_without_identifiers() {
+        #[derive(Clone, Default)]
+        struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        struct CapturedLogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("captured log lock").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLog {
+            type Writer = CapturedLogWriter;
+
+            fn make_writer(&'writer self) -> Self::Writer {
+                CapturedLogWriter(self.0.clone())
+            }
+        }
+
+        const ENDPOINT_CANARY: &str = "https://inventory-endpoint-secret.invalid";
+        const PATH_CANARY: &str = "/inventory/path/secret";
+        let mut first = disk(rustfs_madmin::ITEM_OFFLINE, Some("offline"), 0);
+        first.endpoint = ENDPOINT_CANARY.to_owned();
+        first.drive_path = PATH_CANARY.to_owned();
+        let mut second = disk("ok", Some("online"), 1);
+        second.endpoint = "https://second-secret.invalid".to_owned();
+        second.drive_path = "/second/path/secret".to_owned();
+        second.total_space = 900;
+        second.available_space = 800;
+        let info = rustfs_madmin::StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![2],
+                total_sets: vec![1],
+                drives_per_set: vec![2],
+                ..Default::default()
+            },
+            disks: vec![first, second],
+            ..Default::default()
+        };
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(captured.clone())
+            .finish();
+        let snapshot =
+            tracing::subscriber::with_default(subscriber, || inventory_snapshot(1, 2, info).expect("inventory should encode"));
+
+        assert_eq!(
+            snapshot,
+            InventorySnapshot::current(1, 2, 1_000, 840, [InventoryFlag::ClusterDegraded, InventoryFlag::DriveOffline])
+                .expect("expected inventory should encode")
+        );
+        let encoded = serde_json::to_string(&snapshot).expect("snapshot JSON");
+        let logs = String::from_utf8(captured.0.lock().expect("captured log lock").clone()).expect("UTF-8 logs");
+        assert!(logs.contains("drive_unavailable"));
+        assert!(logs.contains("offline_drive_count=1"));
+        for canary in [ENDPOINT_CANARY, PATH_CANARY, "second-secret", "/second/path"] {
+            assert!(!encoded.contains(canary), "snapshot exposed {canary}");
+            assert!(!logs.contains(canary), "logs exposed {canary}");
+        }
+    }
+
+    #[test]
+    fn inventory_capacity_rejects_invalid_numeric_topology() {
+        let mut invalid = disk("ok", Some("online"), -1);
+        invalid.pool_index = -1;
+
+        assert!(matches!(
+            inventory_capacity(&info(vec![invalid])),
+            Err(InventoryError::SnapshotIncomplete {
+                expected: 1,
+                observed: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn inventory_capacity_falls_back_to_unique_numeric_topology() {
+        let mut pool_zero = disk("ok", Some("online"), 0);
+        pool_zero.total_space = 100;
+        pool_zero.available_space = 40;
+        let mut pool_one = disk("ok", Some("online"), 0);
+        pool_one.pool_index = 1;
+        pool_one.set_index = 2;
+        pool_one.total_space = 200;
+        pool_one.available_space = 80;
+        let empty_widths = rustfs_madmin::StorageInfo {
+            disks: vec![pool_zero.clone(), pool_one.clone()],
+            ..Default::default()
+        };
+        assert_eq!(inventory_capacity(&empty_widths).expect("numeric fallback"), (300, 120));
+
+        let incomplete_widths = rustfs_madmin::StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![1],
+                ..Default::default()
+            },
+            disks: vec![pool_zero, pool_one],
+            ..Default::default()
+        };
+        assert_eq!(inventory_capacity(&incomplete_widths).expect("numeric fallback"), (300, 120));
+    }
+
+    #[test]
+    fn inventory_capacity_aggregates_multiple_pools_and_sets_once() {
+        let mut pool_zero_set_zero = disk("ok", Some("online"), 0);
+        pool_zero_set_zero.total_space = 100;
+        pool_zero_set_zero.available_space = 40;
+        let mut pool_zero_set_one = pool_zero_set_zero.clone();
+        pool_zero_set_one.set_index = 1;
+        let mut pool_one = pool_zero_set_zero.clone();
+        pool_one.pool_index = 1;
+        pool_one.total_space = 200;
+        pool_one.available_space = 80;
+        let info = rustfs_madmin::StorageInfo {
+            backend: rustfs_madmin::BackendInfo {
+                standard_sc_data: vec![1, 1],
+                ..Default::default()
+            },
+            disks: vec![pool_zero_set_zero, pool_zero_set_one, pool_one],
+            ..Default::default()
+        };
+
+        assert_eq!(inventory_capacity(&info).expect("configured topology"), (400, 160));
+    }
+
+    #[test]
+    fn inventory_capacity_overflow_is_rejected() {
+        let mut first = disk("ok", Some("online"), 0);
+        first.total_space = u64::MAX;
+        let mut second = disk("ok", Some("online"), 1);
+        second.total_space = 1;
+        let info = rustfs_madmin::StorageInfo {
+            disks: vec![first, second],
+            ..Default::default()
+        };
+
+        assert!(matches!(inventory_capacity(&info), Err(InventoryError::Capacity)));
     }
 }

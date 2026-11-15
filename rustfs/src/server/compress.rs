@@ -213,13 +213,21 @@ impl HttpCompressionConfig {
     /// Extract filename from Content-Disposition header
     /// Format: attachment; filename="example.txt" or attachment; filename=example.txt
     pub(crate) fn extract_filename_from_content_disposition(header_value: &str) -> Option<String> {
-        // Look for filename= or filename*= parameter
-        let lower = header_value.to_lowercase();
+        // Use ASCII lowercasing so byte offsets remain valid UTF-8 boundaries in header_value.
+        let lower = header_value.to_ascii_lowercase();
+        let mut search_from = 0;
 
-        // Try to find filename="..." or filename=...
-        if let Some(idx) = lower.find("filename=") {
+        // Try to find a semicolon-delimited filename="..." or filename=... parameter.
+        while let Some(rel_idx) = lower[search_from..].find("filename=") {
+            let idx = search_from + rel_idx;
+            let prefix = header_value[..idx].trim_end();
+            if !prefix.is_empty() && !prefix.ends_with(';') {
+                search_from = idx + "filename=".len();
+                continue;
+            }
+
             let start = idx + "filename=".len();
-            let rest = &header_value[start..];
+            let rest = header_value[start..].trim_start();
 
             // Check if it's quoted
             if let Some(stripped) = rest.strip_prefix('"') {
@@ -232,6 +240,8 @@ impl HttpCompressionConfig {
                 let end = rest.find(';').unwrap_or(rest.len());
                 return Some(rest[..end].trim().to_string());
             }
+
+            search_from = start;
         }
 
         None
@@ -407,6 +417,8 @@ pub(crate) enum PathCategory {
     InternodeRpc,
     /// Health/probe paths — skip compression (tiny responses)
     Probe,
+    /// STS Query API — response compatibility is applied outside compression.
+    StsQueryApi,
 }
 
 impl PathCategory {
@@ -416,9 +428,15 @@ impl PathCategory {
             PathCategory::InternodeRpc
         } else if path.starts_with("/rustfs/admin/") || path.starts_with("/minio/admin/") {
             PathCategory::AdminApi
-        } else if path.starts_with("/rustfs/console") {
+        } else if crate::server::has_path_prefix(path, crate::server::console_prefix()) {
             PathCategory::Console
-        } else if path == "/health" || path.starts_with("/health/") {
+        } else if path == "/health"
+            || path.starts_with("/health/")
+            || path == "/minio/health/live"
+            || path == "/minio/health/ready"
+            || path == "/minio/health/cluster"
+            || path == "/minio/health/cluster/read"
+        {
             PathCategory::Probe
         } else {
             PathCategory::S3DataPlane
@@ -538,7 +556,17 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let category = PathCategory::classify(req.uri().path());
+        let category = if req.method() == http::Method::POST
+            && req.uri().path() == "/"
+            && req
+                .extensions()
+                .get::<crate::server::legacy_compat::StsQueryRequest>()
+                .is_some()
+        {
+            PathCategory::StsQueryApi
+        } else {
+            PathCategory::classify(req.uri().path())
+        };
         InjectCategoryFut {
             inner: self.inner.call(req),
             category,
@@ -629,6 +657,24 @@ mod tests {
         assert_eq!(
             HttpCompressionConfig::extract_filename_from_content_disposition(r#"Attachment; FILENAME="test.json""#),
             Some("test.json".to_string())
+        );
+
+        // Multi-byte Unicode characters whose UTF-8 byte length changes under to_lowercase()
+        assert_eq!(
+            HttpCompressionConfig::extract_filename_from_content_disposition(r#"attachment; title="İ"; filename="report.txt""#),
+            Some("report.txt".to_string())
+        );
+        assert_eq!(
+            HttpCompressionConfig::extract_filename_from_content_disposition(r#"attachment; unit="K"; FILENAME="metrics.csv""#),
+            Some("metrics.csv".to_string())
+        );
+
+        // Preceding parameter whose name ends with "filename"
+        assert_eq!(
+            HttpCompressionConfig::extract_filename_from_content_disposition(
+                r#"attachment; x-filename="decoy.txt"; filename="bundle.zip""#
+            ),
+            Some("bundle.zip".to_string())
         );
 
         // No filename
@@ -751,8 +797,10 @@ mod tests {
 
     #[test]
     fn test_path_category_classify_console() {
-        assert_eq!(PathCategory::classify("/rustfs/console/index.html"), PathCategory::Console);
-        assert_eq!(PathCategory::classify("/rustfs/console"), PathCategory::Console);
+        let prefix = crate::server::console_prefix();
+        assert_eq!(PathCategory::classify(&format!("{prefix}/index.html")), PathCategory::Console);
+        assert_eq!(PathCategory::classify(prefix), PathCategory::Console);
+        assert_eq!(PathCategory::classify(&format!("{prefix}-other/index.html")), PathCategory::S3DataPlane);
     }
 
     #[test]
@@ -766,6 +814,10 @@ mod tests {
         assert_eq!(PathCategory::classify("/health"), PathCategory::Probe);
         assert_eq!(PathCategory::classify("/health/live"), PathCategory::Probe);
         assert_eq!(PathCategory::classify("/health/ready"), PathCategory::Probe);
+        assert_eq!(PathCategory::classify("/minio/health/live"), PathCategory::Probe);
+        assert_eq!(PathCategory::classify("/minio/health/ready"), PathCategory::Probe);
+        assert_eq!(PathCategory::classify("/minio/health/cluster"), PathCategory::Probe);
+        assert_eq!(PathCategory::classify("/minio/health/cluster/read"), PathCategory::Probe);
     }
 
     #[test]
@@ -775,5 +827,6 @@ mod tests {
         assert!(!PathCategory::Console.should_evaluate_compression());
         assert!(!PathCategory::InternodeRpc.should_evaluate_compression());
         assert!(!PathCategory::Probe.should_evaluate_compression());
+        assert!(!PathCategory::StsQueryApi.should_evaluate_compression());
     }
 }

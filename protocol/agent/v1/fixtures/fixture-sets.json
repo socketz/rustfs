@@ -1,0 +1,77 @@
+{
+  "protocolVersion": "v1",
+  "maxFilesPerSet": 12,
+  "manifestFile": "MANIFEST.sha256",
+  "consumerCopy": {
+    "repository": "rustfs/rustfs",
+    "path": "protocol/agent/v1/fixtures",
+    "requirement": "Byte-identical copy of every populated set, compared by make protocol-compat."
+  },
+  "sets": [
+    {
+      "name": "auth",
+      "status": "populated",
+      "purpose": "Client certificate profile, RFC 9440 header profile, authentication and credential-rotation proof vectors, surface separation, and the frozen error reason registry."
+    },
+    {
+      "name": "version",
+      "status": "populated",
+      "purpose": "Protocol version negotiation decisions, the frozen v1 negotiation field registry, and additive compatibility in both skew directions."
+    },
+    {
+      "name": "registration",
+      "status": "populated",
+      "purpose": "Registration token exchange, proof of possession, replay rejection, and certificate issuance."
+    },
+    {
+      "name": "heartbeat",
+      "status": "populated",
+      "purpose": "Heartbeat payloads, Connect receive time, and freshness window behavior."
+    },
+    {
+      "name": "inventory",
+      "status": "populated",
+      "purpose": "Inventory snapshot payloads and their allow-listed collection fields."
+    },
+    {
+      "name": "object-performance",
+      "status": "populated",
+      "purpose": "Bounded performance.object@1 result acceptance and rejection vectors."
+    },
+    {
+      "name": "network-performance",
+      "status": "populated",
+      "purpose": "Bounded performance.network@1 aggregate results, peer attribution, unit semantics, and budget rejection vectors."
+    },
+    {
+      "name": "site-replication-performance",
+      "status": "populated",
+      "purpose": "Bounded performance.siteReplication@1 aggregate results, destination-confirmation semantics, and rejection of operational secrets and unresolved target controls."
+    },
+    {
+      "name": "telemetry",
+      "status": "populated",
+      "purpose": "Consent-bound telemetry.record@1, telemetry.otlp@1, and telemetry.replay@1 producer results, resource limits, redaction boundaries, cancellation, and signed local exports."
+    },
+    {
+      "name": "diagnostic-scheduler",
+      "status": "populated",
+      "purpose": "Consent-bound diagnostic policy scheduling, bounded retry, cancellation, restart deduplication, and outbound Connect-visible execution receipts."
+    },
+    {
+      "name": "offline-enrollment",
+      "status": "populated",
+      "purpose": "Air-gapped device enrolment and signed artifact exchange without a certificate."
+    },
+    {
+      "name": "bundle",
+      "status": "populated",
+      "purpose": "Support bundle manifests, upload authorization, archive validation, and signed typed offline diagnostic imports."
+    },
+    {
+      "name": "redaction",
+      "status": "populated",
+      "purpose": "Deterministic redaction of telemetry and support bundle content."
+    }
+  ]
+}

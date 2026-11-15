@@ -23,7 +23,7 @@ use super::paths::parse_s3_path;
 use crate::common::client::s3::StorageBackend;
 use crate::common::gateway::S3Action;
 use russh_sftp::protocol::{File, FileAttributes, StatusCode};
-use s3s::dto::ListObjectsV2Input;
+use rustfs_gateway_types::{BucketName, Timestamp, dto::ListObjectsV2Input};
 use std::collections::HashMap;
 
 const SFTP_META_MTIME: &str = "mtime";
@@ -34,7 +34,7 @@ const SFTP_META_GID: &str = "gid";
 /// Build the SFTP FileAttributes struct returned by STAT, LSTAT, and
 /// FSTAT. Callers are responsible for any clamping or conversion of the
 /// mtime field. See timestamp_to_mtime for the conversion used when the
-/// source is an s3s Timestamp.
+/// source is a gateway Timestamp.
 pub(super) fn s3_attrs_to_sftp(size: u64, mtime: Option<u32>, is_dir: bool) -> FileAttributes {
     let permissions = if is_dir { POSIX_DIR_MODE } else { POSIX_FILE_MODE };
     FileAttributes {
@@ -87,15 +87,11 @@ pub(super) fn apply_user_metadata_to_sftp_attrs(attrs: &mut FileAttributes, meta
     }
 }
 
-/// Convert an s3s Timestamp into the u32 seconds field SFTPv3 expects.
+/// Convert a gateway Timestamp into the u32 seconds field SFTPv3 expects.
 /// Pre-1970 values clamp to 0. Post-2106 values clamp to u32::MAX. The
 /// clamps prevent the i64-to-u32 cast from wrapping.
-pub(super) fn timestamp_to_mtime(ts: Option<s3s::dto::Timestamp>) -> Option<u32> {
-    ts.map(|t| {
-        let odt: time::OffsetDateTime = t.into();
-        let secs = odt.unix_timestamp().clamp(0, u32::MAX as i64);
-        secs as u32
-    })
+pub(super) fn timestamp_to_mtime(ts: Option<Timestamp>) -> Option<u32> {
+    ts.map(|t| t.secs().clamp(0, u32::MAX as i64) as u32)
 }
 
 /// Build the ls -l style longname string for a directory entry. Delegates
@@ -137,7 +133,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             // on success. Size and mtime are not returned by HeadBucket.
             None => {
                 self.authorize(&S3Action::HeadBucket, &bucket, None).await?;
-                self.run_backend("head_bucket", self.storage.head_bucket(&bucket, self.access_key(), self.secret_key()))
+                self.run_backend("head_bucket", self.storage.head_bucket(&bucket, self.credentials()))
                     .await?;
                 Ok(s3_attrs_to_sftp(0, None, true))
             }
@@ -154,43 +150,34 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             Some(object_key) => {
                 self.authorize(&S3Action::HeadObject, &bucket, Some(&object_key)).await?;
                 match self
-                    .run_backend_with_err(
-                        "head_object",
-                        self.storage
-                            .head_object(&bucket, &object_key, self.access_key(), self.secret_key()),
-                    )
+                    .run_backend_with_err("head_object", self.storage.head_object(&bucket, &object_key, self.credentials()))
                     .await?
                 {
                     Ok(out) => {
                         let size = out.content_length.unwrap_or(0).max(0) as u64;
                         let mtime = timestamp_to_mtime(out.last_modified);
                         let mut attrs = s3_attrs_to_sftp(size, mtime, false);
-                        if let Some(metadata) = out.metadata {
-                            apply_user_metadata_to_sftp_attrs(&mut attrs, &metadata);
-                        }
+                        let metadata = out.metadata.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
+                        apply_user_metadata_to_sftp_attrs(&mut attrs, &metadata);
                         Ok(attrs)
                     }
                     Err(e) if is_not_found_error(&e) => {
                         // No object at this key. Check whether it is a
                         // directory by listing with the key as a prefix.
                         let prefix = format!("{object_key}/");
-                        self.authorize(&S3Action::ListBucket, &bucket, Some(prefix.as_str())).await?;
                         let input = ListObjectsV2Input::builder()
-                            .bucket(bucket.clone())
-                            .prefix(Some(prefix))
-                            .delimiter(Some("/".to_string()))
-                            .max_keys(Some(1))
-                            .build()
-                            .map_err(|e| s3_error_to_sftp("build_list_objects", e))?;
+                            .bucket(BucketName::new(bucket.clone()).map_err(|e| s3_error_to_sftp("build_list_objects", e))?)
+                            .prefix(prefix)
+                            .delimiter("/".to_string())
+                            .max_keys(1)
+                            .build();
+                        self.authorize_list_objects(&input).await?;
                         let out = self
-                            .run_backend(
-                                "list_objects_v2",
-                                self.storage.list_objects_v2(input, self.access_key(), self.secret_key()),
-                            )
+                            .run_backend("list_objects_v2", self.storage.list_objects_v2(input, self.credentials()))
                             .await?;
 
-                        let has_contents = out.contents.map(|c| !c.is_empty()).unwrap_or(false);
-                        let has_prefixes = out.common_prefixes.map(|c| !c.is_empty()).unwrap_or(false);
+                        let has_contents = !out.contents.is_empty();
+                        let has_prefixes = !out.common_prefixes.is_empty();
                         if has_contents || has_prefixes {
                             Ok(s3_attrs_to_sftp(0, None, true))
                         } else {
@@ -307,15 +294,13 @@ mod tests {
 
     #[test]
     fn timestamp_to_mtime_clamps_negative_to_zero() {
-        let pre_epoch = s3s::dto::Timestamp::from(time::OffsetDateTime::from_unix_timestamp(-86400).expect("valid timestamp"));
+        let pre_epoch = Timestamp::from_secs(-86400);
         assert_eq!(timestamp_to_mtime(Some(pre_epoch)), Some(0));
     }
 
     #[test]
     fn timestamp_to_mtime_clamps_overflow_to_u32_max() {
-        let far_future = s3s::dto::Timestamp::from(
-            time::OffsetDateTime::from_unix_timestamp(u32::MAX as i64 + 86400).expect("valid timestamp"),
-        );
+        let far_future = Timestamp::from_secs(u32::MAX as i64 + 86400);
         assert_eq!(timestamp_to_mtime(Some(far_future)), Some(u32::MAX));
     }
 

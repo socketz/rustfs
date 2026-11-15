@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::health::MemInfo;
@@ -78,7 +78,7 @@ pub struct DiskIOStats {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DiskMetric {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "n_disks")]
     pub n_disks: usize,
     #[serde(rename = "offline")]
@@ -144,6 +144,30 @@ pub struct ScannerCheckpointReport {
 pub struct ScannerSourceWorkSnapshot {
     #[serde(rename = "source", default)]
     pub source: String,
+    #[serde(rename = "checked", default)]
+    pub checked: u64,
+    #[serde(rename = "queued", default)]
+    pub queued: u64,
+    #[serde(rename = "executed", default)]
+    pub executed: u64,
+    #[serde(rename = "failed", default)]
+    pub failed: u64,
+    #[serde(rename = "skipped", default)]
+    pub skipped: u64,
+    #[serde(rename = "missed", default)]
+    pub missed: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerReplicationRepairSnapshot {
+    #[serde(rename = "source", default)]
+    pub source: String,
+    #[serde(rename = "kind", default)]
+    pub kind: String,
+    #[serde(rename = "scanner_role", default)]
+    pub scanner_role: String,
+    #[serde(rename = "execution_owner", default)]
+    pub execution_owner: String,
     #[serde(rename = "checked", default)]
     pub checked: u64,
     #[serde(rename = "queued", default)]
@@ -260,8 +284,136 @@ impl ScannerMaintenanceControlSnapshot {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScannerUsageFreshnessSnapshot {
+    #[serde(rename = "dirty_pending_buckets", default)]
+    pub dirty_pending_buckets: u64,
+    #[serde(rename = "last_dirty_mark_unix_secs", default)]
+    pub last_dirty_mark_unix_secs: u64,
+    #[serde(rename = "last_dirty_clear_unix_secs", default)]
+    pub last_dirty_clear_unix_secs: u64,
+    #[serde(rename = "last_cycle_dirty_buckets", default)]
+    pub last_cycle_dirty_buckets: u64,
+    #[serde(rename = "last_cycle_cleared_dirty_buckets", default)]
+    pub last_cycle_cleared_dirty_buckets: u64,
+    #[serde(rename = "last_usage_save_unix_secs", default)]
+    pub last_usage_save_unix_secs: u64,
+    #[serde(rename = "last_usage_save_result", default)]
+    pub last_usage_save_result: String,
+    #[serde(rename = "last_usage_save_result_code", default)]
+    pub last_usage_save_result_code: u64,
+    #[serde(rename = "last_durable_success_unix_secs", default)]
+    pub last_durable_success_unix_secs: u64,
+    #[serde(rename = "last_publication_unix_secs", default)]
+    pub last_publication_unix_secs: u64,
+    #[serde(rename = "last_publication_state", default)]
+    pub last_publication_state: String,
+    #[serde(rename = "last_publication_reason", default)]
+    pub last_publication_reason: String,
+    #[serde(rename = "deferred_pending", default)]
+    pub deferred_pending: bool,
+    #[serde(rename = "deferred_total", default)]
+    pub deferred_total: u64,
+    #[serde(rename = "last_deferred_unix_secs", default)]
+    pub last_deferred_unix_secs: u64,
+    #[serde(rename = "last_deferred_reason", default)]
+    pub last_deferred_reason: String,
+    /// Cluster-activity guardrail vetoes, attributed as `<field>@<host>`.
+    #[serde(rename = "guardrail_veto_total", default)]
+    pub guardrail_veto_total: u64,
+    #[serde(rename = "last_guardrail_veto_unix_secs", default)]
+    pub last_guardrail_veto_unix_secs: u64,
+    #[serde(rename = "last_guardrail_veto_reason", default)]
+    pub last_guardrail_veto_reason: String,
+    /// Cycles eligible for a dirty-bucket scope that walked the whole
+    /// namespace instead; the reason names the scope precondition that failed.
+    #[serde(rename = "scope_fallback_total", default)]
+    pub scope_fallback_total: u64,
+    #[serde(rename = "last_scope_fallback_unix_secs", default)]
+    pub last_scope_fallback_unix_secs: u64,
+    #[serde(rename = "last_scope_fallback_reason", default)]
+    pub last_scope_fallback_reason: String,
+    #[serde(rename = "disk_io_budget_wait_events", default)]
+    pub disk_io_budget_wait_events: u64,
+    #[serde(rename = "disk_io_budget_wait_millis", default)]
+    pub disk_io_budget_wait_millis: u64,
+    #[serde(rename = "last_disk_io_budget_wait_unix_secs", default)]
+    pub last_disk_io_budget_wait_unix_secs: u64,
+}
+
+impl ScannerUsageFreshnessSnapshot {
+    fn merge(&mut self, other: &Self) {
+        let self_deferred_state_at = self.last_deferred_unix_secs.max(self.last_durable_success_unix_secs);
+        let other_deferred_state_at = other.last_deferred_unix_secs.max(other.last_durable_success_unix_secs);
+        self.dirty_pending_buckets = self.dirty_pending_buckets.saturating_add(other.dirty_pending_buckets);
+        self.last_dirty_mark_unix_secs = self.last_dirty_mark_unix_secs.max(other.last_dirty_mark_unix_secs);
+        self.last_dirty_clear_unix_secs = self.last_dirty_clear_unix_secs.max(other.last_dirty_clear_unix_secs);
+        self.last_cycle_dirty_buckets = self.last_cycle_dirty_buckets.saturating_add(other.last_cycle_dirty_buckets);
+        self.last_cycle_cleared_dirty_buckets = self
+            .last_cycle_cleared_dirty_buckets
+            .saturating_add(other.last_cycle_cleared_dirty_buckets);
+        if other.last_usage_save_unix_secs > self.last_usage_save_unix_secs {
+            self.last_usage_save_unix_secs = other.last_usage_save_unix_secs;
+            self.last_usage_save_result = other.last_usage_save_result.clone();
+            self.last_usage_save_result_code = other.last_usage_save_result_code;
+        }
+        self.last_durable_success_unix_secs = self.last_durable_success_unix_secs.max(other.last_durable_success_unix_secs);
+        if other.last_publication_unix_secs > self.last_publication_unix_secs {
+            self.last_publication_unix_secs = other.last_publication_unix_secs;
+            self.last_publication_state = other.last_publication_state.clone();
+            self.last_publication_reason = other.last_publication_reason.clone();
+        }
+        self.deferred_total = self.deferred_total.saturating_add(other.deferred_total);
+        self.guardrail_veto_total = self.guardrail_veto_total.saturating_add(other.guardrail_veto_total);
+        self.disk_io_budget_wait_events = self
+            .disk_io_budget_wait_events
+            .saturating_add(other.disk_io_budget_wait_events);
+        self.disk_io_budget_wait_millis = self
+            .disk_io_budget_wait_millis
+            .saturating_add(other.disk_io_budget_wait_millis);
+        self.last_disk_io_budget_wait_unix_secs = self
+            .last_disk_io_budget_wait_unix_secs
+            .max(other.last_disk_io_budget_wait_unix_secs);
+        if other.last_guardrail_veto_unix_secs > self.last_guardrail_veto_unix_secs {
+            self.last_guardrail_veto_unix_secs = other.last_guardrail_veto_unix_secs;
+            self.last_guardrail_veto_reason = other.last_guardrail_veto_reason.clone();
+        }
+        self.scope_fallback_total = self.scope_fallback_total.saturating_add(other.scope_fallback_total);
+        if other.last_scope_fallback_unix_secs > self.last_scope_fallback_unix_secs {
+            self.last_scope_fallback_unix_secs = other.last_scope_fallback_unix_secs;
+            self.last_scope_fallback_reason = other.last_scope_fallback_reason.clone();
+        }
+        if other_deferred_state_at > self_deferred_state_at {
+            self.deferred_pending = other.deferred_pending;
+        } else if other_deferred_state_at == self_deferred_state_at {
+            self.deferred_pending |= other.deferred_pending;
+        }
+        if other.last_deferred_unix_secs > self.last_deferred_unix_secs {
+            self.last_deferred_unix_secs = other.last_deferred_unix_secs;
+            self.last_deferred_reason = other.last_deferred_reason.clone();
+        }
+    }
+}
+
 impl ScannerSourceWorkSnapshot {
     fn merge(&mut self, other: &Self) {
+        self.checked = self.checked.saturating_add(other.checked);
+        self.queued = self.queued.saturating_add(other.queued);
+        self.executed = self.executed.saturating_add(other.executed);
+        self.failed = self.failed.saturating_add(other.failed);
+        self.skipped = self.skipped.saturating_add(other.skipped);
+        self.missed = self.missed.saturating_add(other.missed);
+    }
+}
+
+impl ScannerReplicationRepairSnapshot {
+    fn merge(&mut self, other: &Self) {
+        if self.scanner_role.is_empty() && !other.scanner_role.is_empty() {
+            self.scanner_role = other.scanner_role.clone();
+        }
+        if self.execution_owner.is_empty() && !other.execution_owner.is_empty() {
+            self.execution_owner = other.execution_owner.clone();
+        }
         self.checked = self.checked.saturating_add(other.checked);
         self.queued = self.queued.saturating_add(other.queued);
         self.executed = self.executed.saturating_add(other.executed);
@@ -280,6 +432,23 @@ fn merge_source_work_snapshots(target: &mut Vec<ScannerSourceWorkSnapshot>, sour
         }
     }
     target.sort_by(|left, right| left.source.cmp(&right.source));
+}
+
+fn merge_replication_repair_snapshots(
+    target: &mut Vec<ScannerReplicationRepairSnapshot>,
+    source: &[ScannerReplicationRepairSnapshot],
+) {
+    for repair in source {
+        if let Some(existing) = target
+            .iter_mut()
+            .find(|existing| existing.source == repair.source && existing.kind == repair.kind)
+        {
+            existing.merge(repair);
+        } else {
+            target.push(repair.clone());
+        }
+    }
+    target.sort_by(|left, right| left.source.cmp(&right.source).then_with(|| left.kind.cmp(&right.kind)));
 }
 
 const SCANNER_PRIMARY_PRESSURE_NONE: &str = "none";
@@ -302,6 +471,8 @@ pub struct ScannerPacingPressureSnapshot {
     pub last_cycle_pause_observed: bool,
     #[serde(rename = "last_cycle_throttle_sleep_ratio", default)]
     pub last_cycle_throttle_sleep_ratio: f64,
+    #[serde(rename = "last_cycle_disk_io_budget_wait_ratio", default)]
+    pub last_cycle_disk_io_budget_wait_ratio: f64,
     #[serde(rename = "last_cycle_yield_ratio", default)]
     pub last_cycle_yield_ratio: f64,
     #[serde(rename = "last_cycle_total_pause_ratio", default)]
@@ -317,6 +488,7 @@ impl Default for ScannerPacingPressureSnapshot {
             last_cycle_budget_limited: false,
             last_cycle_pause_observed: false,
             last_cycle_throttle_sleep_ratio: 0.0,
+            last_cycle_disk_io_budget_wait_ratio: 0.0,
             last_cycle_yield_ratio: 0.0,
             last_cycle_total_pause_ratio: 0.0,
         }
@@ -329,6 +501,8 @@ impl ScannerPacingPressureSnapshot {
             "queued_scans"
         } else if self.last_cycle_budget_limited {
             "cycle_budget"
+        } else if self.last_cycle_disk_io_budget_wait_ratio > 0.0 {
+            "disk_io_budget"
         } else if self.last_cycle_pause_observed {
             "throttle_pause"
         } else if self.current_active_scans > 0 {
@@ -351,6 +525,9 @@ impl ScannerPacingPressureSnapshot {
         self.last_cycle_throttle_sleep_ratio = self
             .last_cycle_throttle_sleep_ratio
             .max(other.last_cycle_throttle_sleep_ratio);
+        self.last_cycle_disk_io_budget_wait_ratio = self
+            .last_cycle_disk_io_budget_wait_ratio
+            .max(other.last_cycle_disk_io_budget_wait_ratio);
         self.last_cycle_yield_ratio = self.last_cycle_yield_ratio.max(other.last_cycle_yield_ratio);
         self.last_cycle_total_pause_ratio = self.last_cycle_total_pause_ratio.max(other.last_cycle_total_pause_ratio);
         self.refresh_primary_pressure();
@@ -373,6 +550,12 @@ pub struct ScannerLifecycleExpirySnapshot {
     pub scanner_queued: u64,
     #[serde(rename = "scanner_missed", default)]
     pub scanner_missed: u64,
+    #[serde(rename = "scanner_blocked", default)]
+    pub scanner_blocked: u64,
+    #[serde(rename = "scanner_not_enqueued", default)]
+    pub scanner_not_enqueued: u64,
+    #[serde(rename = "delete_failed", default)]
+    pub delete_failed: u64,
 }
 
 impl ScannerLifecycleExpirySnapshot {
@@ -384,6 +567,9 @@ impl ScannerLifecycleExpirySnapshot {
         self.queue_missed = self.queue_missed.saturating_add(other.queue_missed);
         self.scanner_queued = self.scanner_queued.saturating_add(other.scanner_queued);
         self.scanner_missed = self.scanner_missed.saturating_add(other.scanner_missed);
+        self.scanner_blocked = self.scanner_blocked.saturating_add(other.scanner_blocked);
+        self.scanner_not_enqueued = self.scanner_not_enqueued.saturating_add(other.scanner_not_enqueued);
+        self.delete_failed = self.delete_failed.saturating_add(other.delete_failed);
     }
 }
 
@@ -438,13 +624,15 @@ impl ScannerLifecycleTransitionSnapshot {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScannerMetrics {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "current_cycle")]
     pub current_cycle: u64,
+    #[serde(rename = "current_cycle_active", default, skip_serializing_if = "Option::is_none")]
+    pub current_cycle_active: Option<bool>,
     #[serde(rename = "current_started")]
-    pub current_started: DateTime<Utc>,
+    pub current_started: Timestamp,
     #[serde(rename = "cycle_complete_times")]
-    pub cycles_completed_at: Vec<DateTime<Utc>>,
+    pub cycles_completed_at: Vec<Timestamp>,
     #[serde(rename = "ongoing_buckets")]
     pub ongoing_buckets: usize,
     #[serde(rename = "active_scan_paths", default)]
@@ -489,6 +677,10 @@ pub struct ScannerMetrics {
     pub current_cycle_throttle_sleep_events: u64,
     #[serde(rename = "current_cycle_throttle_sleep_duration_seconds", default)]
     pub current_cycle_throttle_sleep_duration_seconds: f64,
+    #[serde(rename = "current_cycle_disk_io_budget_wait_events", default)]
+    pub current_cycle_disk_io_budget_wait_events: u64,
+    #[serde(rename = "current_cycle_disk_io_budget_wait_duration_seconds", default)]
+    pub current_cycle_disk_io_budget_wait_duration_seconds: f64,
     #[serde(rename = "current_cycle_ilm_actions", default)]
     pub current_cycle_ilm_actions: u64,
     #[serde(rename = "current_cycle_lifecycle_expiry_actions", default)]
@@ -535,6 +727,10 @@ pub struct ScannerMetrics {
     pub last_cycle_throttle_sleep_events: u64,
     #[serde(rename = "last_cycle_throttle_sleep_duration_seconds", default)]
     pub last_cycle_throttle_sleep_duration_seconds: f64,
+    #[serde(rename = "last_cycle_disk_io_budget_wait_events", default)]
+    pub last_cycle_disk_io_budget_wait_events: u64,
+    #[serde(rename = "last_cycle_disk_io_budget_wait_duration_seconds", default)]
+    pub last_cycle_disk_io_budget_wait_duration_seconds: f64,
     #[serde(rename = "last_cycle_ilm_actions", default)]
     pub last_cycle_ilm_actions: u64,
     #[serde(rename = "last_cycle_heal_objects", default)]
@@ -545,6 +741,8 @@ pub struct ScannerMetrics {
     pub last_cycle_usage_saves: u64,
     #[serde(rename = "failed_cycles", default)]
     pub failed_cycles: u64,
+    #[serde(rename = "superseded_cycles", default)]
+    pub superseded_cycles: u64,
     #[serde(rename = "partial_cycles_unknown", default)]
     pub partial_cycles_unknown: u64,
     #[serde(rename = "partial_cycles_runtime", default)]
@@ -561,6 +759,8 @@ pub struct ScannerMetrics {
     pub lifecycle_expiry: ScannerLifecycleExpirySnapshot,
     #[serde(rename = "lifecycle_transition", default)]
     pub lifecycle_transition: ScannerLifecycleTransitionSnapshot,
+    #[serde(rename = "usage_freshness", default)]
+    pub usage_freshness: ScannerUsageFreshnessSnapshot,
     #[serde(rename = "maintenance_control", default)]
     pub maintenance_control: ScannerMaintenanceControlSnapshot,
     #[serde(rename = "throttle_idle_mode_enabled", default)]
@@ -579,6 +779,14 @@ pub struct ScannerMetrics {
     pub cycle_max_objects: u64,
     #[serde(rename = "cycle_max_directories", default)]
     pub cycle_max_directories: u64,
+    #[serde(rename = "cycle_timeout_total", default)]
+    pub cycle_timeout_total: u64,
+    #[serde(rename = "cycle_recovery_required_total", default)]
+    pub cycle_recovery_required_total: u64,
+    #[serde(rename = "cycle_last_progress_age", default)]
+    pub cycle_last_progress_age: u64,
+    #[serde(rename = "leader_lease_without_progress", default)]
+    pub leader_lease_without_progress: bool,
     #[serde(rename = "bitrot_cycle_enabled", default)]
     pub bitrot_cycle_enabled: bool,
     #[serde(rename = "bitrot_cycle_seconds", default)]
@@ -599,12 +807,42 @@ pub struct ScannerMetrics {
     pub current_cycle_source_work: Vec<ScannerSourceWorkSnapshot>,
     #[serde(rename = "last_cycle_source_work", default)]
     pub last_cycle_source_work: Vec<ScannerSourceWorkSnapshot>,
+    #[serde(rename = "replication_repair", default)]
+    pub replication_repair: Vec<ScannerReplicationRepairSnapshot>,
+    #[serde(rename = "current_cycle_replication_repair", default)]
+    pub current_cycle_replication_repair: Vec<ScannerReplicationRepairSnapshot>,
+    #[serde(rename = "last_cycle_replication_repair", default)]
+    pub last_cycle_replication_repair: Vec<ScannerReplicationRepairSnapshot>,
     #[serde(rename = "partial_cycles", default)]
     pub partial_cycles: u64,
 }
 
 impl ScannerMetrics {
+    pub fn is_current_cycle_active(&self) -> bool {
+        self.current_cycle_active.unwrap_or(self.current_cycle > 0)
+    }
+
     pub fn merge(&mut self, other: &Self) {
+        // Legacy nodes omit the activity field and use a non-zero cycle as
+        // their active signal. New nodes publish explicit first-cycle and idle
+        // states, including cycle zero.
+        let self_cycle_active = self.is_current_cycle_active();
+        let other_cycle_active = other.is_current_cycle_active();
+        let self_cycle_authority = (
+            self_cycle_active,
+            self.current_cycle,
+            self.cycles_completed_at.len(),
+            self.cycles_completed_at.as_slice(),
+            self.current_started,
+        );
+        let other_cycle_authority = (
+            other_cycle_active,
+            other.current_cycle,
+            other.cycles_completed_at.len(),
+            other.cycles_completed_at.as_slice(),
+            other.current_started,
+        );
+        let other_cycle_is_authoritative = self_cycle_authority < other_cycle_authority;
         let other_is_newer = self.collected_at < other.collected_at;
         if other_is_newer {
             self.collected_at = other.collected_at;
@@ -624,6 +862,8 @@ impl ScannerMetrics {
             self.cycle_max_duration_seconds = other.cycle_max_duration_seconds;
             self.cycle_max_objects = other.cycle_max_objects;
             self.cycle_max_directories = other.cycle_max_directories;
+            self.cycle_last_progress_age = other.cycle_last_progress_age;
+            self.leader_lease_without_progress = other.leader_lease_without_progress;
             self.bitrot_cycle_enabled = other.bitrot_cycle_enabled;
             self.bitrot_cycle_seconds = other.bitrot_cycle_seconds;
         }
@@ -636,6 +876,7 @@ impl ScannerMetrics {
         self.pacing_pressure.merge(&other.pacing_pressure);
         self.lifecycle_expiry.merge(&other.lifecycle_expiry);
         self.lifecycle_transition.merge(&other.lifecycle_transition);
+        self.usage_freshness.merge(&other.usage_freshness);
         self.maintenance_control.merge(&other.maintenance_control);
         self.current_set_scan_concurrency_limit = self
             .current_set_scan_concurrency_limit
@@ -671,6 +912,10 @@ impl ScannerMetrics {
             .current_cycle_throttle_sleep_events
             .saturating_add(other.current_cycle_throttle_sleep_events);
         self.current_cycle_throttle_sleep_duration_seconds += other.current_cycle_throttle_sleep_duration_seconds;
+        self.current_cycle_disk_io_budget_wait_events = self
+            .current_cycle_disk_io_budget_wait_events
+            .saturating_add(other.current_cycle_disk_io_budget_wait_events);
+        self.current_cycle_disk_io_budget_wait_duration_seconds += other.current_cycle_disk_io_budget_wait_duration_seconds;
         self.current_cycle_ilm_actions = self.current_cycle_ilm_actions.saturating_add(other.current_cycle_ilm_actions);
         self.current_cycle_lifecycle_expiry_actions = self
             .current_cycle_lifecycle_expiry_actions
@@ -703,6 +948,10 @@ impl ScannerMetrics {
             .last_cycle_throttle_sleep_events
             .saturating_add(other.last_cycle_throttle_sleep_events);
         self.last_cycle_throttle_sleep_duration_seconds += other.last_cycle_throttle_sleep_duration_seconds;
+        self.last_cycle_disk_io_budget_wait_events = self
+            .last_cycle_disk_io_budget_wait_events
+            .saturating_add(other.last_cycle_disk_io_budget_wait_events);
+        self.last_cycle_disk_io_budget_wait_duration_seconds += other.last_cycle_disk_io_budget_wait_duration_seconds;
         self.last_cycle_ilm_actions = self.last_cycle_ilm_actions.saturating_add(other.last_cycle_ilm_actions);
         self.last_cycle_lifecycle_expiry_actions = self
             .last_cycle_lifecycle_expiry_actions
@@ -716,6 +965,13 @@ impl ScannerMetrics {
             .saturating_add(other.last_cycle_replication_checks);
         self.last_cycle_usage_saves = self.last_cycle_usage_saves.saturating_add(other.last_cycle_usage_saves);
         self.failed_cycles = self.failed_cycles.saturating_add(other.failed_cycles);
+        self.cycle_timeout_total = self.cycle_timeout_total.saturating_add(other.cycle_timeout_total);
+        self.cycle_recovery_required_total = self
+            .cycle_recovery_required_total
+            .saturating_add(other.cycle_recovery_required_total);
+        self.cycle_last_progress_age = self.cycle_last_progress_age.max(other.cycle_last_progress_age);
+        self.leader_lease_without_progress |= other.leader_lease_without_progress;
+        self.superseded_cycles = self.superseded_cycles.saturating_add(other.superseded_cycles);
         self.partial_cycles_unknown = self.partial_cycles_unknown.saturating_add(other.partial_cycles_unknown);
         self.partial_cycles_runtime = self.partial_cycles_runtime.saturating_add(other.partial_cycles_runtime);
         self.partial_cycles_objects = self.partial_cycles_objects.saturating_add(other.partial_cycles_objects);
@@ -730,20 +986,20 @@ impl ScannerMetrics {
         merge_source_work_snapshots(&mut self.source_work, &other.source_work);
         merge_source_work_snapshots(&mut self.current_cycle_source_work, &other.current_cycle_source_work);
         merge_source_work_snapshots(&mut self.last_cycle_source_work, &other.last_cycle_source_work);
+        merge_replication_repair_snapshots(&mut self.replication_repair, &other.replication_repair);
+        merge_replication_repair_snapshots(&mut self.current_cycle_replication_repair, &other.current_cycle_replication_repair);
+        merge_replication_repair_snapshots(&mut self.last_cycle_replication_repair, &other.last_cycle_replication_repair);
 
         if self.ongoing_buckets < other.ongoing_buckets {
             self.ongoing_buckets = other.ongoing_buckets;
         }
 
-        if self.current_cycle < other.current_cycle {
+        if other_cycle_is_authoritative {
             self.current_cycle = other.current_cycle;
             self.cycles_completed_at = other.cycles_completed_at.clone();
             self.current_started = other.current_started;
         }
-
-        if other.cycles_completed_at.len() > self.cycles_completed_at.len() {
-            self.cycles_completed_at = other.cycles_completed_at.clone();
-        }
+        self.current_cycle_active = Some(self_cycle_active || other_cycle_active);
 
         if !other.life_time_ops.is_empty() && self.life_time_ops.is_empty() {
             self.life_time_ops = other.life_time_ops.clone();
@@ -805,14 +1061,66 @@ pub struct Metrics {
     pub cpu: Option<CPUMetrics>,
     #[serde(rename = "rpc", skip_serializing_if = "Option::is_none")]
     pub rpc: Option<RPCMetrics>,
+    /// Absent means this node did not report HTTP outcomes, not zero traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpMetrics>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HttpMetrics {
+    #[serde(rename = "collected")]
+    pub collected_at: Timestamp,
+    pub requests: Vec<HttpRequestMetric>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpRequestMetric {
+    pub method: String,
+    pub operation: String,
+    pub outcome: String,
+    pub total: u64,
+}
+
+impl HttpMetrics {
+    fn merge(&mut self, other: &Self) {
+        self.collected_at = self.collected_at.max(other.collected_at);
+        let mut totals = std::collections::BTreeMap::new();
+        for series in self.requests.drain(..).chain(other.requests.iter().cloned()) {
+            let total = totals
+                .entry((series.method, series.operation, series.outcome))
+                .or_insert(0_u64);
+            *total = total.saturating_add(series.total);
+        }
+        self.requests = totals
+            .into_iter()
+            .map(|((method, operation, outcome), total)| HttpRequestMetric {
+                method,
+                operation,
+                outcome,
+                total,
+            })
+            .collect();
+    }
 }
 
 impl Metrics {
     pub fn merge(&mut self, other: &Self) {
+        if let Some(http) = &other.http {
+            match &mut self.http {
+                Some(existing) => existing.merge(http),
+                None => self.http = Some(http.clone()),
+            }
+        }
         if let Some(scanner) = other.scanner.as_ref() {
             match self.scanner {
                 Some(ref mut s_scanner) => s_scanner.merge(scanner),
-                None => self.scanner = Some(scanner.clone()),
+                None => {
+                    let mut scanner = scanner.clone();
+                    if scanner.current_cycle_active.is_none() {
+                        scanner.current_cycle_active = Some(scanner.is_current_cycle_active());
+                    }
+                    self.scanner = Some(scanner);
+                }
             }
         }
 
@@ -863,7 +1171,7 @@ impl Metrics {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RPCMetrics {
     #[serde(rename = "collectedAt")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
 
     pub connected: i32,
 
@@ -893,7 +1201,7 @@ pub struct RPCMetrics {
     pub out_queue: i32,
 
     #[serde(rename = "lastPongTime")]
-    pub last_pong_time: DateTime<Utc>,
+    pub last_pong_time: Timestamp,
 
     #[serde(rename = "lastPingMS")]
     pub last_ping_ms: f64,
@@ -902,7 +1210,7 @@ pub struct RPCMetrics {
     pub max_ping_dur_ms: f64, // Maximum across all merged entries.
 
     #[serde(rename = "lastConnectTime")]
-    pub last_connect_time: DateTime<Utc>,
+    pub last_connect_time: Timestamp,
 
     #[serde(rename = "byDestination", skip_serializing_if = "Option::is_none")]
     pub by_destination: Option<HashMap<String, RPCMetrics>>,
@@ -977,7 +1285,7 @@ pub struct CPUMetrics {}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NetMetrics {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "interfaceName")]
     pub interface_name: String,
     #[serde(rename = "netstats")]
@@ -1066,7 +1374,7 @@ pub struct NetDevLine {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MemMetrics {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "memInfo")]
     pub info: MemInfo,
 }
@@ -1074,13 +1382,13 @@ pub struct MemMetrics {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SiteResyncMetrics {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "resyncStatus", skip_serializing_if = "Option::is_none")]
     pub resync_status: Option<String>,
     #[serde(rename = "startTime")]
-    pub start_time: DateTime<Utc>,
+    pub start_time: Timestamp,
     #[serde(rename = "lastUpdate")]
-    pub last_update: DateTime<Utc>,
+    pub last_update: Timestamp,
     #[serde(rename = "numBuckets")]
     pub num_buckets: i64,
     #[serde(rename = "resyncID")]
@@ -1114,7 +1422,7 @@ impl SiteResyncMetrics {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BatchJobMetrics {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "Jobs")]
     pub jobs: HashMap<String, JobMetric>,
 }
@@ -1142,9 +1450,9 @@ pub struct JobMetric {
     #[serde(rename = "jobType")]
     pub job_type: String,
     #[serde(rename = "startTime")]
-    pub start_time: DateTime<Utc>,
+    pub start_time: Timestamp,
     #[serde(rename = "lastUpdate")]
-    pub last_update: DateTime<Utc>,
+    pub last_update: Timestamp,
     #[serde(rename = "retryAttempts")]
     pub retry_attempts: i32,
     pub complete: bool,
@@ -1229,7 +1537,7 @@ impl RealtimeMetrics {
         self.hosts.sort();
 
         for (k, v) in other.by_disk.into_iter() {
-            self.by_disk.entry(k.to_string()).and_modify(|h| *h = v.clone()).or_insert(v);
+            self.by_disk.entry(k).and_modify(|h| *h = v.clone()).or_insert(v);
         }
     }
 }
@@ -1237,7 +1545,7 @@ impl RealtimeMetrics {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OsMetrics {
     #[serde(rename = "collected")]
-    pub collected_at: DateTime<Utc>,
+    pub collected_at: Timestamp,
     #[serde(rename = "life_time_ops")]
     pub life_time_ops: HashMap<String, u64>,
     #[serde(rename = "last_minute")]
@@ -1269,10 +1577,542 @@ pub struct Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jiff::SignedDuration;
+
+    fn fixed_timestamp() -> Timestamp {
+        Timestamp::constant(1_700_000_000, 123_456_000)
+    }
+
+    #[test]
+    fn http_metrics_merge_preserves_outcomes_and_missing_node_support() {
+        #[derive(Serialize, Deserialize, Default)]
+        #[serde(default)]
+        struct LegacyMetrics {
+            rpc: Option<RPCMetrics>,
+        }
+        let old_map = rmp_serde::to_vec_named(&LegacyMetrics::default()).expect("legacy map");
+        assert!(rmp_serde::from_slice::<Metrics>(&old_map).expect("new reader").http.is_none());
+        let missing: Metrics = serde_json::from_str("{}").expect("old node metrics");
+        assert!(missing.http.is_none());
+        let mut combined = RealtimeMetrics::default();
+        for (host, successes, failures) in [("node1", 99, 1), ("node2", 0, 100)] {
+            let metrics = Metrics {
+                http: Some(HttpMetrics {
+                    collected_at: fixed_timestamp(),
+                    requests: [("2xx", successes), ("5xx", failures)]
+                        .into_iter()
+                        .map(|(outcome, total)| HttpRequestMetric {
+                            method: "PUT".into(),
+                            operation: "s3:PutObject".into(),
+                            outcome: outcome.into(),
+                            total,
+                        })
+                        .collect(),
+                }),
+                ..Default::default()
+            };
+            let encoded = rmp_serde::to_vec_named(&metrics).expect("peer metric map");
+            let old_reader: LegacyMetrics = rmp_serde::from_slice(&encoded).expect("old reader ignores HTTP field");
+            assert!(old_reader.rpc.is_none());
+            let decoded: Metrics = rmp_serde::from_slice(&encoded).expect("peer metric roundtrip");
+            combined.merge(RealtimeMetrics {
+                aggregated: decoded,
+                by_host: HashMap::from([(host.into(), metrics)]),
+                hosts: vec![host.into()],
+                ..Default::default()
+            });
+        }
+        let aggregate = combined.aggregated.http.as_ref().expect("HTTP support");
+        assert_eq!(
+            aggregate
+                .requests
+                .iter()
+                .find(|s| s.outcome == "5xx")
+                .expect("failures")
+                .total,
+            101
+        );
+        assert_eq!(aggregate.requests.iter().map(|s| s.total).sum::<u64>(), 200);
+        assert_eq!(combined.by_host["node2"].http.as_ref().expect("node2").requests[1].total, 100);
+        combined.aggregated.merge(&missing);
+        assert_eq!(
+            combined
+                .aggregated
+                .http
+                .as_ref()
+                .expect("supported peers remain")
+                .requests
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn admin_metrics_timestamps_serialize_as_rfc3339_utc() {
+        let timestamp = fixed_timestamp();
+
+        let disk = serde_json::to_value(DiskMetric {
+            collected_at: timestamp,
+            ..Default::default()
+        })
+        .expect("disk metrics should serialize");
+        assert_eq!(disk["collected"], "2023-11-14T22:13:20.123456Z");
+        let disk: DiskMetric = serde_json::from_value(disk).expect("disk metrics should deserialize");
+        assert_eq!(disk.collected_at, timestamp);
+
+        let scanner = serde_json::to_value(ScannerMetrics {
+            collected_at: timestamp,
+            current_started: timestamp,
+            cycles_completed_at: vec![timestamp],
+            ..Default::default()
+        })
+        .expect("scanner metrics should serialize");
+        assert_eq!(scanner["collected"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(scanner["current_started"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(scanner["cycle_complete_times"][0], "2023-11-14T22:13:20.123456Z");
+        let scanner: ScannerMetrics = serde_json::from_value(scanner).expect("scanner metrics should deserialize");
+        assert_eq!(scanner.collected_at, timestamp);
+        assert_eq!(scanner.current_started, timestamp);
+        assert_eq!(scanner.cycles_completed_at, vec![timestamp]);
+
+        let rpc = serde_json::to_value(RPCMetrics {
+            collected_at: timestamp,
+            last_pong_time: timestamp,
+            last_connect_time: timestamp,
+            ..Default::default()
+        })
+        .expect("rpc metrics should serialize");
+        assert_eq!(rpc["collectedAt"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(rpc["lastPongTime"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(rpc["lastConnectTime"], "2023-11-14T22:13:20.123456Z");
+        let rpc: RPCMetrics = serde_json::from_value(rpc).expect("rpc metrics should deserialize");
+        assert_eq!(rpc.collected_at, timestamp);
+        assert_eq!(rpc.last_pong_time, timestamp);
+        assert_eq!(rpc.last_connect_time, timestamp);
+
+        let batch = serde_json::to_value(BatchJobMetrics {
+            collected_at: timestamp,
+            jobs: HashMap::from([(
+                "job-a".to_string(),
+                JobMetric {
+                    job_id: "job-a".to_string(),
+                    start_time: timestamp,
+                    last_update: timestamp,
+                    ..Default::default()
+                },
+            )]),
+        })
+        .expect("batch metrics should serialize");
+        assert_eq!(batch["collected"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(batch["Jobs"]["job-a"]["startTime"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(batch["Jobs"]["job-a"]["lastUpdate"], "2023-11-14T22:13:20.123456Z");
+        let batch: BatchJobMetrics = serde_json::from_value(batch).expect("batch metrics should deserialize");
+        assert_eq!(batch.collected_at, timestamp);
+        let job = batch.jobs.get("job-a").expect("job should deserialize");
+        assert_eq!(job.start_time, timestamp);
+        assert_eq!(job.last_update, timestamp);
+
+        let net = serde_json::to_value(NetMetrics {
+            collected_at: timestamp,
+            ..Default::default()
+        })
+        .expect("net metrics should serialize");
+        assert_eq!(net["collected"], "2023-11-14T22:13:20.123456Z");
+        let net: NetMetrics = serde_json::from_value(net).expect("net metrics should deserialize");
+        assert_eq!(net.collected_at, timestamp);
+
+        let mem = serde_json::to_value(MemMetrics {
+            collected_at: timestamp,
+            ..Default::default()
+        })
+        .expect("mem metrics should serialize");
+        assert_eq!(mem["collected"], "2023-11-14T22:13:20.123456Z");
+        let mem: MemMetrics = serde_json::from_value(mem).expect("mem metrics should deserialize");
+        assert_eq!(mem.collected_at, timestamp);
+
+        let site_resync = serde_json::to_value(SiteResyncMetrics {
+            collected_at: timestamp,
+            start_time: timestamp,
+            last_update: timestamp,
+            ..Default::default()
+        })
+        .expect("site resync metrics should serialize");
+        assert_eq!(site_resync["collected"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(site_resync["startTime"], "2023-11-14T22:13:20.123456Z");
+        assert_eq!(site_resync["lastUpdate"], "2023-11-14T22:13:20.123456Z");
+        let site_resync: SiteResyncMetrics = serde_json::from_value(site_resync).expect("site resync metrics should deserialize");
+        assert_eq!(site_resync.collected_at, timestamp);
+        assert_eq!(site_resync.start_time, timestamp);
+        assert_eq!(site_resync.last_update, timestamp);
+
+        let os = serde_json::to_value(OsMetrics {
+            collected_at: timestamp,
+            ..Default::default()
+        })
+        .expect("os metrics should serialize");
+        assert_eq!(os["collected"], "2023-11-14T22:13:20.123456Z");
+        let os: OsMetrics = serde_json::from_value(os).expect("os metrics should deserialize");
+        assert_eq!(os.collected_at, timestamp);
+    }
+
+    #[test]
+    fn scanner_metrics_serializes_cycle_active_presence() {
+        let missing_value = serde_json::to_value(ScannerMetrics::default()).expect("scanner metrics should serialize");
+        assert!(missing_value.get("current_cycle_active").is_none());
+        let missing: ScannerMetrics =
+            serde_json::from_value(missing_value).expect("older scanner metrics without cycle-active should decode");
+        assert_eq!(missing.current_cycle_active, None);
+
+        let explicit_false_value = serde_json::to_value(ScannerMetrics {
+            current_cycle_active: Some(false),
+            ..Default::default()
+        })
+        .expect("scanner metrics with explicit cycle-active should serialize");
+        assert_eq!(explicit_false_value["current_cycle_active"], serde_json::Value::Bool(false));
+        let explicit_false: ScannerMetrics =
+            serde_json::from_value(explicit_false_value).expect("explicit cycle-active should decode");
+        assert_eq!(explicit_false.current_cycle_active, Some(false));
+    }
+
+    #[test]
+    fn usage_freshness_deferred_fields_are_backward_compatible_and_merge() {
+        let legacy: ScannerUsageFreshnessSnapshot = serde_json::from_value(serde_json::json!({
+            "dirty_pending_buckets": 2,
+            "last_usage_save_result": "success"
+        }))
+        .expect("legacy usage freshness should decode");
+        assert!(!legacy.deferred_pending);
+        assert_eq!(legacy.deferred_total, 0);
+        assert_eq!(legacy.guardrail_veto_total, 0);
+        assert_eq!(legacy.last_guardrail_veto_unix_secs, 0);
+        assert!(legacy.last_guardrail_veto_reason.is_empty());
+        assert_eq!(legacy.scope_fallback_total, 0);
+        assert_eq!(legacy.last_scope_fallback_unix_secs, 0);
+        assert!(legacy.last_scope_fallback_reason.is_empty());
+
+        let mut fallbacks = ScannerUsageFreshnessSnapshot::default();
+        fallbacks.merge(&ScannerUsageFreshnessSnapshot {
+            scope_fallback_total: 3,
+            last_scope_fallback_unix_secs: 40,
+            last_scope_fallback_reason: "dirty_bucket_overflow".to_string(),
+            ..Default::default()
+        });
+        fallbacks.merge(&ScannerUsageFreshnessSnapshot {
+            scope_fallback_total: 1,
+            last_scope_fallback_unix_secs: 25,
+            last_scope_fallback_reason: "baseline_unavailable".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(fallbacks.scope_fallback_total, 4);
+        assert_eq!(fallbacks.last_scope_fallback_unix_secs, 40);
+        assert_eq!(fallbacks.last_scope_fallback_reason, "dirty_bucket_overflow");
+
+        let mut vetoes = ScannerUsageFreshnessSnapshot::default();
+        vetoes.merge(&ScannerUsageFreshnessSnapshot {
+            guardrail_veto_total: 2,
+            last_guardrail_veto_unix_secs: 30,
+            last_guardrail_veto_reason: "publication_blocked@<local>".to_string(),
+            ..Default::default()
+        });
+        vetoes.merge(&ScannerUsageFreshnessSnapshot {
+            guardrail_veto_total: 1,
+            last_guardrail_veto_unix_secs: 20,
+            last_guardrail_veto_reason: "movement_generation@node-2".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(vetoes.guardrail_veto_total, 3);
+        assert_eq!(vetoes.last_guardrail_veto_unix_secs, 30);
+        assert_eq!(vetoes.last_guardrail_veto_reason, "publication_blocked@<local>");
+
+        let mut merged = ScannerUsageFreshnessSnapshot::default();
+        merged.merge(&ScannerUsageFreshnessSnapshot {
+            deferred_pending: true,
+            deferred_total: 2,
+            last_deferred_unix_secs: 20,
+            last_deferred_reason: "data_movement".to_string(),
+            ..Default::default()
+        });
+        merged.merge(&ScannerUsageFreshnessSnapshot {
+            deferred_total: 1,
+            last_deferred_unix_secs: 10,
+            last_deferred_reason: "older".to_string(),
+            ..Default::default()
+        });
+        assert!(merged.deferred_pending);
+        assert_eq!(merged.deferred_total, 3);
+        assert_eq!(merged.last_deferred_unix_secs, 20);
+        assert_eq!(merged.last_deferred_reason, "data_movement");
+
+        merged.merge(&ScannerUsageFreshnessSnapshot {
+            deferred_pending: false,
+            last_durable_success_unix_secs: 30,
+            last_publication_unix_secs: 30,
+            last_publication_state: "success".to_string(),
+            ..Default::default()
+        });
+        assert!(!merged.deferred_pending);
+        assert_eq!(merged.last_durable_success_unix_secs, 30);
+        assert_eq!(merged.last_publication_state, "success");
+    }
+
+    #[test]
+    fn scanner_metrics_merge_prefers_an_active_first_cycle() {
+        let collected_at = Timestamp::now();
+        let idle_started = collected_at - SignedDuration::from_hours(1);
+        let active_started = collected_at - SignedDuration::from_secs(5);
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            current_cycle: 0,
+            current_cycle_active: Some(false),
+            current_started: idle_started,
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + SignedDuration::from_secs(1),
+            current_cycle: 0,
+            current_cycle_active: Some(true),
+            current_started: active_started,
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.current_cycle_active, Some(true));
+        assert_eq!(scanner.current_cycle, 0);
+        assert_eq!(scanner.current_started, active_started);
+    }
+
+    #[test]
+    fn metrics_merge_preserves_explicit_active_first_cycle() {
+        let mut aggregated = Metrics::default();
+        aggregated.merge(&Metrics {
+            scanner: Some(ScannerMetrics {
+                current_cycle_active: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let scanner = aggregated.scanner.expect("aggregated scanner metrics");
+        assert_eq!(scanner.current_cycle_active, Some(true));
+        assert_eq!(scanner.current_cycle, 0);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_preserves_legacy_nonzero_active_signal() {
+        let collected_at = Timestamp::now();
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + SignedDuration::from_secs(1),
+            current_cycle: 7,
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.current_cycle_active, Some(true));
+        assert_eq!(scanner.current_cycle, 7);
+    }
+
+    #[test]
+    fn metrics_merge_normalizes_first_legacy_scanner_snapshot() {
+        let legacy = Metrics {
+            scanner: Some(ScannerMetrics {
+                current_cycle: 7,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut aggregated = Metrics::default();
+
+        aggregated.merge(&legacy);
+
+        let scanner = aggregated.scanner.expect("aggregated scanner metrics");
+        assert_eq!(scanner.current_cycle_active, Some(true));
+        assert_eq!(scanner.current_cycle, 7);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_preserves_explicit_inactive_nonzero_cycle() {
+        let collected_at = Timestamp::now();
+        let mut scanner = ScannerMetrics::default();
+
+        scanner.merge(&ScannerMetrics {
+            collected_at,
+            current_cycle: 7,
+            current_cycle_active: Some(false),
+            ..Default::default()
+        });
+
+        assert_eq!(scanner.current_cycle_active, Some(false));
+        assert_eq!(scanner.current_cycle, 7);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_cycle_active_is_order_independent() {
+        let collected_at = Timestamp::now();
+        let legacy_active = ScannerMetrics {
+            collected_at,
+            current_cycle: 7,
+            current_started: collected_at - SignedDuration::from_secs(10),
+            ..Default::default()
+        };
+        let explicit_idle = ScannerMetrics {
+            collected_at,
+            current_cycle: 0,
+            current_cycle_active: Some(false),
+            current_started: collected_at - SignedDuration::from_hours(1),
+            ..Default::default()
+        };
+
+        let mut legacy_first = legacy_active.clone();
+        legacy_first.merge(&explicit_idle);
+        let mut legacy_second = explicit_idle.clone();
+        legacy_second.merge(&legacy_active);
+        assert_eq!(legacy_first.current_cycle_active, Some(true));
+        assert_eq!(legacy_second.current_cycle_active, Some(true));
+        assert_eq!(legacy_first.current_cycle, 7);
+        assert_eq!(legacy_second.current_cycle, 7);
+
+        let explicit_inactive_nonzero = ScannerMetrics {
+            collected_at,
+            current_cycle: 7,
+            current_cycle_active: Some(false),
+            ..Default::default()
+        };
+        let mut inactive_first = explicit_inactive_nonzero.clone();
+        inactive_first.merge(&explicit_idle);
+        let mut inactive_second = explicit_idle;
+        inactive_second.merge(&explicit_inactive_nonzero);
+        assert_eq!(inactive_first.current_cycle_active, Some(false));
+        assert_eq!(inactive_second.current_cycle_active, Some(false));
+        assert_eq!(inactive_first.current_cycle, 7);
+        assert_eq!(inactive_second.current_cycle, 7);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_cycle_authority_is_order_independent() {
+        let collected_at = Timestamp::now();
+        let completion = collected_at - SignedDuration::from_mins(1);
+        let earlier_active = ScannerMetrics {
+            collected_at,
+            current_cycle: 7,
+            current_cycle_active: Some(true),
+            current_started: collected_at - SignedDuration::from_secs(10),
+            cycles_completed_at: vec![completion],
+            ..Default::default()
+        };
+        let later_active = ScannerMetrics {
+            collected_at: collected_at + SignedDuration::from_secs(1),
+            current_cycle: 7,
+            current_cycle_active: Some(true),
+            current_started: collected_at - SignedDuration::from_secs(5),
+            cycles_completed_at: vec![completion],
+            ..Default::default()
+        };
+
+        let mut earlier_first = earlier_active.clone();
+        earlier_first.merge(&later_active);
+        let mut later_first = later_active.clone();
+        later_first.merge(&earlier_active);
+
+        assert_eq!(earlier_first.current_started, later_active.current_started);
+        assert_eq!(later_first.current_started, later_active.current_started);
+        assert_eq!(earlier_first.cycles_completed_at, later_active.cycles_completed_at);
+        assert_eq!(later_first.cycles_completed_at, later_active.cycles_completed_at);
+
+        let stale_idle = ScannerMetrics {
+            collected_at,
+            current_cycle_active: Some(false),
+            current_started: collected_at - SignedDuration::from_hours(1),
+            ..Default::default()
+        };
+        let completed_idle = ScannerMetrics {
+            collected_at: collected_at + SignedDuration::from_secs(1),
+            current_cycle_active: Some(false),
+            current_started: collected_at - SignedDuration::from_secs(5),
+            cycles_completed_at: vec![completion],
+            ..Default::default()
+        };
+
+        let mut stale_first = stale_idle.clone();
+        stale_first.merge(&completed_idle);
+        let mut completed_first = completed_idle.clone();
+        completed_first.merge(&stale_idle);
+
+        assert_eq!(stale_first.current_started, completed_idle.current_started);
+        assert_eq!(completed_first.current_started, completed_idle.current_started);
+        assert_eq!(stale_first.cycles_completed_at, completed_idle.cycles_completed_at);
+        assert_eq!(completed_first.cycles_completed_at, completed_idle.cycles_completed_at);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_cycle_authority_is_associative() {
+        let collected_at = Timestamp::now();
+        let older_completion = collected_at - SignedDuration::from_mins(3);
+        let last_completion = collected_at - SignedDuration::from_mins(1);
+        let cycle_seven = ScannerMetrics {
+            collected_at,
+            current_cycle: 7,
+            current_cycle_active: Some(true),
+            current_started: collected_at - SignedDuration::from_secs(10),
+            cycles_completed_at: vec![older_completion, last_completion],
+            ..Default::default()
+        };
+        let cycle_eight = ScannerMetrics {
+            collected_at: collected_at + SignedDuration::from_secs(1),
+            current_cycle: 8,
+            current_cycle_active: Some(true),
+            current_started: collected_at - SignedDuration::from_secs(5),
+            cycles_completed_at: vec![last_completion],
+            ..Default::default()
+        };
+        let newer_idle = ScannerMetrics {
+            collected_at: collected_at + SignedDuration::from_hours(1),
+            current_cycle_active: Some(false),
+            current_started: collected_at - SignedDuration::from_hours(1),
+            ..Default::default()
+        };
+
+        let mut left_associative = cycle_seven.clone();
+        left_associative.merge(&cycle_eight);
+        left_associative.merge(&newer_idle);
+
+        let mut right_group = cycle_eight.clone();
+        right_group.merge(&newer_idle);
+        let mut right_associative = cycle_seven.clone();
+        right_associative.merge(&right_group);
+
+        assert_eq!(left_associative.current_cycle, 8);
+        assert_eq!(right_associative.current_cycle, 8);
+        assert_eq!(left_associative.current_started, cycle_eight.current_started);
+        assert_eq!(right_associative.current_started, cycle_eight.current_started);
+        assert_eq!(left_associative.cycles_completed_at, cycle_eight.cycles_completed_at);
+        assert_eq!(right_associative.cycles_completed_at, cycle_eight.cycles_completed_at);
+
+        for order in [
+            [&cycle_seven, &cycle_eight, &newer_idle],
+            [&cycle_seven, &newer_idle, &cycle_eight],
+            [&cycle_eight, &cycle_seven, &newer_idle],
+            [&cycle_eight, &newer_idle, &cycle_seven],
+            [&newer_idle, &cycle_seven, &cycle_eight],
+            [&newer_idle, &cycle_eight, &cycle_seven],
+        ] {
+            let mut merged = ScannerMetrics::default();
+            for scanner in order {
+                merged.merge(scanner);
+            }
+            assert_eq!(merged.current_cycle_active, Some(true));
+            assert_eq!(merged.current_cycle, 8);
+            assert_eq!(merged.current_started, cycle_eight.current_started);
+            assert_eq!(merged.cycles_completed_at, cycle_eight.cycles_completed_at);
+        }
+    }
 
     #[test]
     fn scanner_metrics_merge_aggregates_partial_cycles_by_source() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics {
             collected_at,
             last_cycle_partial_source: "usage".to_string(),
@@ -1295,7 +2135,7 @@ mod tests {
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             last_cycle_partial_source: "lifecycle".to_string(),
             last_cycle_partial_source_code: 2,
             pacing_pressure: ScannerPacingPressureSnapshot {
@@ -1347,7 +2187,7 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_preserves_pause_pressure_without_duration() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics {
             collected_at,
             pacing_pressure: ScannerPacingPressureSnapshot {
@@ -1358,7 +2198,7 @@ mod tests {
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             pacing_pressure: ScannerPacingPressureSnapshot::default(),
             ..Default::default()
         });
@@ -1383,7 +2223,7 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_aggregates_lifecycle_transition_status() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics {
             collected_at,
             current_cycle_lifecycle_expiry_actions: 2,
@@ -1398,6 +2238,9 @@ mod tests {
                 queue_missed: 3,
                 scanner_queued: 5,
                 scanner_missed: 2,
+                scanner_blocked: 4,
+                scanner_not_enqueued: 1,
+                delete_failed: 1,
             },
             lifecycle_transition: ScannerLifecycleTransitionSnapshot {
                 current_queue_capacity: 8,
@@ -1418,7 +2261,7 @@ mod tests {
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             current_cycle_lifecycle_expiry_actions: 11,
             current_cycle_lifecycle_transition_actions: 13,
             last_cycle_lifecycle_expiry_actions: 17,
@@ -1431,6 +2274,9 @@ mod tests {
                 queue_missed: 2,
                 scanner_queued: 6,
                 scanner_missed: 4,
+                scanner_blocked: 7,
+                scanner_not_enqueued: 5,
+                delete_failed: 2,
             },
             lifecycle_transition: ScannerLifecycleTransitionSnapshot {
                 current_queue_capacity: 4,
@@ -1457,6 +2303,9 @@ mod tests {
         assert_eq!(scanner.lifecycle_expiry.queue_missed, 5);
         assert_eq!(scanner.lifecycle_expiry.scanner_queued, 11);
         assert_eq!(scanner.lifecycle_expiry.scanner_missed, 6);
+        assert_eq!(scanner.lifecycle_expiry.scanner_blocked, 11);
+        assert_eq!(scanner.lifecycle_expiry.scanner_not_enqueued, 6);
+        assert_eq!(scanner.lifecycle_expiry.delete_failed, 3);
         assert_eq!(scanner.lifecycle_transition.current_queue_capacity, 12);
         assert_eq!(scanner.lifecycle_transition.current_queued, 5);
         assert_eq!(scanner.lifecycle_transition.current_active, 3);
@@ -1478,7 +2327,7 @@ mod tests {
 
     #[test]
     fn scanner_metrics_merge_aggregates_maintenance_control_status() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics {
             collected_at,
             maintenance_control: ScannerMaintenanceControlSnapshot {
@@ -1499,7 +2348,7 @@ mod tests {
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             maintenance_control: ScannerMaintenanceControlSnapshot {
                 primary_control: "blocked_source".to_string(),
                 sources: vec![
@@ -1558,8 +2407,167 @@ mod tests {
     }
 
     #[test]
+    fn scanner_metrics_merge_aggregates_replication_repair_status() {
+        let collected_at = Timestamp::now();
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "bucket_replication".to_string(),
+                kind: "object".to_string(),
+                scanner_role: "repair_admission".to_string(),
+                execution_owner: "bucket_replication_queue".to_string(),
+                queued: 2,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + SignedDuration::from_secs(1),
+            replication_repair: vec![
+                ScannerReplicationRepairSnapshot {
+                    source: "bucket_replication".to_string(),
+                    kind: "object".to_string(),
+                    scanner_role: "repair_admission".to_string(),
+                    execution_owner: "bucket_replication_queue".to_string(),
+                    missed: 3,
+                    ..Default::default()
+                },
+                ScannerReplicationRepairSnapshot {
+                    source: "bucket_replication".to_string(),
+                    kind: "delete_marker".to_string(),
+                    scanner_role: "repair_admission".to_string(),
+                    execution_owner: "bucket_replication_queue".to_string(),
+                    skipped: 4,
+                    ..Default::default()
+                },
+                ScannerReplicationRepairSnapshot {
+                    source: "site_replication".to_string(),
+                    kind: "active_resync".to_string(),
+                    scanner_role: "boundary_signal".to_string(),
+                    execution_owner: "site_replication_runtime".to_string(),
+                    queued: 5,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let object = scanner
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "object")
+            .expect("bucket object repair snapshot should be merged");
+        assert_eq!(object.scanner_role, "repair_admission");
+        assert_eq!(object.execution_owner, "bucket_replication_queue");
+        assert_eq!(object.queued, 2);
+        assert_eq!(object.missed, 3);
+
+        let delete_marker = scanner
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "delete_marker")
+            .expect("bucket delete-marker repair snapshot should be merged");
+        assert_eq!(delete_marker.scanner_role, "repair_admission");
+        assert_eq!(delete_marker.execution_owner, "bucket_replication_queue");
+        assert_eq!(delete_marker.skipped, 4);
+
+        let site_resync = scanner
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "site_replication" && repair.kind == "active_resync")
+            .expect("site active resync snapshot should remain separate");
+        assert_eq!(site_resync.scanner_role, "boundary_signal");
+        assert_eq!(site_resync.execution_owner, "site_replication_runtime");
+        assert_eq!(site_resync.queued, 5);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_preserves_replication_repair_metadata_from_newer_nodes() {
+        let collected_at = Timestamp::now();
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "bucket_replication".to_string(),
+                kind: "object".to_string(),
+                checked: 2,
+                ..Default::default()
+            }],
+            current_cycle_replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "bucket_replication".to_string(),
+                kind: "delete_marker".to_string(),
+                queued: 3,
+                ..Default::default()
+            }],
+            last_cycle_replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "site_replication".to_string(),
+                kind: "active_resync".to_string(),
+                missed: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + SignedDuration::from_secs(1),
+            replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "bucket_replication".to_string(),
+                kind: "object".to_string(),
+                scanner_role: "repair_admission".to_string(),
+                execution_owner: "bucket_replication_queue".to_string(),
+                checked: 5,
+                ..Default::default()
+            }],
+            current_cycle_replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "bucket_replication".to_string(),
+                kind: "delete_marker".to_string(),
+                scanner_role: "repair_admission".to_string(),
+                execution_owner: "bucket_replication_queue".to_string(),
+                queued: 7,
+                ..Default::default()
+            }],
+            last_cycle_replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "site_replication".to_string(),
+                kind: "active_resync".to_string(),
+                scanner_role: "boundary_signal".to_string(),
+                execution_owner: "site_replication_runtime".to_string(),
+                missed: 11,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let object = scanner
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "object")
+            .expect("mixed-version object repair snapshot should be merged");
+        assert_eq!(object.scanner_role, "repair_admission");
+        assert_eq!(object.execution_owner, "bucket_replication_queue");
+        assert_eq!(object.checked, 7);
+
+        let delete_marker = scanner
+            .current_cycle_replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "delete_marker")
+            .expect("mixed-version current-cycle repair snapshot should be merged");
+        assert_eq!(delete_marker.scanner_role, "repair_admission");
+        assert_eq!(delete_marker.execution_owner, "bucket_replication_queue");
+        assert_eq!(delete_marker.queued, 10);
+
+        let active_resync = scanner
+            .last_cycle_replication_repair
+            .iter()
+            .find(|repair| repair.source == "site_replication" && repair.kind == "active_resync")
+            .expect("mixed-version last-cycle repair snapshot should be merged");
+        assert_eq!(active_resync.scanner_role, "boundary_signal");
+        assert_eq!(active_resync.execution_owner, "site_replication_runtime");
+        assert_eq!(active_resync.missed, 15);
+    }
+
+    #[test]
     fn scanner_metrics_merge_preserves_distributed_status_fields() {
-        let collected_at = Utc::now();
+        let collected_at = Timestamp::now();
         let mut scanner = ScannerMetrics {
             collected_at,
             active_scan_paths: 1,
@@ -1596,6 +2604,7 @@ mod tests {
             last_cycle_replication_checks: 7,
             last_cycle_usage_saves: 8,
             failed_cycles: 1,
+            superseded_cycles: 2,
             partial_cycles_unknown: 2,
             partial_cycles_runtime: 3,
             partial_cycles_objects: 4,
@@ -1632,7 +2641,7 @@ mod tests {
         };
 
         scanner.merge(&ScannerMetrics {
-            collected_at: collected_at + chrono::Duration::seconds(1),
+            collected_at: collected_at + SignedDuration::from_secs(1),
             active_scan_paths: 2,
             oldest_active_path_age_seconds: 45,
             active_paths: vec!["node-b/disk-b/bucket-b".to_string()],
@@ -1667,6 +2676,7 @@ mod tests {
             last_cycle_replication_checks: 70,
             last_cycle_usage_saves: 80,
             failed_cycles: 10,
+            superseded_cycles: 20,
             partial_cycles_unknown: 20,
             partial_cycles_runtime: 30,
             partial_cycles_objects: 40,
@@ -1748,6 +2758,7 @@ mod tests {
         assert_eq!(scanner.last_cycle_replication_checks, 77);
         assert_eq!(scanner.last_cycle_usage_saves, 88);
         assert_eq!(scanner.failed_cycles, 11);
+        assert_eq!(scanner.superseded_cycles, 22);
         assert_eq!(scanner.partial_cycles_unknown, 22);
         assert_eq!(scanner.partial_cycles_runtime, 33);
         assert_eq!(scanner.partial_cycles_objects, 44);

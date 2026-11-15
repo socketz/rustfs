@@ -13,185 +13,302 @@
 // limitations under the License.
 
 use super::*;
-use crate::config::get_global_storage_class;
-use rustfs_storage_api::StorageAdminApi;
+use crate::config::storageclass;
+use crate::core::pools::merge_pool_status_refresh;
+use crate::layout::pool_space::{ServerPoolsAvailableSpace, build_server_pools_available_space};
+use crate::runtime::sources as runtime_sources;
+use crate::storage_api_contracts::{admin::StorageAdminApi, namespace::NamespaceLocking as _, object::ObjectOperations as _};
+use futures::stream::{FuturesUnordered, StreamExt};
+pub(in crate::store) mod support;
 
-struct LatestObjectInfoCandidate {
-    info: Option<ObjectInfo>,
-    idx: usize,
-    err: Option<Error>,
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_POOLS: &str = "pools";
+const EVENT_POOL_META_RELOAD: &str = "pool_meta_reload";
+
+#[cfg(test)]
+struct PreparedPoolReadFallbackBarrierState {
+    object: String,
+    pause_before_refetch: bool,
+    fanout_arrived: tokio::sync::Notify,
+    fanout_release: tokio::sync::Notify,
+    refetch_arrived: tokio::sync::Notify,
+    refetch_release: tokio::sync::Notify,
 }
 
-struct RebalanceDeletePoolResult {
-    pool_idx: usize,
-    result: Result<ObjectInfo>,
+#[cfg(test)]
+pub(in crate::store) struct PreparedPoolReadFallbackBarrier {
+    state: Arc<PreparedPoolReadFallbackBarrierState>,
 }
 
-fn pool_lookup_not_found_error(bucket: &str, object: &str, opts: &ObjectOptions) -> Error {
-    let object = decode_dir_object(object);
+#[cfg(test)]
+static PREPARED_POOL_READ_FALLBACK_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<PreparedPoolReadFallbackBarrierState>>>,
+> = std::sync::OnceLock::new();
 
-    if let Some(version_id) = &opts.version_id {
-        StorageError::VersionNotFound(bucket.to_owned(), object, version_id.clone())
+#[cfg(test)]
+impl PreparedPoolReadFallbackBarrier {
+    pub(in crate::store) fn install(object: &str, pause_before_refetch: bool) -> Self {
+        let state = Arc::new(PreparedPoolReadFallbackBarrierState {
+            object: object.to_string(),
+            pause_before_refetch,
+            fanout_arrived: tokio::sync::Notify::new(),
+            fanout_release: tokio::sync::Notify::new(),
+            refetch_arrived: tokio::sync::Notify::new(),
+            refetch_release: tokio::sync::Notify::new(),
+        });
+        *PREPARED_POOL_READ_FALLBACK_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("prepared pool read fallback barrier must not be poisoned") = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(in crate::store) async fn wait_after_fanout(&self) {
+        self.state.fanout_arrived.notified().await;
+    }
+
+    pub(in crate::store) fn release_after_fanout(&self) {
+        self.state.fanout_release.notify_one();
+    }
+
+    pub(in crate::store) async fn wait_before_refetch(&self) {
+        self.state.refetch_arrived.notified().await;
+    }
+
+    pub(in crate::store) fn release_before_refetch(&self) {
+        self.state.refetch_release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for PreparedPoolReadFallbackBarrier {
+    fn drop(&mut self) {
+        self.state.fanout_release.notify_waiters();
+        self.state.refetch_release.notify_waiters();
+        if let Some(barrier) = PREPARED_POOL_READ_FALLBACK_BARRIER.get() {
+            *barrier
+                .lock()
+                .expect("prepared pool read fallback barrier must not be poisoned") = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_prepared_pool_read_after_fanout(object: &str) {
+    let state = PREPARED_POOL_READ_FALLBACK_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("prepared pool read fallback barrier must not be poisoned")
+        .as_ref()
+        .filter(|state| state.object == object)
+        .cloned();
+    if let Some(state) = state {
+        state.fanout_arrived.notify_one();
+        state.fanout_release.notified().await;
+    }
+}
+
+#[cfg(test)]
+async fn pause_prepared_pool_read_before_refetch(object: &str) {
+    let state = PREPARED_POOL_READ_FALLBACK_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("prepared pool read fallback barrier must not be poisoned")
+        .as_ref()
+        .filter(|state| state.object == object && state.pause_before_refetch)
+        .cloned();
+    if let Some(state) = state {
+        state.refetch_arrived.notify_one();
+        state.refetch_release.notified().await;
+    }
+}
+/// Capacity that every online drive of one pool reports to free-space target
+/// selection, per store, until the guard drops.
+#[cfg(all(test, feature = "test-util"))]
+static POOL_SPACE_FOR_TEST: std::sync::Mutex<Vec<(Uuid, usize, crate::disk::DiskInfo)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct PoolSpaceForTest(Uuid);
+
+#[cfg(all(test, feature = "test-util"))]
+impl PoolSpaceForTest {
+    pub(crate) fn install(store: Uuid, pools: &[(usize, crate::disk::DiskInfo)]) -> Self {
+        POOL_SPACE_FOR_TEST
+            .lock()
+            .expect("pool space override must not be poisoned")
+            .extend(pools.iter().map(|(pool, info)| (store, *pool, info.clone())));
+        Self(store)
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for PoolSpaceForTest {
+    fn drop(&mut self) {
+        POOL_SPACE_FOR_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(store, _, _)| *store != self.0);
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+fn pool_space_for_test(
+    store: Uuid,
+    pool: usize,
+    infos: Vec<Option<crate::disk::DiskInfo>>,
+) -> Vec<Option<crate::disk::DiskInfo>> {
+    let overrides = POOL_SPACE_FOR_TEST.lock().expect("pool space override must not be poisoned");
+    let Some((_, _, info)) = overrides
+        .iter()
+        .find(|(override_store, override_pool, _)| *override_store == store && *override_pool == pool)
+    else {
+        return infos;
+    };
+    infos.into_iter().map(|disk| disk.map(|_| info.clone())).collect()
+}
+
+#[cfg(test)]
+use support::resolve_latest_object_info_candidates;
+use support::{
+    LatestObjectInfoCandidate, PoolErr, PoolObjInfo, pool_lookup_not_found_error, rebalance_disk_set_lookup_error,
+    resolve_latest_object_info_candidates_with_pool_state, resolve_rebalance_delete_from_all_pools_results,
+    resolve_store_rebalance_pool_meta_reload_result, validate_prepared_pool_refetch_identity,
+};
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct BackendStorageClassInfo {
+    standard_sc_data: Vec<usize>,
+    standard_sc_parities: Vec<usize>,
+    standard_sc_parity: Option<usize>,
+    rr_sc_data: Vec<usize>,
+    rr_sc_parities: Vec<usize>,
+    rr_sc_parity: Option<usize>,
+}
+
+fn resolve_pool_layout(
+    drives_per_set: &[usize],
+    mut parity_for_pool: impl FnMut(usize, usize) -> Option<usize>,
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    let mut parities = Vec::with_capacity(drives_per_set.len());
+    let mut data = Vec::with_capacity(drives_per_set.len());
+
+    for (pool_index, &drives) in drives_per_set.iter().enumerate() {
+        if drives == 0 {
+            return None;
+        }
+
+        let parity = parity_for_pool(pool_index, drives)?;
+        let data_drives = drives.checked_sub(parity)?;
+        if data_drives == 0 || parity > data_drives {
+            return None;
+        }
+
+        data.push(data_drives);
+        parities.push(parity);
+    }
+
+    Some((parities, data))
+}
+
+fn homogeneous_parity(parities: &[usize]) -> Option<usize> {
+    let first = *parities.first()?;
+    parities.iter().all(|&parity| parity == first).then_some(first)
+}
+
+fn resolve_complete_pool_layouts(
+    drives_per_set: &[usize],
+    standard_parity_for_pool: impl FnMut(usize, usize) -> Option<usize>,
+    rr_parity_for_pool: impl FnMut(usize, usize) -> Option<usize>,
+) -> Option<BackendStorageClassInfo> {
+    let (standard_sc_parities, standard_sc_data) = resolve_pool_layout(drives_per_set, standard_parity_for_pool)?;
+    let (rr_sc_parities, rr_sc_data) = resolve_pool_layout(drives_per_set, rr_parity_for_pool)?;
+
+    for ((&standard_parity, &rr_parity), &drives) in standard_sc_parities.iter().zip(&rr_sc_parities).zip(drives_per_set) {
+        storageclass::validate_parity_inner(standard_parity, rr_parity, drives).ok()?;
+    }
+
+    Some(BackendStorageClassInfo {
+        standard_sc_parity: homogeneous_parity(&standard_sc_parities),
+        standard_sc_data,
+        standard_sc_parities,
+        rr_sc_parity: homogeneous_parity(&rr_sc_parities),
+        rr_sc_data,
+        rr_sc_parities,
+    })
+}
+
+fn resolve_backend_storage_class_info(
+    config: &storageclass::Config,
+    drives_per_set: &[usize],
+    default_standard_parities: &[usize],
+) -> BackendStorageClassInfo {
+    if drives_per_set.len() != default_standard_parities.len() {
+        return BackendStorageClassInfo::default();
+    }
+
+    if !config.is_initialized() {
+        let Some((standard_sc_parities, standard_sc_data)) =
+            resolve_pool_layout(drives_per_set, |pool_index, _| default_standard_parities.get(pool_index).copied())
+        else {
+            return BackendStorageClassInfo::default();
+        };
+
+        return BackendStorageClassInfo {
+            standard_sc_parity: homogeneous_parity(&standard_sc_parities),
+            standard_sc_data,
+            standard_sc_parities,
+            ..Default::default()
+        };
+    }
+
+    match (config.parities_for_sc(storageclass::STANDARD), config.parities_for_sc(storageclass::RRS)) {
+        (Some(standard), Some(rr)) if standard.len() == drives_per_set.len() && rr.len() == drives_per_set.len() => {
+            resolve_complete_pool_layouts(
+                drives_per_set,
+                |pool_index, drives| config.parity_for_pool(storageclass::STANDARD, pool_index, drives),
+                |pool_index, drives| config.parity_for_pool(storageclass::RRS, pool_index, drives),
+            )
+            .unwrap_or_default()
+        }
+        (None, None) => {
+            let Some(standard) = config.get_parity_for_sc(storageclass::STANDARD) else {
+                return BackendStorageClassInfo::default();
+            };
+            let Some(rr) = config.get_parity_for_sc(storageclass::RRS) else {
+                return BackendStorageClassInfo::default();
+            };
+
+            resolve_complete_pool_layouts(drives_per_set, |_, _| Some(standard), |_, _| Some(rr)).unwrap_or_default()
+        }
+        _ => BackendStorageClassInfo::default(),
+    }
+}
+
+fn build_backend_info(
+    config: &storageclass::Config,
+    drives_per_set: &[usize],
+    default_standard_parities: &[usize],
+    total_sets: &[usize],
+) -> rustfs_madmin::BackendInfo {
+    let storage_class_info = if total_sets.len() == drives_per_set.len() {
+        resolve_backend_storage_class_info(config, drives_per_set, default_standard_parities)
     } else {
-        StorageError::ObjectNotFound(bucket.to_owned(), object)
+        BackendStorageClassInfo::default()
+    };
+
+    rustfs_madmin::BackendInfo {
+        backend_type: rustfs_madmin::BackendByte::Erasure,
+        online_disks: rustfs_madmin::BackendDisks::new(),
+        offline_disks: rustfs_madmin::BackendDisks::new(),
+        standard_sc_data: storage_class_info.standard_sc_data,
+        standard_sc_parities: storage_class_info.standard_sc_parities,
+        standard_sc_parity: storage_class_info.standard_sc_parity,
+        rr_sc_data: storage_class_info.rr_sc_data,
+        rr_sc_parities: storage_class_info.rr_sc_parities,
+        rr_sc_parity: storage_class_info.rr_sc_parity,
+        total_sets: total_sets.to_vec(),
+        drives_per_set: drives_per_set.to_vec(),
     }
-}
-
-fn resolve_store_rebalance_pool_meta_reload_result(result: Result<()>, stage: &str) -> Result<()> {
-    result.map_err(|err| Error::other(format!("store rebalance pool meta reload failed during {stage}: {err}")))
-}
-
-fn resolve_rebalance_delete_from_all_pools_result(result: Result<ObjectInfo>, bucket: &str, object: &str) -> Result<ObjectInfo> {
-    result.map_err(|err| Error::other(format!("failed to delete rebalance source object {bucket}/{object}: {err}")))
-}
-
-fn is_ignorable_rebalance_delete_error(err: &Error) -> bool {
-    is_err_object_not_found(err) || is_err_version_not_found(err)
-}
-
-fn rebalance_delete_pool_error(pool_idx: usize, bucket: &str, object: &str, err: Error) -> Error {
-    Error::other(format!("pool {pool_idx} delete failed for {bucket}/{object}: {err}"))
-}
-
-fn resolve_rebalance_delete_from_all_pools_results(
-    results: Vec<RebalanceDeletePoolResult>,
-    bucket: &str,
-    object: &str,
-) -> Result<ObjectInfo> {
-    let mut deleted = None;
-    let mut ignored_error = None;
-
-    for pool_result in results {
-        let pool_idx = pool_result.pool_idx;
-        match pool_result.result {
-            Ok(info) => {
-                if deleted.is_none() {
-                    deleted = Some(info);
-                }
-            }
-            Err(err) if is_ignorable_rebalance_delete_error(&err) => {
-                ignored_error = Some((pool_idx, err));
-            }
-            Err(err) => {
-                return Err(rebalance_delete_pool_error(pool_idx, bucket, object, err));
-            }
-        }
-    }
-
-    if let Some(info) = deleted {
-        return Ok(info);
-    }
-
-    if let Some((pool_idx, err)) = ignored_error {
-        return Err(rebalance_delete_pool_error(pool_idx, bucket, object, err));
-    }
-
-    Err(Error::other(format!(
-        "failed to delete rebalance source object {bucket}/{object}: no pools were attempted"
-    )))
-}
-
-fn rebalance_disk_set_lookup_error(pool_idx: usize, set_idx: usize, pool_count: usize) -> Error {
-    Error::other(format!(
-        "failed to resolve rebalance disk set: pool index {pool_idx}, set index {set_idx}, pool count {pool_count}",
-    ))
-}
-
-fn resolve_latest_object_info_candidates(
-    mut candidates: Vec<LatestObjectInfoCandidate>,
-    bucket: &str,
-    object: &str,
-    opts: &ObjectOptions,
-) -> Result<(ObjectInfo, usize)> {
-    candidates.sort_by(|a, b| {
-        let a_mod = if let Some(info) = &a.info {
-            info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        } else {
-            OffsetDateTime::UNIX_EPOCH
-        };
-
-        let b_mod = if let Some(info) = &b.info {
-            info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-        } else {
-            OffsetDateTime::UNIX_EPOCH
-        };
-
-        if a_mod == b_mod {
-            return if a.idx < b.idx { Ordering::Greater } else { Ordering::Less };
-        }
-
-        b_mod.cmp(&a_mod)
-    });
-
-    for candidate in candidates {
-        if let Some(info) = candidate.info {
-            return Ok((info, candidate.idx));
-        }
-
-        if let Some(err) = candidate.err
-            && !is_err_object_not_found(&err)
-            && !is_err_version_not_found(&err)
-        {
-            return Err(err);
-        }
-    }
-
-    Err(pool_lookup_not_found_error(bucket, object, opts))
-}
-
-async fn build_server_pools_available_space(
-    bucket: &str,
-    size: i64,
-    n_sets: &[usize],
-    infos: &[Vec<Option<DiskInfo>>],
-) -> ServerPoolsAvailableSpace {
-    let mut server_pools = vec![PoolAvailableSpace::default(); infos.len()];
-
-    for (i, zinfo) in infos.iter().enumerate() {
-        if zinfo.is_empty() {
-            server_pools[i] = PoolAvailableSpace {
-                index: i,
-                ..Default::default()
-            };
-
-            continue;
-        }
-
-        if !is_meta_bucketname(bucket) && !has_space_for(zinfo, size).await.unwrap_or_default() {
-            server_pools[i] = PoolAvailableSpace {
-                index: i,
-                ..Default::default()
-            };
-
-            continue;
-        }
-
-        let mut available = 0;
-        let mut max_used_pct = 0;
-        for disk in zinfo.iter().flatten() {
-            if disk.total == 0 {
-                continue;
-            }
-
-            available += disk.total - disk.used;
-
-            let pct_used = disk.used * 100 / disk.total;
-
-            if pct_used > max_used_pct {
-                max_used_pct = pct_used;
-            }
-        }
-
-        available *= n_sets[i] as u64;
-
-        server_pools[i] = PoolAvailableSpace {
-            index: i,
-            available,
-            max_used_pct,
-        }
-    }
-
-    ServerPoolsAvailableSpace(server_pools)
 }
 
 impl ECStore {
@@ -207,7 +324,7 @@ impl ECStore {
                 //     if disk.is_none() {
                 //         continue;
                 //     }
-                //     // let disk = disk.as_ref().unwrap().clone();
+                //     // let disk = disk.as_ref().expect("operation should succeed").clone();
                 //     // futures.push(disk.delete(
                 //     //     bucket,
                 //     //     prefix,
@@ -236,40 +353,172 @@ impl ECStore {
     }
 
     pub(super) async fn delete_prefix(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        for pool in self.pools.iter() {
+        let dispatch_scope = if opts.tier_delete_journal_api.is_some() {
+            let incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
+            let authorization = opts
+                .tier_delete_dispatch_authorization
+                .as_ref()
+                .ok_or_else(|| Error::other("prefix mutation is missing its dispatched-journal authorization"))?;
+            authorization.ensure_current(bucket, incarnation, object)?;
+            Some((authorization, incarnation))
+        } else {
+            None
+        };
+        if opts.lifecycle_delete_all.is_some() {
+            let mut preflight_opts = opts.clone();
+            preflight_opts
+                .lifecycle_delete_all
+                .as_mut()
+                .ok_or(StorageError::PreconditionFailed)?
+                .phase = crate::object_api::LifecycleDeleteAllPhase::Preflight;
+            for pool in &self.pools {
+                if let Some((authorization, incarnation)) = dispatch_scope {
+                    authorization.ensure_current(bucket, incarnation, object)?;
+                }
+                #[cfg(test)]
+                lifecycle_delete_all_test_failure(crate::object_api::LifecycleDeleteAllPhase::Preflight, pool.pool_idx)?;
+                pool.delete_object(bucket, object, preflight_opts.clone()).await?;
+            }
+
+            opts.lifecycle_delete_all_journal()
+                .ok_or(StorageError::PreconditionFailed)?
+                .lock()
+                .mark_mutation_started();
+            if let Some((authorization, incarnation)) = dispatch_scope {
+                authorization.mark_mutation_started(bucket, incarnation, object)?;
+            }
+            let mut non_trigger_opts = opts.clone();
+            non_trigger_opts
+                .lifecycle_delete_all
+                .as_mut()
+                .ok_or(StorageError::PreconditionFailed)?
+                .phase = crate::object_api::LifecycleDeleteAllPhase::History;
+            for pool in &self.pools {
+                if let Some((authorization, incarnation)) = dispatch_scope {
+                    authorization.ensure_current(bucket, incarnation, object)?;
+                }
+                #[cfg(test)]
+                lifecycle_delete_all_test_failure(crate::object_api::LifecycleDeleteAllPhase::History, pool.pool_idx)?;
+                let mut pool_opts = non_trigger_opts.clone();
+                pool_opts.delete_prefix = true;
+                pool.delete_object(bucket, object, pool_opts).await?;
+            }
+
+            let mut final_preflight_opts = opts.clone();
+            final_preflight_opts
+                .lifecycle_delete_all
+                .as_mut()
+                .ok_or(StorageError::PreconditionFailed)?
+                .phase = crate::object_api::LifecycleDeleteAllPhase::FinalPreflight;
+            let mut trigger_pools = Vec::new();
+            for (pool_index, pool) in self.pools.iter().enumerate() {
+                if let Some((authorization, incarnation)) = dispatch_scope {
+                    authorization.ensure_current(bucket, incarnation, object)?;
+                }
+                #[cfg(test)]
+                lifecycle_delete_all_test_failure(crate::object_api::LifecycleDeleteAllPhase::FinalPreflight, pool.pool_idx)?;
+                let result = pool.delete_object(bucket, object, final_preflight_opts.clone()).await?;
+                if !result.name.is_empty() {
+                    trigger_pools.push(pool_index);
+                }
+            }
+            if trigger_pools.is_empty() {
+                return Err(StorageError::PreconditionFailed);
+            }
+
+            let mut trigger_opts = opts.clone();
+            trigger_opts
+                .lifecycle_delete_all
+                .as_mut()
+                .ok_or(StorageError::PreconditionFailed)?
+                .phase = crate::object_api::LifecycleDeleteAllPhase::Trigger;
+            for pool_index in trigger_pools {
+                if let Some((authorization, incarnation)) = dispatch_scope {
+                    authorization.ensure_current(bucket, incarnation, object)?;
+                }
+                #[cfg(test)]
+                lifecycle_delete_all_test_failure(crate::object_api::LifecycleDeleteAllPhase::Trigger, pool_index)?;
+                let mut pool_opts = trigger_opts.clone();
+                pool_opts.delete_prefix = true;
+                self.pools[pool_index].delete_object(bucket, object, pool_opts).await?;
+            }
+            return Ok(());
+        }
+
+        let scoped_cleanup = opts
+            .scanner_publication_commit_scope
+            .as_ref()
+            .zip(opts.http_preconditions.as_ref())
+            .filter(|_| bucket == RUSTFS_META_BUCKET && opts.delete_prefix_object);
+        let _cleanup_outcome =
+            scoped_cleanup.map(|(scope, _)| crate::object_api::ScannerPublicationCommitScopeGuard::new(scope.clone()));
+        let mut first_error = None;
+        let mut first_volume_error = None;
+        let mut has_success = false;
+        if let Some((authorization, incarnation)) = dispatch_scope {
+            authorization.mark_mutation_started(bucket, incarnation, object)?;
+        }
+        for pool in &self.pools {
+            if let Some((authorization, incarnation)) = dispatch_scope {
+                authorization.ensure_current(bucket, incarnation, object)?;
+            }
             let mut opts = opts.clone();
             opts.delete_prefix = true;
-            pool.delete_object(bucket, object, opts).await?;
-        }
-
-        Ok(())
-    }
-
-    pub(super) async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
-        // // Return a random one first
-
-        let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
-        server_pools.filter_max_used(100 - (100_f64 * DISK_RESERVE_FRACTION) as u64);
-        let total = server_pools.total_available();
-
-        if total == 0 {
-            return None;
-        }
-
-        let mut rng = rand::rng();
-        let random_u64: u64 = rng.random_range(0..total);
-
-        let choose = random_u64 % total;
-        let mut at_total = 0;
-
-        for pool in server_pools.iter() {
-            at_total += pool.available;
-            if at_total > choose && pool.available > 0 {
-                return Some(pool.index);
+            if let Some((scope, preconditions)) = scoped_cleanup {
+                // The exact-object delete retains its namespace writer across
+                // this lookup and dispatch. Never remove an unobserved revision.
+                let lookup = ObjectOptions {
+                    no_lock: true,
+                    suppress_read_repair: true,
+                    preserve_delete_marker: true,
+                    ..Default::default()
+                };
+                let disks = pool.get_disks_by_key(object);
+                let current = disks.get_object_info(bucket, object, &lookup).await;
+                if let Some(error) =
+                    crate::set_disk::SetDisks::evaluate_write_precondition(current, preconditions, bucket, object, &lookup)
+                {
+                    if matches!(error, StorageError::PreconditionFailed) || crate::error::is_err_object_not_found(&error) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                opts.scanner_publication_commit_scope = Some(scope.pool_delete_participant());
+            }
+            match pool.delete_object(bucket, object, opts).await {
+                Ok(_) => has_success = true,
+                Err(err) if scoped_cleanup.is_none() && is_err_strict_volume_not_found(&err) => {
+                    if first_volume_error.is_none() {
+                        first_volume_error = Some(err);
+                    }
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
             }
         }
 
-        None
+        let result = match first_error {
+            Some(err) => Err(err),
+            None if has_success => Ok(()),
+            None => match first_volume_error {
+                Some(err) => Err(err),
+                None if scoped_cleanup.is_some() => Err(StorageError::PreconditionFailed),
+                None => Ok(()),
+            },
+        };
+        if let Some((scope, _)) = scoped_cleanup
+            && result.is_ok()
+        {
+            let _ = scope.mark_committed();
+        }
+        result
+    }
+
+    pub(super) async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
+        self.get_available_pool_idx_preferring(bucket, object, size, None, None).await
     }
 
     pub(super) async fn get_available_pool_idx_excluding(
@@ -279,11 +528,31 @@ impl ECStore {
         size: i64,
         excluded_pool_idx: usize,
     ) -> Option<usize> {
+        self.get_available_pool_idx_preferring(bucket, object, size, Some(excluded_pool_idx), None)
+            .await
+    }
+
+    /// Free-space choice among the pools that can take `size` more bytes,
+    /// weighted by available space. `preferred_pool_idx` is returned whenever
+    /// it passes the same checks, so a full or excluded pool is never forced.
+    pub(super) async fn get_available_pool_idx_preferring(
+        &self,
+        bucket: &str,
+        object: &str,
+        size: i64,
+        excluded_pool_idx: Option<usize>,
+        preferred_pool_idx: Option<usize>,
+    ) -> Option<usize> {
         let mut server_pools = self.get_server_pools_available_space(bucket, object, size).await;
         server_pools.filter_max_used(100 - (100_f64 * DISK_RESERVE_FRACTION) as u64);
 
-        if let Some(pool) = server_pools.0.get_mut(excluded_pool_idx) {
+        if let Some(pool) = excluded_pool_idx.and_then(|idx| server_pools.0.get_mut(idx)) {
             pool.available = 0;
+        }
+        if let Some(pool_idx) = preferred_pool_idx
+            && server_pools.0.get(pool_idx).is_some_and(|pool| pool.available > 0)
+        {
+            return Some(pool_idx);
         }
 
         let total = server_pools.total_available();
@@ -317,6 +586,8 @@ impl ECStore {
 
             let disks = pool.get_disks_by_key(object).disk_inventory().await;
             let disk_infos = get_disk_infos(&disks).await;
+            #[cfg(all(test, feature = "test-util"))]
+            let disk_infos = pool_space_for_test(self.id, idx, disk_infos);
 
             (idx, pool.set_count, disk_infos)
         }))
@@ -331,7 +602,7 @@ impl ECStore {
     }
 
     pub(super) async fn is_suspended(&self, idx: usize) -> bool {
-        // TODO: LOCK
+        // TODO(backlog): acquire pool metadata lock for consistent suspension check
 
         let pool_meta = self.pool_meta.read().await;
 
@@ -418,7 +689,18 @@ impl ECStore {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<(PoolObjInfo, Vec<PoolErr>)> {
-        self.internal_get_pool_info_existing_with_opts(bucket, object, opts).await
+        self.internal_get_pool_info_existing_with_opts(bucket, object, opts, false)
+            .await
+    }
+
+    pub(super) async fn get_pool_info_for_delete_marker(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(PoolObjInfo, Vec<PoolErr>)> {
+        self.internal_get_pool_info_existing_with_opts(bucket, object, opts, true)
+            .await
     }
 
     async fn internal_get_pool_info_existing_with_opts(
@@ -426,6 +708,7 @@ impl ECStore {
         bucket: &str,
         object: &str,
         opts: &ObjectOptions,
+        require_all_pool_reads: bool,
     ) -> Result<(PoolObjInfo, Vec<PoolErr>)> {
         let mut futures = Vec::new();
         for pool in self.pools.iter() {
@@ -454,6 +737,15 @@ impl ECStore {
                     });
                 }
                 Err(e) => {
+                    // A readable older pool cannot prove ownership of the
+                    // current version while another pool is unreadable. Check
+                    // both raw and object-scoped quorum errors before sorting.
+                    if require_all_pool_reads && !is_err_object_not_found(&e) && !is_err_version_not_found(&e) {
+                        return Err(match e {
+                            Error::ErasureReadQuorum | Error::InsufficientReadQuorum(_, _) => Error::ErasureWriteQuorum,
+                            err => err,
+                        });
+                    }
                     ress.push(PoolObjInfo {
                         index,
                         err: Some(e),
@@ -461,6 +753,34 @@ impl ECStore {
                     });
                 }
             }
+        }
+
+        if require_all_pool_reads {
+            let suspended_pools = {
+                let pool_meta = self.pool_meta.read().await;
+                (0..self.pools.len())
+                    .map(|idx| pool_meta.is_suspended(idx))
+                    .collect::<Vec<_>>()
+            };
+            let candidates = ress
+                .iter()
+                .map(|pinfo| LatestObjectInfoCandidate {
+                    info: pinfo.err.is_none().then(|| pinfo.object_info.clone()),
+                    idx: pinfo.index,
+                    err: pinfo.err.clone(),
+                })
+                .collect();
+            let (object_info, index) =
+                resolve_latest_object_info_candidates_with_pool_state(candidates, &suspended_pools, bucket, object, opts)?;
+            let pools_with_object = self.pools_with_object(&ress, opts).await;
+            return Ok((
+                PoolObjInfo {
+                    index,
+                    object_info,
+                    err: None,
+                },
+                pools_with_object,
+            ));
         }
 
         ress.sort_by(|a, b| {
@@ -486,7 +806,7 @@ impl ECStore {
                 return Ok((pinfo.clone(), self.pools_with_object(&ress, opts).await));
             }
 
-            let err = pinfo.err.as_ref().unwrap();
+            let err = pinfo.err.as_ref().expect("operation should succeed");
 
             if err == &Error::ErasureReadQuorum && !opts.metadata_chg {
                 return Ok((pinfo.clone(), self.pools_with_object(&ress, opts).await));
@@ -552,15 +872,55 @@ impl ECStore {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, usize)> {
+        self.get_latest_object_info_with_pool_policy(bucket, object, opts, false)
+            .await
+    }
+
+    /// Observe every pool for a conditional-write preflight. This does not
+    /// hold the namespace locks needed to prove a condition at publication.
+    pub(super) async fn get_latest_object_info_for_conditional_write(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, usize)> {
+        self.get_latest_object_info_with_pool_policy(bucket, object, opts, true).await
+    }
+
+    async fn get_latest_object_info_with_pool_policy(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        require_all_pools: bool,
+    ) -> Result<(ObjectInfo, usize)> {
+        let suspended_pools = if opts.skip_decommissioned && !require_all_pools {
+            let pool_meta = self.pool_meta.read().await;
+            Some(
+                (0..self.pools.len())
+                    .map(|idx| pool_meta.is_suspended(idx))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
         let mut futures = Vec::with_capacity(self.pools.len());
-        for pool in self.pools.iter() {
-            futures.push(pool.get_object_info(bucket, object, opts));
+        for (idx, pool) in self.pools.iter().enumerate() {
+            if suspended_pools.as_ref().is_some_and(|pools| pools[idx]) {
+                continue;
+            }
+
+            if opts.skip_rebalancing && !require_all_pools && self.is_pool_rebalancing(idx).await {
+                continue;
+            }
+
+            futures.push(async move { (idx, pool.get_object_info(bucket, object, opts).await) });
         }
 
         let results = join_all(futures).await;
         let mut candidates = Vec::with_capacity(self.pools.len());
 
-        for (idx, result) in results.into_iter().enumerate() {
+        for (idx, result) in results {
             match result {
                 Ok(res) => {
                     candidates.push(LatestObjectInfoCandidate {
@@ -570,6 +930,9 @@ impl ECStore {
                     });
                 }
                 Err(e) => {
+                    if require_all_pools && !is_err_object_not_found(&e) && !is_err_version_not_found(&e) {
+                        return Err(e);
+                    }
                     candidates.push(LatestObjectInfoCandidate {
                         info: None,
                         idx,
@@ -579,10 +942,148 @@ impl ECStore {
             }
         }
 
+        let suspended_pools = match suspended_pools {
+            Some(pools) => pools,
+            None => {
+                let pool_meta = self.pool_meta.read().await;
+                (0..self.pools.len())
+                    .map(|idx| pool_meta.is_suspended(idx))
+                    .collect::<Vec<_>>()
+            }
+        };
+
         // Delete markers are returned as latest object infos here. Higher-level
         // access paths are responsible for translating them into read/write
         // semantics such as object-not-found or method-not-allowed.
-        resolve_latest_object_info_candidates(candidates, bucket, object, opts)
+        resolve_latest_object_info_candidates_with_pool_state(candidates, &suspended_pools, bucket, object, opts)
+    }
+
+    pub(super) async fn prepare_latest_object_metadata_with_idx(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(crate::set_disk::PreparedGetObjectMetadata, usize)> {
+        let suspended_pools = if opts.skip_decommissioned {
+            let pool_meta = self.pool_meta.read().await;
+            Some(
+                (0..self.pools.len())
+                    .map(|idx| pool_meta.is_suspended(idx))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        let mut futures = FuturesUnordered::new();
+        for (idx, pool) in self.pools.iter().enumerate() {
+            if suspended_pools.as_ref().is_some_and(|pools| pools[idx]) {
+                continue;
+            }
+
+            if opts.skip_rebalancing && self.is_pool_rebalancing(idx).await {
+                continue;
+            }
+
+            futures.push(async move {
+                let result = pool
+                    .prepare_get_object_reader_metadata(bucket, object, opts)
+                    .await
+                    .map_err(|err| to_object_err(err, vec![bucket, object]));
+                (idx, result)
+            });
+        }
+
+        let mut candidates = (0..self.pools.len()).map(|_| None).collect::<Vec<_>>();
+        // Retain one provisional winner. Other pools only need their lightweight
+        // identity for final conflict checks; if pool state changes while the
+        // fanout runs, the final winner is refetched and revalidated below.
+        let mut latest_prepared = None;
+        let mut latest_mod_time = None;
+        let mut provisional_dynamic_pool_state = None;
+        while let Some((idx, result)) = futures.next().await {
+            match result {
+                Ok(metadata) => {
+                    let mod_time = metadata.object_info().mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+                    let info = metadata.object_info().clone();
+                    let retain = match (latest_mod_time, latest_prepared.as_ref()) {
+                        (None, _) => true,
+                        (Some(current), _) if mod_time > current => true,
+                        (Some(current), _) if mod_time < current => false,
+                        (Some(_), Some((current_idx, _))) => {
+                            if suspended_pools.is_none() && provisional_dynamic_pool_state.is_none() {
+                                let pool_meta = self.pool_meta.read().await;
+                                provisional_dynamic_pool_state = Some(
+                                    (0..self.pools.len())
+                                        .map(|pool_idx| pool_meta.is_suspended(pool_idx))
+                                        .collect::<Vec<_>>(),
+                                );
+                            }
+                            let provisional_pool_state = suspended_pools
+                                .as_ref()
+                                .or(provisional_dynamic_pool_state.as_ref())
+                                .ok_or_else(|| Error::other("GET pool state snapshot is unavailable"))?;
+                            let new_key = (provisional_pool_state.get(idx).copied().unwrap_or(false), std::cmp::Reverse(idx));
+                            let current_key = (
+                                provisional_pool_state.get(*current_idx).copied().unwrap_or(false),
+                                std::cmp::Reverse(*current_idx),
+                            );
+                            new_key < current_key
+                        }
+                        (Some(_), None) => true,
+                    };
+                    if retain {
+                        if latest_mod_time.is_none_or(|current| mod_time > current) {
+                            latest_mod_time = Some(mod_time);
+                        }
+                        latest_prepared = Some((idx, metadata));
+                    }
+                    candidates[idx] = Some(LatestObjectInfoCandidate {
+                        info: Some(info),
+                        idx,
+                        err: None,
+                    });
+                }
+                Err(err) => {
+                    candidates[idx] = Some(LatestObjectInfoCandidate {
+                        info: None,
+                        idx,
+                        err: Some(err),
+                    });
+                }
+            }
+        }
+
+        #[cfg(test)]
+        pause_prepared_pool_read_after_fanout(object).await;
+
+        let suspended_pools = match suspended_pools {
+            Some(pools) => pools,
+            None => {
+                let pool_meta = self.pool_meta.read().await;
+                (0..self.pools.len())
+                    .map(|idx| pool_meta.is_suspended(idx))
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let candidates = candidates.into_iter().flatten().collect();
+        let (winner_info, winner_idx) =
+            resolve_latest_object_info_candidates_with_pool_state(candidates, &suspended_pools, bucket, object, opts)?;
+        if let Some((prepared_idx, metadata)) = latest_prepared
+            && prepared_idx == winner_idx
+        {
+            return Ok((metadata, winner_idx));
+        }
+
+        let pool = self.pools.get(winner_idx).ok_or(Error::ErasureReadQuorum)?;
+        #[cfg(test)]
+        pause_prepared_pool_read_before_refetch(object).await;
+        let metadata = pool
+            .prepare_get_object_reader_metadata(bucket, object, opts)
+            .await
+            .map_err(|err| to_object_err(err, vec![bucket, object]))?;
+        validate_prepared_pool_refetch_identity(&winner_info, metadata.object_info())?;
+        Ok((metadata, winner_idx))
     }
 
     pub(super) async fn delete_object_from_all_pools(
@@ -590,49 +1091,91 @@ impl ECStore {
         bucket: &str,
         object: &str,
         opts: &ObjectOptions,
+        exact: &ObjectInfo,
         errs: Vec<PoolErr>,
     ) -> Result<ObjectInfo> {
+        self.reconcile_decommission_capacity_before_exact_delete(bucket, object, opts, exact)
+            .await?;
+
         let mut results = Vec::with_capacity(errs.len());
 
-        for pe in errs.iter() {
-            if let Some(err) = &pe.err
-                && err == &StorageError::ErasureWriteQuorum
-            {
-                if let Some(idx) = pe.index {
-                    results.push(RebalanceDeletePoolResult {
-                        pool_idx: idx,
-                        result: Err(StorageError::ErasureWriteQuorum),
-                    });
-                }
+        for pe in &errs {
+            let Some(idx) = pe.index else { continue };
+            if pe.err.as_ref() == Some(&StorageError::ErasureWriteQuorum) {
+                results.push(Err(StorageError::ErasureWriteQuorum));
                 continue;
             }
-
-            if let Some(idx) = pe.index {
-                results.push(RebalanceDeletePoolResult {
-                    pool_idx: idx,
-                    result: self.pools[idx].delete_object(bucket, object, opts.clone()).await,
-                });
-            }
+            let pool = self.pools[idx].clone();
+            results.push(
+                self.run_external_decommission_capacity_object_delete(
+                    idx,
+                    bucket,
+                    object,
+                    object,
+                    opts.clone(),
+                    |opts| async move { pool.delete_object(bucket, object, opts).await },
+                )
+                .await,
+            );
         }
 
-        resolve_rebalance_delete_from_all_pools_result(
-            resolve_rebalance_delete_from_all_pools_results(results, bucket, object),
-            bucket,
-            object,
-        )
+        resolve_rebalance_delete_from_all_pools_results(results, bucket, object)
     }
 
-    pub async fn reload_pool_meta(&self) -> Result<()> {
-        let mut meta = PoolMeta::default();
-        resolve_store_rebalance_pool_meta_reload_result(
-            meta.load(self.pools[0].clone(), self.pools.clone()).await,
+    /// Peer reload entry: refreshes in-memory pool metadata from the shared
+    /// persisted snapshot. Returns whether newer state was actually merged so
+    /// callers only trigger missing-worker recovery after a real state change;
+    /// delayed snapshots are merged monotonically and never blind-assigned.
+    pub async fn reload_pool_meta(&self) -> Result<bool> {
+        // Serialize the durable reload with local movement transitions. Loading
+        // before acquiring this gate would allow a stale disk snapshot to
+        // overwrite a newer local transition after the writer commits.
+        let movement_gate = self.ctx.data_movement_operation_gate();
+        let _movement_guard = movement_gate.write().await;
+        let reloaded = resolve_store_rebalance_pool_meta_reload_result(
+            self.load_runtime_pool_meta("store rebalance pool meta reload failed").await,
             "reload_pool_meta",
         )?;
 
+        // Lock order: release the decommission_cancelers guard before taking
+        // the pool_meta write guard; neither is held without the movement gate.
+        let active_workers = {
+            let cancelers = self.decommission_cancelers.read().await;
+            cancelers
+                .iter()
+                .map(|canceler| canceler.as_ref().is_some_and(DecommissionCanceler::is_active))
+                .collect::<Vec<_>>()
+        };
+
+        let incoming_has_pools = !reloaded.pools.is_empty();
         let mut pool_meta = self.pool_meta.write().await;
-        *pool_meta = meta;
-        // *self.pool_meta.write().unwrap() = meta;
-        Ok(())
+        let movement_before = pool_meta.clone();
+        let merged_newer = merge_pool_status_refresh(&mut pool_meta, reloaded, &active_workers);
+        if crate::core::pools::pool_meta_movement_snapshot_changed(&movement_before, &pool_meta) {
+            self.ctx.advance_data_movement_operation_epoch();
+        }
+
+        if !merged_newer && !incoming_has_pools {
+            warn!(
+                event = EVENT_POOL_META_RELOAD,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                result = "ignored",
+                reason = "missing_metadata",
+                "Peer pool meta reload ignored because persisted metadata is missing"
+            );
+        } else if !merged_newer {
+            debug!(
+                event = EVENT_POOL_META_RELOAD,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                result = "ignored",
+                reason = "stale_snapshot",
+                "Peer pool meta reload ignored as a stale snapshot"
+            );
+        }
+
+        Ok(merged_newer)
     }
 
     /// Disk information deduplication function
@@ -673,60 +1216,24 @@ impl ECStore {
         unique_disks.into_values().collect()
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     pub(super) async fn handle_new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
         self.pools[0].new_ns_lock(bucket, object).await
     }
 
     #[instrument(skip(self))]
     pub(super) async fn handle_backend_info(&self) -> rustfs_madmin::BackendInfo {
-        let (standard_sc_parity, rr_sc_parity) = {
-            if let Some(sc) = get_global_storage_class() {
-                let sc_parity = sc
-                    .get_parity_for_sc(storageclass::CLASS_STANDARD)
-                    .or(Some(self.pools[0].default_parity_count));
+        let drives_per_set = StorageAdminApi::set_drive_counts(self);
+        let default_standard_parities = self.pools.iter().map(|pool| pool.default_parity_count).collect::<Vec<_>>();
+        let storage_class = runtime_sources::storage_class_config_snapshot();
+        let total_sets = self.pools.iter().map(|pool| pool.set_count).collect::<Vec<_>>();
 
-                let rrs_sc_parity = sc.get_parity_for_sc(storageclass::RRS);
-
-                (sc_parity, rrs_sc_parity)
-            } else {
-                (Some(self.pools[0].default_parity_count), None)
-            }
-        };
-
-        let mut standard_sc_data = Vec::new();
-        let mut rr_sc_data = Vec::new();
-        let mut drives_per_set = Vec::new();
-        let mut total_sets = Vec::new();
-
-        for (idx, set_count) in StorageAdminApi::set_drive_counts(self).iter().enumerate() {
-            if let Some(sc_parity) = standard_sc_parity {
-                standard_sc_data.push(set_count - sc_parity);
-            }
-            if let Some(sc_parity) = rr_sc_parity {
-                rr_sc_data.push(set_count - sc_parity);
-            }
-            total_sets.push(self.pools[idx].set_count);
-            drives_per_set.push(*set_count);
-        }
-
-        rustfs_madmin::BackendInfo {
-            backend_type: rustfs_madmin::BackendByte::Erasure,
-            online_disks: rustfs_madmin::BackendDisks::new(),
-            offline_disks: rustfs_madmin::BackendDisks::new(),
-            standard_sc_data,
-            standard_sc_parity,
-            rr_sc_data,
-            rr_sc_parity,
-            total_sets,
-            drives_per_set,
-            ..Default::default()
-        }
+        build_backend_info(&storage_class, &drives_per_set, &default_standard_parities, &total_sets)
     }
 
     #[instrument(skip(self))]
     pub(super) async fn handle_storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let Some(notification_sy) = get_global_notification_sys() else {
+        let Some(notification_sy) = runtime_sources::notification_sys() else {
             return rustfs_madmin::StorageInfo::default();
         };
 
@@ -750,11 +1257,11 @@ impl ECStore {
     }
 
     #[instrument(skip(self))]
-    pub(super) async fn handle_local_storage_info(&self) -> rustfs_madmin::StorageInfo {
+    pub(super) async fn handle_local_storage_info(&self, include_metrics: bool) -> rustfs_madmin::StorageInfo {
         let mut futures = Vec::with_capacity(self.pools.len());
 
         for pool in self.pools.iter() {
-            futures.push(pool.local_storage_info_snapshot())
+            futures.push(pool.local_storage_info_snapshot(include_metrics))
         }
 
         let results = join_all(futures).await;
@@ -762,7 +1269,7 @@ impl ECStore {
         let mut disks = Vec::new();
 
         for res in results.into_iter() {
-            disks.extend_from_slice(&res.disks);
+            disks.extend(res.disks);
         }
 
         // 🔧 Defensive deduplication: when aggregating disks from all pools, drop duplicate
@@ -776,7 +1283,11 @@ impl ECStore {
         }
 
         let backend = StorageAdminApi::backend_info(self).await;
-        rustfs_madmin::StorageInfo { backend, disks }
+        rustfs_madmin::StorageInfo {
+            backend,
+            disks,
+            ..Default::default()
+        }
     }
 
     #[instrument(skip(self))]
@@ -815,25 +1326,725 @@ impl ECStore {
 }
 
 #[cfg(test)]
+static LIFECYCLE_DELETE_ALL_TEST_FAILURE: std::sync::Mutex<Option<(crate::object_api::LifecycleDeleteAllPhase, usize)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn lifecycle_delete_all_test_failure(phase: crate::object_api::LifecycleDeleteAllPhase, pool_index: usize) -> Result<()> {
+    if LIFECYCLE_DELETE_ALL_TEST_FAILURE
+        .lock()
+        .expect("lifecycle delete-all failure hook should not poison")
+        .is_some_and(|failure| failure == (phase, pool_index))
+    {
+        return Err(StorageError::PreconditionFailed);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk::DiskInfo;
+    use crate::bucket::replication::{ReplicationStatusType, VersionPurgeStatusType};
+    use crate::config::com::{read_config_no_lock_preserve_empty_with_metadata, save_config};
+    use crate::config::storageclass::{CLASS_RRS, CLASS_STANDARD, lookup_config_for_pools_without_env};
+    use crate::core::pools::{
+        POOL_META_IDENTITY_NAME, POOL_META_NAME, POOL_META_VERSION, PoolDecommissionInfo, PoolStatus,
+        initialized_pool_meta_identity_for_test, pool_meta_v3_commit_state_for_test,
+    };
+    use crate::core::sets::Sets;
+    use crate::disk::error::DiskError;
+    use crate::layout::endpoint::Endpoint;
+    use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::object_api::ObjectLockConfigSnapshot;
+    use crate::set_disk::get_lock_acquire_timeout;
+    use crate::storage_api_contracts::bucket::MakeBucketOptions;
+    use crate::storage_api_contracts::object::ObjectIO as _;
+    use arc_swap::ArcSwap;
+    use rustfs_config::server_config::KVS;
+    use rustfs_filemeta::FileInfo;
+    use std::sync::Arc;
+    use time::{Duration as TimeDuration, OffsetDateTime};
+    use tokio_util::sync::CancellationToken;
+
+    async fn setup_multi_pool_test_store(
+        name: &str,
+        drives_per_pool: &[usize],
+    ) -> (tempfile::TempDir, Arc<ECStore>, CancellationToken) {
+        let temp_dir = tempfile::tempdir().expect("multi-pool test directory should be created");
+        let mut pools = Vec::with_capacity(drives_per_pool.len());
+        for (pool_index, drives_per_set) in drives_per_pool.iter().copied().enumerate() {
+            let mut endpoints = Vec::with_capacity(drives_per_set);
+            for disk_index in 0..drives_per_set {
+                let disk_path = temp_dir.path().join(format!("pool{pool_index}-disk{disk_index}"));
+                tokio::fs::create_dir_all(&disk_path)
+                    .await
+                    .expect("multi-pool test disk should be created");
+                let mut endpoint =
+                    Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
+                endpoint.set_pool_index(pool_index);
+                endpoint.set_set_index(0);
+                endpoint.set_disk_index(disk_index);
+                endpoints.push(endpoint);
+            }
+            pools.push(PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: format!("{name}-pool-{pool_index}"),
+                platform: "test".to_string(),
+            });
+        }
+
+        let endpoint_pools = EndpointServerPools(pools);
+        let instance_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        crate::store::init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
+            .await
+            .expect("multi-pool local disks should initialize");
+        let shutdown = CancellationToken::new();
+        let store = ECStore::new_with_instance_ctx(
+            "127.0.0.1:0".parse().expect("test address should parse"),
+            endpoint_pools,
+            shutdown.clone(),
+            instance_ctx,
+        )
+        .await
+        .expect("multi-pool store should initialize");
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        (temp_dir, store, shutdown)
+    }
+
+    async fn run_scanner_observed_cleanup(
+        if_match_override: Option<&str>,
+        second_payload: Option<&[u8]>,
+        lose_second_quorum: bool,
+    ) -> (
+        Result<crate::object_api::ObjectInfo>,
+        crate::object_api::ScannerPublicationCommitState,
+        Vec<bool>,
+    ) {
+        use crate::config::com::save_config_with_opts_and_metadata;
+        use crate::storage_api_contracts::object::HTTPPreconditions;
+        use std::time::Duration;
+
+        let (_directories, store, shutdown) = setup_multi_pool_test_store("scanner-observed-cleanup", &[4, 4]).await;
+        let object = "buckets/.usage.observed.json";
+        let mut tags = Vec::new();
+        let old_payload = b"old observed snapshot";
+        for (pool, payload) in store.pools.iter().zip([Some(old_payload.as_slice()), second_payload]) {
+            let Some(payload) = payload else { continue };
+            let info = save_config_with_opts_and_metadata(pool.clone(), object, payload.to_vec(), &ObjectOptions::default())
+                .await
+                .expect("seed an observed snapshot on each pool");
+            tags.push(info.etag.expect("seed has CAS tag"));
+        }
+        if let Some(second_payload) = second_payload {
+            assert_eq!(tags[0] == tags[1], old_payload == second_payload);
+        }
+        let epoch = store.scanner_data_usage_publication_epoch().await.expect("publication epoch");
+        let scope = store
+            .scanner_data_usage_publication_commit_scope(epoch, tokio::time::Instant::now() + Duration::from_secs(30), Vec::new())
+            .await
+            .expect("admit observed cleanup");
+        let disconnected = if lose_second_quorum {
+            let pool = &store.pools[1];
+            tokio::time::timeout(Duration::from_secs(10), pool.stop_endpoint_monitor_for_test())
+                .await
+                .expect("fixture must own the disk slots");
+            let set = pool.get_disks_by_key(object);
+            let original = {
+                let mut disks = set.disks.write().await;
+                let offline = vec![None; disks.len()];
+                std::mem::replace(&mut *disks, offline)
+            };
+            Some((set, original))
+        } else {
+            None
+        };
+        let result = store
+            .delete_object(
+                crate::disk::RUSTFS_META_BUCKET,
+                object,
+                ObjectOptions {
+                    delete_prefix: true,
+                    delete_prefix_object: true,
+                    http_preconditions: Some(HTTPPreconditions {
+                        if_match: Some(if_match_override.map_or_else(|| tags.remove(0), str::to_owned)),
+                        ..Default::default()
+                    }),
+                    scanner_publication_commit_scope: Some(scope.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        if let Some((set, disks)) = disconnected {
+            *set.disks.write().await = disks;
+            assert!(!scope.release_movement_permit().await, "partial cleanup cannot release its permit");
+        }
+        let mut still_present = Vec::new();
+        for pool in &store.pools {
+            still_present.push(
+                read_config_no_lock_preserve_empty_with_metadata(pool.clone(), object)
+                    .await
+                    .is_ok(),
+            );
+        }
+        shutdown.cancel();
+        (result, scope.state(), still_present)
+    }
+
+    #[tokio::test]
+    async fn scanner_observed_cleanup_must_keep_scope_live_across_both_pools() {
+        let (result, state, still_present) = run_scanner_observed_cleanup(None, Some(b"old observed snapshot"), false).await;
+        assert!(result.is_ok(), "result {result:?}, scope {state:?}, pool copies {still_present:?}");
+        assert_eq!(state, crate::object_api::ScannerPublicationCommitState::Committed);
+        assert_eq!(still_present, vec![false, false]);
+    }
+
+    #[tokio::test]
+    async fn scanner_observed_cleanup_must_preserve_both_pools_if_cas_changed() {
+        let (result, state, still_present) =
+            run_scanner_observed_cleanup(Some("stale-cas-token"), Some(b"old observed snapshot"), false).await;
+        assert!(
+            matches!(result, Err(StorageError::PreconditionFailed))
+                && state == crate::object_api::ScannerPublicationCommitState::AbortedBeforeCommit
+                && still_present == [true, true],
+            "result {result:?}, scope {state:?}, pool copies {still_present:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_observed_cleanup_must_preserve_a_nonmatching_pool_copy() {
+        let (result, state, still_present) = run_scanner_observed_cleanup(None, Some(b"newer observed snapshot"), false).await;
+        assert!(result.is_ok(), "result {result:?}, scope {state:?}, pool copies {still_present:?}");
+        assert_eq!(state, crate::object_api::ScannerPublicationCommitState::Committed);
+        assert_eq!(still_present, vec![false, true]);
+    }
+
+    #[tokio::test]
+    async fn scanner_observed_cleanup_must_succeed_when_another_pool_has_no_copy() {
+        let (result, state, still_present) = run_scanner_observed_cleanup(None, None, false).await;
+        assert!(result.is_ok(), "result {result:?}, scope {state:?}, pool copies {still_present:?}");
+        assert_eq!(state, crate::object_api::ScannerPublicationCommitState::Committed);
+        assert_eq!(still_present, vec![false, false]);
+    }
+
+    #[tokio::test]
+    async fn scanner_observed_cleanup_must_retain_ownership_after_partial_failure() {
+        let (result, state, still_present) = run_scanner_observed_cleanup(None, Some(b"old observed snapshot"), true).await;
+        assert!(result.is_err(), "partial cleanup must fail");
+        assert_eq!(state, crate::object_api::ScannerPublicationCommitState::Indeterminate);
+        assert_eq!(still_present, vec![false, true]);
+    }
+
+    struct LifecycleDeleteAllFailureGuard;
+
+    impl Drop for LifecycleDeleteAllFailureGuard {
+        fn drop(&mut self) {
+            *LIFECYCLE_DELETE_ALL_TEST_FAILURE
+                .lock()
+                .expect("lifecycle delete-all failure hook should not poison") = None;
+        }
+    }
+
+    async fn seed_multi_pool_delete_all(store: &Arc<ECStore>, bucket: &str, object: &str) -> ObjectOptions {
+        let trigger_id = Uuid::new_v4();
+        for (pool_index, pool) in store.pools.iter().enumerate() {
+            let mut history_reader = PutObjReader::from_vec(format!("{object}-history-{pool_index}").into_bytes());
+            pool.put_object(
+                bucket,
+                object,
+                &mut history_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(Uuid::new_v4().to_string()),
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("history should be stored");
+            let mut trigger_reader = PutObjReader::from_vec(format!("{object}-trigger-{pool_index}").into_bytes());
+            pool.put_object(
+                bucket,
+                object,
+                &mut trigger_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(trigger_id.to_string()),
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("shared trigger should be stored");
+        }
+        let mut opts = ObjectOptions {
+            delete_prefix: true,
+            delete_prefix_object: true,
+            versioned: true,
+            lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
+                version_id: Some(trigger_id),
+                delete_marker: false,
+                action: rustfs_scanner_metrics::metrics::IlmAction::DeleteAllVersionsAction,
+                rule_id: "rule".to_string(),
+                phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
+            }),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            ))),
+            delete_replication_config_snapshot: Some(Arc::new(
+                crate::bucket::replication::DeleteReplicationConfigSnapshot::default(),
+            )),
+            ..Default::default()
+        };
+        opts.ensure_lifecycle_delete_all_journal();
+        opts
+    }
+
+    async fn ordinary_version_count(store: &ECStore, pool_index: usize, bucket: &str, object: &str) -> usize {
+        store.pools[pool_index].disk_set[0]
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("pool metadata should load")
+            .map(|versions| {
+                versions
+                    .versions
+                    .iter()
+                    .filter(|version| !version.tier_free_version())
+                    .count()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn delete_prefix_attempts_later_pools_after_an_earlier_pool_error() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("delete-prefix", &[2, 4]).await;
+        let bucket = format!("delete-prefix-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in both pools");
+
+        let first_pool_disks = store.pools[0].disk_set[0].disks.read().await.clone();
+        for disk in first_pool_disks.iter().flatten() {
+            disk.write_all(&bucket, "blocked", bytes::Bytes::from_static(b"not-a-directory"))
+                .await
+                .expect("first pool should contain a blocking parent file");
+        }
+        let later_pool_disks = store.pools[1].disk_set[0].disks.read().await.clone();
+        let later_data_disk = later_pool_disks[0].clone().expect("later pool should have its first disk");
+        later_data_disk
+            .write_all(&bucket, "blocked/prefix/object", bytes::Bytes::from_static(b"data"))
+            .await
+            .expect("later pool should contain the prefix on its available disk");
+        *store.pools[1].disk_set[0].disks.write().await = vec![Some(later_data_disk.clone()), None, None, None];
+
+        let err = store
+            .delete_prefix(&bucket, "blocked/prefix", &ObjectOptions::default())
+            .await
+            .expect_err("the first pool's hard error must be returned");
+
+        assert!(
+            matches!(err, StorageError::PrefixAccessDenied(ref error_bucket, ref error_prefix)
+                if error_bucket == &bucket && error_prefix == "blocked/prefix"),
+            "unexpected multi-pool delete error: {err:?}"
+        );
+        assert!(matches!(
+            later_data_disk.read_all(&bucket, "blocked/prefix/object").await,
+            Err(DiskError::FileNotFound)
+        ));
+
+        *store.pools[1].disk_set[0].disks.write().await = later_pool_disks.clone();
+        for disk in first_pool_disks.iter().flatten() {
+            disk.write_all(&bucket, "second-blocked", bytes::Bytes::from_static(b"not-a-directory"))
+                .await
+                .expect("first pool should contain a second blocking parent file");
+        }
+        for disk in later_pool_disks.iter().flatten() {
+            disk.write_all(&bucket, "second-blocked/prefix/object", bytes::Bytes::from_static(b"data"))
+                .await
+                .expect("later pool should contain the second prefix");
+        }
+        let err = store
+            .delete_prefix(&bucket, "second-blocked/prefix", &ObjectOptions::default())
+            .await
+            .expect_err("a successful later pool must not override the first pool's hard error");
+        assert!(
+            matches!(err, StorageError::PrefixAccessDenied(ref error_bucket, ref error_prefix)
+                if error_bucket == &bucket && error_prefix == "second-blocked/prefix"),
+            "unexpected hard-error plus success result: {err:?}"
+        );
+        for disk in later_pool_disks.iter().flatten() {
+            assert!(matches!(
+                disk.read_all(&bucket, "second-blocked/prefix/object").await,
+                Err(DiskError::FileNotFound)
+            ));
+        }
+
+        for disk in later_pool_disks.iter().flatten() {
+            disk.delete_volume(&bucket, true)
+                .await
+                .expect("the bucket should be absent from the later pool");
+        }
+        let healthy_object = "healthy/prefix/object";
+        for disk in first_pool_disks.iter().flatten() {
+            disk.write_all(&bucket, healthy_object, bytes::Bytes::from_static(b"data"))
+                .await
+                .expect("the first pool should contain the healthy prefix");
+        }
+        store
+            .delete_prefix(&bucket, "healthy/prefix", &ObjectOptions::default())
+            .await
+            .expect("one successful pool should make a partially missing bucket idempotent");
+        for disk in first_pool_disks.iter().flatten() {
+            assert!(matches!(disk.read_all(&bucket, healthy_object).await, Err(DiskError::FileNotFound)));
+        }
+
+        let missing_bucket = format!("delete-prefix-missing-{}", Uuid::new_v4().simple());
+        let err = store
+            .delete_prefix(&missing_bucket, "missing/prefix", &ObjectOptions::default())
+            .await
+            .expect_err("a bucket missing from every pool must remain an error");
+        assert_eq!(err, StorageError::BucketNotFound(missing_bucket));
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lifecycle_delete_all_history_failure_preserves_trigger_and_retry_converges() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("lifecycle-delete-all", &[4, 4]).await;
+        let bucket = format!("lifecycle-delete-all-{}", Uuid::new_v4().simple());
+        let object = "object";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in both pools");
+
+        assert!(store.pools.len() >= 2);
+        for (pool_index, pool) in store.pools.iter().enumerate().take(2) {
+            let mut reader = PutObjReader::from_vec(format!("pool-{pool_index}-history").into_bytes());
+            pool.put_object(
+                &bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("historical version should be stored");
+        }
+        let marker = store.pools[0]
+            .delete_object(
+                &bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("trigger marker should be stored in the first pool");
+        let marker_id = marker.version_id.expect("trigger marker should have a version id");
+        let mut opts = ObjectOptions {
+            delete_prefix: true,
+            delete_prefix_object: true,
+            versioned: true,
+            lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
+                version_id: Some(marker_id),
+                delete_marker: true,
+                action: rustfs_scanner_metrics::metrics::IlmAction::DelMarkerDeleteAllVersionsAction,
+                rule_id: "rule".to_string(),
+                phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
+            }),
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            ))),
+            delete_replication_config_snapshot: Some(Arc::new(
+                crate::bucket::replication::DeleteReplicationConfigSnapshot::default(),
+            )),
+            ..Default::default()
+        };
+        opts.ensure_lifecycle_delete_all_journal();
+
+        let _failure_guard = LifecycleDeleteAllFailureGuard;
+        *LIFECYCLE_DELETE_ALL_TEST_FAILURE
+            .lock()
+            .expect("lifecycle delete-all failure hook should not poison") =
+            Some((crate::object_api::LifecycleDeleteAllPhase::History, 1));
+        let err = store
+            .delete_prefix(&bucket, object, &opts)
+            .await
+            .expect_err("a later pool history failure must stop before trigger deletion");
+        assert_eq!(err, StorageError::PreconditionFailed);
+        assert!(
+            opts.lifecycle_delete_all_journal()
+                .expect("delete-all journal should be initialized")
+                .lock()
+                .mutation_started()
+        );
+
+        let first_pool = store.pools[0].disk_set[0]
+            .load_file_info_versions_exact(&bucket, object)
+            .await
+            .expect("first pool metadata should load")
+            .expect("the trigger should remain");
+        let first_pool_ordinary: Vec<&FileInfo> = first_pool
+            .versions
+            .iter()
+            .filter(|version| !version.tier_free_version())
+            .collect();
+        assert_eq!(first_pool_ordinary.len(), 1);
+        assert_eq!(first_pool_ordinary[0].version_id, Some(marker_id));
+        assert!(first_pool_ordinary[0].deleted);
+
+        *LIFECYCLE_DELETE_ALL_TEST_FAILURE
+            .lock()
+            .expect("lifecycle delete-all failure hook should not poison") = None;
+        store
+            .delete_prefix(&bucket, object, &opts)
+            .await
+            .expect("retry should delete remaining history and its trigger owner");
+        for pool in &store.pools {
+            assert!(
+                pool.disk_set[0]
+                    .load_file_info_versions_exact(&bucket, object)
+                    .await
+                    .expect("pool metadata should load after retry")
+                    .is_none(),
+                "all ordinary versions should be removed after retry"
+            );
+        }
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lifecycle_delete_all_phase_failures_preserve_barriers_and_retry() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("lifecycle-delete-all-phases", &[4, 4]).await;
+        let bucket = format!("lifecycle-delete-all-phases-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in both pools");
+        let _failure_guard = LifecycleDeleteAllFailureGuard;
+
+        for (object, phase, expected_counts, mutation_started) in [
+            ("preflight-failure", crate::object_api::LifecycleDeleteAllPhase::Preflight, [2, 2], false),
+            (
+                "final-preflight-failure",
+                crate::object_api::LifecycleDeleteAllPhase::FinalPreflight,
+                [1, 1],
+                true,
+            ),
+            ("trigger-failure", crate::object_api::LifecycleDeleteAllPhase::Trigger, [0, 1], true),
+        ] {
+            let opts = seed_multi_pool_delete_all(&store, &bucket, object).await;
+            *LIFECYCLE_DELETE_ALL_TEST_FAILURE
+                .lock()
+                .expect("lifecycle delete-all failure hook should not poison") = Some((phase, 1));
+            let err = store
+                .delete_prefix(&bucket, object, &opts)
+                .await
+                .expect_err("injected phase failure should stop the transaction");
+            assert_eq!(err, StorageError::PreconditionFailed);
+            assert_eq!(
+                opts.lifecycle_delete_all_journal()
+                    .expect("delete-all journal should be initialized")
+                    .lock()
+                    .mutation_started(),
+                mutation_started
+            );
+            assert_eq!(ordinary_version_count(&store, 0, &bucket, object).await, expected_counts[0]);
+            assert_eq!(ordinary_version_count(&store, 1, &bucket, object).await, expected_counts[1]);
+
+            *LIFECYCLE_DELETE_ALL_TEST_FAILURE
+                .lock()
+                .expect("lifecycle delete-all failure hook should not poison") = None;
+            store
+                .delete_prefix(&bucket, object, &opts)
+                .await
+                .expect("retry should converge after the injected failure is removed");
+            assert_eq!(ordinary_version_count(&store, 0, &bucket, object).await, 0);
+            assert_eq!(ordinary_version_count(&store, 1, &bucket, object).await, 0);
+        }
+
+        shutdown.cancel();
+    }
+
+    fn assert_backend_layout_empty(info: &rustfs_madmin::BackendInfo) {
+        assert!(info.standard_sc_parities.is_empty());
+        assert!(info.standard_sc_data.is_empty());
+        assert_eq!(info.standard_sc_parity, None);
+        assert!(info.rr_sc_parities.is_empty());
+        assert!(info.rr_sc_data.is_empty());
+        assert_eq!(info.rr_sc_parity, None);
+    }
+
+    #[test]
+    fn build_backend_info_reports_heterogeneous_automatic_config_in_pool_order() {
+        let config = lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("automatic storage class should resolve");
+
+        let info = build_backend_info(&config, &[4, 2], &[2, 1], &[7, 3]);
+
+        assert!(matches!(info.backend_type, rustfs_madmin::BackendByte::Erasure));
+        assert_eq!(info.standard_sc_parities, vec![2, 1]);
+        assert_eq!(info.standard_sc_data, vec![2, 1]);
+        assert_eq!(info.standard_sc_parity, None);
+        assert_eq!(info.rr_sc_parities, vec![1, 1]);
+        assert_eq!(info.rr_sc_data, vec![3, 1]);
+        assert_eq!(info.rr_sc_parity, Some(1));
+        assert_eq!(info.drives_per_set, vec![4, 2]);
+        assert_eq!(info.total_sets, vec![7, 3]);
+    }
+
+    #[test]
+    fn build_backend_info_keeps_truthful_homogeneous_scalar() {
+        let mut kvs = KVS::new();
+        kvs.insert(CLASS_STANDARD.to_string(), "EC:2".to_string());
+        let config =
+            lookup_config_for_pools_without_env(&kvs, &[4, 6]).expect("explicit storage class should resolve for every pool");
+
+        let info = build_backend_info(&config, &[4, 6], &[2, 3], &[1, 1]);
+
+        assert_eq!(info.standard_sc_parities, vec![2, 2]);
+        assert_eq!(info.standard_sc_data, vec![2, 4]);
+        assert_eq!(info.standard_sc_parity, Some(2));
+        assert_eq!(info.rr_sc_parities, vec![1, 1]);
+        assert_eq!(info.rr_sc_data, vec![3, 5]);
+        assert_eq!(info.rr_sc_parity, Some(1));
+    }
+
+    #[test]
+    fn build_backend_info_reports_single_disk_pool_without_inventing_parity() {
+        let config = lookup_config_for_pools_without_env(&KVS::new(), &[4, 1]).expect("single disk pool should resolve");
+
+        let info = build_backend_info(&config, &[4, 1], &[2, 0], &[1, 1]);
+
+        assert_eq!(info.standard_sc_parities, vec![2, 0]);
+        assert_eq!(info.standard_sc_data, vec![2, 1]);
+        assert_eq!(info.standard_sc_parity, None);
+        assert_eq!(info.rr_sc_parities, vec![1, 0]);
+        assert_eq!(info.rr_sc_data, vec![3, 1]);
+        assert_eq!(info.rr_sc_parity, None);
+    }
+
+    #[test]
+    fn build_backend_info_uses_pool_defaults_only_when_truly_uninitialized() {
+        let info = build_backend_info(&Default::default(), &[4, 2], &[1, 0], &[1, 1]);
+
+        assert_eq!(info.standard_sc_parities, vec![1, 0]);
+        assert_eq!(info.standard_sc_data, vec![3, 2]);
+        assert_eq!(info.standard_sc_parity, None);
+        assert!(info.rr_sc_parities.is_empty());
+        assert!(info.rr_sc_data.is_empty());
+        assert_eq!(info.rr_sc_parity, None);
+    }
+
+    #[test]
+    fn build_backend_info_fails_closed_on_initialized_snapshot_mismatch() {
+        let config = lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("automatic storage class should resolve");
+
+        let info = build_backend_info(&config, &[4, 6], &[1, 2], &[1, 1]);
+
+        assert_backend_layout_empty(&info);
+        assert_eq!(info.drives_per_set, vec![4, 6]);
+        assert_eq!(info.total_sets, vec![1, 1]);
+    }
+
+    #[test]
+    fn build_backend_info_expands_valid_legacy_scalar_snapshot() {
+        let mut kvs = KVS::new();
+        kvs.insert(CLASS_STANDARD.to_string(), "EC:2".to_string());
+        kvs.insert(CLASS_RRS.to_string(), "EC:1".to_string());
+        let current =
+            lookup_config_for_pools_without_env(&kvs, &[4, 6]).expect("distinct legacy scalars should resolve for every pool");
+        let encoded = serde_json::to_string(&current).expect("config should serialize");
+        let legacy: storageclass::Config = serde_json::from_str(&encoded).expect("legacy scalar config should deserialize");
+
+        let info = build_backend_info(&legacy, &[4, 6], &[2, 3], &[1, 1]);
+
+        assert_eq!(info.standard_sc_parities, vec![2, 2]);
+        assert_eq!(info.standard_sc_data, vec![2, 4]);
+        assert_eq!(info.standard_sc_parity, Some(2));
+        assert_eq!(info.rr_sc_parities, vec![1, 1]);
+        assert_eq!(info.rr_sc_data, vec![3, 5]);
+        assert_eq!(info.rr_sc_parity, Some(1));
+    }
+
+    #[test]
+    fn build_backend_info_rejects_legacy_scalar_invalid_for_later_pool() {
+        let current = lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("automatic config should resolve");
+        let encoded = serde_json::to_string(&current).expect("config should serialize");
+        let legacy: storageclass::Config = serde_json::from_str(&encoded).expect("legacy scalar config should deserialize");
+
+        let info = build_backend_info(&legacy, &[4, 2], &[2, 1], &[1, 1]);
+
+        assert_backend_layout_empty(&info);
+    }
+
+    #[test]
+    fn build_backend_info_never_reports_invalid_geometry() {
+        let config = storageclass::Config::default();
+
+        assert_backend_layout_empty(&build_backend_info(&config, &[4, 2], &[5, 1], &[1, 1]));
+        assert_backend_layout_empty(&build_backend_info(&config, &[0], &[0], &[1]));
+        assert_backend_layout_empty(&build_backend_info(&config, &[4], &[3], &[1]));
+    }
+
+    #[test]
+    fn build_backend_info_rejects_mismatched_topology_lengths() {
+        let config = lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("automatic storage class should resolve");
+
+        assert_backend_layout_empty(&build_backend_info(&config, &[4, 2], &[2], &[1, 1]));
+        assert_backend_layout_empty(&build_backend_info(&config, &[4, 2], &[2, 1], &[1]));
+
+        let empty = build_backend_info(&Default::default(), &[], &[], &[]);
+        assert_backend_layout_empty(&empty);
+        assert!(empty.drives_per_set.is_empty());
+        assert!(empty.total_sets.is_empty());
+    }
+
+    #[test]
+    fn build_backend_info_uses_one_complete_arc_swap_snapshot() {
+        let old = lookup_config_for_pools_without_env(&KVS::new(), &[4, 2]).expect("old config should resolve");
+        let mut new_kvs = KVS::new();
+        new_kvs.insert(CLASS_STANDARD.to_string(), "EC:1".to_string());
+        let new = lookup_config_for_pools_without_env(&new_kvs, &[4, 2]).expect("new config should resolve");
+        let snapshots = ArcSwap::from_pointee(old);
+        let held_old = snapshots.load_full();
+        snapshots.store(Arc::new(new));
+
+        let old_info = build_backend_info(&held_old, &[4, 2], &[2, 1], &[1, 1]);
+        let new_info = build_backend_info(&snapshots.load_full(), &[4, 2], &[2, 1], &[1, 1]);
+
+        assert_eq!(old_info.standard_sc_parities, vec![2, 1]);
+        assert_eq!(old_info.standard_sc_data, vec![2, 1]);
+        assert_eq!(old_info.standard_sc_parity, None);
+        assert_eq!(old_info.rr_sc_parities, vec![1, 1]);
+        assert_eq!(new_info.standard_sc_parities, vec![1, 1]);
+        assert_eq!(new_info.standard_sc_data, vec![3, 1]);
+        assert_eq!(new_info.standard_sc_parity, Some(1));
+        assert_eq!(new_info.rr_sc_parities, vec![1, 1]);
+    }
 
     fn object_info_with_mod_time(unix_ts: i64, delete_marker: bool) -> ObjectInfo {
         ObjectInfo {
-            mod_time: Some(OffsetDateTime::from_unix_timestamp(unix_ts).unwrap()),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(unix_ts).expect("operation should succeed")),
             delete_marker,
             ..Default::default()
         }
     }
 
-    fn disk_info(total: u64, used: u64, free: u64) -> DiskInfo {
-        DiskInfo {
-            total,
-            used,
-            free,
-            free_inodes: 1_024,
-            ..Default::default()
+    fn object_info_with_identity(unix_ts: i64, delete_marker: bool, version_id: Uuid, etag: Option<String>) -> ObjectInfo {
+        ObjectInfo {
+            version_id: Some(version_id),
+            etag,
+            ..object_info_with_mod_time(unix_ts, delete_marker)
         }
     }
 
@@ -852,15 +2063,15 @@ mod tests {
             },
         ];
 
-        let (info, idx) =
-            resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default()).unwrap();
+        let (info, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect("operation should succeed");
 
         assert_eq!(idx, 1);
         assert!(info.delete_marker);
     }
 
     #[test]
-    fn resolve_latest_object_info_candidates_prefers_higher_pool_idx_on_equal_mod_time() {
+    fn resolve_latest_object_info_candidates_prefers_higher_pool_idx_on_equal_mod_time_for_equivalent_candidates() {
         let candidates = vec![
             LatestObjectInfoCandidate {
                 info: Some(object_info_with_mod_time(10, false)),
@@ -874,9 +2085,774 @@ mod tests {
             },
         ];
 
-        let (_, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default()).unwrap();
+        let (_, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect("operation should succeed");
 
         assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_prefers_active_target_over_higher_suspended_source() {
+        let source = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        let target = source.clone();
+
+        let (info, idx) = resolve_latest_object_info_candidates_with_pool_state(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(target),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            &[false, true],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("an active committed target should fence an equivalent suspended source");
+
+        assert_eq!(idx, 0);
+        assert_eq!(info.version_id, Some(Uuid::from_u128(1)));
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_keeps_lone_suspended_source_readable() {
+        let source = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+
+        let (_, idx) = resolve_latest_object_info_candidates_with_pool_state(
+            vec![LatestObjectInfoCandidate {
+                info: Some(source),
+                idx: 1,
+                err: None,
+            }],
+            &[false, true],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("a source-only object must remain readable before migration commits");
+
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_suspended_source_identity_conflict() {
+        let target = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-new".to_string()));
+        let source = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-old".to_string()));
+
+        let err = resolve_latest_object_info_candidates_with_pool_state(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(target),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            &[false, true],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect_err("pool state must not mask an equal-time identity conflict");
+
+        assert_eq!(err, Error::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_keeps_index_fallback_for_fully_equivalent_identities() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()))),
+                idx: 2,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()))),
+                idx: 7,
+                err: None,
+            },
+        ];
+
+        let (info, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect("equivalent replicas must resolve deterministically");
+
+        assert_eq!(idx, 7);
+        assert_eq!(info.version_id, Some(Uuid::from_u128(1)));
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_equal_time_version_id_conflict() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()))),
+                idx: 0,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(2), Some("etag-a".to_string()))),
+                idx: 1,
+                err: None,
+            },
+        ];
+
+        let err = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect_err("divergent version ids must not silently resolve to the higher pool index");
+
+        assert_eq!(err, Error::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_equal_time_etag_conflict() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-old".to_string()))),
+                idx: 0,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-new".to_string()))),
+                idx: 1,
+                err: None,
+            },
+        ];
+
+        let err = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect_err("divergent etags must not silently resolve to the higher pool index");
+
+        assert_eq!(err, Error::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_equal_time_delete_marker_conflict() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), None)),
+                idx: 0,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, true, Uuid::from_u128(1), Some("etag-a".to_string()))),
+                idx: 1,
+                err: None,
+            },
+        ];
+
+        let err = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect_err("a delete marker tied with a live version must not be masked by the pool index");
+
+        assert_eq!(err, Error::ErasureReadQuorum);
+    }
+
+    fn assert_equal_time_identity_conflict(left: ObjectInfo, right: ObjectInfo) {
+        let err = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(left),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(right),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect_err("equal-time identity divergence must fail closed");
+
+        assert_eq!(err, Error::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_equal_time_payload_identity_conflicts() {
+        let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+
+        let mut size = base.clone();
+        size.size = 1;
+        assert_equal_time_identity_conflict(base.clone(), size);
+
+        let mut actual_size = base.clone();
+        actual_size.actual_size = 1;
+        assert_equal_time_identity_conflict(base.clone(), actual_size);
+
+        let mut checksum = base.clone();
+        checksum.checksum = Some(bytes::Bytes::from_static(b"checksum"));
+        assert_equal_time_identity_conflict(base.clone(), checksum);
+
+        let mut parts = base.clone();
+        parts.parts = std::sync::Arc::new(vec![rustfs_filemeta::ObjectPartInfo {
+            etag: "part-etag".to_string(),
+            number: 1,
+            size: 1,
+            ..Default::default()
+        }]);
+        assert_equal_time_identity_conflict(base.clone(), parts);
+
+        let mut transition = base;
+        transition.transitioned_object.tier = "tier-a".to_string();
+        assert_equal_time_identity_conflict(
+            object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string())),
+            transition,
+        );
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_data_movement_rewrites() {
+        let mut source = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        source.data_dir = Some(Uuid::from_u128(1));
+
+        let mut target = source.clone();
+        target.data_dir = Some(Uuid::from_u128(2));
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_DATA_MOVED,
+            "true".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+            "0".to_string(),
+        );
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(target.clone()),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("a committed data-movement target must remain readable before source cleanup");
+
+        assert_eq!(idx, 1);
+        assert_eq!(info.data_dir, target.data_dir);
+    }
+
+    /// A partially moved entry: the retained source lists every version, the
+    /// target only the ones copied so far (rustfs/backlog#2873, defect F).
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_a_moved_copy_with_a_shorter_version_list() {
+        let mut source = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        source.data_dir = Some(Uuid::from_u128(1));
+        source.num_versions = 5;
+        source.successor_mod_time = Some(OffsetDateTime::from_unix_timestamp(20).expect("test timestamp should be valid"));
+
+        let mut target = source.clone();
+        target.data_dir = Some(Uuid::from_u128(2));
+        target.num_versions = 4;
+        target.is_latest = !source.is_latest;
+        target.successor_mod_time = None;
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_DATA_MOVED,
+            "true".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
+            "0".to_string(),
+        );
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(target.clone()),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("a version copied by a partially moved entry must stay readable");
+
+        assert_eq!(idx, 1);
+        assert_eq!(info.data_dir, target.data_dir);
+    }
+
+    /// An exact copy of an identified version, such as a delete marker copied
+    /// by a partially moved entry, is the same version whatever each pool's
+    /// version list holds.
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_an_identified_version_with_a_shorter_version_list() {
+        let source = object_info_with_identity(10, true, Uuid::from_u128(1), None);
+        let mut target = source.clone();
+        target.num_versions = source.num_versions + 3;
+        target.successor_mod_time = Some(OffsetDateTime::from_unix_timestamp(20).expect("test timestamp should be valid"));
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(target),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("an exact copy of an identified version must resolve");
+
+        assert_eq!(idx, 1);
+        assert!(info.delete_marker);
+    }
+
+    /// The delete marker a partially moved entry copied carries the target's
+    /// bucket incarnation fence and a shorter version list; it is still the
+    /// source's marker, so the latest read answers with that marker.
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_a_copied_delete_marker_with_its_incarnation_fence() {
+        let mut source = object_info_with_identity(10, true, Uuid::from_u128(1), None);
+        source.num_versions = 4;
+        let mut target = source.clone();
+        target.num_versions = 2;
+        rustfs_utils::http::metadata_compat::insert_str(
+            Arc::make_mut(&mut target.user_defined),
+            rustfs_utils::http::metadata_compat::SUFFIX_BUCKET_INCARNATION_ID,
+            Uuid::from_u128(2).to_string(),
+        );
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(source),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(target),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("a copied delete marker must resolve as the latest version");
+
+        assert_eq!(idx, 1);
+        assert!(info.delete_marker);
+    }
+
+    fn tiered_null_version_file_info() -> FileInfo {
+        FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: None,
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(10).expect("test timestamp should be valid")),
+            size: 1024,
+            metadata: std::collections::HashMap::from([("etag".to_string(), "tiered-etag".to_string())]),
+            transition_status: rustfs_filemeta::TRANSITION_COMPLETE.to_string(),
+            transition_tier: "WARM".to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version: Some("remote-version".to_string()),
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            num_versions: 3,
+            is_latest: false,
+            successor_mod_time: Some(OffsetDateTime::from_unix_timestamp(20).expect("test timestamp should be valid")),
+            ..FileInfo::new("bucket/object", 2, 2)
+        }
+    }
+
+    /// Tiered migration publishes metadata without a data-moved marker. The
+    /// same null version can be historical on the source and latest on a
+    /// partially populated target.
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_a_tiered_null_version_with_a_shorter_history() {
+        use rustfs_filemeta::TransitionVersionState;
+
+        for (remote_version, state) in [
+            (Some("remote-version"), TransitionVersionState::Exact),
+            (None, TransitionVersionState::KnownDisabled),
+            (Some("null"), TransitionVersionState::SuspendedNull),
+            (Some("legacy-version"), TransitionVersionState::Unknown),
+            (None, TransitionVersionState::Unknown),
+        ] {
+            let mut source_file = tiered_null_version_file_info();
+            source_file.transition_version = remote_version.map(str::to_string);
+            source_file.transition_version_state = state;
+            let mut target_file = source_file.clone();
+            crate::data_movement::prepare_tiered_data_movement_file_info(&mut target_file)
+                .expect("tiered metadata preparation should preserve the remote tuple");
+            target_file.num_versions = 1;
+            target_file.is_latest = true;
+            target_file.successor_mod_time = None;
+
+            for versioned in [false, true] {
+                let source = ObjectInfo::from_file_info(&source_file, "bucket", "object", versioned);
+                let target = ObjectInfo::from_file_info(&target_file, "bucket", "object", versioned);
+                assert_eq!(source.version_id, versioned.then_some(Uuid::nil()));
+                assert!(!rustfs_utils::http::contains_key_str(
+                    &target.user_defined,
+                    rustfs_utils::http::SUFFIX_DATA_MOVED
+                ));
+
+                let (info, idx) = resolve_latest_object_info_candidates(
+                    vec![
+                        LatestObjectInfoCandidate {
+                            info: Some(source),
+                            idx: 0,
+                            err: None,
+                        },
+                        LatestObjectInfoCandidate {
+                            info: Some(target),
+                            idx: 1,
+                            err: None,
+                        },
+                    ],
+                    "bucket",
+                    "object",
+                    &ObjectOptions {
+                        version_id: Some("null".to_string()),
+                        versioned,
+                        ..Default::default()
+                    },
+                )
+                .expect("an exact tiered null-version copy must remain readable before source cleanup");
+
+                assert_eq!(idx, 1);
+                assert_eq!(info.version_id, versioned.then_some(Uuid::nil()));
+                assert_eq!(info.transitioned_object.status, rustfs_filemeta::TRANSITION_COMPLETE);
+                assert_eq!(info.transitioned_object.tier, "WARM");
+                assert_eq!(info.transitioned_object.name, "remote/object");
+                assert_eq!(info.transitioned_object.version_id, remote_version.unwrap_or_default());
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_tiered_null_version_identity_conflicts() {
+        let source = ObjectInfo::from_file_info(&tiered_null_version_file_info(), "bucket", "object", true);
+        let changes: [fn(&mut ObjectInfo); 5] = [
+            |info| info.transitioned_object.tier = "OTHER".to_string(),
+            |info| info.transitioned_object.name = "remote/other".to_string(),
+            |info| info.transitioned_object.version_id = "other-version".to_string(),
+            |info| info.size += 1,
+            |info| info.etag = Some("other-etag".to_string()),
+        ];
+
+        for change in changes {
+            let mut target = source.clone();
+            target.num_versions = 1;
+            change(&mut target);
+            assert_equal_time_identity_conflict(source.clone(), target);
+        }
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_tiered_null_history_without_a_complete_remote_tuple() {
+        let source = ObjectInfo::from_file_info(&tiered_null_version_file_info(), "bucket", "object", true);
+        let changes: [fn(&mut ObjectInfo); 5] = [
+            |info| info.transitioned_object.status.clear(),
+            |info| info.transitioned_object.status = "pending".to_string(),
+            |info| info.transitioned_object.tier.clear(),
+            |info| info.transitioned_object.name.clear(),
+            |info| info.transitioned_object.free_version = true,
+        ];
+
+        for change in changes {
+            let mut source = source.clone();
+            change(&mut source);
+            let mut target = source.clone();
+            target.num_versions = 1;
+            assert_equal_time_identity_conflict(source, target);
+        }
+    }
+
+    /// A null version has no id to prove both pools hold the same version, so
+    /// a differing version list still fails closed.
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_null_version_history_conflict() {
+        let mut left = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        left.version_id = None;
+        let mut right = left.clone();
+        right.num_versions = left.num_versions + 1;
+        assert_equal_time_identity_conflict(left.clone(), right);
+
+        let mut right = left.clone();
+        right.is_latest = !left.is_latest;
+        assert_equal_time_identity_conflict(left.clone(), right);
+
+        let mut right = left.clone();
+        right.successor_mod_time = Some(OffsetDateTime::from_unix_timestamp(20).expect("test timestamp should be valid"));
+        assert_equal_time_identity_conflict(left, right);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_unmarked_data_dir_conflict() {
+        let mut left = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        left.data_dir = Some(Uuid::from_u128(1));
+
+        let mut right = left.clone();
+        right.data_dir = Some(Uuid::from_u128(2));
+
+        assert_equal_time_identity_conflict(left, right);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_accepts_internal_metadata_aliases() {
+        let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        let mut rustfs_alias = base.clone();
+        rustfs_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+            "x-rustfs-internal-compression".to_string(),
+            "zstd".to_string(),
+        )]));
+        let mut minio_alias = base.clone();
+        minio_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+            "X-MINIO-INTERNAL-COMPRESSION".to_string(),
+            "zstd".to_string(),
+        )]));
+
+        let (_, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(rustfs_alias),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(minio_alias),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("same-value internal aliases should resolve");
+        assert_eq!(idx, 1);
+
+        let mut dual_alias = base.clone();
+        dual_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([
+            ("x-rustfs-internal-compression".to_string(), "zstd".to_string()),
+            ("x-minio-internal-compression".to_string(), "zstd".to_string()),
+        ]));
+        let mut single_alias = base;
+        single_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+            "x-rustfs-internal-compression".to_string(),
+            "zstd".to_string(),
+        )]));
+
+        let (_, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(dual_alias),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(single_alias),
+                    idx: 1,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("dual-key and single-key internal metadata should resolve");
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_different_internal_metadata_alias_values() {
+        let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        let mut rustfs_alias = base.clone();
+        rustfs_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+            "x-rustfs-internal-compression".to_string(),
+            "zstd".to_string(),
+        )]));
+        let mut minio_alias = base;
+        minio_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+            "x-minio-internal-compression".to_string(),
+            "snappy".to_string(),
+        )]));
+
+        assert_equal_time_identity_conflict(rustfs_alias, minio_alias);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_preserves_dynamic_internal_metadata_identity_case() {
+        for suffix_prefix in ["replication-reset-", "replication-delete-marker-version-"] {
+            let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+            let mut rustfs_alias = base.clone();
+            rustfs_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+                format!(
+                    "X-RUSTFS-INTERNAL-{}{suffix}",
+                    suffix_prefix.to_uppercase(),
+                    suffix = "arn:aws:s3:::Bucket"
+                ),
+                "value".to_string(),
+            )]));
+            let mut minio_alias = base.clone();
+            minio_alias.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+                format!("x-minio-internal-{suffix_prefix}arn:aws:s3:::Bucket"),
+                "value".to_string(),
+            )]));
+
+            let (_, idx) = resolve_latest_object_info_candidates(
+                vec![
+                    LatestObjectInfoCandidate {
+                        info: Some(rustfs_alias.clone()),
+                        idx: 0,
+                        err: None,
+                    },
+                    LatestObjectInfoCandidate {
+                        info: Some(minio_alias),
+                        idx: 1,
+                        err: None,
+                    },
+                ],
+                "bucket",
+                "object",
+                &ObjectOptions::default(),
+            )
+            .expect("dynamic internal aliases with the same target should resolve");
+            assert_eq!(idx, 1);
+
+            let mut different_target_case = base;
+            different_target_case.user_defined = std::sync::Arc::new(std::collections::HashMap::from([(
+                format!("x-minio-internal-{suffix_prefix}arn:aws:s3:::bucket"),
+                "value".to_string(),
+            )]));
+
+            assert_equal_time_identity_conflict(rustfs_alias, different_target_case);
+        }
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_conflicting_internal_metadata_aliases_in_one_candidate() {
+        let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        let mut first = base.clone();
+        first.user_defined = std::sync::Arc::new(std::collections::HashMap::from([
+            ("x-rustfs-internal-compression".to_string(), "zstd".to_string()),
+            ("x-minio-internal-compression".to_string(), "snappy".to_string()),
+        ]));
+        let mut second = base;
+        second.user_defined = first.user_defined.clone();
+
+        assert_equal_time_identity_conflict(first, second);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_replication_identity_conflict() {
+        let base = object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+
+        let mut replication = base.clone();
+        replication.replication_status_internal = Some("PENDING".to_string());
+        replication.replication_status = ReplicationStatusType::Pending;
+        assert_equal_time_identity_conflict(base.clone(), replication);
+
+        let mut purge = base.clone();
+        purge.version_purge_status_internal = Some("PENDING".to_string());
+        purge.version_purge_status = VersionPurgeStatusType::Pending;
+        assert_equal_time_identity_conflict(base.clone(), purge);
+
+        let mut decision = base;
+        decision.replication_decision = "replicate".to_string();
+        assert_equal_time_identity_conflict(
+            object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string())),
+            decision,
+        );
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_rejects_none_vs_unix_epoch_mod_time() {
+        let mut without_mod_time = object_info_with_identity(0, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+        without_mod_time.mod_time = None;
+        let with_unix_epoch = object_info_with_identity(0, false, Uuid::from_u128(1), Some("etag-a".to_string()));
+
+        assert_equal_time_identity_conflict(without_mod_time, with_unix_epoch);
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_ignores_older_identity_conflicts() {
+        let latest = object_info_with_identity(20, false, Uuid::from_u128(1), Some("etag-latest".to_string()));
+        let mut older = object_info_with_identity(10, true, Uuid::from_u128(2), Some("etag-old".to_string()));
+        older.data_dir = Some(Uuid::from_u128(2));
+
+        let (info, idx) = resolve_latest_object_info_candidates(
+            vec![
+                LatestObjectInfoCandidate {
+                    info: Some(latest),
+                    idx: 0,
+                    err: None,
+                },
+                LatestObjectInfoCandidate {
+                    info: Some(older),
+                    idx: 9,
+                    err: None,
+                },
+            ],
+            "bucket",
+            "object",
+            &ObjectOptions::default(),
+        )
+        .expect("older identity divergence must not affect the latest candidate");
+
+        assert_eq!(idx, 0);
+        assert_eq!(
+            info.mod_time,
+            Some(OffsetDateTime::from_unix_timestamp(20).expect("operation should succeed"))
+        );
+    }
+
+    #[test]
+    fn resolve_latest_object_info_candidates_ignores_not_found_pools_when_resolving() {
+        let candidates = vec![
+            LatestObjectInfoCandidate {
+                info: Some(object_info_with_identity(10, false, Uuid::from_u128(1), Some("etag-a".to_string()))),
+                idx: 0,
+                err: None,
+            },
+            LatestObjectInfoCandidate {
+                info: None,
+                idx: 1,
+                err: Some(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
+            },
+        ];
+
+        let (info, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect("not-found pools must not block resolution of found candidates");
+
+        assert_eq!(idx, 0);
+        assert_eq!(info.version_id, Some(Uuid::from_u128(1)));
     }
 
     #[test]
@@ -951,7 +2927,7 @@ mod tests {
 
     #[test]
     fn resolve_store_rebalance_pool_meta_reload_result_wraps_error_context() {
-        let err = resolve_store_rebalance_pool_meta_reload_result(Err(Error::SlowDown), "reload_pool_meta")
+        let err = resolve_store_rebalance_pool_meta_reload_result::<()>(Err(Error::SlowDown), "reload_pool_meta")
             .expect_err("failed pool meta reload should be wrapped");
         let err_message = err.to_string();
         assert!(err_message.contains("store rebalance pool meta reload failed during reload_pool_meta"));
@@ -959,55 +2935,21 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rebalance_delete_from_all_pools_result_passthrough_ok() {
-        let info = ObjectInfo {
-            bucket: "bucket".to_string(),
-            name: "object".to_string(),
-            ..Default::default()
-        };
-
-        let resolved = resolve_rebalance_delete_from_all_pools_result(Ok(info.clone()), "bucket", "object")
-            .expect("successful rebalance delete should pass through");
-
-        assert_eq!(resolved.bucket, info.bucket);
-        assert_eq!(resolved.name, info.name);
-    }
-
-    #[test]
-    fn resolve_rebalance_delete_from_all_pools_result_wraps_object_context() {
-        let err = resolve_rebalance_delete_from_all_pools_result(Err(Error::SlowDown), "bucket", "object")
-            .expect_err("failed rebalance delete should be wrapped");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("failed to delete rebalance source object bucket/object"), "{rendered}");
-        assert!(rendered.contains(&Error::SlowDown.to_string()), "{rendered}");
-    }
-
-    #[test]
     fn resolve_rebalance_delete_from_all_pools_results_fails_on_later_pool_error() {
         let err = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Ok(ObjectInfo {
-                        bucket: "bucket".to_string(),
-                        name: "object".to_string(),
-                        ..Default::default()
-                    }),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Err(Error::SlowDown),
-                },
+                Ok(ObjectInfo {
+                    bucket: "bucket".to_string(),
+                    name: "object".to_string(),
+                    ..Default::default()
+                }),
+                Err(Error::SlowDown),
             ],
             "bucket",
             "object",
         )
         .expect_err("non-ignorable errors from later pools must not be hidden");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("pool 1 delete failed for bucket/object"), "{rendered}");
-        assert!(rendered.contains(&Error::SlowDown.to_string()), "{rendered}");
+        assert_eq!(err, Error::SlowDown);
     }
 
     #[test]
@@ -1020,14 +2962,8 @@ mod tests {
 
         let resolved = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Ok(info.clone()),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
-                },
+                Ok(info.clone()),
+                Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
             ],
             "bucket",
             "object",
@@ -1048,14 +2984,8 @@ mod tests {
 
         let resolved = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Ok(info.clone()),
-                },
+                Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
+                Ok(info.clone()),
             ],
             "bucket",
             "object",
@@ -1070,50 +3000,35 @@ mod tests {
     fn resolve_rebalance_delete_from_all_pools_results_fails_when_all_results_are_ignored_errors() {
         let err = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Err(Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())),
-                },
+                Err(Error::ObjectNotFound("bucket".to_string(), "object".to_string())),
+                Err(Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())),
             ],
             "bucket",
             "object",
         )
         .expect_err("all ignored errors without any successful delete should still fail");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("pool 1 delete failed for bucket/object"), "{rendered}");
-        assert!(rendered.contains("Version not found"), "{rendered}");
+        assert_eq!(
+            err,
+            Error::VersionNotFound("bucket".to_string(), "object".to_string(), "vid-1".to_string())
+        );
     }
 
     #[test]
     fn resolve_rebalance_delete_from_all_pools_results_fails_on_write_quorum_even_with_success() {
         let err = resolve_rebalance_delete_from_all_pools_results(
             vec![
-                RebalanceDeletePoolResult {
-                    pool_idx: 0,
-                    result: Ok(ObjectInfo {
-                        bucket: "bucket".to_string(),
-                        name: "object".to_string(),
-                        ..Default::default()
-                    }),
-                },
-                RebalanceDeletePoolResult {
-                    pool_idx: 1,
-                    result: Err(Error::ErasureWriteQuorum),
-                },
+                Ok(ObjectInfo {
+                    bucket: "bucket".to_string(),
+                    name: "object".to_string(),
+                    ..Default::default()
+                }),
+                Err(Error::ErasureWriteQuorum),
             ],
             "bucket",
             "object",
         )
         .expect_err("write quorum failures must fail the aggregate delete");
-        let rendered = err.to_string();
-
-        assert!(rendered.contains("pool 1 delete failed for bucket/object"), "{rendered}");
-        assert!(rendered.contains(&Error::ErasureWriteQuorum.to_string()), "{rendered}");
+        assert_eq!(err, Error::ErasureWriteQuorum);
     }
 
     #[test]
@@ -1126,36 +3041,620 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn build_server_pools_available_space_returns_zero_for_empty_pool_info() {
-        let spaces = build_server_pools_available_space("bucket-a", 64, &[1], &[Vec::new()]).await;
+    fn reload_test_pool_status(decommission: Option<PoolDecommissionInfo>, last_update: time::OffsetDateTime) -> PoolStatus {
+        PoolStatus {
+            id: 0,
+            cmd_line: "pool-0".to_string(),
+            last_update,
+            decommission,
+        }
+    }
 
-        assert_eq!(spaces.0.len(), 1);
-        assert_eq!(spaces.0[0].index, 0);
-        assert_eq!(spaces.0[0].available, 0);
-        assert_eq!(spaces.0[0].max_used_pct, 0);
+    fn reload_test_pool_meta(pool: PoolStatus) -> PoolMeta {
+        PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![pool],
+            dont_save: false,
+        }
+    }
+
+    async fn persist_reload_snapshot(store: &ECStore, snapshot: &PoolMeta) {
+        snapshot
+            .save_for_startup(store.pools.clone())
+            .await
+            .expect("pool meta snapshot should persist to every pool");
+    }
+
+    #[derive(Debug)]
+    struct PoolMetaCommitPauseStorage {
+        inner: Arc<Sets>,
+        pause_committed_pool_meta: bool,
+        paused: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::object::ObjectIO for PoolMetaCommitPauseStorage {
+        type Error = Error;
+        type RangeSpec = crate::storage_api_contracts::range::HTTPRangeSpec;
+        type HeaderMap = http::HeaderMap;
+        type ObjectOptions = crate::object_api::ObjectOptions;
+        type ObjectInfo = crate::object_api::ObjectInfo;
+        type GetObjectReader = crate::object_api::GetObjectReader;
+        type PutObjectReader = crate::object_api::PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            bucket: &str,
+            object: &str,
+            range: Option<Self::RangeSpec>,
+            h: Self::HeaderMap,
+            opts: &Self::ObjectOptions,
+        ) -> std::result::Result<Self::GetObjectReader, Error> {
+            self.inner.get_object_reader(bucket, object, range, h, opts).await
+        }
+
+        async fn put_object(
+            &self,
+            bucket: &str,
+            object: &str,
+            data: &mut Self::PutObjectReader,
+            opts: &Self::ObjectOptions,
+        ) -> std::result::Result<Self::ObjectInfo, Error> {
+            let result = self.inner.put_object(bucket, object, data, opts).await;
+            if result.is_ok() && object == POOL_META_NAME && self.pause_committed_pool_meta {
+                let committed = read_config_no_lock_preserve_empty_with_metadata(self.inner.clone(), POOL_META_NAME)
+                    .await
+                    .ok()
+                    .and_then(|(payload, _)| pool_meta_v3_commit_state_for_test(payload).ok())
+                    .is_some_and(|(_, committed)| committed);
+                if committed {
+                    self.paused.notify_one();
+                    self.release.notified().await;
+                }
+            }
+            result
+        }
     }
 
     #[tokio::test]
-    async fn build_server_pools_available_space_computes_available_capacity_and_max_used_pct() {
-        let infos = vec![vec![Some(disk_info(1_000, 100, 900)), Some(disk_info(1_000, 200, 800))]];
+    #[serial_test::serial]
+    async fn pool_meta_runtime_load_waits_for_multi_pool_commit_fence() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-load-fence", &[2, 2]).await;
+        let old = PoolMeta::new(&store.pools, &PoolMeta::default()).expect("initial pool metadata should be built");
+        old.save_for_startup(store.pools.clone())
+            .await
+            .expect("old V3 pool metadata should persist");
+        let (old_payload, _) = read_config_no_lock_preserve_empty_with_metadata(store.pools[0].clone(), POOL_META_NAME)
+            .await
+            .expect("old V3 pool metadata should be readable");
+        let (old_generation, old_committed) =
+            pool_meta_v3_commit_state_for_test(old_payload).expect("old replica should be a V3 envelope");
+        assert!(old_committed, "old generation should be committed before the mixed-state save");
+        let next_generation = old_generation.checked_add(1).expect("test generation should not exhaust");
+        let mut newer = old.clone();
+        newer.pools[0].last_update += TimeDuration::seconds(1);
 
-        let spaces = build_server_pools_available_space("bucket-a", 64, &[2], &infos).await;
+        let pool_meta_lock = store.pools[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+            .await
+            .expect("pool metadata lock should be created");
+        let pool_meta_guard = pool_meta_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("pool metadata write fence should be acquired");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let mut load_task = tokio::spawn({
+            let store = store.clone();
+            let started = started.clone();
+            async move {
+                started.notify_one();
+                store.load_runtime_pool_meta("test runtime pool metadata load").await
+            }
+        });
+        started.notified().await;
+        let save_paused = Arc::new(tokio::sync::Notify::new());
+        let save_release = Arc::new(tokio::sync::Notify::new());
+        let save_task = tokio::spawn({
+            let newer = newer.clone();
+            let pools = vec![
+                Arc::new(PoolMetaCommitPauseStorage {
+                    inner: store.pools[0].clone(),
+                    pause_committed_pool_meta: true,
+                    paused: save_paused.clone(),
+                    release: save_release.clone(),
+                }),
+                Arc::new(PoolMetaCommitPauseStorage {
+                    inner: store.pools[1].clone(),
+                    pause_committed_pool_meta: false,
+                    paused: save_paused.clone(),
+                    release: save_release.clone(),
+                }),
+            ];
+            async move { newer.save_for_startup(pools).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), save_paused.notified())
+            .await
+            .expect("the newer V3 generation should pause after the first replica commit");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut load_task)
+                .await
+                .is_err(),
+            "runtime load must not observe a partially committed V3 generation while fenced"
+        );
+        let (committed_payload, _) = read_config_no_lock_preserve_empty_with_metadata(store.pools[0].clone(), POOL_META_NAME)
+            .await
+            .expect("first replica should be readable while the runtime read is fenced");
+        let (pending_payload, _) = read_config_no_lock_preserve_empty_with_metadata(store.pools[1].clone(), POOL_META_NAME)
+            .await
+            .expect("second replica should be readable while the runtime read is fenced");
+        assert_eq!(
+            pool_meta_v3_commit_state_for_test(committed_payload).expect("first replica should be a V3 envelope"),
+            (next_generation, true),
+            "first replica should hold the committed new generation before the fence releases"
+        );
+        assert_eq!(
+            pool_meta_v3_commit_state_for_test(pending_payload).expect("second replica should be a V3 envelope"),
+            (next_generation, false),
+            "second replica should still hold the pending new generation before the fence releases"
+        );
 
-        assert_eq!(spaces.0.len(), 1);
-        assert_eq!(spaces.0[0].index, 0);
-        assert_eq!(spaces.0[0].available, 3_400);
-        assert_eq!(spaces.0[0].max_used_pct, 20);
+        save_release.notify_one();
+        save_task
+            .await
+            .expect("newer V3 save task should not panic")
+            .expect("the newer generation should finish while the runtime read is fenced");
+        drop(pool_meta_guard);
+
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), load_task)
+            .await
+            .expect("runtime load should finish after commit publication")
+            .expect("runtime load task should not panic")
+            .expect("runtime load should select the completed snapshot");
+        assert_eq!(loaded.pools[0].last_update, newer.pools[0].last_update);
+        shutdown.cancel();
     }
 
     #[tokio::test]
-    async fn build_server_pools_available_space_skips_capacity_guard_for_meta_bucket() {
-        let infos = vec![vec![Some(disk_info(10, 9, 1)), Some(disk_info(10, 9, 1))]];
+    #[serial_test::serial]
+    async fn runtime_save_current_pool_meta_reaches_v3_cas_and_disarms_transaction() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-runtime-cas", &[2]).await;
+        let bootstrapped = store
+            .load_runtime_pool_meta("verify fresh bootstrap V3 CAS save")
+            .await
+            .expect("fresh startup should durably publish pool metadata");
+        assert_eq!(bootstrapped.version, 3);
+        let (bootstrap_payload, _) = read_config_no_lock_preserve_empty_with_metadata(store.pools[0].clone(), POOL_META_NAME)
+            .await
+            .expect("fresh bootstrap V3 replica should be readable");
+        assert_eq!(
+            pool_meta_v3_commit_state_for_test(bootstrap_payload).expect("fresh bootstrap V3 envelope should decode"),
+            (1, true)
+        );
 
-        let spaces = build_server_pools_available_space(crate::disk::RUSTFS_META_BUCKET, 1_024, &[1], &infos).await;
+        let saved_at = OffsetDateTime::now_utc() + TimeDuration::seconds(30);
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.pools[0].last_update = saved_at;
+        }
 
-        assert_eq!(spaces.0.len(), 1);
-        assert_eq!(spaces.0[0].available, 2);
-        assert_eq!(spaces.0[0].max_used_pct, 90);
+        store
+            .save_current_pool_meta_for_test(&[0])
+            .await
+            .expect("runtime pool metadata save should reach V3 conditional writes");
+        store
+            .ensure_pool_meta_side_effects_safe("runtime save publication")
+            .await
+            .expect("successful runtime publication must disarm the transaction guard");
+        let persisted = store
+            .load_runtime_pool_meta("verify runtime V3 CAS save")
+            .await
+            .expect("runtime load should observe the committed save");
+        assert_eq!(persisted.version, 3);
+        assert_eq!(persisted.pools[0].last_update, saved_at);
+        let (runtime_payload, _) = read_config_no_lock_preserve_empty_with_metadata(store.pools[0].clone(), POOL_META_NAME)
+            .await
+            .expect("runtime V3 replica should be readable");
+        assert_eq!(
+            pool_meta_v3_commit_state_for_test(runtime_payload).expect("runtime V3 envelope should decode"),
+            (2, true)
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stale_clear_decommission_cannot_erase_active_or_queued_replacement() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-stale-clear", &[2, 2]).await;
+        let replacement_time = OffsetDateTime::UNIX_EPOCH + TimeDuration::seconds(100);
+        let cases = [
+            (
+                "failed-active",
+                PoolDecommissionInfo {
+                    failed: true,
+                    ..Default::default()
+                },
+                PoolDecommissionInfo {
+                    start_time: Some(replacement_time),
+                    ..Default::default()
+                },
+            ),
+            (
+                "canceled-queued",
+                PoolDecommissionInfo {
+                    canceled: true,
+                    ..Default::default()
+                },
+                PoolDecommissionInfo {
+                    queued: true,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (case, stale_terminal, replacement_info) in cases {
+            let mut replacement = store
+                .load_runtime_pool_meta("prepare stale clear replacement")
+                .await
+                .expect("the current durable pool metadata should load");
+            replacement.pools[0].last_update = replacement_time;
+            replacement.pools[0].decommission = Some(replacement_info.clone());
+            persist_reload_snapshot(&store, &replacement).await;
+
+            let mut stale_local = replacement.clone();
+            stale_local.pools[0].last_update = OffsetDateTime::UNIX_EPOCH;
+            stale_local.pools[0].decommission = Some(stale_terminal.clone());
+            *store.pool_meta.write().await = stale_local;
+
+            let err = store
+                .clear_decommission(0)
+                .await
+                .expect_err("a stale terminal clear must not erase a durable replacement");
+            assert!(
+                err.to_string()
+                    .contains("persisted active or queued decommission cannot be cleared"),
+                "unexpected {case} rejection: {err}"
+            );
+
+            let durable = store
+                .load_runtime_pool_meta("verify stale clear replacement")
+                .await
+                .expect("the durable replacement should remain readable");
+            let durable_info = durable.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the durable replacement must not be cleared");
+            assert_eq!(durable.pools[0].last_update, replacement_time, "{case} replacement revision changed");
+            assert_eq!(
+                durable_info.start_time, replacement_info.start_time,
+                "{case} replacement generation changed"
+            );
+            assert_eq!(durable_info.queued, replacement_info.queued, "{case} replacement queue state changed");
+
+            let local = store.pool_meta.read().await;
+            let local_info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the failed clear must roll back the stale local terminal state");
+            assert_eq!(local_info.failed, stale_terminal.failed, "{case} failed state was not rolled back");
+            assert_eq!(local_info.canceled, stale_terminal.canceled, "{case} canceled state was not rolled back");
+        }
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_pool_meta_reload_does_not_rollback_newer_local_states() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-stale", &[2]).await;
+
+        let stale_time = OffsetDateTime::now_utc();
+        let newer_time = stale_time + TimeDuration::seconds(30);
+        let progressed_states: [(&str, PoolDecommissionInfo); 4] = [
+            (
+                "queued",
+                PoolDecommissionInfo {
+                    queued: true,
+                    start_time: Some(stale_time),
+                    ..Default::default()
+                },
+            ),
+            (
+                "canceled",
+                PoolDecommissionInfo {
+                    canceled: true,
+                    start_time: Some(stale_time),
+                    ..Default::default()
+                },
+            ),
+            (
+                "failed",
+                PoolDecommissionInfo {
+                    failed: true,
+                    start_time: Some(stale_time),
+                    ..Default::default()
+                },
+            ),
+            (
+                "complete",
+                PoolDecommissionInfo {
+                    complete: true,
+                    start_time: Some(stale_time),
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (state_label, local_state) in progressed_states {
+            {
+                let mut pool_meta = store.pool_meta.write().await;
+                *pool_meta = reload_test_pool_meta(reload_test_pool_status(Some(local_state.clone()), newer_time));
+            }
+
+            // A delayed peer message carries a snapshot that predates the local progression.
+            let stale_snapshot = reload_test_pool_meta(reload_test_pool_status(
+                Some(PoolDecommissionInfo {
+                    start_time: Some(stale_time),
+                    ..Default::default()
+                }),
+                stale_time,
+            ));
+            persist_reload_snapshot(&store, &stale_snapshot).await;
+
+            let merged_newer = store.reload_pool_meta().await.expect("stale reload should succeed");
+            assert!(
+                !merged_newer,
+                "a delayed reload must not report merged newer state for the {state_label} progression"
+            );
+
+            let pool_meta = store.pool_meta.read().await;
+            let info = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .expect("local decommission state should survive a stale reload");
+            assert_eq!(info.queued, local_state.queued, "{state_label} queued flag must not roll back");
+            assert_eq!(info.canceled, local_state.canceled, "{state_label} canceled flag must not roll back");
+            assert_eq!(info.failed, local_state.failed, "{state_label} failed flag must not roll back");
+            assert_eq!(info.complete, local_state.complete, "{state_label} complete flag must not roll back");
+            assert_eq!(
+                pool_meta.pools[0].last_update, newer_time,
+                "{state_label} progress timestamp must be kept"
+            );
+        }
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_pool_meta_reload_merges_newer_state_and_is_idempotent_on_duplicate_delivery() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-duplicate", &[2]).await;
+
+        let older_time = OffsetDateTime::now_utc();
+        let newer_time = older_time + TimeDuration::seconds(30);
+
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            *pool_meta = reload_test_pool_meta(reload_test_pool_status(
+                Some(PoolDecommissionInfo {
+                    items_decommissioned: 1,
+                    ..Default::default()
+                }),
+                older_time,
+            ));
+        }
+        let newer_snapshot = reload_test_pool_meta(reload_test_pool_status(
+            Some(PoolDecommissionInfo {
+                complete: true,
+                items_decommissioned: 10,
+                ..Default::default()
+            }),
+            newer_time,
+        ));
+        persist_reload_snapshot(&store, &newer_snapshot).await;
+
+        let merged_newer = store.reload_pool_meta().await.expect("first reload should succeed");
+        assert!(merged_newer, "a strictly newer persisted snapshot must merge");
+
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let info = pool_meta.pools[0].decommission.as_ref().expect("merged decommission state");
+            assert!(info.complete);
+            assert_eq!(info.items_decommissioned, 10);
+            assert_eq!(pool_meta.pools[0].last_update, newer_time);
+        }
+
+        // Redelivering the same generation must be a no-op.
+        let duplicate_merged = store.reload_pool_meta().await.expect("duplicate reload should succeed");
+        assert!(!duplicate_merged, "a duplicate delivery must not re-apply merged state");
+
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let info = pool_meta.pools[0].decommission.as_ref().expect("merged decommission state");
+            assert!(info.complete);
+            assert_eq!(info.items_decommissioned, 10);
+            assert_eq!(pool_meta.pools[0].last_update, newer_time);
+        }
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_pool_meta_reload_keeps_active_worker_progress_over_newer_snapshot() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-worker", &[2]).await;
+        *store.decommission_cancelers.write().await = vec![Some(crate::core::pools::DecommissionCanceler::new_for_test(
+            CancellationToken::new(),
+        ))];
+
+        let worker_time = OffsetDateTime::now_utc();
+        let newer_time = worker_time + TimeDuration::seconds(30);
+
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            *pool_meta = reload_test_pool_meta(reload_test_pool_status(
+                Some(PoolDecommissionInfo {
+                    start_time: Some(worker_time),
+                    items_decommissioned: 10,
+                    bytes_done: 1_024,
+                    ..Default::default()
+                }),
+                worker_time,
+            ));
+        }
+        // Even a strictly newer terminal snapshot must not override a live worker.
+        let newer_terminal_snapshot = reload_test_pool_meta(reload_test_pool_status(
+            Some(PoolDecommissionInfo {
+                complete: true,
+                ..Default::default()
+            }),
+            newer_time,
+        ));
+        persist_reload_snapshot(&store, &newer_terminal_snapshot).await;
+
+        let merged_newer = store
+            .reload_pool_meta()
+            .await
+            .expect("reload under an active worker should succeed");
+        assert!(!merged_newer, "an active local worker must block snapshot replacement");
+
+        let pool_meta = store.pool_meta.read().await;
+        let info = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("worker progress should remain");
+        assert!(!info.complete);
+        assert_eq!(info.items_decommissioned, 10);
+        assert_eq!(info.bytes_done, 1_024);
+        assert_eq!(pool_meta.pools[0].last_update, worker_time);
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_pool_meta_reload_latches_recovery_when_initialized_metadata_is_missing() {
+        let (temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-missing", &[2]).await;
+
+        let kept_time = OffsetDateTime::now_utc();
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            *pool_meta = reload_test_pool_meta(reload_test_pool_status(
+                Some(PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                }),
+                kept_time,
+            ));
+        }
+        // Persist first so the test controls exactly what exists on disk.
+        persist_reload_snapshot(
+            &store,
+            &reload_test_pool_meta(reload_test_pool_status(
+                Some(PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                }),
+                kept_time,
+            )),
+        )
+        .await;
+
+        let mut deleted_any = false;
+        for disk_index in 0..2 {
+            let pool_bin_dir = temp_dir
+                .path()
+                .join(format!("pool0-disk{disk_index}"))
+                .join(crate::disk::RUSTFS_META_BUCKET)
+                .join(crate::core::pools::POOL_META_NAME);
+            if pool_bin_dir.exists() {
+                tokio::fs::remove_dir_all(&pool_bin_dir)
+                    .await
+                    .expect("persisted pool metadata object dir should be removable");
+                deleted_any = true;
+            }
+        }
+        // The meta-bucket layout may nest objects per pool; fall back to removing
+        // every pool.bin object directory below the temp root.
+        if !deleted_any {
+            panic!("no pool.bin found under {:?}", temp_dir.path());
+        }
+
+        let err = store
+            .reload_pool_meta()
+            .await
+            .expect_err("an initialized cluster with every pool.bin missing must require recovery");
+        assert!(err.to_string().contains("initialized cluster identity exists"));
+        store
+            .ensure_pool_meta_side_effects_safe("test reload side effect")
+            .await
+            .expect_err("the recovery-required reload must latch the runtime side-effect gate");
+
+        let pool_meta = store.pool_meta.read().await;
+        let info = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("missing persisted metadata must not default local state away");
+        assert!(info.complete);
+        assert_eq!(pool_meta.pools[0].last_update, kept_time);
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_pool_meta_reload_latches_recovery_after_identity_epoch_conflict() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-identity-conflict", &[2, 2]).await;
+        let conflicting_identity =
+            initialized_pool_meta_identity_for_test(store.id, 2).expect("conflicting initialized identity should encode");
+        save_config(store.pools[1].clone(), POOL_META_IDENTITY_NAME, conflicting_identity)
+            .await
+            .expect("second pool identity should be replaced for the conflict scenario");
+
+        let err = store
+            .reload_pool_meta()
+            .await
+            .expect_err("divergent identity epochs must reject runtime reload");
+        assert!(
+            err.to_string()
+                .contains("identity replicas disagree on cluster identity or epoch")
+        );
+        store
+            .ensure_pool_meta_side_effects_safe("identity epoch conflict side effect")
+            .await
+            .expect_err("identity epoch conflict must latch the runtime side-effect gate");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_pool_meta_reload_latches_recovery_after_future_identity_version() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-future-identity", &[2, 2]).await;
+        let (mut future_identity, _) =
+            read_config_no_lock_preserve_empty_with_metadata(store.pools[1].clone(), POOL_META_IDENTITY_NAME)
+                .await
+                .expect("current identity should be readable");
+        let current_version = u16::from_le_bytes([future_identity[2], future_identity[3]]);
+        let future_version = current_version
+            .checked_add(1)
+            .expect("identity version should have a future value");
+        future_identity[2..4].copy_from_slice(&future_version.to_le_bytes());
+        save_config(store.pools[1].clone(), POOL_META_IDENTITY_NAME, future_identity)
+            .await
+            .expect("second pool identity should be replaced with a future version");
+
+        let err = store
+            .reload_pool_meta()
+            .await
+            .expect_err("a future identity version must reject runtime reload");
+        assert!(err.to_string().contains("pool metadata incompatible"));
+        store
+            .ensure_pool_meta_side_effects_safe("future identity version side effect")
+            .await
+            .expect_err("future identity version must latch the runtime side-effect gate");
+
+        shutdown.cancel();
     }
 }

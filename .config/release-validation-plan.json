@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "plan_id": "rustfs-release-validation",
+  "description": "Certification for immutable candidates. All shipped platforms require native identity and startup; stable and prerelease require the pinned upgrade matrix. Linux-only acceptance never authorizes publication.",
+  "release_types": [
+    "preview",
+    "prerelease",
+    "stable"
+  ],
+  "targets": [
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "abi": "musl"
+    },
+    {
+      "os": "linux",
+      "arch": "aarch64",
+      "abi": "musl"
+    },
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "abi": "gnu"
+    },
+    {
+      "os": "linux",
+      "arch": "aarch64",
+      "abi": "gnu"
+    },
+    {
+      "os": "macos",
+      "arch": "aarch64",
+      "abi": "none"
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "abi": "msvc"
+    }
+  ],
+  "targets_basis": "Platform matrix of .github/workflows/build.yml (prepare-platform-matrix). gnu and macOS targets build with the pyroscope feature; musl and Windows targets build with no extra features.",
+  "features": [
+    "pyroscope"
+  ],
+  "trusted_workflows": [
+    {
+      "repository": "rustfs/rustfs",
+      "workflow_id": "release-candidate.yml"
+    },
+    {
+      "repository": "rustfs/rustfs",
+      "workflow_id": "release-complete.yml"
+    }
+  ],
+  "trusted_workflows_basis": "Receipts are produced by the reviewed main workflows and fetched by exact run ID with GitHub artifact digest verification. Candidate inputs freeze the harness commit separately from product source.",
+  "lanes": [
+    {
+      "lane": "identity",
+      "harness_repository": "rustfs/rustfs",
+      "harness_sha": "candidate.workflow_sha",
+      "harness_basis": "The exact workflow commit is frozen in candidate inputs; no mutable branch is accepted as a harness identity.",
+      "timeout_seconds": 1800,
+      "environment_capabilities": [
+        "process-exec"
+      ],
+      "cases": [
+        "artifact-identity",
+        "startup"
+      ],
+      "applies_to": {
+        "release_types": [
+          "preview",
+          "prerelease",
+          "stable"
+        ],
+        "platforms": "all"
+      },
+      "applies_basis": "Artifact identity and startup checks are mandatory for every release type, preview included, on every shipped target (rustfs/backlog#2662 frozen design item 5)."
+    },
+    {
+      "lane": "upgrade",
+      "harness_repository": "rustfs/rustfs",
+      "harness_sha": "candidate.workflow_sha",
+      "harness_basis": "The exact workflow commit is frozen in candidate inputs; no mutable branch is accepted as a harness identity.",
+      "timeout_seconds": 5400,
+      "environment_capabilities": [
+        "process-exec",
+        "previous-release-artifact"
+      ],
+      "cases": [
+        "direct-upgrade",
+        "mixed-version-upgrade",
+        "bucket-config-upgrade",
+        "bucket-config-rollback",
+        "multipart-layout-upgrade",
+        "multipart-layout-baseline"
+      ],
+      "cases_basis": "Case IDs of the pinned previous-release matrix in .github/workflows/e2e-upgrade.yml (source.version/asset/sha256 and the case list mapped there).",
+      "applies_to": {
+        "release_types": [
+          "prerelease",
+          "stable"
+        ],
+        "platforms": [
+          {
+            "os": "linux",
+            "arch": "x86_64",
+            "abi": "gnu"
+          }
+        ]
+      },
+      "applies_basis": "preview releases use the pre-declared smaller set (identity lane only). The upgrade lane is only exercised on linux-x86_64-gnu, the platform of the pinned source assets."
+    }
+  ],
+  "upgrade_sources": {
+    "basis": "Exactly the two previous-release sources pinned in .github/workflows/e2e-upgrade.yml are exercised today (source.version / source.asset / source.sha256). No other N-1/N-2 compatibility is claimed, and these digests are not inferred from tags.",
+    "sources": [
+      {
+        "version": "1.0.1",
+        "role": "N-1",
+        "artifact_name": "rustfs-linux-x86_64-gnu-v1.0.1.zip",
+        "artifact_sha256": "9742e183cb0dfb0d48fa909797af572fe47b7f827569036baa4156e0d3958ee5"
+      },
+      {
+        "version": "1.0.0-rc.5",
+        "role": "N-2",
+        "artifact_name": "rustfs-linux-x86_64-gnu-v1.0.0-rc.5.zip",
+        "artifact_sha256": "3ee8df71e8edcfada533be452c4135868f697bc515460ae97b027313eade7a3d"
+      }
+    ],
+    "rollback_supported": false,
+    "rollback_basis": "Only the bucket-config-rollback case (rollback_to_previous_release_reads_current_bucket_metadata) is exercised. Full data-plane rollback is not certified and is never a default claim."
+  }
+}

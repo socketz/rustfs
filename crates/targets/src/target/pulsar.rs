@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -23,22 +24,30 @@ use crate::{
     store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, open_target_queue_store,
-        persist_queued_payload_to_store, redacted_secret,
+        TargetTlsState, TargetType, build_queued_payload_with_records, build_target_tls_fingerprint, is_connectivity_error,
+        open_target_queue_store, persist_queued_payload_to_store, redacted_secret, sanitize_queue_dir_component,
+        with_delivery_deadline,
     },
 };
 use async_trait::async_trait;
+// Use parking_lot's Mutex for the synchronous client/TLS state guards: it does
+// not poison on panic, so a panic while a guard is held cannot cascade into
+// `.unwrap()` panics on every later access (backlog#983).
+use parking_lot::Mutex;
 use pulsar::{Authentication, Producer, Pulsar, TokioExecutor};
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 use url::Url;
+use uuid::Uuid;
+
+const PULSAR_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const PULSAR_FAILED_DELIVERY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct PulsarArgs {
@@ -81,7 +90,7 @@ impl PulsarArgs {
             return Ok(());
         }
 
-        validate_pulsar_broker(&self.broker)?;
+        let parsed = validate_pulsar_broker(&self.broker)?;
 
         if self.topic.trim().is_empty() {
             return Err(TargetError::Configuration("Pulsar topic cannot be empty".to_string()));
@@ -107,12 +116,17 @@ impl PulsarArgs {
             return Err(TargetError::Configuration("Pulsar queue directory must be an absolute path".to_string()));
         }
 
-        let parsed = Url::parse(&self.broker)
-            .map_err(|e| TargetError::Configuration(format!("Invalid Pulsar broker URL: {e} (value: '{}')", self.broker)))?;
         let tls_enabled = parsed.scheme() == "pulsar+ssl";
-        if !tls_enabled && (!self.tls_ca.is_empty() || self.tls_allow_insecure || !self.tls_hostname_verification) {
+        // A CA bundle is TLS trust material a plaintext `pulsar://` broker
+        // silently ignores, so treat it as a genuine misconfiguration. The
+        // `tls_allow_insecure` / `tls_hostname_verification` toggles, however,
+        // are inert on a non-TLS broker (they only take effect for
+        // `pulsar+ssl`); rejecting non-default values would leave a persisted
+        // target permanently offline after a restart even though the flags do
+        // nothing — see issue #4796.
+        if !tls_enabled && !self.tls_ca.is_empty() {
             return Err(TargetError::Configuration(
-                "Pulsar TLS settings are only allowed with pulsar+ssl brokers".to_string(),
+                "Pulsar tls_ca is only allowed with pulsar+ssl brokers".to_string(),
             ));
         }
 
@@ -146,8 +160,21 @@ pub fn validate_pulsar_broker(broker: &str) -> Result<Url, TargetError> {
     Ok(url)
 }
 
+fn pulsar_producer_name(target_id: &TargetID, target_type: TargetType, nonce: Uuid) -> String {
+    let target_type = match target_type {
+        TargetType::NotifyEvent => "notify",
+        TargetType::AuditLog => "audit",
+    };
+
+    format!("rustfs-{target_type}-pulsar-{}-{nonce}", sanitize_queue_dir_component(&target_id.id))
+}
+
 pub async fn connect_pulsar(args: &PulsarArgs) -> Result<Pulsar<TokioExecutor>, TargetError> {
     args.validate()?;
+    #[cfg(feature = "fips")]
+    if Url::parse(&args.broker).is_ok_and(|url| url.scheme() == "pulsar+ssl") {
+        super::ensure_rustls_provider_installed()?;
+    }
 
     let mut builder = Pulsar::builder(args.broker.clone(), TokioExecutor);
 
@@ -186,7 +213,7 @@ pub async fn connect_pulsar(args: &PulsarArgs) -> Result<Pulsar<TokioExecutor>, 
 
 pub struct PulsarTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: PulsarArgs,
@@ -203,14 +230,14 @@ where
 
 impl<E> PulsarTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
         Box::new(PulsarTarget::<E> {
             id: self.id.clone(),
             args: self.args.clone(),
-            client: Mutex::new(self.client.lock().unwrap().clone()),
-            tls_state: Mutex::new(self.tls_state.lock().unwrap().clone()),
+            client: Mutex::new(self.client.lock().clone()),
+            tls_state: Mutex::new(self.tls_state.lock().clone()),
             tls_adapter: self.tls_adapter.clone(),
             producer: AsyncMutex::new(None),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
@@ -248,12 +275,29 @@ where
     }
 
     fn clear_cached_client_connection(&self) {
-        self.client.lock().unwrap().take();
+        self.client.lock().take();
     }
 
     fn clear_cached_client(&self) {
         self.clear_cached_client_connection();
-        self.tls_state.lock().unwrap().reset();
+        self.tls_state.lock().reset();
+    }
+
+    async fn clear_failed_delivery_state(&self) {
+        match tokio::time::timeout(PULSAR_FAILED_DELIVERY_CLEANUP_TIMEOUT, self.producer.lock()).await {
+            Ok(mut producer) => {
+                producer.take();
+            }
+            Err(_) => {
+                warn!(
+                    target_id = %self.id,
+                    reason = "producer_cleanup_lock_timeout",
+                    "Timed out clearing the Pulsar producer after a failed delivery"
+                );
+            }
+        }
+        self.clear_cached_client();
+        self.connected.store(false, Ordering::SeqCst);
     }
 
     async fn get_or_connect_client(&self) -> Result<Pulsar<TokioExecutor>, TargetError> {
@@ -262,28 +306,28 @@ where
         if let Some(adapter) = &self.tls_adapter {
             let material = adapter.current_material();
             {
-                let mut guard = self.client.lock().unwrap();
+                let mut guard = self.client.lock();
                 *guard = Some((*material).clone());
             }
         } else {
             let next_fingerprint = build_target_tls_fingerprint(&self.args.tls_ca, "", "").await?;
             let tls_changed = {
-                let tls_state_guard = self.tls_state.lock().unwrap();
+                let tls_state_guard = self.tls_state.lock();
                 tls_state_guard.needs_update(&next_fingerprint)
             };
             if tls_changed {
                 self.clear_cached_client_connection();
-                self.tls_state.lock().unwrap().refresh(next_fingerprint);
+                self.tls_state.lock().refresh(next_fingerprint);
             }
         }
 
-        if let Some(client) = self.client.lock().unwrap().clone() {
+        if let Some(client) = self.client.lock().clone() {
             return Ok(client);
         }
 
         let client = connect_pulsar(&self.args).await?;
         self.connected.store(true, Ordering::SeqCst);
-        let mut guard = self.client.lock().unwrap();
+        let mut guard = self.client.lock();
         let shared = guard.get_or_insert_with(|| client.clone()).clone();
         Ok(shared)
     }
@@ -297,7 +341,7 @@ where
         let producer = client
             .producer()
             .with_topic(self.args.topic.clone())
-            .with_name(self.id.id.clone())
+            .with_name(pulsar_producer_name(&self.id, self.args.target_type, Uuid::new_v4()))
             .build()
             .await
             .map_err(|e| TargetError::Network(format!("Failed to create Pulsar producer: {e}")))?;
@@ -314,20 +358,30 @@ where
     }
 
     async fn send_body(&self, body: Vec<u8>) -> Result<(), TargetError> {
-        self.init_producer().await?;
-        let mut guard = self.producer.lock().await;
-        let producer = guard
-            .as_mut()
-            .ok_or_else(|| TargetError::Configuration("Pulsar producer not initialized".to_string()))?;
-        let receipt = producer
-            .send_non_blocking(body)
-            .await
-            .map_err(|e| TargetError::Request(format!("Failed to send Pulsar message: {e}")))?;
-        receipt
-            .await
-            .map_err(|e| TargetError::Request(format!("Failed to receive Pulsar receipt: {e}")))?;
-        self.delivery_counters.record_success();
-        Ok(())
+        let result = with_delivery_deadline(PULSAR_DELIVERY_TIMEOUT, "Pulsar delivery", async {
+            self.init_producer().await?;
+            let mut guard = self.producer.lock().await;
+            let producer = guard
+                .as_mut()
+                .ok_or_else(|| TargetError::Configuration("Pulsar producer not initialized".to_string()))?;
+            let receipt = producer
+                .send_non_blocking(body)
+                .await
+                .map_err(|e| TargetError::Request(format!("Failed to send Pulsar message: {e}")))?;
+            receipt
+                .await
+                .map_err(|e| TargetError::Request(format!("Failed to receive Pulsar receipt: {e}")))?;
+            self.delivery_counters.record_success();
+            Ok(())
+        })
+        .await;
+
+        if let Err(err) = &result
+            && is_connectivity_error(err)
+        {
+            self.clear_failed_delivery_state().await;
+        }
+        result
     }
 }
 
@@ -339,7 +393,7 @@ where
 #[async_trait]
 impl<E> ReloadableTargetTls for PulsarTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = Pulsar<TokioExecutor>;
 
@@ -364,7 +418,7 @@ where
     ) -> Result<(), TargetError> {
         // Pulsar client is Clone, so we clone from the Arc and store it.
         {
-            let mut guard = self.client.lock().unwrap();
+            let mut guard = self.client.lock();
             *guard = Some((*material).clone());
         }
         // Producer is bound to the old client; clear it so next send rebuilds.
@@ -384,7 +438,7 @@ where
 #[async_trait]
 impl<E> Target<E> for PulsarTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()
@@ -471,8 +525,11 @@ where
     }
 
     fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
-        self.delivery_counters
-            .snapshot(self.store.as_deref().map_or(0, |store| store.len() as u64))
+        self.delivery_counters.snapshot(
+            self.store.as_deref().map_or(0, |store| store.len() as u64),
+            // Pulsar targets record no terminal failures and keep no failed store.
+            0,
+        )
     }
 
     fn record_final_failure(&self) {
@@ -500,6 +557,22 @@ mod tests {
             queue_limit: 0,
             target_type: TargetType::NotifyEvent,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_delivery_cleanup_is_bounded_when_the_producer_lock_is_busy() {
+        let target = Arc::new(PulsarTarget::<String>::new("pulsar:test".to_string(), base_args()).expect("target should build"));
+        target.connected.store(true, Ordering::SeqCst);
+        let producer_guard = target.producer.lock().await;
+        let cleanup = {
+            let target = Arc::clone(&target);
+            tokio::spawn(async move { target.clear_failed_delivery_state().await })
+        };
+
+        cleanup.await.expect("cleanup task should not panic");
+
+        assert!(!target.connected.load(Ordering::SeqCst));
+        drop(producer_guard);
     }
 
     #[test]
@@ -536,5 +609,100 @@ mod tests {
             ..base_args()
         };
         assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn validate_pulsar_accepts_inert_tls_toggles_on_plaintext_broker() {
+        // `tls_allow_insecure` / `tls_hostname_verification` are no-ops on a
+        // `pulsar://` broker, so a target persisted with these non-default
+        // values must still validate — otherwise it stays offline after a
+        // restart (issue #4796).
+        let args = PulsarArgs {
+            tls_allow_insecure: true,
+            tls_hostname_verification: false,
+            ..base_args()
+        };
+        args.validate().expect("inert TLS toggles must not fail a plaintext broker");
+    }
+
+    #[test]
+    fn validate_pulsar_rejects_tls_ca_on_plaintext_broker() {
+        let args = PulsarArgs {
+            tls_ca: "/etc/ssl/certs/ca.pem".to_string(),
+            ..base_args()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn pulsar_producer_name_keeps_target_context_and_unique_suffix() {
+        let id = TargetID::new("test2".to_string(), ChannelTargetType::Pulsar.as_str().to_string());
+        let nonce = Uuid::from_u128(0x12345678_90ab_cdef_1234_567890abcdef);
+
+        let name = pulsar_producer_name(&id, TargetType::NotifyEvent, nonce);
+
+        assert_eq!(name, "rustfs-notify-pulsar-test2-12345678-90ab-cdef-1234-567890abcdef");
+    }
+
+    #[test]
+    fn pulsar_producer_name_includes_target_type() {
+        let id = TargetID::new("audit-target".to_string(), ChannelTargetType::Pulsar.as_str().to_string());
+        let nonce = Uuid::from_u128(0x12345678_90ab_cdef_1234_567890abcdef);
+
+        let name = pulsar_producer_name(&id, TargetType::AuditLog, nonce);
+
+        assert_eq!(name, "rustfs-audit-pulsar-audit-target-12345678-90ab-cdef-1234-567890abcdef");
+    }
+
+    #[test]
+    fn pulsar_producer_name_sanitizes_target_id() {
+        let raw_target_id = "tenant:alpha/beta";
+        let id = TargetID::new(raw_target_id.to_string(), ChannelTargetType::Pulsar.as_str().to_string());
+        let nonce = Uuid::from_u128(0x12345678_90ab_cdef_1234_567890abcdef);
+
+        let name = pulsar_producer_name(&id, TargetType::NotifyEvent, nonce);
+
+        assert!(!name.contains(':'));
+        assert!(!name.contains('/'));
+        assert_eq!(
+            name,
+            format!(
+                "rustfs-notify-pulsar-{}-12345678-90ab-cdef-1234-567890abcdef",
+                sanitize_queue_dir_component(raw_target_id)
+            )
+        );
+    }
+
+    #[test]
+    fn pulsar_producer_name_changes_for_each_producer_generation() {
+        let id = TargetID::new("test".to_string(), ChannelTargetType::Pulsar.as_str().to_string());
+        let first = Uuid::from_u128(0x12345678_90ab_cdef_1234_567890abcdef);
+        let second = Uuid::from_u128(0xfedcba09_8765_4321_fedc_ba0987654321);
+
+        assert_ne!(
+            pulsar_producer_name(&id, TargetType::NotifyEvent, first),
+            pulsar_producer_name(&id, TargetType::NotifyEvent, second)
+        );
+    }
+
+    #[test]
+    fn init_producer_uses_generated_unique_producer_name_contract() {
+        fn without_ascii_whitespace(value: &str) -> String {
+            let mut compacted = String::with_capacity(value.len());
+            compacted.extend(value.bytes().filter(|byte| !byte.is_ascii_whitespace()).map(char::from));
+            compacted
+        }
+
+        let source = without_ascii_whitespace(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/target/pulsar.rs")));
+        let expected_name_call = [
+            ".with_name(",
+            "pulsar_producer_name(&self.id, self.args.target_type, Uuid::new_v4())",
+            ")",
+        ]
+        .concat();
+        let forbidden_target_id_call = [".with_name(", "self.id.id.clone()", ")"].concat();
+
+        assert!(source.contains(&without_ascii_whitespace(&expected_name_call)));
+        assert!(!source.contains(&without_ascii_whitespace(&forbidden_target_id_call)));
     }
 }

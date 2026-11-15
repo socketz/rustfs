@@ -14,8 +14,9 @@
 
 use super::{
     ActionSet, Args, BucketPolicyArgs, Effect, Error as IamError, Functions, ID, Principal, ResourceSet, Validator,
-    action::{Action, S3Action},
+    action::{Action, KmsAction, S3Action},
     function::key_name::{KeyName, S3KeyName},
+    resource::Resource,
     variables::{VariableContext, VariableResolver},
 };
 use crate::error::{Error, Result};
@@ -88,6 +89,51 @@ enum ActionFamily {
     Mixed,
 }
 
+/// A requested KMS key identifier, reduced to what `key/<key_id>` patterns are
+/// written against.
+///
+/// Policies name a key by its id, and [`Resource`] validation refuses a key
+/// pattern containing a separator. An identifier reaching the matcher in any
+/// other spelling of the same key was therefore compared as a different key: a
+/// `Deny` on `key/<id>` did not cover a request naming that key by its AWS ARN.
+/// Only the spellings the AWS KMS API itself accepts are recognized; anything
+/// else is matched literally.
+#[derive(Debug, PartialEq)]
+pub enum RequestedKmsKey<'a> {
+    /// A key id, taken from the identifier itself or from a key ARN
+    /// (`arn:<partition>:kms:<region>:<account>:key/<key_id>`).
+    Key(&'a str),
+    /// An alias name or alias ARN: it names a key only the backend can resolve.
+    Alias,
+}
+
+impl<'a> RequestedKmsKey<'a> {
+    /// Whether two identifiers provably name the same key. An alias is never
+    /// provably the same key as anything, itself included.
+    pub fn same_key(left: &str, right: &str) -> bool {
+        matches!(
+            (RequestedKmsKey::parse(left), RequestedKmsKey::parse(right)),
+            (RequestedKmsKey::Key(left), RequestedKmsKey::Key(right)) if left == right
+        )
+    }
+
+    pub fn parse(identifier: &'a str) -> Self {
+        let fields: Vec<&str> = identifier.splitn(6, ':').collect();
+        let resource = match fields.as_slice() {
+            ["arn", _partition, "kms", _region, _account, resource] => *resource,
+            _ if identifier.starts_with(Resource::KMS_ALIAS_SEGMENT) => return Self::Alias,
+            _ => return Self::Key(identifier),
+        };
+        if resource.starts_with(Resource::KMS_ALIAS_SEGMENT) {
+            return Self::Alias;
+        }
+        match resource.strip_prefix(Resource::KMS_KEY_SEGMENT) {
+            Some(key_id) if !key_id.is_empty() && !key_id.contains('/') => Self::Key(key_id),
+            _ => Self::Key(identifier),
+        }
+    }
+}
+
 impl Statement {
     fn skips_resource_match_for_args(&self, args: &Args<'_>) -> bool {
         if self.is_sts() {
@@ -143,7 +189,7 @@ impl Statement {
 
         for action in self.actions.iter() {
             match action {
-                Action::S3Action(_) => saw_s3 = true,
+                Action::All | Action::S3Action(_) => saw_s3 = true,
                 Action::AdminAction(_) => saw_admin = true,
                 Action::StsAction(_) => saw_sts = true,
                 Action::KmsAction(_) => saw_kms = true,
@@ -173,11 +219,116 @@ impl Statement {
         Some(ActionFamily::Mixed)
     }
 
-    /// Returns true when this statement would reach `conditions.evaluate_with_resolver` in
-    /// [`Statement::is_allowed`] (including the KMS shortcut path). Does not evaluate conditions.
-    pub(crate) async fn request_reaches_condition_eval(&self, args: &Args<'_>, resolver: &VariableResolver) -> bool {
-        if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
+    /// Resource scope check for KMS statements, which match `arn:aws:kms:::key/<key_id>`
+    /// patterns instead of the bucket/object path grammar used by S3 statements.
+    ///
+    /// Call-site contract (wired up by the admin/SSE authorization paths): the requested
+    /// key identifier travels in `args.object`, as the request spelled it, with `args.bucket`
+    /// left empty; [`RequestedKmsKey`] reduces it to the key id the patterns are written
+    /// against. An empty `args.object` means the caller did not scope the request to a
+    /// key, which preserves the legacy match-every-key behaviour.
+    async fn kms_key_scope_matches(&self, args: &Args<'_>, resolver: &VariableResolver) -> bool {
+        if self.not_resources.iter().any(|resource| matches!(resource, Resource::All)) {
             return false;
+        }
+
+        if matches!(args.action, Action::KmsAction(KmsAction::BackupAction | KmsAction::RestoreAction))
+            && ((!self.resources.is_empty() && !self.resources.iter().any(|resource| matches!(resource, Resource::All)))
+                || !self.not_resources.is_empty())
+        {
+            // Global bundle operations require an unscoped Allow, while a Deny
+            // covering any key must still block an operation covering every key.
+            return matches!(self.effect, Effect::Deny);
+        }
+
+        let kms_resources: Vec<&Resource> = self
+            .resources
+            .iter()
+            .filter(|resource| matches!(resource, Resource::All | Resource::Kms(_)))
+            .collect();
+        let kms_not_resources: Vec<&Resource> = self.not_resources.iter().filter(|resource| resource.is_kms()).collect();
+
+        if kms_resources.len() != self.resources.len() || kms_not_resources.len() != self.not_resources.len() {
+            // Statements combining KMS actions with S3 resources predate KMS resource
+            // support and were always evaluated as if unscoped; keep that behaviour
+            // but surface it, since the S3 patterns never constrain key access.
+            tracing::warn!(
+                sid = %self.sid.0,
+                "KMS statement carries non-KMS resources; they are ignored and the statement matches every key"
+            );
+        }
+
+        if kms_resources.is_empty() && kms_not_resources.is_empty() {
+            // No KMS resources: the statement scopes by action only (legacy form).
+            return true;
+        }
+
+        if args.object.is_empty() {
+            // Call sites that do not pass a key resource keep the pre-resource-scoping
+            // behaviour where any key matches.
+            return true;
+        }
+
+        let key_id = match RequestedKmsKey::parse(args.object) {
+            RequestedKmsKey::Key(key_id) => key_id,
+            RequestedKmsKey::Alias => {
+                // Which key an alias names is known only to the backend, so a
+                // statement scoped to particular keys cannot be shown to cover
+                // or to exclude it. Fail closed in both directions: every
+                // key-scoped Deny applies, and only an Allow on all keys does.
+                return match self.effect {
+                    Effect::Deny => true,
+                    Effect::Allow => {
+                        kms_not_resources.is_empty()
+                            && kms_resources.iter().any(|resource| match resource {
+                                Resource::All => true,
+                                Resource::Kms(pattern) => pattern == "*",
+                                Resource::S3(_) => false,
+                            })
+                    }
+                };
+            }
+        };
+        let requested = format!("{}{}", Resource::KMS_KEY_SEGMENT, key_id);
+
+        if !kms_resources.is_empty() {
+            let mut matched = false;
+            for resource in kms_resources {
+                if resource
+                    .is_match_with_resolver(&requested, args.conditions, Some(resolver))
+                    .await
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return false;
+            }
+        }
+
+        for resource in kms_not_resources {
+            if resource
+                .is_match_with_resolver(&requested, args.conditions, Some(resolver))
+                .await
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Returns true when this statement would reach `conditions.evaluate_with_resolver` in
+    /// [`Statement::is_allowed`] (including the KMS resource path). Does not evaluate conditions.
+    pub(crate) async fn request_reaches_condition_eval(&self, args: &Args<'_>, resolver: &VariableResolver) -> bool {
+        let deny = matches!(self.effect, Effect::Deny);
+        if !self.actions.statement_covers(&self.not_actions, &args.action, deny) {
+            return false;
+        }
+
+        if self.is_kms() {
+            return self.kms_key_scope_matches(args, resolver).await;
         }
 
         let resource = build_resource(
@@ -186,10 +337,6 @@ impl Statement {
             args.object,
             self.conditions.references_key_name(&KeyName::S3(S3KeyName::S3Prefix)),
         );
-
-        if self.is_kms() && (resource == "/" || self.resources.is_empty()) {
-            return true;
-        }
 
         if self.resources.is_empty() && self.not_resources.is_empty() && !self.is_admin() && !self.is_sts() {
             return false;
@@ -273,6 +420,19 @@ impl Validator for Statement {
             return Err(IamError::BothResourceAndNotResource.into());
         }
 
+        // KMS resources only make sense on pure-KMS statements. The reverse
+        // combination (KMS actions with S3 resources) predates KMS resources,
+        // may already be stored, and stays loadable; evaluation treats it as
+        // unscoped and warns.
+        let has_kms_resource = self
+            .resources
+            .iter()
+            .chain(self.not_resources.iter())
+            .any(|resource| resource.is_kms());
+        if has_kms_resource && !matches!(action_family, Some(ActionFamily::Kms)) {
+            return Err(IamError::KmsResourceWithNonKmsAction.into());
+        }
+
         self.actions.is_valid()?;
         self.not_actions.is_valid()?;
         self.resources.is_valid()?;
@@ -283,11 +443,16 @@ impl Validator for Statement {
 }
 
 impl PartialEq for Statement {
+    // This equality drives `Policy::drop_duplicate_statements`/`merge_policies`, so it
+    // must compare every field that affects matching. Any new match-affecting field
+    // added to `Statement` MUST be compared here too, otherwise semantically-distinct
+    // statements can be silently dropped and shrink Deny coverage.
     fn eq(&self, other: &Self) -> bool {
         self.effect == other.effect
             && self.actions == other.actions
             && self.not_actions == other.not_actions
             && self.resources == other.resources
+            && self.not_resources == other.not_resources
             && self.conditions == other.conditions
     }
 }
@@ -318,11 +483,24 @@ pub struct BPStatement {
 impl BPStatement {
     /// Returns true when this statement would reach `conditions.evaluate` in [`BPStatement::is_allowed`].
     pub(crate) async fn request_reaches_condition_eval(&self, args: &BucketPolicyArgs<'_>) -> bool {
+        if !self.actions.is_empty() && self.actions.iter().all(|action| matches!(action, Action::KmsAction(_))) {
+            // Bucket policies cannot grant or deny KMS access; such statements are
+            // rejected at validation but may exist in policies stored before that
+            // check. Skip them so they never influence bucket traffic. Statements
+            // mixing KMS with S3 actions keep evaluating their S3 actions as before.
+            tracing::warn!(
+                sid = %self.sid.0,
+                "ignoring bucket policy statement with KMS actions during evaluation"
+            );
+            return false;
+        }
+
         if !self.principal.is_match(args.account) {
             return false;
         }
 
-        if (!self.actions.is_match(&args.action) && !self.actions.is_empty()) || self.not_actions.is_match(&args.action) {
+        let deny = matches!(self.effect, Effect::Deny);
+        if !self.actions.statement_covers(&self.not_actions, &args.action, deny) {
             return false;
         }
 
@@ -372,6 +550,24 @@ impl Validator for BPStatement {
 
         if !self.actions.is_empty() && !self.not_actions.is_empty() {
             return Err(IamError::BothActionAndNotAction.into());
+        }
+
+        // Bucket policies govern S3 access; KMS grants belong in identity policies.
+        // Rejected here (PutBucketPolicy) only: deserialization stays permissive so
+        // stored policies from before this check keep loading, and evaluation skips
+        // pure-KMS statements with a warning.
+        let has_kms_action = self
+            .actions
+            .iter()
+            .chain(self.not_actions.iter())
+            .any(|action| matches!(action, Action::KmsAction(_)));
+        let has_kms_resource = self
+            .resources
+            .iter()
+            .chain(self.not_resources.iter())
+            .any(|resource| resource.is_kms());
+        if has_kms_action || has_kms_resource {
+            return Err(IamError::KmsUnsupportedInBucketPolicy.into());
         }
 
         if self.resources.is_empty() && self.not_resources.is_empty() {

@@ -12,124 +12,77 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::admin::{auth::validate_admin_request, router::Operation};
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::RemoteAddr;
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-use http::HeaderMap;
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::app::RequestEnvelope;
 use http::StatusCode;
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-use http::header::CONTENT_TYPE;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use tracing::info;
 
-pub(super) async fn authorize_profile_request(req: &S3Request<Body>) -> S3Result<()> {
-    let Some(input_cred) = req.credentials.as_ref() else {
+/// The pre-check keeps these endpoints' historical `AccessDenied` missing-credentials
+/// response; the shared gate reports `InvalidRequest` "get cred failed".
+pub(super) async fn authorize_profile_envelope(envelope: &RequestEnvelope) -> S3Result<()> {
+    if envelope.credentials().is_none() {
         return Err(s3_error!(AccessDenied, "Signature is required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+    authorize_admin_envelope(envelope, vec![Action::AdminAction(AdminAction::ProfilingAdminAction)]).await?;
+    Ok(())
+}
 
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(AdminAction::ProfilingAdminAction)],
-        remote_addr,
-    )
-    .await
+pub(super) fn profile_not_implemented_response(message: String) -> AdminResponse {
+    AdminResponse::new(StatusCode::NOT_IMPLEMENTED, Body::from(message))
 }
 
 pub struct TriggerProfileCPU {}
 #[async_trait::async_trait]
 impl Operation for TriggerProfileCPU {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_profile_request(&req).await?;
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        authorize_profile_envelope(req.envelope()).await?;
         info!("Triggering CPU profile dump via S3 request...");
 
-        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))]
-        {
-            return Ok(S3Response::new((
-                StatusCode::NOT_IMPLEMENTED,
-                Body::from(
-                    crate::profiling::dump_cpu_pprof_for(std::time::Duration::from_secs(0))
-                        .await
-                        .unwrap_err(),
-                ),
-            )));
-        }
-
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-        {
-            let dur = std::time::Duration::from_secs(60);
-            match crate::profiling::dump_cpu_pprof_for(dur).await {
-                Ok(path) => {
-                    let mut header = HeaderMap::new();
-                    header.insert(CONTENT_TYPE, "text/html".parse().unwrap());
-                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(path.display().to_string())), header))
-                }
-                Err(e) => Err(s3s::s3_error!(InternalError, "{}", format!("Failed to dump CPU profile: {e}"))),
-            }
-        }
+        crate::profiling::log_cpu_pprof_dump_skipped();
+        Ok(profile_not_implemented_response(crate::profiling::local_cpu_pprof_unsupported_message()))
     }
 }
 
 pub struct TriggerProfileMemory {}
 #[async_trait::async_trait]
 impl Operation for TriggerProfileMemory {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        authorize_profile_request(&req).await?;
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        authorize_profile_envelope(req.envelope()).await?;
         info!("Triggering Memory profile dump via S3 request...");
 
-        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-        {
-            return Ok(S3Response::new((
-                StatusCode::NOT_IMPLEMENTED,
-                Body::from(crate::profiling::dump_memory_pprof_now().await.unwrap_err()),
-            )));
-        }
-
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-        {
-            match crate::profiling::dump_memory_pprof_now().await {
-                Ok(path) => {
-                    let mut header = HeaderMap::new();
-                    header.insert(CONTENT_TYPE, "text/html".parse().unwrap());
-                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(path.display().to_string())), header))
-                }
-                Err(e) => Err(s3s::s3_error!(InternalError, "{}", format!("Failed to dump Memory profile: {e}"))),
-            }
-        }
+        crate::profiling::log_memory_pprof_dump_skipped();
+        Ok(profile_not_implemented_response(crate::profiling::memory_pprof_unsupported_message()))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TriggerProfileCPU, TriggerProfileMemory};
-    use crate::admin::router::Operation;
+    use super::{TriggerProfileCPU, TriggerProfileMemory, authorize_profile_envelope};
+    use crate::admin::operation::test_support::TestRequest;
+    use crate::admin::operation::{AdminRequest, Operation};
     use crate::server::{PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
-    use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
     use matchit::Params;
-    use s3s::{Body, S3ErrorCode, S3Request};
+    use rustfs_s3_types::S3ErrorCode;
 
-    fn build_profile_request(uri: &'static str) -> S3Request<Body> {
-        S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: Uri::from_static(uri),
-            headers: HeaderMap::new(),
-            extensions: Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
+    #[tokio::test]
+    async fn authorize_profile_envelope_keeps_the_access_denied_precheck() {
+        let owned_request = TestRequest::new(Method::GET, "/debug/pprof/cpu").build();
+        let owned = authorize_profile_envelope(owned_request.envelope())
+            .await
+            .expect_err("no credentials");
+
+        assert_eq!(owned.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(owned.message(), Some("Signature is required"));
+    }
+
+    fn build_profile_request(uri: &'static str) -> AdminRequest {
+        TestRequest::new(Method::GET, uri).build()
     }
 
     #[tokio::test]

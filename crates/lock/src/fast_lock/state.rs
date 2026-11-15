@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 
@@ -21,10 +21,14 @@ use crate::fast_lock::optimized_notify::OptimizedNotify;
 use crate::fast_lock::types::{LockMode, LockPriority};
 
 /// Optimized atomic lock state encoding in u64
-/// Bits: [63:48] reserved | [47:32] writers_waiting | [31:16] readers_waiting | [15:8] readers_count | [7:1] flags | [0] writer_flag
+/// Bits: [63:48] readers_count | [47:32] writers_waiting | [31:16] readers_waiting | [15:1] reserved | [0] writer_flag
+///
+/// The reader count is 16 bits wide because distributed bucket-scoped read locks (for example the
+/// per-bucket lifecycle and metadata-transaction fences) are held by every in-flight request into that
+/// bucket on every node, so a single key routinely has hundreds of concurrent holders.
 const WRITER_FLAG_MASK: u64 = 0x1;
-const READERS_SHIFT: u8 = 8;
-const READERS_MASK: u64 = 0xFF << READERS_SHIFT; // Support up to 255 concurrent readers
+const READERS_SHIFT: u8 = 48;
+const READERS_MASK: u64 = 0xFFFF << READERS_SHIFT;
 const READERS_WAITING_SHIFT: u8 = 16;
 const READERS_WAITING_MASK: u64 = 0xFFFF << READERS_WAITING_SHIFT;
 const WRITERS_WAITING_SHIFT: u8 = 32;
@@ -78,19 +82,25 @@ impl AtomicLockState {
 
     /// Try to acquire shared lock (fast path)
     pub fn try_acquire_shared(&self) -> bool {
+        self.try_acquire_shared_with_mask(NO_WRITER_AND_NO_WAITING_WRITERS)
+    }
+
+    // Publication admission already orders readers against waiting writers.
+    fn try_acquire_admitted_shared(&self) -> bool {
+        self.try_acquire_shared_with_mask(WRITER_FLAG_MASK)
+    }
+
+    fn try_acquire_shared_with_mask(&self, blocked_mask: u64) -> bool {
         self.update_access_time();
 
         loop {
             let current = self.state.load(Ordering::Acquire);
 
-            // Fast path check - cannot acquire if there's a writer or writers waiting
-            if (current & NO_WRITER_AND_NO_WAITING_WRITERS) != 0 {
+            if (current & blocked_mask) != 0 {
                 return false;
             }
 
-            let readers = self.readers_count(current);
-            if readers == 0xFF {
-                // Updated limit to 255
+            if self.readers_count(current) == u16::MAX {
                 return false; // Too many readers
             }
 
@@ -110,13 +120,31 @@ impl AtomicLockState {
     pub fn try_acquire_exclusive(&self) -> bool {
         self.update_access_time();
 
-        // Must be completely unlocked to acquire exclusive
-        let expected = 0;
-        let new_state = WRITER_FLAG_MASK;
+        loop {
+            let current = self.state.load(Ordering::Acquire);
 
-        self.state
-            .compare_exchange(expected, new_state, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
+            // Only ownership bits may block acquisition: no writer flag, no
+            // active readers. The waiting counters are preserved, not
+            // required to be zero — demanding a fully-zero word means a lock
+            // with registered waiters can be acquired by *no one*, including
+            // the waiters themselves (each sees the others' registration),
+            // so contended acquisition only succeeds in windows where every
+            // waiter happens to be unregistered. `try_acquire_shared` above
+            // already masks correctly; this mirrors it.
+            if (current & (WRITER_FLAG_MASK | READERS_MASK)) != 0 {
+                return false;
+            }
+
+            let new_state = current | WRITER_FLAG_MASK;
+
+            if self
+                .state
+                .compare_exchange_weak(current, new_state, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
     }
 
     /// Release shared lock
@@ -277,8 +305,8 @@ impl AtomicLockState {
         self.last_accessed.store(now, Ordering::Relaxed);
     }
 
-    fn readers_count(&self, state: u64) -> u8 {
-        ((state & READERS_MASK) >> READERS_SHIFT) as u8
+    fn readers_count(&self, state: u64) -> u16 {
+        ((state & READERS_MASK) >> READERS_SHIFT) as u16
     }
 
     fn readers_waiting(&self, state: u64) -> u16 {
@@ -287,6 +315,13 @@ impl AtomicLockState {
 
     fn writers_waiting(&self, state: u64) -> u16 {
         ((state & WRITERS_WAITING_MASK) >> WRITERS_WAITING_SHIFT) as u16
+    }
+
+    pub(crate) fn holder_and_waiter_counts(&self) -> (u64, u64) {
+        let state = self.state.load(Ordering::Acquire);
+        let holders = u64::from(self.readers_count(state)) + u64::from((state & WRITER_FLAG_MASK) != 0);
+        let waiters = u64::from(self.readers_waiting(state)) + u64::from(self.writers_waiting(state));
+        (holders, waiters)
     }
 
     #[cfg(test)]
@@ -309,6 +344,7 @@ pub struct ObjectLockState {
     // First cache line: Most frequently accessed data
     /// Atomic state for fast operations
     pub atomic_state: AtomicLockState,
+    pub(super) publication: OnceLock<Arc<super::publication::PublicationQueue>>,
 
     // Second cache line: Notification mechanisms
     /// Notification for readers (traditional)
@@ -352,6 +388,7 @@ impl ObjectLockState {
     pub fn new() -> Self {
         Self {
             atomic_state: AtomicLockState::new(),
+            publication: OnceLock::new(),
             read_notify: Notify::new(),
             write_notify: Notify::new(),
             optimized_notify: OptimizedNotify::new(),
@@ -367,6 +404,19 @@ impl ObjectLockState {
             return false;
         }
 
+        self.record_shared_owner(owner, lock_timeout);
+        true
+    }
+
+    pub(super) fn try_acquire_admitted_shared(&self, owner: &Arc<str>, lock_timeout: Duration) -> bool {
+        if !self.atomic_state.try_acquire_admitted_shared() {
+            return false;
+        }
+        self.record_shared_owner(owner, lock_timeout);
+        true
+    }
+
+    fn record_shared_owner(&self, owner: &Arc<str>, lock_timeout: Duration) {
         self.atomic_state.update_access_time();
         let mut shared = self.shared_owners.write();
         if let Some(entry) = shared.iter_mut().find(|entry| entry.owner.as_ref() == owner.as_ref()) {
@@ -381,7 +431,6 @@ impl ObjectLockState {
                 lock_timeout,
             });
         }
-        true
     }
 
     /// Try fast path exclusive lock acquisition
@@ -412,6 +461,9 @@ impl ObjectLockState {
                 Some(shared.remove(pos))
             };
             if self.atomic_state.release_shared() {
+                if let Some(queue) = self.publication.get() {
+                    queue.changed.notify_waiters();
+                }
                 if shared.is_empty() {
                     drop(shared);
                     self.optimized_notify.notify_writer();
@@ -455,6 +507,9 @@ impl ObjectLockState {
             if self.atomic_state.release_exclusive() {
                 *current = None;
                 drop(current);
+                if let Some(queue) = self.publication.get() {
+                    queue.changed.notify_waiters();
+                }
                 // Notify waiters using optimized system - prefer writers over readers
                 if self
                     .atomic_state
@@ -528,6 +583,89 @@ mod tests {
 
         assert!(state.release_exclusive());
         assert!(!state.release_exclusive());
+    }
+
+    // Regression for the waiter-preserving exclusive CAS.
+    //
+    // The acquisition CAS used to demand a fully-zero state word, which
+    // includes the readers_waiting/writers_waiting counters. A free lock with
+    // registered waiters was then acquirable by *no one* — including the
+    // waiters themselves, each blocked by the others' registration — so
+    // contended acquisition only succeeded in windows where every waiter
+    // happened to be unregistered. Reverting to `expected = 0` must fail here.
+    #[test]
+    fn exclusive_acquisition_ignores_registered_waiters() {
+        let state = AtomicLockState::new();
+
+        // Waiters register while the lock is held, then the holder releases.
+        assert!(state.try_acquire_exclusive());
+        assert!(state.inc_writers_waiting());
+        assert!(state.inc_readers_waiting());
+        assert!(state.release_exclusive());
+
+        // The lock is now free — only the waiting counters are set.
+        assert!(
+            state.try_acquire_exclusive(),
+            "registered waiters must not block acquisition of a free lock"
+        );
+        // ...and the CAS must preserve those counters, not clobber them.
+        assert_eq!(state.writers_waiting_count(), 1);
+        assert_eq!(state.readers_waiting_count(), 1);
+
+        assert!(state.release_exclusive());
+        state.dec_writers_waiting();
+
+        // Ownership bits still block, registered waiters or not.
+        assert!(state.try_acquire_shared());
+        assert!(!state.try_acquire_exclusive(), "an active reader must still block");
+        assert!(state.release_shared());
+
+        state.dec_readers_waiting();
+        assert!(state.is_free());
+    }
+
+    // Bucket-scoped fences are read-locked by every in-flight request into the bucket, so one key
+    // needs far more than 255 concurrent shared holders. The old 8-bit reader count refused the
+    // 256th reader outright.
+    #[test]
+    fn shared_lock_admits_more_than_255_holders() {
+        let state = ObjectLockState::new();
+        let timeout = Duration::from_secs(30);
+        let owners: Vec<Arc<str>> = (0..1024).map(|i| Arc::from(format!("owner-{i}"))).collect();
+
+        for owner in &owners {
+            assert!(
+                state.try_acquire_shared_fast(owner, timeout),
+                "shared acquisition for {owner} must succeed"
+            );
+        }
+        assert_eq!(state.atomic_state.holder_and_waiter_counts(), (1024, 0));
+        assert!(!state.try_acquire_exclusive_fast(&Arc::from("writer"), timeout));
+
+        for owner in &owners {
+            assert!(state.release_shared(owner), "shared release for {owner} must succeed");
+        }
+        assert!(state.try_acquire_exclusive_fast(&Arc::from("writer"), timeout));
+    }
+
+    #[test]
+    fn shared_lock_refuses_readers_beyond_counter_capacity() {
+        let state = AtomicLockState::new();
+        assert!(state.inc_readers_waiting());
+
+        for _ in 0..u16::MAX {
+            assert!(state.try_acquire_shared());
+        }
+        assert!(!state.try_acquire_shared(), "the reader count must not overflow");
+        assert_eq!(state.holder_and_waiter_counts(), (u64::from(u16::MAX), 1));
+        assert_eq!(
+            state.readers_waiting_count(),
+            1,
+            "a full reader count must not spill into the waiter counters"
+        );
+
+        assert!(state.release_shared());
+        assert!(state.try_acquire_shared(), "a released slot must be reusable");
     }
 
     #[test]

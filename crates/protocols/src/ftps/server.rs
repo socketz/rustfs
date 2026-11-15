@@ -15,7 +15,7 @@
 use super::config::{FtpsConfig, FtpsInitError};
 use super::driver::FtpsDriver;
 use crate::common::client::s3::StorageBackend;
-use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
+use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext, is_temporary_credential};
 use crate::constants::{network::DEFAULT_SOURCE_IP, paths::ROOT_PATH};
 use libunftp::options::FtpsRequired;
 use rustfs_config::{DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL};
@@ -26,6 +26,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -109,14 +110,19 @@ where
             ftps_required = self.config.ftps_required,
             "FTPS server starting"
         );
+        if self.config.tls_enabled && self.config.cert_dir.is_some() {
+            rustfs_tls_runtime::ensure_crypto_provider().map_err(|err| FtpsInitError::InvalidConfig(err.to_string()))?;
+        }
         let (reload_shutdown_tx, reload_shutdown_rx) = watch::channel(false);
 
         let storage_clone = self.storage.clone();
         let mut server_builder = libunftp::ServerBuilder::with_user_detail_provider(
             Box::new(move || FtpsDriver::new(storage_clone.clone())),
-            Arc::new(FtpsUserDetailProvider),
+            Arc::new(ConnectionUserDetailProvider),
         )
-        .authenticator(Arc::new(FtpsAuthenticator::new()));
+        .authenticator(Arc::new(ConnectionAuthenticator {
+            require_data_tls: self.config.tls_enabled && (self.config.ftps_required || self.config.ca_file.is_some()),
+        }));
 
         // Configure passive ports for data connections
         if let Some(passive_ports) = &self.config.passive_ports {
@@ -187,16 +193,12 @@ where
                     reload_shutdown_rx.clone(),
                 );
 
-                // Build ServerConfig with SNI support
-                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-                let server_config = rustls::ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_cert_resolver(resolver);
+                let server_config = crate::common::tls::server_config(resolver, self.config.ca_file.as_deref())
+                    .map_err(|error| FtpsInitError::InvalidConfig(format!("Invalid client CA configuration: {error}")))?;
 
                 server_builder = server_builder.ftps_manual::<std::path::PathBuf>(Arc::new(server_config));
 
-                if self.config.ftps_required {
+                if self.config.ftps_required || self.config.ca_file.is_some() {
                     debug!(
                         event = EVENT_FTPS_TLS_STATE,
                         component = LOG_COMPONENT_PROTOCOLS,
@@ -206,7 +208,7 @@ where
                     );
                     server_builder = server_builder.ftps_required(FtpsRequired::All, FtpsRequired::All);
                 }
-            } else if self.config.ftps_required {
+            } else if self.config.ftps_required || self.config.ca_file.is_some() {
                 return Err(FtpsInitError::InvalidConfig(
                     "FTPS required but certificate directory not provided".into(),
                 ));
@@ -370,11 +372,49 @@ impl UserDetailProvider for FtpsUserDetailProvider {
 
         let ftps_user = FtpsUser {
             username: principal.username.clone(),
-            name: identity.credentials.name.clone(),
+            name: identity.credentials.name,
             session_context,
         };
 
         Ok(ftps_user)
+    }
+}
+
+// libunftp passes only Principal between authentication and user construction.
+// Encode the verified connection attributes in that private handoff so concurrent
+// logins for the same account cannot overwrite each other's source address.
+#[derive(Debug)]
+struct ConnectionAuthenticator {
+    require_data_tls: bool,
+}
+
+#[async_trait::async_trait]
+impl Authenticator for ConnectionAuthenticator {
+    async fn authenticate(&self, username: &str, creds: &Credentials) -> Result<Principal, AuthenticationError> {
+        let principal = FtpsAuthenticator::new().authenticate(username, creds).await?;
+        let secure =
+            self.require_data_tls && matches!(creds.command_channel_security, unftp_core::auth::ChannelEncryptionState::Tls);
+        let username = serde_json::to_string(&(principal.username, creds.source_ip, secure)).map_err(|error| {
+            AuthenticationError::ImplPropagated("Connection context unavailable".to_owned(), Some(Box::new(error)))
+        })?;
+        Ok(Principal { username })
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionUserDetailProvider;
+
+#[async_trait::async_trait]
+impl UserDetailProvider for ConnectionUserDetailProvider {
+    type User = FtpsUser;
+
+    async fn provide_user_detail(&self, principal: &Principal) -> Result<Self::User, UserDetailError> {
+        let (username, source_ip, secure_transport): (String, IpAddr, bool) = serde_json::from_str(&principal.username)
+            .map_err(|error| UserDetailError::with_source("Invalid connection context", error))?;
+        let mut user = FtpsUserDetailProvider.provide_user_detail(&Principal { username }).await?;
+        user.session_context.source_ip = source_ip;
+        user.session_context.secure_transport = secure_transport;
+        Ok(user)
     }
 }
 
@@ -464,7 +504,28 @@ impl Authenticator for FtpsAuthenticator {
             AuthenticationError::BadUser
         })?;
 
-        if !identity.credentials.secret_key.eq(&s3_creds.secret_key) {
+        if is_temporary_credential(&identity.credentials) {
+            warn!(
+                event = EVENT_FTPS_AUTH_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_FTPS_AUTH,
+                result = "temporary_credential_rejected",
+                phase = "authenticate",
+                username = %masked_username,
+                "FTPS auth rejected temporary credential"
+            );
+            return Err(AuthenticationError::BadUser);
+        }
+
+        // Constant-time secret comparison to prevent timing side-channel
+        // attacks. Same primitive used by the SFTP handler and rustfs/src/auth.rs.
+        let secret_matches: bool = identity
+            .credentials
+            .secret_key
+            .as_bytes()
+            .ct_eq(s3_creds.secret_key.as_bytes())
+            .into();
+        if !secret_matches {
             warn!(
                 event = EVENT_FTPS_AUTH_STATE,
                 component = LOG_COMPONENT_PROTOCOLS,

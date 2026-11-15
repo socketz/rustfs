@@ -39,12 +39,12 @@
 use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
-use crate::telemetry::filter::build_env_filter;
-use crate::telemetry::guard::{MemoryProfilingAgent, OtelGuard, ProfilingAgent};
-use crate::telemetry::local::{build_json_log_layer, spawn_cleanup_task};
-use crate::telemetry::recorder::Recorder;
+use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter, s3s_log_filter};
+use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
+use crate::telemetry::local::{build_json_log_layer, open_rolling_appender, spawn_cleanup_task};
+use crate::telemetry::recorder::{Recorder, install_process_global_recorder};
 use crate::telemetry::resource::build_resource;
-use crate::telemetry::rolling::{RollingAppender, Rotation};
+use crate::telemetry::rolling::Rotation;
 // Import helper functions from local.rs (sibling module)
 use crate::TelemetryError;
 use metrics::counter;
@@ -54,21 +54,92 @@ use opentelemetry_otlp::{Compression, Protocol, WithExportConfig, WithHttpConfig
 use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 use opentelemetry_sdk::{
     logs::SdkLoggerProvider,
-    metrics::{PeriodicReader, SdkMeterProvider},
+    metrics::{Aggregation, Instrument, PeriodicReader, SdkMeterProvider, Stream},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
 use percent_encoding::percent_decode_str;
-use rustfs_config::observability::{DEFAULT_OBS_LOG_MATCH_MODE, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES};
+use rustfs_config::observability::DEFAULT_OBS_LOG_MATCH_MODE;
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
     DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
 };
 use std::collections::HashMap;
-use std::{fs, io::IsTerminal, time::Duration};
-use tracing::info;
+use std::{fs, io::IsTerminal, path::Path, time::Duration};
+use tracing::{info, warn};
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
-use tracing_subscriber::{Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+const GET_OBJECT_DURATION_HISTOGRAM_METRICS: &[&str] = &[
+    "rustfs_io_get_object_request_duration_seconds",
+    "rustfs_io_get_object_total_duration_seconds",
+    "rustfs_io_get_object_total_duration_seconds_with_path",
+    "rustfs_io_get_object_stage_duration_seconds",
+    "rustfs_io_get_object_stage_duration_seconds_by_size",
+];
+
+const GET_OBJECT_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.00075, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075,
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+const LOCAL_BATCH_DURATION_HISTOGRAM_METRICS: &[&str] = &[
+    "rustfs_io_get_object_local_batch_prepare_seconds",
+    "rustfs_io_get_object_local_batch_stage_seconds",
+];
+
+const LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.0000001, 0.00000025, 0.0000005, 0.000001, 0.0000025, 0.000005, 0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001,
+    0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+const OBJECT_LOCK_DURATION_HISTOGRAM_METRICS: &[&str] = &[
+    "rustfs_object_lock_diag_acquire_duration_seconds",
+    "rustfs_object_lock_diag_hold_duration_seconds",
+];
+
+// Resolve millisecond acquisitions without losing long-held delete and recovery locks.
+const OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.00075, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075,
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0,
+];
+
+const INTERNODE_DURATION_HISTOGRAM_METRICS: &[&str] = &[
+    "rustfs_system_network_internode_operation_duration_ms",
+    "rustfs_system_network_internode_operation_server_duration_ms",
+    "rustfs_system_network_internode_bulk_body_wait_duration_ms",
+];
+// Internode instruments record milliseconds, including sub-millisecond control RPCs.
+const INTERNODE_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 50.0, 75.0, 100.0, 250.0,
+    500.0, 1000.0, 2500.0, 5000.0, 10000.0, 30000.0, 60000.0, 120000.0,
+];
+
+const DEFAULT_OTLP_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const OTEL_EXPORTER_OTLP_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TIMEOUT";
+const OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT";
+const OTEL_EXPORTER_OTLP_METRICS_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT";
+const OTEL_EXPORTER_OTLP_LOGS_TIMEOUT: &str = "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT";
+
+#[cfg(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+const REDACTED_PROFILING_ENDPOINT: &str = "[redacted]";
+
+#[cfg(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+fn log_profiler_failure(result: &'static str, error_kind: &'static str) {
+    warn!(
+        backend = "pyroscope",
+        endpoint = REDACTED_PROFILING_ENDPOINT,
+        result,
+        error_kind,
+        "Profiling export agent initialization failed"
+    );
+}
 
 /// Initialize the full OpenTelemetry HTTP pipeline (traces + metrics + logs).
 ///
@@ -97,70 +168,37 @@ pub(super) fn init_observability_http(
     logger_level: &str,
     is_production: bool,
 ) -> Result<OtelGuard, TelemetryError> {
+    let otlp_tls_ca_bundle = OtlpTlsCaBundle::load(config)?;
+
     // ── Resource & sampling ──────────────────────────────────────────────────
     // Build the common resource once so all enabled signals report the same
     // service identity and deployment metadata.
     let res = build_resource(config);
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME).to_owned();
-    let use_stdout = config.use_stdout.unwrap_or(!is_production);
+    let use_stdout = resolve_otlp_use_stdout(config.use_stdout, is_production);
     let sample_ratio = config.sample_ratio.unwrap_or(SAMPLE_RATIO);
     let sampler = build_tracer_sampler(sample_ratio);
 
     // ── Endpoint resolution ───────────────────────────────────────────────────
     // Each signal may have a dedicated endpoint; if absent, fall back to the
     // root endpoint with the standard OTLP path suffix appended.
-    let root_ep = config.endpoint.clone();
+    let root_ep = normalize_otlp_root_endpoint(&config.endpoint);
 
-    let trace_ep: String = config
-        .trace_endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if !root_ep.is_empty() {
-                format!("{root_ep}/v1/traces")
-            } else {
-                String::new()
-            }
-        });
-
-    let metric_ep: String = config
-        .metric_endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if !root_ep.is_empty() {
-                format!("{root_ep}/v1/metrics")
-            } else {
-                String::new()
-            }
-        });
+    let trace_ep = resolve_signal_endpoint(config.trace_endpoint.as_deref(), root_ep, "/v1/traces");
+    let metric_ep = resolve_signal_endpoint(config.metric_endpoint.as_deref(), root_ep, "/v1/metrics");
 
     // If `log_endpoint` is not explicitly set, fall back to `root_ep/v1/logs`
     // only when a root endpoint exists. An empty result intentionally triggers
     // the file-logging path below instead of silently disabling application logs.
-    let log_ep: String = config
-        .log_endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if !root_ep.is_empty() {
-                format!("{root_ep}/v1/logs")
-            } else {
-                String::new()
-            }
-        });
+    let log_ep = resolve_signal_endpoint(config.log_endpoint.as_deref(), root_ep, "/v1/logs");
 
     // ── Tracer provider (HTTP) ────────────────────────────────────────────────
-    let tracer_provider = build_tracer_provider(&trace_ep, config, res.clone(), sampler, use_stdout)?;
+    let tracer_provider =
+        build_tracer_provider(&trace_ep, config, otlp_tls_ca_bundle.as_ref(), res.clone(), sampler, use_stdout)?;
 
     // ── Meter provider (HTTP) ─────────────────────────────────────────────────
-    let meter_provider = build_meter_provider(&metric_ep, config, res.clone(), &service_name, use_stdout)?;
-
-    let profiling_agent = init_profiler(config);
-    let memory_profiling_agent = init_memory_profiler(config);
+    let meter_provider =
+        build_meter_provider(&metric_ep, config, otlp_tls_ca_bundle.as_ref(), res.clone(), &service_name, use_stdout)?;
 
     // ── Logger Logic ──────────────────────────────────────────────────────────
     // Logging is the only signal that may intentionally route to either OTLP
@@ -179,18 +217,17 @@ pub(super) fn init_observability_http(
         // Init OTLP logger logic.
         // We initialize the OTLP collector and honor the configured stdout setting
         // (e.g. via RUSTFS_OBS_USE_STDOUT / config.use_stdout) when building the provider.
-        logger_provider = build_logger_provider(&log_ep, config, res, false)?;
+        logger_provider = build_logger_provider(&log_ep, config, otlp_tls_ca_bundle.as_ref(), res, use_stdout)?;
 
         // Build bridge to capture `tracing` events.
-        otel_bridge = logger_provider
-            .as_ref()
-            .map(|p| OpenTelemetryTracingBridge::new(p).with_filter(build_env_filter(logger_level, None)));
+        otel_bridge = logger_provider.as_ref().map(OpenTelemetryTracingBridge::new);
 
         // No separate formatting layer is added here; when OTLP logging is
         // active, the OpenTelemetry bridge is the authoritative sink for
         // `tracing` events unless local file logging is needed as a fallback.
     }
-    let span_events = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
+    let span_events = crate::telemetry::local::resolve_span_events();
+    let span_list = crate::telemetry::local::resolve_span_list(logger_level);
     // ── Case 2: File Logging
     // If a log directory is configured and OTLP log export is unavailable, use
     // the same rolling-file behavior as the local-only telemetry backend.
@@ -218,16 +255,12 @@ pub(super) fn init_observability_http(
                 "daily" => Rotation::Daily,
                 _ => Rotation::Daily,
             };
-            let max_single_file_size = config
-                .log_max_single_file_size_bytes
-                .unwrap_or(DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES);
-
-            let file_appender =
-                RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
+            let (file_appender, roll_signal) = open_rolling_appender(config, log_directory, log_filename, rotation, match_mode)?;
+            crate::telemetry::local::validate_stdout_sink(&file_appender)?;
 
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            let file_layer = build_json_log_layer(non_blocking, false, span_events.clone());
-            let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
+            let file_layer = build_json_log_layer(non_blocking, false, span_events.clone(), span_list);
+            let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files, roll_signal);
             Ok((file_layer, guard, cleanup_handle, rotation_str))
         })();
 
@@ -244,8 +277,10 @@ pub(super) fn init_observability_http(
                     log_directory,
                     rotation = %rotation_str,
                     keep_files,
-                    stdout_mirror_enabled = config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED)
-                        || !is_production,
+                    stdout_mirror_enabled = crate::telemetry::local::resolve_file_stdout_mirror(
+                        config.log_stdout_enabled,
+                        is_production,
+                    ),
                     logger_level,
                     is_production,
                     "Initialized local logging fallback for observability"
@@ -267,23 +302,27 @@ pub(super) fn init_observability_http(
 
     // Optional stdout mirror (matching init_file_logging_internal logic)
     // This is separate from OTLP stdout logic. If file logging is enabled, we honor its stdout rules.
-    if force_stdout_logging || config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) || !is_production {
+    if force_stdout_logging || crate::telemetry::local::resolve_file_stdout_mirror(config.log_stdout_enabled, is_production) {
         let (stdout_nb, stdout_g) = tracing_appender::non_blocking(std::io::stdout());
         stdout_guard = Some(stdout_g);
-        stdout_layer_opt = Some(build_json_log_layer(stdout_nb, std::io::stdout().is_terminal(), span_events));
+        stdout_layer_opt = Some(build_json_log_layer(stdout_nb, std::io::stdout().is_terminal(), span_events, span_list));
     }
     let local_file_fallback_enabled = file_layer_opt.is_some();
     let stdout_mirror_enabled = stdout_guard.is_some();
     let filter = build_env_filter(logger_level, None);
     tracing_subscriber::registry()
         .with(filter)
+        .with(super::http2_ping_timeout_layer())
+        .with(pyroscope_log_filter())
+        .with(s3s_log_filter())
         .with(ErrorLayer::default())
         .with(file_layer_opt)
         .with(stdout_layer_opt)
         .with(tracer_layer)
         .with(otel_bridge)
         .with(metrics_layer)
-        .init();
+        .try_init()
+        .map_err(|err| TelemetryError::SubscriberInit(err.to_string()))?;
 
     counter!("rustfs_start_total").increment(1);
     info!(
@@ -303,8 +342,7 @@ pub(super) fn init_observability_http(
         tracer_provider,
         meter_provider,
         logger_provider,
-        profiling_agent,
-        memory_profiling_agent,
+        profiling_agent: None,
         tracing_guard,
         stdout_guard,
         cleanup_handle,
@@ -322,6 +360,7 @@ pub(super) fn init_observability_http(
 fn build_tracer_provider(
     trace_ep: &str,
     config: &OtelConfig,
+    otlp_tls_ca_bundle: Option<&OtlpTlsCaBundle>,
     res: opentelemetry_sdk::Resource,
     sampler: Sampler,
     use_stdout: bool,
@@ -339,8 +378,12 @@ fn build_tracer_provider(
     if !trace_headers.is_empty() {
         exporter_builder = exporter_builder.with_headers(trace_headers);
     }
-    if let Some(timeout) = resolve_signal_timeout(config.endpoint_timeout_millis, config.trace_timeout_millis) {
+    let timeout = resolve_signal_timeout(config.endpoint_timeout_millis, config.trace_timeout_millis);
+    if let Some(timeout) = timeout {
         exporter_builder = exporter_builder.with_timeout(timeout);
+    }
+    if let Some(http_client) = build_otlp_http_client(otlp_tls_ca_bundle, timeout, OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)? {
+        exporter_builder = exporter_builder.with_http_client(http_client);
     }
     let exporter = exporter_builder
         .build()
@@ -375,10 +418,31 @@ fn build_tracer_provider(
 /// disappear due to configuration mistakes.
 fn build_tracer_sampler(sample_ratio: f64) -> Sampler {
     if sample_ratio.is_finite() && (0.0..=1.0).contains(&sample_ratio) {
-        Sampler::TraceIdRatioBased(sample_ratio)
+        Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(sample_ratio)))
     } else {
-        Sampler::AlwaysOn
+        Sampler::ParentBased(Box::new(Sampler::AlwaysOn))
     }
+}
+
+fn resolve_otlp_use_stdout(config_use_stdout: Option<bool>, is_production: bool) -> bool {
+    config_use_stdout.unwrap_or(!is_production)
+}
+
+fn normalize_otlp_root_endpoint(root_ep: &str) -> &str {
+    root_ep.trim_end_matches('/')
+}
+
+fn resolve_signal_endpoint(signal_endpoint: Option<&str>, root_ep: &str, suffix: &str) -> String {
+    signal_endpoint
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if root_ep.is_empty() {
+                String::new()
+            } else {
+                format!("{root_ep}{suffix}")
+            }
+        })
 }
 
 /// Build an optional [`SdkMeterProvider`] for the given metrics endpoint.
@@ -389,6 +453,7 @@ fn build_tracer_sampler(sample_ratio: f64) -> Sampler {
 fn build_meter_provider(
     metric_ep: &str,
     config: &OtelConfig,
+    otlp_tls_ca_bundle: Option<&OtlpTlsCaBundle>,
     res: opentelemetry_sdk::Resource,
     service_name: &str,
     use_stdout: bool,
@@ -407,22 +472,29 @@ fn build_meter_provider(
     if !metric_headers.is_empty() {
         exporter_builder = exporter_builder.with_headers(metric_headers);
     }
-    if let Some(timeout) = resolve_signal_timeout(config.endpoint_timeout_millis, config.metric_timeout_millis) {
+    let timeout = resolve_signal_timeout(config.endpoint_timeout_millis, config.metric_timeout_millis);
+    if let Some(timeout) = timeout {
         exporter_builder = exporter_builder.with_timeout(timeout);
+    }
+    if let Some(http_client) = build_otlp_http_client(otlp_tls_ca_bundle, timeout, OTEL_EXPORTER_OTLP_METRICS_TIMEOUT)? {
+        exporter_builder = exporter_builder.with_http_client(http_client);
     }
     let exporter = exporter_builder
         .build()
         .map_err(|e| TelemetryError::BuildMetricExporter(e.to_string()))?;
 
-    let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
+    let meter_interval = resolve_meter_interval(config);
 
     let (provider, recorder) = Recorder::builder(service_name.to_string())
         .with_meter_provider(|b: opentelemetry_sdk::metrics::MeterProviderBuilder| {
-            let b = b.with_resource(res).with_reader(
-                PeriodicReader::builder(exporter)
-                    .with_interval(Duration::from_secs(meter_interval))
-                    .build(),
-            );
+            let b = b
+                .with_resource(res)
+                .with_reader(
+                    PeriodicReader::builder(exporter)
+                        .with_interval(Duration::from_secs(meter_interval))
+                        .build(),
+                )
+                .with_view(duration_histogram_view);
             if use_stdout {
                 b.with_reader(create_periodic_reader(meter_interval))
             } else {
@@ -432,9 +504,35 @@ fn build_meter_provider(
         .build();
 
     global::set_meter_provider(provider.clone());
-    metrics::set_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
+    install_process_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
     set_observability_metric_enabled(true);
     Ok(Some(provider))
+}
+
+fn duration_histogram_view(instrument: &Instrument) -> Option<Stream> {
+    let boundaries = duration_histogram_buckets(instrument.name())?;
+
+    Stream::builder()
+        .with_aggregation(Aggregation::ExplicitBucketHistogram {
+            boundaries: boundaries.to_vec(),
+            record_min_max: true,
+        })
+        .build()
+        .ok()
+}
+
+fn duration_histogram_buckets(name: &str) -> Option<&'static [f64]> {
+    if LOCAL_BATCH_DURATION_HISTOGRAM_METRICS.contains(&name) {
+        Some(LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS)
+    } else if GET_OBJECT_DURATION_HISTOGRAM_METRICS.contains(&name) {
+        Some(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS)
+    } else if OBJECT_LOCK_DURATION_HISTOGRAM_METRICS.contains(&name) {
+        Some(OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS)
+    } else if INTERNODE_DURATION_HISTOGRAM_METRICS.contains(&name) {
+        Some(INTERNODE_DURATION_HISTOGRAM_BUCKETS)
+    } else {
+        None
+    }
 }
 
 /// Build an optional [`SdkLoggerProvider`] for the given log endpoint.
@@ -444,6 +542,7 @@ fn build_meter_provider(
 fn build_logger_provider(
     log_ep: &str,
     config: &OtelConfig,
+    otlp_tls_ca_bundle: Option<&OtlpTlsCaBundle>,
     res: opentelemetry_sdk::Resource,
     use_stdout: bool,
 ) -> Result<Option<SdkLoggerProvider>, TelemetryError> {
@@ -460,8 +559,12 @@ fn build_logger_provider(
     if !log_headers.is_empty() {
         exporter_builder = exporter_builder.with_headers(log_headers);
     }
-    if let Some(timeout) = resolve_signal_timeout(config.endpoint_timeout_millis, config.log_timeout_millis) {
+    let timeout = resolve_signal_timeout(config.endpoint_timeout_millis, config.log_timeout_millis);
+    if let Some(timeout) = timeout {
         exporter_builder = exporter_builder.with_timeout(timeout);
+    }
+    if let Some(http_client) = build_otlp_http_client(otlp_tls_ca_bundle, timeout, OTEL_EXPORTER_OTLP_LOGS_TIMEOUT)? {
+        exporter_builder = exporter_builder.with_http_client(http_client);
     }
     let exporter = exporter_builder
         .build()
@@ -484,7 +587,7 @@ fn build_logger_provider(
     feature = "pyroscope",
     any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
 ))]
-fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
+pub(super) fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
     use pyroscope::pyroscope::PyroscopeAgentBuilder;
     use rustfs_config::VERSION;
@@ -496,8 +599,22 @@ fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
         return None;
     }
 
-    let endpoint = config.profiling_endpoint.as_ref()?.as_str();
-    if endpoint.is_empty() {
+    let Some(endpoint) = config
+        .profiling_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+    else {
+        warn!(
+            backend = "pyroscope",
+            result = "profiling_endpoint_missing",
+            "Profiling export is enabled but no profiling endpoint was configured"
+        );
+        return None;
+    };
+
+    if url::Url::parse(endpoint).is_err() {
+        log_profiler_failure("profiling_endpoint_invalid", "invalid_endpoint");
         return None;
     }
 
@@ -507,15 +624,21 @@ fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     let version = config.service_version.as_deref().unwrap_or(VERSION);
     let sample_rate = 100; // 100 Hz
 
-    let agent = PyroscopeAgentBuilder::new(endpoint, service_name, sample_rate, "pyroscope-rs", "1.0.1", backend)
+    let agent = match PyroscopeAgentBuilder::new(endpoint, service_name, sample_rate, "pyroscope-rs", "1.0.1", backend)
         .tags(vec![("version", version), ("profile_type", "cpu")])
         .build()
-        .ok()?;
+    {
+        Ok(agent) => agent,
+        Err(_) => {
+            log_profiler_failure("profiling_agent_build_failed", "build");
+            return None;
+        }
+    };
 
     match agent.start() {
         Ok(agent) => Some(agent),
-        Err(err) => {
-            eprintln!("Pyroscope agent start error: {err:?}");
+        Err(_) => {
+            log_profiler_failure("profiling_agent_start_failed", "start");
             None
         }
     }
@@ -525,66 +648,18 @@ fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     feature = "pyroscope",
     any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
 )))]
-fn init_profiler(_config: &OtelConfig) -> Option<ProfilingAgent> {
-    None
-}
-
-/// Initialise a Pyroscope agent for continuous **memory** profiling via jemalloc.
-///
-/// This is only available on `linux + gnu + x86_64` where tikv-jemallocator
-/// is the global allocator and `jemalloc_pprof::PROF_CTL` is accessible.
-///
-/// Returns `None` when profiling export is disabled, the endpoint is missing,
-/// jemalloc profiling is not activated, or the agent fails to build/start.
-#[cfg(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-fn init_memory_profiler(config: &OtelConfig) -> Option<MemoryProfilingAgent> {
-    use pyroscope::backend::jemalloc_backend;
-    use pyroscope::pyroscope::PyroscopeAgentBuilder;
-    use rustfs_config::VERSION;
-
-    if !config
+pub(super) fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
+    if config
         .profiling_export_enabled
         .unwrap_or(rustfs_config::DEFAULT_OBS_PROFILING_EXPORT_ENABLED)
     {
-        return None;
+        warn!(
+            backend = "pyroscope",
+            result = "profiling_feature_not_compiled",
+            required_feature = "pyroscope",
+            "Profiling export is enabled but this binary was built without Pyroscope support"
+        );
     }
-
-    let endpoint = config.profiling_endpoint.as_ref()?.as_str();
-    if endpoint.is_empty() {
-        return None;
-    }
-
-    // Verify jemalloc profiling is available and activated
-    {
-        let prof_ctl = jemalloc_pprof::PROF_CTL.as_ref()?;
-        let ctl = prof_ctl.try_lock().ok()?;
-        if !ctl.activated() {
-            eprintln!("Memory profiling skipped: jemalloc profiling is not activated");
-            return None;
-        }
-    }
-
-    let backend = jemalloc_backend();
-    let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
-    let version = config.service_version.as_deref().unwrap_or(VERSION);
-    let sample_rate = 100;
-
-    let agent = PyroscopeAgentBuilder::new(endpoint, service_name, sample_rate, "pyroscope-rs", "1.0.1", backend)
-        .tags(vec![("version", version), ("profile_type", "memory")])
-        .build()
-        .ok()?;
-
-    match agent.start() {
-        Ok(agent) => Some(agent),
-        Err(err) => {
-            eprintln!("Memory profiling agent start error: {err:?}");
-            None
-        }
-    }
-}
-
-#[cfg(not(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-fn init_memory_profiler(_config: &OtelConfig) -> Option<MemoryProfilingAgent> {
     None
 }
 
@@ -596,6 +671,22 @@ fn create_periodic_reader(interval: u64) -> PeriodicReader<opentelemetry_stdout:
     PeriodicReader::builder(opentelemetry_stdout::MetricExporter::default())
         .with_interval(Duration::from_secs(interval))
         .build()
+}
+
+fn resolve_meter_interval(config: &OtelConfig) -> u64 {
+    match config.meter_interval {
+        Some(0) => {
+            warn!(
+                result = "invalid_meter_interval",
+                configured_seconds = 0_u64,
+                fallback_seconds = METER_INTERVAL,
+                "Metrics export interval is invalid; using default interval"
+            );
+            METER_INTERVAL
+        }
+        Some(interval) => interval,
+        None => METER_INTERVAL,
+    }
 }
 
 fn resolve_signal_headers(common_headers: Option<&str>, signal_headers: Option<&str>) -> HashMap<String, String> {
@@ -631,31 +722,347 @@ fn resolve_signal_timeout(common_timeout_millis: Option<u64>, signal_timeout_mil
         .map(Duration::from_millis)
 }
 
+struct OtlpTlsCaBundle {
+    certificates: Vec<reqwest::Certificate>,
+}
+
+impl OtlpTlsCaBundle {
+    fn load(config: &OtelConfig) -> Result<Option<Self>, TelemetryError> {
+        let Some(ca_file) = config.tls_ca_file.as_deref() else {
+            return Ok(None);
+        };
+        let path = Path::new(ca_file);
+        if !path.is_absolute() {
+            return Err(TelemetryError::OtlpTlsCaPathNotAbsolute);
+        }
+
+        let pem_bundle = fs::read(path).map_err(TelemetryError::OtlpTlsCaRead)?;
+        if pem_bundle.iter().all(u8::is_ascii_whitespace) {
+            return Err(TelemetryError::OtlpTlsCaEmpty);
+        }
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem_bundle).map_err(TelemetryError::OtlpTlsCaParse)?;
+        if certificates.is_empty() {
+            return Err(TelemetryError::OtlpTlsCaInvalid);
+        }
+        Ok(Some(Self { certificates }))
+    }
+
+    fn build_http_client(
+        &self,
+        configured_timeout: Option<Duration>,
+        otel_signal_timeout_env: &str,
+    ) -> Result<reqwest::blocking::Client, TelemetryError> {
+        // OpenTelemetry's default processors call exporters on standard threads without a Tokio runtime.
+        let timeout = configured_timeout.unwrap_or_else(|| resolve_otlp_http_timeout(otel_signal_timeout_env));
+        std::thread::Builder::new()
+            .name("otlp-http-client-init".to_string())
+            .spawn({
+                let certificates = self.certificates.clone();
+                move || {
+                    reqwest::blocking::Client::builder()
+                        .timeout(timeout)
+                        .tls_certs_merge(certificates)
+                        .build()
+                }
+            })
+            .map_err(|error| TelemetryError::Io(error.to_string()))?
+            .join()
+            .map_err(|_| TelemetryError::Io("OTLP HTTP client initialization thread panicked".to_string()))?
+            .map_err(TelemetryError::BuildOtlpHttpClient)
+    }
+}
+
+fn build_otlp_http_client(
+    otlp_tls_ca_bundle: Option<&OtlpTlsCaBundle>,
+    configured_timeout: Option<Duration>,
+    otel_signal_timeout_env: &str,
+) -> Result<Option<reqwest::blocking::Client>, TelemetryError> {
+    otlp_tls_ca_bundle
+        .map(|bundle| bundle.build_http_client(configured_timeout, otel_signal_timeout_env))
+        .transpose()
+}
+
+fn resolve_otlp_http_timeout(signal_timeout_env: &str) -> Duration {
+    [signal_timeout_env, OTEL_EXPORTER_OTLP_TIMEOUT]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().and_then(|value| value.parse::<u64>().ok()))
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_OTLP_HTTP_TIMEOUT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::io::{self, Write};
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const LOG_TRACER_CHILD_ENV: &str = "RUSTFS_OBS_LOG_TRACER_CHILD";
+
+    fn config_with_tls_ca_file(path: &Path) -> OtelConfig {
+        OtelConfig {
+            tls_ca_file: Some(path.display().to_string()),
+            ..OtelConfig::default()
+        }
+    }
+
+    fn load_tls_ca_bundle(path: &Path) -> OtlpTlsCaBundle {
+        OtlpTlsCaBundle::load(&config_with_tls_ca_file(path))
+            .expect("load CA bundle")
+            .expect("configured CA file should produce a bundle")
+    }
+
+    async fn spawn_test_tls_server() -> (String, String, tokio::task::JoinHandle<bool>) {
+        spawn_test_tls_server_with_requests(1).await
+    }
+
+    async fn spawn_test_tls_server_with_requests(request_count: usize) -> (String, String, tokio::task::JoinHandle<bool>) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).expect("generate TLS server certificate");
+        let ca_pem = certified.cert.pem();
+        let private_key = rustls_pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+            .expect("convert TLS server private key");
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certified.cert.der().clone()], private_key)
+            .expect("build TLS server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TLS test server");
+        let endpoint = format!("https://{}", listener.local_addr().expect("read TLS test server address"));
+        let server = tokio::spawn(async move {
+            for _ in 0..request_count {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return false;
+                };
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    return false;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1_024];
+                loop {
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return false;
+                    };
+                    if read == 0 {
+                        return false;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await
+                    .is_err()
+                    || stream.shutdown().await.is_err()
+                {
+                    return false;
+                }
+            }
+            true
+        });
+        (endpoint, ca_pem, server)
+    }
+
+    #[tokio::test]
+    async fn periodic_reader_exports_with_custom_ca_without_a_tokio_reactor() {
+        use opentelemetry::metrics::MeterProvider as _;
+
+        let (endpoint, ca_pem, server) = spawn_test_tls_server_with_requests(2).await;
+        let file = tempfile::NamedTempFile::new().expect("create CA file");
+        std::fs::write(file.path(), ca_pem).expect("write CA file");
+        let bundle = load_tls_ca_bundle(file.path());
+        let client = build_otlp_http_client(Some(&bundle), Some(Duration::from_secs(1)), OTEL_EXPORTER_OTLP_METRICS_TIMEOUT)
+            .expect("build custom CA client")
+            .expect("custom CA should build a client");
+        let exporter = opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_endpoint(endpoint)
+            .with_protocol(Protocol::HttpBinary)
+            .with_http_client(client)
+            .build()
+            .expect("build OTLP metrics exporter");
+        let reader = PeriodicReader::builder(exporter)
+            .with_interval(Duration::from_secs(60))
+            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let counter = provider.meter("test").u64_counter("test.counter").build();
+        counter.add(1, &[]);
+
+        tokio::task::spawn_blocking(move || {
+            provider.force_flush().expect("flush metric through periodic reader");
+            provider.shutdown().expect("shutdown periodic reader");
+        })
+        .await
+        .expect("periodic reader worker task");
+        assert!(server.await.expect("TLS test server task"));
+    }
+
+    #[tokio::test]
+    async fn otlp_http_client_trusts_every_certificate_in_a_pem_bundle() {
+        let (first_endpoint, first_ca_pem, first_server) = spawn_test_tls_server().await;
+        let (second_endpoint, second_ca_pem, second_server) = spawn_test_tls_server().await;
+        let file = tempfile::NamedTempFile::new().expect("create CA bundle file");
+        std::fs::write(file.path(), format!("{first_ca_pem}\n{second_ca_pem}")).expect("write CA bundle");
+
+        let bundle = load_tls_ca_bundle(file.path());
+        let client = build_otlp_http_client(Some(&bundle), Some(Duration::from_millis(250)), OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)
+            .expect("build client with CA bundle")
+            .expect("custom CA should build a client");
+        // Exercise the client on a blocking worker without a Tokio reactor, as the default exporters do.
+        let first_client = client.clone();
+        assert_eq!(
+            tokio::task::spawn_blocking(move || first_client.get(first_endpoint).send().map(|response| response.status()))
+                .await
+                .expect("first blocking client request task")
+                .expect("first bundled CA should complete TLS handshake"),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            tokio::task::spawn_blocking(move || client.get(second_endpoint).send().map(|response| response.status()))
+                .await
+                .expect("second blocking client request task")
+                .expect("second bundled CA should complete TLS handshake"),
+            reqwest::StatusCode::OK
+        );
+        assert!(first_server.await.expect("first bundled TLS server task"));
+        assert!(second_server.await.expect("second bundled TLS server task"));
+    }
+
+    #[test]
+    fn otlp_http_client_rejects_relative_missing_empty_and_invalid_ca_files() {
+        let relative = OtelConfig {
+            tls_ca_file: Some("otlp-ca.pem".to_string()),
+            ..OtelConfig::default()
+        };
+        assert!(matches!(OtlpTlsCaBundle::load(&relative), Err(TelemetryError::OtlpTlsCaPathNotAbsolute)));
+
+        let missing_directory = tempfile::tempdir().expect("create missing CA directory");
+        let missing = OtelConfig {
+            tls_ca_file: Some(missing_directory.path().join("otlp-ca.pem").display().to_string()),
+            ..OtelConfig::default()
+        };
+        assert!(matches!(OtlpTlsCaBundle::load(&missing), Err(TelemetryError::OtlpTlsCaRead(_))));
+
+        let empty = tempfile::NamedTempFile::new().expect("create empty CA file");
+        assert!(matches!(
+            OtlpTlsCaBundle::load(&config_with_tls_ca_file(empty.path())),
+            Err(TelemetryError::OtlpTlsCaEmpty)
+        ));
+
+        let invalid = tempfile::NamedTempFile::new().expect("create invalid CA file");
+        std::fs::write(invalid.path(), b"not a PEM certificate").expect("write invalid CA file");
+        assert!(matches!(
+            OtlpTlsCaBundle::load(&config_with_tls_ca_file(invalid.path())),
+            Err(TelemetryError::OtlpTlsCaInvalid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn otlp_http_client_trusts_the_configured_ca_and_rejects_another_ca() {
+        let (endpoint, ca_pem, trusted_server) = spawn_test_tls_server().await;
+        let trusted_file = tempfile::NamedTempFile::new().expect("create trusted CA file");
+        std::fs::write(trusted_file.path(), ca_pem).expect("write trusted CA file");
+        let trusted_bundle = load_tls_ca_bundle(trusted_file.path());
+        let trusted_client =
+            build_otlp_http_client(Some(&trusted_bundle), Some(Duration::from_secs(1)), OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)
+                .expect("build trusted client")
+                .expect("custom CA should build a client");
+        assert_eq!(
+            tokio::task::spawn_blocking(move || trusted_client.get(&endpoint).send().map(|response| response.status()))
+                .await
+                .expect("trusted blocking client request task")
+                .expect("configured CA should complete TLS handshake"),
+            reqwest::StatusCode::OK
+        );
+        assert!(trusted_server.await.expect("trusted TLS server task"));
+
+        let (endpoint, _ca_pem, untrusted_server) = spawn_test_tls_server().await;
+        let wrong_ca =
+            rcgen::generate_simple_self_signed(vec!["wrong.test".to_string()]).expect("generate unrelated CA certificate");
+        let untrusted_file = tempfile::NamedTempFile::new().expect("create unrelated CA file");
+        std::fs::write(untrusted_file.path(), wrong_ca.cert.pem()).expect("write unrelated CA file");
+        let untrusted_bundle = load_tls_ca_bundle(untrusted_file.path());
+        let untrusted_client =
+            build_otlp_http_client(Some(&untrusted_bundle), Some(Duration::from_secs(1)), OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)
+                .expect("build untrusted client")
+                .expect("custom CA should build a client");
+        assert!(
+            tokio::task::spawn_blocking(move || untrusted_client.get(&endpoint).send().is_err())
+                .await
+                .expect("untrusted blocking client request task")
+        );
+        assert!(!untrusted_server.await.expect("untrusted TLS server task"));
+    }
+
+    #[test]
+    fn otlp_http_client_is_not_built_without_a_custom_ca_file() {
+        assert!(
+            build_otlp_http_client(None, None, OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)
+                .expect("no CA file keeps the default client")
+                .is_none()
+        );
+    }
+
+    #[derive(Clone)]
+    struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("lock test log buffer").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     #[test]
     /// Valid ratios should produce trace-id-ratio sampling.
     fn test_build_tracer_sampler_uses_trace_ratio_for_valid_values() {
         let sampler = build_tracer_sampler(0.0);
-        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("TraceIdRatioBased"));
 
         let sampler = build_tracer_sampler(1.0);
-        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("TraceIdRatioBased"));
 
         let sampler = build_tracer_sampler(0.5);
-        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("TraceIdRatioBased"));
     }
 
     #[test]
     /// Invalid ratios should degrade to the safest non-dropping sampler.
     fn test_build_tracer_sampler_rejects_invalid_ratio_with_always_on() {
         let sampler = build_tracer_sampler(-0.1);
-        assert!(format!("{sampler:?}").contains("AlwaysOn"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("AlwaysOn"));
 
         let sampler = build_tracer_sampler(1.2);
-        assert!(format!("{sampler:?}").contains("AlwaysOn"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("AlwaysOn"));
     }
 
     #[test]
@@ -686,5 +1093,256 @@ mod tests {
         assert_eq!(resolve_signal_timeout(None, None), None);
         assert_eq!(resolve_signal_timeout(Some(0), None), None);
         assert_eq!(resolve_signal_timeout(None, Some(0)), None);
+    }
+
+    #[test]
+    fn test_normalize_otlp_root_endpoint_trims_trailing_slashes() {
+        assert_eq!(normalize_otlp_root_endpoint("http://collector:4318/"), "http://collector:4318");
+        assert_eq!(normalize_otlp_root_endpoint("http://collector:4318///"), "http://collector:4318");
+        assert_eq!(normalize_otlp_root_endpoint("http://collector:4318"), "http://collector:4318");
+    }
+
+    #[test]
+    fn test_resolve_signal_endpoint_avoids_double_slashes() {
+        assert_eq!(
+            resolve_signal_endpoint(None, normalize_otlp_root_endpoint("http://collector:4318/"), "/v1/traces"),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            resolve_signal_endpoint(Some("http://custom:4318/v1/custom"), "http://collector:4318", "/v1/traces"),
+            "http://custom:4318/v1/custom"
+        );
+        assert_eq!(resolve_signal_endpoint(None, "", "/v1/traces"), "");
+    }
+
+    #[test]
+    fn test_resolve_otlp_use_stdout_honors_config_or_environment_default() {
+        assert!(resolve_otlp_use_stdout(Some(true), true));
+        assert!(!resolve_otlp_use_stdout(Some(false), false));
+        assert!(resolve_otlp_use_stdout(None, false));
+        assert!(!resolve_otlp_use_stdout(None, true));
+    }
+
+    #[test]
+    fn test_resolve_meter_interval_rejects_zero() {
+        let config = OtelConfig {
+            meter_interval: Some(0),
+            ..OtelConfig::default()
+        };
+
+        assert_eq!(resolve_meter_interval(&config), METER_INTERVAL);
+    }
+
+    #[test]
+    fn test_duration_histogram_metric_match_is_scoped() {
+        for name in [
+            "rustfs_io_get_object_stage_duration_seconds",
+            "rustfs_io_get_object_request_duration_seconds",
+        ] {
+            assert_eq!(duration_histogram_buckets(name), Some(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS));
+        }
+        for name in LOCAL_BATCH_DURATION_HISTOGRAM_METRICS {
+            assert_eq!(duration_histogram_buckets(name), Some(LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS));
+        }
+        for name in OBJECT_LOCK_DURATION_HISTOGRAM_METRICS {
+            assert_eq!(duration_histogram_buckets(name), Some(OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS));
+        }
+        for name in INTERNODE_DURATION_HISTOGRAM_METRICS {
+            assert_eq!(duration_histogram_buckets(name), Some(INTERNODE_DURATION_HISTOGRAM_BUCKETS));
+        }
+        for name in [
+            "rustfs_io_put_object_request_duration_seconds",
+            "rustfs_io_get_object_response_size_bytes",
+            "rustfs_io_get_object_local_batch_shards",
+            "rustfs_object_lock_diag_slow_acquire_total",
+            "rustfs_object_lock_diag_acquire_duration_seconds_bucket",
+        ] {
+            assert!(duration_histogram_buckets(name).is_none());
+        }
+    }
+
+    #[test]
+    fn object_lock_histograms_export_millisecond_and_long_hold_buckets() {
+        use metrics::Recorder as _;
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter,
+            data::{AggregatedMetrics, MetricData},
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone())
+            .with_interval(Duration::from_secs(60))
+            .build();
+        let (provider, recorder) = Recorder::builder("lock-histogram-test")
+            .with_meter_provider(|builder| builder.with_reader(reader).with_view(duration_histogram_view))
+            .build();
+        let metadata = metrics::Metadata::new(module_path!(), metrics::Level::INFO, None);
+
+        for (name, observations) in [
+            (OBJECT_LOCK_DURATION_HISTOGRAM_METRICS[0], [0.002, 0.004, 0.012]),
+            (OBJECT_LOCK_DURATION_HISTOGRAM_METRICS[1], [0.002, 12.9, 31.0]),
+            (INTERNODE_DURATION_HISTOGRAM_METRICS[0], [0.04, 3.2, 31000.0]),
+            (INTERNODE_DURATION_HISTOGRAM_METRICS[1], [0.02, 1.2, 1300.0]),
+            (INTERNODE_DURATION_HISTOGRAM_METRICS[2], [0.01, 4.2, 1200.0]),
+        ] {
+            let histogram = recorder.register_histogram(&metrics::Key::from_name(name), &metadata);
+            for seconds in observations {
+                histogram.record(seconds);
+            }
+        }
+        provider.force_flush().expect("export lock duration observations");
+        let exported = exporter.get_finished_metrics().expect("read exported lock histograms");
+        let mut checked = 0;
+        for metric in exported
+            .iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+        {
+            let expected = match metric.name() {
+                "rustfs_object_lock_diag_acquire_duration_seconds" => [(0.002, 1), (0.004, 1), (0.015, 1)],
+                "rustfs_object_lock_diag_hold_duration_seconds" => [(0.002, 1), (15.0, 1), (60.0, 1)],
+                "rustfs_system_network_internode_operation_duration_ms" => [(0.05, 1), (4.0, 1), (60000.0, 1)],
+                "rustfs_system_network_internode_operation_server_duration_ms" => [(0.025, 1), (1.5, 1), (2500.0, 1)],
+                "rustfs_system_network_internode_bulk_body_wait_duration_ms" => [(0.01, 1), (5.0, 1), (2500.0, 1)],
+                _ => continue,
+            };
+            let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+                panic!("lock duration must export as an f64 histogram");
+            };
+            let points: Vec<_> = histogram.data_points().collect();
+            assert_eq!(points.len(), 1, "one time series for each lock duration instrument");
+            let point = points[0];
+            assert_eq!(point.count(), 3, "all observations reach the exporter");
+            let counts: Vec<_> = point.bucket_counts().collect();
+            assert_eq!(counts.last(), Some(&0), "observations do not fall into the overflow bucket");
+            let occupied: Vec<_> = point.bounds().zip(counts).filter(|(_, count)| *count != 0).collect();
+            assert_eq!(occupied, expected, "seconds remain distinct at millisecond and long-hold scales");
+            checked += 1;
+        }
+        assert_eq!(checked, 5, "lock and internode duration histograms were exported");
+        provider.shutdown().expect("stop lock histogram test provider");
+    }
+
+    #[test]
+    fn test_get_object_duration_histogram_buckets_are_sorted() {
+        assert!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.first(), Some(&0.0001));
+        assert_eq!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.last(), Some(&10.0));
+    }
+
+    #[test]
+    fn local_batch_duration_buckets_resolve_sub_microsecond_operations() {
+        assert!(
+            LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        assert_eq!(LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS.first(), Some(&0.0000001));
+        assert_eq!(LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS.last(), Some(&10.0));
+    }
+
+    #[cfg(all(
+        feature = "pyroscope",
+        any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+    ))]
+    #[test]
+    fn test_init_profiler_invalid_endpoint_redacts_sensitive_components() {
+        let endpoint = "https://profile-user:profile-token@10.24.0.5:invalid/private/profiles?access_token=query-secret";
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TestWriter(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(writer)
+            .finish();
+
+        let config = OtelConfig {
+            profiling_export_enabled: Some(true),
+            profiling_endpoint: Some(endpoint.to_string()),
+            ..OtelConfig::default()
+        };
+
+        tracing::subscriber::with_default(subscriber, || assert!(init_profiler(&config).is_none()));
+
+        let rendered = String::from_utf8(buffer.lock().expect("lock test log buffer").clone()).expect("decode test log");
+        assert!(rendered.contains(REDACTED_PROFILING_ENDPOINT));
+        assert!(rendered.contains("error_kind=\"invalid_endpoint\""));
+        for leaked in [
+            "profile-user",
+            "profile-token",
+            "10.24.0.5",
+            "private/profiles",
+            "query-secret",
+        ] {
+            assert!(!rendered.contains(leaked), "profiling log leaked {leaked}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn test_pyroscope_upload_failure_targets_stay_filtered_when_env_filter_enables_them() {
+        let endpoint = "https://profile-user:profile-token@10.24.0.5/private/profiles?access_token=query-secret";
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TestWriter(Arc::clone(&buffer));
+        let env_filter = tracing_subscriber::EnvFilter::new("pyroscope=trace")
+            .add_directive("trace".parse().expect("parse trace filter directive"))
+            .add_directive("Pyroscope::Session=trace".parse().expect("parse Pyroscope filter directive"));
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(pyroscope_log_filter())
+            .with(s3s_log_filter())
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .without_time()
+                    .with_writer(writer),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(target: "pyroscope::session", "SessionManager - Failed to send session: {endpoint}");
+            tracing::error!(target: "Pyroscope::Session", "SessionManager - Failed to send session: {endpoint}");
+        });
+
+        let rendered = String::from_utf8(buffer.lock().expect("lock test log buffer").clone()).expect("decode test log");
+        assert!(rendered.is_empty(), "filtered Pyroscope upload failure reached a log sink: {rendered}");
+    }
+
+    #[test]
+    fn test_pyroscope_log_facade_upload_failure_is_filtered() {
+        let endpoint = "https://profile-user:profile-token@10.24.0.5/private/profiles?access_token=query-secret";
+        if env::var_os(LOG_TRACER_CHILD_ENV).is_some() {
+            tracing_subscriber::registry()
+                .with(build_env_filter("info", None))
+                .with(pyroscope_log_filter())
+                .with(s3s_log_filter())
+                .with(tracing_subscriber::fmt::layer().with_ansi(false).without_time())
+                .try_init()
+                .expect("install isolated LogTracer subscriber");
+            log::error!(target: "pyroscope::session", "SessionManager - Failed to send session: {endpoint}");
+            log::error!(target: "Pyroscope::Session", "SessionManager - Failed to send session: {endpoint}");
+            return;
+        }
+
+        let output = Command::new(env::current_exe().expect("resolve test executable"))
+            .args([
+                "--exact",
+                "telemetry::otel::tests::test_pyroscope_log_facade_upload_failure_is_filtered",
+                "--nocapture",
+            ])
+            .env(LOG_TRACER_CHILD_ENV, "1")
+            .env("RUST_LOG", "trace,pyroscope=trace,Pyroscope::Session=trace")
+            .output()
+            .expect("run isolated LogTracer test process");
+        assert!(output.status.success(), "isolated LogTracer test failed: {output:?}");
+
+        let rendered = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        for leaked in [
+            "profile-user",
+            "profile-token",
+            "10.24.0.5",
+            "private/profiles",
+            "query-secret",
+        ] {
+            assert!(!rendered.contains(leaked), "LogTracer path leaked {leaked}: {rendered}");
+        }
     }
 }

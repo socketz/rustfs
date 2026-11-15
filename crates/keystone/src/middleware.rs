@@ -15,14 +15,14 @@
 //! Keystone authentication middleware
 //!
 //! This middleware intercepts HTTP requests and checks for OpenStack Keystone
-//! authentication headers (X-Auth-Token). If found, it validates the token
+//! authentication headers (X-Auth-Token or Swift X-Storage-Token). If found, it validates the token
 //! with Keystone and stores the authenticated credentials in task-local storage
 //! for use by downstream authentication handlers.
 //!
 //! ## Authentication Flow
 //!
 //! 1. Check if Keystone is enabled (via global provider)
-//! 2. Extract X-Auth-Token header from request
+//! 2. Extract X-Auth-Token or X-Storage-Token header from request
 //! 3. If token present:
 //!    - Validate with Keystone service
 //!    - On success: Store credentials in task-local, continue processing
@@ -40,7 +40,6 @@ use futures::Future;
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use rustfs_credentials::Credentials;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -49,6 +48,9 @@ use tower::{Layer, Service};
 use tracing::{debug, info, warn};
 
 use crate::KeystoneAuthProvider;
+
+const HEADER_X_AUTH_TOKEN: &str = "X-Auth-Token";
+const HEADER_X_STORAGE_TOKEN: &str = "X-Storage-Token";
 
 // Task-local storage for Keystone credentials
 // This allows passing credentials from middleware to auth handlers
@@ -106,11 +108,12 @@ pub struct KeystoneAuthMiddleware<S> {
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
 
-impl<S, B> Service<Request<Incoming>> for KeystoneAuthMiddleware<S>
+impl<S, ReqBody, B> Service<Request<ReqBody>> for KeystoneAuthMiddleware<S>
 where
-    S: Service<Request<Incoming>, Response = Response<B>> + Clone + Send + 'static,
+    S: Service<Request<ReqBody>, Response = Response<B>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
+    ReqBody: Send + 'static,
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<BoxError> + Send + 'static,
 {
@@ -122,7 +125,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let keystone_auth = self.keystone_auth.clone();
         let mut inner = self.inner.clone();
 
@@ -140,11 +143,10 @@ where
                 }
             };
 
-            // Extract X-Auth-Token header
             let token = extract_keystone_token(req.headers());
 
             if let Some(token) = token {
-                debug!("Keystone middleware: Found X-Auth-Token header, validating");
+                debug!("Keystone middleware: Found Keystone token header, validating");
 
                 // Validate token with Keystone
                 match keystone_auth.authenticate_with_token(token).await {
@@ -171,11 +173,15 @@ where
     <Message>Invalid Keystone token</Message>
     <Details>{}</Details>
 </Error>"#,
-                            xml_escape(&e.to_string())
+                            xml_escape(match e {
+                                crate::KeystoneError::InvalidToken => "Invalid token",
+                                crate::KeystoneError::TokenExpired => "Token expired",
+                                _ => "Keystone token validation failed",
+                            })
                         );
 
                         let body: BoxBody = Full::new(Bytes::from(error_xml))
-                            .map_err(|e| -> BoxError { Box::new(e) })
+                            .map_err(|never| match never {})
                             .boxed_unsync();
 
                         let response = Response::builder()
@@ -191,7 +197,7 @@ where
             }
 
             // No Keystone token header present, pass through to normal S3 authentication
-            debug!("Keystone middleware: No X-Auth-Token header, passing through to S3 auth");
+            debug!("Keystone middleware: No Keystone token header, passing through to S3 auth");
             let resp = inner.call(req).await?;
             let (parts, body) = resp.into_parts();
             let body: BoxBody = body.map_err(Into::into).boxed_unsync();
@@ -200,14 +206,11 @@ where
     }
 }
 
-/// Extract Keystone token from request headers
-///
-/// Checks for X-Auth-Token header (Keystone v3 standard).
-/// Note: X-Storage-Token (Swift) support deferred to future PR per Q4.C
 fn extract_keystone_token(headers: &HeaderMap) -> Option<&str> {
-    headers.get("X-Auth-Token").and_then(|v| v.to_str().ok())
-    // TODO: Add X-Storage-Token support in Phase 2 (Swift API)
-    // .or_else(|| headers.get("X-Storage-Token").and_then(|v| v.to_str().ok()))
+    headers
+        .get(HEADER_X_AUTH_TOKEN)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| headers.get(HEADER_X_STORAGE_TOKEN).and_then(|v| v.to_str().ok()))
 }
 
 /// Escape XML special characters to prevent injection
@@ -243,6 +246,7 @@ mod tests {
             None,
             "Default".to_string(),
             true,
+            Duration::from_secs(30),
         );
         let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60), true);
         let layer = KeystoneAuthLayer::new(Some(Arc::new(provider)));
@@ -254,8 +258,18 @@ mod tests {
         let mut headers = HeaderMap::new();
         assert!(extract_keystone_token(&headers).is_none());
 
-        headers.insert("X-Auth-Token", "test-token-123".parse().unwrap());
+        headers.insert(HEADER_X_AUTH_TOKEN, "test-token-123".parse().expect("auth token header should parse"));
         assert_eq!(extract_keystone_token(&headers), Some("test-token-123"));
+
+        headers.clear();
+        headers.insert(
+            HEADER_X_STORAGE_TOKEN,
+            "swift-token-456".parse().expect("storage token header should parse"),
+        );
+        assert_eq!(extract_keystone_token(&headers), Some("swift-token-456"));
+
+        headers.insert(HEADER_X_AUTH_TOKEN, "auth-token-789".parse().expect("auth token header should parse"));
+        assert_eq!(extract_keystone_token(&headers), Some("auth-token-789"));
     }
 
     #[tokio::test]

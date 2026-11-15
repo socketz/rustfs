@@ -12,12 +12,11 @@
 </p>
 
 <p align="center">
-<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14181" alt="rustfs%2Frustfs | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a> 
-<a href="https://runacap.com/ross-index/q4-2025/" target="_blank" rel="noopener"><img style="width: 260px; height: 55px" src="https://runacap.com/wp-content/uploads/2026/01/ROSS_badge_white_Q4_2025.svg" alt="ROSS Index - Fastest Growing Open-Source Startups in Q4 2025 | Runa Capital" height="55" /></a>
+<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14181" alt="rustfs%2Frustfs | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </p>
 
 <p align="center">
-  <a href="https://docs.rustfs.com/installation/">Getting Started</a>
+  <a href="https://docs.rustfs.com/en/installation">Getting Started</a>
   · <a href="https://docs.rustfs.com/">Docs</a>
   · <a href="https://github.com/rustfs/rustfs/issues">Bug reports</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">Discussions</a>
@@ -34,7 +33,7 @@ English | <a href="https://github.com/rustfs/rustfs/blob/main/README_ZH.md">简�
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=ru">Русский</a>
 </p>
 
-RustFS is a high-performance, distributed object storage system built in Rust—one of the most loved programming languages worldwide. RustFS combines the simplicity of MinIO with the memory safety and raw performance of Rust. It offers full S3 compatibility, is completely open-source, and is optimized for data lakes, AI, and big data workloads.
+RustFS is a high-performance, distributed object storage system built in Rust—one of the most loved programming languages worldwide. RustFS combines the simplicity of MinIO with the memory safety and raw performance of Rust. It offers broad S3 API compatibility for supported features, is completely open-source, and is optimized for data lakes, AI, and big data workloads.
 
 Unlike other storage systems, RustFS is released under the permissible Apache 2.0 license, avoiding the restrictions of AGPL. With Rust as its foundation, RustFS delivers superior speed and secure distributed features for next-generation object storage.
 
@@ -42,23 +41,40 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 
 - **High Performance**: Built with Rust to ensure maximum speed and resource efficiency.
 - **Distributed Architecture**: Scalable and fault-tolerant design suitable for large-scale deployments.
-- **S3 Compatibility**: Seamless integration with existing S3-compatible applications and tools.
+- **S3 Compatibility**: Seamless integration with common S3-compatible applications and tools; current coverage is tracked in the [S3 compatibility matrix](docs/architecture/s3-compatibility-matrix.md).
 - **OpenStack Swift API**: Native support for Swift protocol with Keystone authentication.
 - **OpenStack Keystone Integration**: Native support for OpenStack Keystone authentication with X-Auth-Token headers.
 - **Data Lake Support**: Optimized for high-throughput big data and AI workloads.
 - **Open Source**: Licensed under Apache 2.0, encouraging unrestricted community contributions and commercial usage.
 - **User-Friendly**: Designed with simplicity in mind for easy deployment and management.
 
-| Feature                 | Status       | Feature                  | Status           |
-| :---------------------- | :----------- | :----------------------- | :--------------- |
-| **S3 Core Features**    | ✅ Available | **Bitrot Protection**    | ✅ Available     |
-| **Upload / Download**   | ✅ Available | **Single Node Mode**     | ✅ Available     |
-| **Versioning**          | ✅ Available | **Bucket Replication**   | ✅ Available     |
-| **Logging**             | ✅ Available | **Lifecycle Management** | 🚧 Under Testing |
-| **Event Notifications** | ✅ Available | **Distributed Mode**     | 🚧 Under Testing |
-| **K8s Helm Charts**     | ✅ Available | **RustFS KMS**           | 🚧 Under Testing |
-| **Keystone Auth**       | ✅ Available | **Multi-Tenancy**        | ✅ Available     |
-| **Swift API**           | ✅ Available | **Swift Metadata Ops**   | 🚧 Partial       |
+Status legend: ✅ Available — shipped and covered by CI gates; 🧪 Preview — shipped behind an opt-in flag or with a bounded compatibility claim.
+
+| Feature                          | Status       | Feature                            | Status       |
+| :------------------------------- | :----------- | :--------------------------------- | :----------- |
+| **S3 Core Features**             | ✅ Available | **Distributed Mode**               | ✅ Available |
+| **Upload / Download**            | ✅ Available | **Single Node Mode**               | ✅ Available |
+| **Versioning**                   | ✅ Available | **Bitrot Protection**              | ✅ Available |
+| **Object Lock (WORM)**           | ✅ Available | **Healing & Scanner**              | ✅ Available |
+| **Server-Side Encryption**       | ✅ Available | **Pool Expansion / Decommission**  | ✅ Available |
+| **RustFS KMS**                   | ✅ Available | **Bucket Replication**             | ✅ Available |
+| **Lifecycle Management (ILM)**   | ✅ Available | **Site Replication**               | ✅ Available |
+| **ILM Tiering (Remote S3)**      | ✅ Available | **Bucket Quota**                   | ✅ Available |
+| **S3 Select**                    | ✅ Available | **Event Notifications**            | ✅ Available |
+| **S3 Tables (Iceberg REST)**     | 🧪 Preview   | **Audit Logging**                  | ✅ Available |
+| **IAM / Policies**               | ✅ Available | **Logging & Observability**        | ✅ Available |
+| **OIDC / SSO**                   | ✅ Available | **Web Console**                    | ✅ Available |
+| **Keystone Auth**                | ✅ Available | **K8s Helm Charts**                | ✅ Available |
+| **Swift API**                    | ✅ Available | **FTPS / WebDAV**                  | ✅ Available |
+| **Multi-Tenancy**                | ✅ Available | **SFTP**                           | ✅ Available |
+| **MinIO On-Disk Compatibility**  | 🧪 Preview   |                                    |              |
+
+Notes:
+
+- **RustFS KMS**: Vault (KV2 / Transit) and AWS KMS backends are supported for production. The `Local` and `Static` backends are for development and testing only. See [KMS backend security properties](docs/operations/kms-backend-security.md).
+- **Swift API / SFTP**: opt-in cargo features (`--features swift`, `--features sftp`, or `full`). FTPS and WebDAV are enabled in the default build.
+- **S3 Tables**: ships as an Iceberg REST Catalog with automated PyIceberg and DuckDB coverage; other engines and vendor profiles carry bounded claims listed in the [S3 Tables support matrix](docs/architecture/s3-tables-support-matrix.md).
+- **MinIO On-Disk Compatibility**: gated behind the `rio-v2` feature and not part of the default build. Objects MinIO encrypted are not readable by RustFS. See [MinIO file-format interoperability](docs/architecture/minio-file-format-compat.md).
 
 ## RustFS vs MinIO Performance
 
@@ -81,7 +97,7 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 | **Language & Safety**  | **Rust-based**<br>Memory safety by design.                                                                                                            | **Go or C-based**<br>Potential for memory GC pauses or leaks.                            |
 | **Data Sovereignty**   | **No Telemetry / Full Compliance**<br>Guards against unauthorized cross-border data egress. Compliant with GDPR (EU/UK), CCPA (US), and APPI (Japan). | **Potential Risk**<br>Possible legal exposure and unwanted data telemetry.               |
 | **Licensing**          | **Permissive Apache 2.0**<br>Business-friendly, no "poison pill" clauses.                                                                             | **Restrictive AGPL v3**<br>Risk of license traps and intellectual property pollution.    |
-| **Compatibility**      | **100% S3 Compatible**<br>Works with any cloud provider or client, anywhere.                                                                          | **Variable Compatibility**<br>May lack support for local cloud vendors or specific APIs. |
+| **Compatibility**      | **S3-Compatible Core**<br>Works with common S3-compatible clients, with coverage tracked in the compatibility matrix.                                  | **Variable Compatibility**<br>May lack support for local cloud vendors or specific APIs. |
 | **Edge & IoT**         | **Strong Edge Support**<br>Ideal for secure, innovative edge devices.                                                                                 | **Weak Edge Support**<br>Often too heavy for edge gateways.                              |
 | **Risk Profile**       | **Enterprise Risk Mitigation**<br>Clear IP rights and safe for commercial use.                                                                        | **Legal Risks**<br>Intellectual property ambiguity and usage restrictions.               |
 
@@ -92,6 +108,15 @@ Star RustFS on GitHub and be instantly notified of new releases.
 <img src="https://github.com/user-attachments/assets/7ee40bb4-3e46-4eac-b0d0-5fbeb85ff8f3" />
 
 ## Quickstart
+
+> [!IMPORTANT]
+> **Pool expansion notice:**
+>
+> - A single-node single-drive (SNSD) deployment is supported only as a standalone local path. It cannot expand in place or be added as a Pool. To move to a multi-drive topology, create a new deployment and migrate data through S3.
+> - Keep an existing multi-drive Pool's endpoints and Erasure Set width unchanged; expand by appending a new Pool. With ellipsis-based expansion, every Pool argument must contain an ellipsis expression and expand to at least two drive endpoints.
+> - Single-node multi-drive Pools and multi-node Pools with one drive per node are allowed, subject to valid Erasure Set geometry and EC settings; acceptance does not guarantee host-failure tolerance.
+>
+> These topology rules follow MinIO, but automatic parity selection differs between the projects. See the [Pool layout compatibility and regression tests](docs/testing/pool-layout-compatibility.md) before expanding a deployment.
 
 To get started with RustFS, follow these steps:
 
@@ -105,6 +130,10 @@ curl -O https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
 
 The RustFS container runs as a non-root user `rustfs` (UID/GID `10001:10001`). If you bind-mount host directories with Docker or Compose, every mounted path must be writable by that user, otherwise startup may fail with permission denied errors. This applies to data directories, log directories, and TLS certificate directories when `RUSTFS_TLS_PATH` is enabled.
 
+**Upgrading an existing data volume:** some older images ran as root. Replacing the image does not change ownership of mounted files. Before upgrading to a non-root image, stop the instances using the volume, confirm the actual host mount paths and runtime UID/GID, and grant that identity access to all existing data and log directories. For ordinary Docker bind mounts using the default identity, run `sudo chown -R 10001:10001 /actual/data /actual/logs` on the host. Repeat for each data mount; do not apply this recursively to unrelated shared directories. Kubernetes, NFS, ACLs, and rootless UID mappings may require a different ownership or access-control adjustment.
+
+RustFS checks creation, writing, and deletion of a small temporary file in each data root and fixed internal metadata directories when opening a local disk. A failed check rejects that disk through the existing startup/quorum rules and logs the filesystem error; permission diagnostics include the runtime UID/GID and path owner on Unix. This is not a recursive scan of existing buckets or objects: permissions must also allow access to their contents. RustFS does not change ownership automatically. After migration, verify upload, download, and deletion rather than relying only on a green health endpoint.
+
 ```bash
 # Create data and logs directories
 mkdir -p data logs
@@ -116,13 +145,17 @@ chown -R 10001:10001 data logs
 docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
 # Using specific version
-docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-beta.8
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.5
 ```
 
 If you use [podman](https://github.com/containers/podman) instead of docker, you can install the RustFS with the below command
 
 ```bash
-podman run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
+# Create data and logs directories
+mkdir -p data logs
+
+# Run the container (podman will automatically set the folders ownership)
+podman run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data:Z,U -v $(pwd)/logs:/logs:Z,U rustfs/rustfs:latest
 ```
 
 If you enable TLS with a bind-mounted certificate directory, prepare that mount the same way:
@@ -132,10 +165,10 @@ mkdir -p certs
 chown -R 10001:10001 certs
 ```
 
-You can also use Docker Compose. Using the `docker-compose.yml` file in the root directory:
+You can also use Docker Compose. Using the `docker-compose-simple.yml` file in the root directory:
 
 ```bash
-docker compose --profile observability up -d
+docker compose -f docker-compose-simple.yml up -d
 ```
 
 Before running Compose with host bind mounts:
@@ -143,12 +176,12 @@ Before running Compose with host bind mounts:
 - Ensure every mounted host path is writable by `10001:10001`.
 - If you enable TLS, ensure the certificate mount for `/opt/tls` is also readable by `10001:10001`.
 - If matching host ownership is not practical, run the `rustfs` service with `user: "<host-uid>:<host-gid>"` instead.
-- `docker-compose-simple.yml` includes a `volume-permission-helper` service for named volumes. `docker-compose.yml` relies on you to prepare bind-mounted host paths in advance.
+- `docker-compose-simple.yml` includes a `volume-permission-helper` service for named volumes. `docker-compose-simple.yml` relies on you to prepare bind-mounted host paths in advance.
 
 Similarly, you can run the command with podman
 
 ```bash
-podman compose --profile observability up -d
+podman compose -f docker-compose-simple.yml up -d
 ```
 
 Webhook notification quick start (Docker):
@@ -159,14 +192,20 @@ docker run -d --name rustfs -p 9000:9000 \
   -e RUSTFS_NOTIFY_WEBHOOK_ENABLE_PRIMARY=on \
   -e RUSTFS_NOTIFY_WEBHOOK_ENDPOINT_PRIMARY=http://<host-ip>:3020/webhook \
   -e RUSTFS_NOTIFY_WEBHOOK_QUEUE_DIR_PRIMARY=/tmp/rustfs-events \
+  -e RUSTFS_OUTBOUND_ALLOW_ORIGINS=http://<host-ip>:3020 \
   rustfs/rustfs:latest
 ```
 
 Notes:
 - `RUSTFS_NOTIFY_ENABLE=true` enables the global notify module switch.
 - For ARN `arn:rustfs:sqs::primary:webhook`, use instance-scoped env vars with `_PRIMARY`.
-- If queue dir is omitted, default is `/opt/rustfs/events`; ensure it is writable by the container runtime user.
+- If queue dir is omitted, the official image maps `/opt/rustfs/events` into the persistent `/data` volume so it is writable by the runtime user and pending events survive container recreation. Override `queue_dir` when using another deployment layout, or set `RUSTFS_TARGET_STORE_DIR` to move every default queue; native Windows defaults to `%ProgramData%\RustFS`. See [Target queue storage](docs/operations/target-queue-storage.md).
 - `RUSTFS_NOTIFY_WEBHOOK_SKIP_TLS_VERIFY_PRIMARY` defaults to `false`; enabling it skips webhook TLS certificate verification, allows MITM attacks, and emits a startup warning. Prefer `RUSTFS_NOTIFY_WEBHOOK_CLIENT_CA_PRIMARY` for private CAs.
+- Since `1.0.0-beta.11`, webhook endpoints on private or container networks
+  (`Docker Compose service names`, `host.docker.internal`, RFC 1918 addresses) are
+  blocked unless their exact `scheme://host:port` origin is listed in
+  `RUSTFS_OUTBOUND_ALLOW_ORIGINS` (the origin only, without the path). See
+  [Outbound Connection Policy](docs/operations/outbound-connection-policy.md).
 
 **NOTE**: We recommend reviewing the `docker-compose.yml` file before running. It defines several services including Grafana, Prometheus, and Jaeger, which are helpful for RustFS observability. If you wish to start Redis or Nginx containers, you can specify the corresponding profiles.
 
@@ -176,13 +215,16 @@ For developers who want to build RustFS Docker images from source with multi-arc
 
 ```bash
 # Build multi-architecture images locally
-./docker-buildx.sh --build-arg RELEASE=latest
+./docker-buildx.sh
+
+# Build a single-platform image locally
+./docker-buildx.sh -p linux/amd64
 
 # Build and push to registry
 ./docker-buildx.sh --push
 
 # Build specific version
-./docker-buildx.sh --release v1.0.0 --push
+./docker-buildx.sh --release 1.0.5 --push
 
 # Build for custom registry
 ./docker-buildx.sh --registry your-registry.com --namespace yourname --push
@@ -200,7 +242,7 @@ You can also use Make targets for convenience:
 ```bash
 make docker-buildx                    # Build locally
 make docker-buildx-push               # Build and push
-make docker-buildx-version VERSION=v1.0.0  # Build specific version
+make docker-buildx-version VERSION=1.0.5  # Build specific version
 make help-docker                      # Show all Docker-related commands
 ```
 
@@ -214,7 +256,10 @@ For scanner pacing, cycle budgets, bitrot cadence, lifecycle transition status,
 and single-node single-disk idle CPU tuning, see
 [Scanner Runtime Controls](docs/operations/scanner-runtime-controls.md). For
 repeatable scanner-pressure validation, see
-[Scanner Benchmark Runbook](docs/operations/scanner-benchmark-runbook.md).
+[Scanner Benchmark Runbook](docs/operations/scanner-benchmark-runbook.md). For
+drive timeout knobs on slow storage — including the walk stall budget that
+governs `ListObjects` on large prefixes — see
+[Drive Timeout Tuning](docs/operations/drive-timeout-tuning.md).
 
 ### 5\. Nix Flake (Option 5)
 
@@ -233,6 +278,26 @@ nix build
 nix run
 ```
 
+The flake also exports a NixOS module and the RustFS `rc` client. Add the
+module to your system and provide credentials through runtime files (for
+example, sops-nix or agenix) so secrets are never stored in the Nix store:
+
+```nix
+imports = [ inputs.rustfs.nixosModules.rustfs ];
+
+services.rustfs = {
+  enable = true;
+  accessKeyFile = "/run/secrets/rustfs-access-key";
+  secretKeyFile = "/run/secrets/rustfs-secret-key";
+  volumes = [ "/var/lib/rustfs" ];
+};
+```
+
+Install the S3-compatible client with
+`nix profile install github:rustfs/rustfs#rustfs-client` (the executable is named
+`rc`), or use `inputs.rustfs.packages.${pkgs.system}.rustfs-client` in a system
+configuration.
+
 ### 6\. X-CMD (Option 6)
 
 If you are an [x-cmd](https://www.x-cmd.com/install/rustfs) user:
@@ -246,6 +311,10 @@ x env use rustfs
 rustfs --help
 ```
 
+### 7\. Docker Swarm with the SwarmCLI chart (Option 7)
+
+Follow the [SwarmCLI chart guide](https://docs.rustfs.com/en/installation/cloud-native/swarmcli-chart) to run RustFS on Docker Swarm, as a single-node service or a distributed, erasure-coded cluster with one peer per node, with the open-source [SwarmCLI `rustfs` chart](https://github.com/Eldara-Tech/swarmcli-charts/tree/main/charts/rustfs). The chart keeps the root credentials in Docker secrets and refuses the default `rustfsadmin` keys, upgrades and rolls back as versioned releases, and can serve the S3 API over HTTPS through Traefik. Its Console stays off until you enable it. The chart and [SwarmCLI](https://github.com/Eldara-Tech/swarmcli) are maintained by Eldara Tech, not by the RustFS project.
+
 ---
 
 ### Accessing RustFS
@@ -255,7 +324,7 @@ rustfs --help
 2. **Create a Bucket**: Use the console to create a new bucket for your objects.
 3. **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs/clients to interact with your RustFS instance.
 
-**NOTE**: To access the RustFS instance via `https`, please refer to the [TLS Configuration Docs](https://docs.rustfs.com/integration/tls-configured.html).
+**NOTE**: To access the RustFS instance via `https`, please refer to the [TLS Configuration Docs](https://docs.rustfs.com/integration/tls-configured).
 
 ### OIDC Roles Claim (Microsoft Entra ID)
 
@@ -331,12 +400,18 @@ If you have any questions or need assistance:
 RustFS is a community-driven project, and we appreciate all contributions. Check out the [Contributors](https://github.com/rustfs/rustfs/graphs/contributors) page to see the amazing people who have helped make RustFS better.
 
 <a href="https://github.com/rustfs/rustfs/graphs/contributors">
-<img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" alt="Contributors" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/rustfs/rustfs/star-history/contributors-dark.svg">
+  <img src="https://raw.githubusercontent.com/rustfs/rustfs/star-history/contributors-light.svg" alt="RustFS contributors">
+</picture>
 </a>
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=rustfs/rustfs&type=date&legend=top-left)](https://www.star-history.com/#rustfs/rustfs&type=date&legend=top-left)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/rustfs/rustfs/star-history/star-history-dark.svg">
+  <img src="https://raw.githubusercontent.com/rustfs/rustfs/star-history/star-history-light.svg" alt="RustFS star history chart">
+</picture>
 
 ## License
 

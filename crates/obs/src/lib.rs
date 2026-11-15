@@ -31,7 +31,7 @@
 //!
 //! # #[tokio::main]
 //! # async fn main() {
-//! #   let _guard = match init_obs(None).await {
+//! #   let _guard = match init_obs(None, None).await {
 //! #         Ok(g) => g,
 //! #         Err(e) => {
 //! #             panic!("Failed to initialize observability: {:?}", e);
@@ -64,6 +64,7 @@ mod error;
 mod global;
 mod logging;
 pub mod metrics;
+mod node_identity;
 mod telemetry;
 
 pub use cleaner::*;
@@ -75,10 +76,10 @@ pub use metrics::schema::*;
 pub use metrics::{
     MetricsRuntimeCancellationSource, MetricsRuntimeController, MetricsRuntimeControllerSnapshot, MetricsRuntimeDesiredSnapshot,
     MetricsRuntimeDesiredState, MetricsRuntimeIntervalsSnapshot, MetricsRuntimeReconcilePlan, MetricsRuntimeServiceState,
-    MetricsRuntimeShutdownHandle, MetricsRuntimeStatusSnapshot, MetricsRuntimeWorkerMutation, init_metrics_collectors,
-    init_metrics_runtime, metrics_runtime_controller_snapshot, metrics_runtime_status_snapshot,
+    MetricsRuntimeShutdownHandle, MetricsRuntimeStatusSnapshot, MetricsRuntimeWorkerMutation, init_metrics_runtime,
+    metrics_runtime_controller_snapshot, metrics_runtime_status_snapshot,
 };
-pub use telemetry::{OtelGuard, Recorder};
+pub use telemetry::{HTTP_SERVER_LOG_TARGET, OtelGuard, Recorder};
 
 // Dial9 Tokio runtime telemetry
 // Re-export dial9 types at crate root level for easier access

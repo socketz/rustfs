@@ -12,48 +12,92 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Debug;
+
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+/// Namespace-lock object reserved for bucket lifecycle generation fencing.
+/// Empty S3 object keys are invalid, so this cannot collide with an object lock.
+pub const BUCKET_LIFECYCLE_LOCK_OBJECT: &str = "";
+
+/// Options for creating a new bucket.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MakeBucketOptions {
+    /// Enable object lock for the bucket.
     pub lock_enabled: bool,
+    /// Enable versioning for the bucket.
     pub versioning_enabled: bool,
+    /// Force creation even if bucket already exists.
     pub force_create: bool,
+    /// Optional creation timestamp.
     pub created_at: Option<OffsetDateTime>,
+    /// Skip acquiring namespace lock.
     pub no_lock: bool,
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+/// Operation to perform on a bucket during site replication delete.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SRBucketDeleteOp {
+    /// No operation.
     #[default]
     NoOp,
+    /// Mark the bucket for deletion.
     MarkDelete,
+    /// Purge the bucket and all its contents.
     Purge,
 }
 
-#[derive(Debug, Default, Clone)]
+/// Options for deleting a bucket.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DeleteBucketOptions {
+    /// Skip acquiring namespace lock.
     pub no_lock: bool,
+    /// Do not recreate bucket on failure.
     pub no_recreate: bool,
+    /// Force deletion even if bucket is not empty.
     pub force: bool,
+    /// Delete empty directory remnants after the local peer verifies no object metadata exists.
+    pub force_if_empty: bool,
+    /// Site replication delete operation.
     pub srdelete_op: SRBucketDeleteOp,
 }
 
+/// Options for querying bucket information.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BucketOptions {
+    /// Include deleted buckets in results.
     pub deleted: bool,
+    /// Use cached bucket information.
     pub cached: bool,
+    /// Skip loading bucket metadata.
     pub no_metadata: bool,
 }
 
+/// Information about a bucket.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BucketInfo {
+    /// Bucket name.
     pub name: String,
+    /// Creation timestamp.
     pub created: Option<OffsetDateTime>,
+    /// Deletion timestamp (if deleted).
     pub deleted: Option<OffsetDateTime>,
+    /// Whether versioning is enabled.
     pub versioning: bool,
+    /// Whether object locking is enabled.
     pub object_locking: bool,
+}
+
+/// Bucket-level storage operations.
+#[async_trait::async_trait]
+pub trait BucketOperations: Send + Sync + Debug {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<(), Self::Error>;
+    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo, Self::Error>;
+    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>, Self::Error>;
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]

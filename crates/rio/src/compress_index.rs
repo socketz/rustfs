@@ -49,7 +49,6 @@ pub struct IndexInfo {
     pub uncompressed_offset: i64,
 }
 
-#[allow(dead_code)]
 impl Index {
     pub fn new() -> Self {
         Self {
@@ -58,14 +57,6 @@ impl Index {
             info: Vec::new(),
             est_block_uncomp: 0,
         }
-    }
-
-    #[allow(dead_code)]
-    fn reset(&mut self, max_block: usize) {
-        self.est_block_uncomp = max_block as i64;
-        self.total_compressed = -1;
-        self.total_uncompressed = -1;
-        self.info.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -229,7 +220,7 @@ impl Index {
         b.extend_from_slice(S2_INDEX_HEADER);
 
         // Add total sizes
-        let mut tmp = [0u8; 8];
+        let mut tmp = [0u8; 10];
         let n = write_varint(&mut tmp, uncomp_total);
         b.extend_from_slice(&tmp[..n]);
         let n = write_varint(&mut tmp, comp_total);
@@ -481,75 +472,43 @@ impl Index {
     }
 }
 
-// Helper functions for varint encoding/decoding
-fn write_varint(buf: &mut [u8], mut v: i64) -> usize {
+// Helper functions for signed varint encoding/decoding (ZigZag + LEB128,
+// matching Go binary.PutVarint / binary.Varint used by the S2 index format).
+fn write_varint(buf: &mut [u8], v: i64) -> usize {
+    let mut uv = ((v as u64) << 1) ^ ((v >> 63) as u64);
     let mut n = 0;
-    while v >= 0x80 {
-        buf[n] = (v as u8) | 0x80;
-        v >>= 7;
+    while uv >= 0x80 {
+        buf[n] = (uv as u8) | 0x80;
+        uv >>= 7;
         n += 1;
     }
-    buf[n] = v as u8;
+    buf[n] = uv as u8;
     n + 1
 }
 
 fn read_varint(buf: &[u8]) -> io::Result<(i64, usize)> {
-    let mut result = 0i64;
-    let mut shift = 0;
+    let mut uv = 0u64;
+    let mut shift = 0u32;
     let mut n = 0;
 
     while n < buf.len() {
         let byte = buf[n];
         n += 1;
-        result |= ((byte & 0x7F) as i64) << shift;
+        if n == 10 && byte > 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow"));
+        }
+        uv |= ((byte & 0x7F) as u64) << shift;
         if byte < 0x80 {
+            let result = ((uv >> 1) as i64) ^ (-((uv & 1) as i64));
             return Ok((result, n));
         }
         shift += 7;
+        if shift >= 64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow"));
+        }
     }
 
     Err(io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected EOF"))
-}
-
-// Helper functions for index header manipulation
-#[allow(dead_code)]
-pub fn remove_index_headers(b: &[u8]) -> Option<&[u8]> {
-    if b.len() < 4 + S2_INDEX_TRAILER.len() {
-        return None;
-    }
-
-    // Skip size
-    let b = &b[4..];
-
-    // Check trailer
-    if !b.starts_with(S2_INDEX_TRAILER) {
-        return None;
-    }
-
-    Some(&b[S2_INDEX_TRAILER.len()..])
-}
-
-#[allow(dead_code)]
-pub fn restore_index_headers(in_data: &[u8]) -> Vec<u8> {
-    if in_data.is_empty() {
-        return Vec::new();
-    }
-
-    let mut b = Vec::with_capacity(4 + S2_INDEX_HEADER.len() + in_data.len() + S2_INDEX_TRAILER.len() + 4);
-    b.extend_from_slice(&[0x50, 0x2A, 0x4D, 0x18]);
-    b.extend_from_slice(S2_INDEX_HEADER);
-    b.extend_from_slice(in_data);
-
-    let total_size = (b.len() + 4 + S2_INDEX_TRAILER.len()) as u32;
-    b.extend_from_slice(&total_size.to_le_bytes());
-    b.extend_from_slice(S2_INDEX_TRAILER);
-
-    let chunk_len = b.len() - 4;
-    b[1] = chunk_len as u8;
-    b[2] = (chunk_len >> 8) as u8;
-    b[3] = (chunk_len >> 16) as u8;
-
-    b
 }
 
 #[cfg(test)]
@@ -764,6 +723,35 @@ mod tests {
         assert_eq!(decoded.total_uncompressed, source.total_uncompressed);
         assert_eq!(decoded.total_compressed, source.total_compressed);
         assert_eq!(decoded.info.len(), source.info.len());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_index_round_trip_with_negative_compressed_deltas_and_maximum_totals() -> io::Result<()> {
+        let mut source = Index::new();
+        source.est_block_uncomp = 1 << 20;
+        // Compressed blocks much smaller than est_block_uncomp / 2 (512 KiB)
+        // produce negative c_off residuals (-524,088 and -262,144).
+        source.add(0, 0)?;
+        source.add(200, 1 << 20)?;
+        source.add(300, 2 << 20)?;
+        source.add(450, (3 << 20) + 12345)?;
+        // ZigZag + LEB128 needs all 10 bytes for the largest valid signed value.
+        source.total_uncompressed = i64::MAX;
+        source.total_compressed = i64::MAX;
+
+        let encoded = source.clone().into_vec();
+        let mut decoded = Index::new();
+        let rest = decoded.load(encoded.as_ref())?;
+        assert!(rest.is_empty());
+        assert_eq!(decoded.total_uncompressed, source.total_uncompressed);
+        assert_eq!(decoded.total_compressed, source.total_compressed);
+        assert_eq!(decoded.info.len(), source.info.len());
+        for (actual, expected) in decoded.info.iter().zip(source.info.iter()) {
+            assert_eq!(actual.compressed_offset, expected.compressed_offset);
+            assert_eq!(actual.uncompressed_offset, expected.uncompressed_offset);
+        }
 
         Ok(())
     }

@@ -19,13 +19,14 @@
 //! configuration, and dependencies.
 
 use super::{InfoOpts, InfoType};
+use crate::runtime_sources::current_buffer_config;
 use crate::version::build;
 use rustfs_credentials::Masked;
 use serde::Serialize;
 use std::fmt;
 
 /// CPU information
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 struct CpuInfo {
     /// Number of logical CPU cores
     core_count: usize,
@@ -49,7 +50,7 @@ impl CpuInfo {
 
         // Calculate average CPU usage
         let usage_percent = if core_count > 0 {
-            sys.cpus().iter().map(|c| c.cpu_usage() as f64).sum::<f64>() / core_count as f64
+            sys.cpus().iter().map(|c| c.usage() as f64).sum::<f64>() / core_count as f64
         } else {
             0.0
         };
@@ -64,7 +65,7 @@ impl CpuInfo {
 }
 
 /// Memory information
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 struct MemoryInfo {
     /// Total system memory in bytes
     total_bytes: u64,
@@ -147,7 +148,9 @@ struct DiskInfo {
 
 impl DiskInfo {
     fn collect_all() -> Vec<Self> {
-        let disks = sysinfo::Disks::new_with_refreshed_list();
+        let Ok(disks) = sysinfo::Disks::new_with_refreshed_list() else {
+            return Vec::new();
+        };
         disks
             .iter()
             .map(|disk| {
@@ -203,7 +206,7 @@ impl ServiceDiskInfo {
         let volume_path = std::path::Path::new(first_volume);
 
         // Find the disk that contains this volume
-        let disks = sysinfo::Disks::new_with_refreshed_list();
+        let disks = sysinfo::Disks::new_with_refreshed_list().ok()?;
         for disk in disks.iter() {
             let mount_point = disk.mount_point();
             if volume_path.starts_with(mount_point) {
@@ -288,18 +291,23 @@ struct SystemInfo {
 impl SystemInfo {
     fn collect() -> Self {
         // Create system info collector
-        let mut sys = sysinfo::System::new_all();
-        sys.refresh_all();
-        sys.refresh_cpu_all();
+        let mut sys = sysinfo::System::new_all().ok();
+        if let Some(sys) = sys.as_mut() {
+            sys.refresh_all();
+            sys.refresh_cpu_all();
+        }
 
         Self {
             os_type: sysinfo::System::distribution_id(),
-            os_version: sysinfo::System::long_os_version().unwrap_or_else(|| "Unknown".to_string()),
+            os_version: sysinfo::System::long_os_version().unwrap_or_else(|_| "Unknown".to_string()),
             architecture: std::env::consts::ARCH.to_string(),
-            hostname: sysinfo::System::host_name().unwrap_or_else(|| "Unknown".to_string()),
-            kernel_version: sysinfo::System::kernel_long_version(),
-            cpu: CpuInfo::collect(&sys),
-            memory: MemoryInfo::collect(&sys),
+            hostname: sysinfo::System::host_name().unwrap_or_else(|_| "Unknown".to_string()),
+            kernel_version: sysinfo::System::kernel_long_version().unwrap_or_default(),
+            cpu: sys.as_ref().map(CpuInfo::collect).unwrap_or_else(|| CpuInfo {
+                brand: "Unknown".to_owned(),
+                ..Default::default()
+            }),
+            memory: sys.as_ref().map(MemoryInfo::collect).unwrap_or_default(),
             disks: DiskInfo::collect_all(),
         }
     }
@@ -382,29 +390,29 @@ struct RuntimeInfo {
 
 impl RuntimeInfo {
     fn collect() -> Self {
-        let (process_id, memory_usage_mb, cpu_usage_percent) = if let Ok(pid) = sysinfo::get_current_pid() {
-            let mut sys = sysinfo::System::new();
-            sys.refresh_processes_specifics(
-                sysinfo::ProcessesToUpdate::Some(&[pid]),
-                true,
-                sysinfo::ProcessRefreshKind::everything(),
-            );
+        let (process_id, memory_usage_mb, cpu_usage_percent) =
+            if let (Ok(pid), Ok(mut sys)) = (sysinfo::get_current_pid(), sysinfo::System::new()) {
+                sys.refresh_processes_specifics(
+                    sysinfo::ProcessesToUpdate::Some(&[pid]),
+                    true,
+                    sysinfo::ProcessRefreshKind::everything(),
+                );
 
-            let process = sys.process(pid);
-            let (memory_usage_mb, cpu_usage_percent) = if let Some(p) = process {
-                let memory = p.memory() as f64 / 1024.0 / 1024.0; // Convert to MB
-                let cpu = p.cpu_usage() as f64;
-                (memory, cpu)
+                let process = sys.process(pid);
+                let (memory_usage_mb, cpu_usage_percent) = if let Some(p) = process {
+                    let memory = p.memory() as f64 / 1024.0 / 1024.0; // Convert to MB
+                    let cpu = p.cpu_usage() as f64;
+                    (memory, cpu)
+                } else {
+                    (0.0, 0.0)
+                };
+
+                (pid.as_u32(), memory_usage_mb, cpu_usage_percent)
             } else {
-                (0.0, 0.0)
+                // Failed to retrieve current PID; degrade gracefully by
+                // skipping per-process stats and using sentinel values.
+                (0, 0.0, 0.0)
             };
-
-            (pid.as_u32(), memory_usage_mb, cpu_usage_percent)
-        } else {
-            // Failed to retrieve current PID; degrade gracefully by
-            // skipping per-process stats and using sentinel values.
-            (0, 0.0, 0.0)
-        };
 
         // // Get available CPU parallelism (roughly, logical cores available to the process)
         let cpu_parallelism = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
@@ -527,6 +535,7 @@ struct ConfigInfoJson {
     kms_backend: String,
     buffer_profile: String,
     workload_profile: Option<WorkloadProfileJson>,
+    veeam_sosapi_enable: bool,
 }
 
 /// Workload profile information for JSON output
@@ -543,9 +552,9 @@ fn collect_config_info_json() -> ConfigInfoJson {
 
     // Get workload profile info
     let workload_profile = {
-        use super::workload_profiles::{get_global_buffer_config, is_buffer_profile_enabled};
+        use super::workload_profiles::is_buffer_profile_enabled;
         if is_buffer_profile_enabled() {
-            let config = get_global_buffer_config();
+            let config = current_buffer_config().unwrap_or_default();
             let profile = config.workload_profile();
             let buffer_config = profile.config();
             Some(WorkloadProfileJson {
@@ -571,6 +580,10 @@ fn collect_config_info_json() -> ConfigInfoJson {
         kms_backend: snapshot.kms_backend.clone(),
         buffer_profile: snapshot.buffer_profile.clone(),
         workload_profile,
+        veeam_sosapi_enable: rustfs_utils::get_env_bool(
+            rustfs_config::ENV_VEEAM_SOSAPI_ENABLE,
+            rustfs_config::DEFAULT_VEEAM_SOSAPI_ENABLE,
+        ),
     }
 }
 
@@ -590,12 +603,19 @@ struct FeatureSpec {
     default_enabled: bool,
 }
 
-fn feature_specs() -> [FeatureSpec; 8] {
-    [
+fn feature_specs() -> &'static [FeatureSpec] {
+    &[
+        FeatureSpec {
+            name: "default",
+            enabled: cfg!(feature = "default"),
+            description: "Default feature set",
+            dependencies: "ftps + webdav",
+            default_enabled: true,
+        },
         FeatureSpec {
             name: "metrics-gpu",
             enabled: cfg!(feature = "metrics-gpu"),
-            description: "Metrics GPU support",
+            description: "GPU metrics support",
             dependencies: "rustfs-obs/gpu",
             default_enabled: false,
         },
@@ -609,7 +629,7 @@ fn feature_specs() -> [FeatureSpec; 8] {
         FeatureSpec {
             name: "swift",
             enabled: cfg!(feature = "swift"),
-            description: "Swift storage backend",
+            description: "OpenStack Swift protocol support",
             dependencies: "rustfs-protocols/swift",
             default_enabled: false,
         },
@@ -619,6 +639,13 @@ fn feature_specs() -> [FeatureSpec; 8] {
             description: "WebDAV protocol support",
             dependencies: "rustfs-protocols/webdav",
             default_enabled: true,
+        },
+        FeatureSpec {
+            name: "sftp",
+            enabled: cfg!(feature = "sftp"),
+            description: "SFTP protocol support",
+            dependencies: "rustfs-protocols/sftp",
+            default_enabled: false,
         },
         FeatureSpec {
             name: "license",
@@ -635,17 +662,80 @@ fn feature_specs() -> [FeatureSpec; 8] {
             default_enabled: false,
         },
         FeatureSpec {
-            name: "manual-test-runners",
-            enabled: cfg!(feature = "manual-test-runners"),
-            description: "Enable manual test binaries",
+            name: "tracing-chunk-debug",
+            enabled: cfg!(feature = "tracing-chunk-debug"),
+            description: "Per-chunk data-plane tracing",
             dependencies: "(none)",
             default_enabled: false,
         },
         FeatureSpec {
             name: "full",
             enabled: cfg!(feature = "full"),
-            description: "All features enabled",
-            dependencies: "metrics-gpu + ftps + swift + webdav",
+            description: "Full protocol and observability bundle",
+            dependencies: "metrics-gpu + ftps + swift + webdav + sftp + pyroscope",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "e2e-test-hooks",
+            enabled: cfg!(feature = "e2e-test-hooks"),
+            description: "End-to-end test hooks",
+            dependencies: "(none)",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "connect-e2e-short-credentials",
+            enabled: cfg!(feature = "connect-e2e-short-credentials"),
+            description: "Short-lived Connect credentials for debug E2E builds",
+            dependencies: "(none)",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "offline-enrollment-e2e-root",
+            enabled: cfg!(feature = "offline-enrollment-e2e-root"),
+            description: "Dedicated offline enrollment E2E root",
+            dependencies: "(none)",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "rio-v2",
+            enabled: cfg!(feature = "rio-v2"),
+            description: "RIO v2 storage path support",
+            dependencies: "rustfs-ecstore/rio-v2",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "pyroscope",
+            enabled: cfg!(feature = "pyroscope"),
+            description: "Pyroscope profiling support",
+            dependencies: "rustfs-obs/pyroscope",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "dial9",
+            enabled: cfg!(feature = "dial9"),
+            description: "Tokio runtime telemetry",
+            dependencies: "rustfs-obs/dial9",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "hotpath",
+            enabled: cfg!(feature = "hotpath"),
+            description: "Hotpath instrumentation",
+            dependencies: "hotpath + RustFS crate hotpath features",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "hotpath-alloc",
+            enabled: cfg!(feature = "hotpath-alloc"),
+            description: "Hotpath allocation diagnostics",
+            dependencies: "hotpath + hotpath/hotpath-alloc + RustFS crate hotpath-alloc features",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "hotpath-cpu",
+            enabled: cfg!(feature = "hotpath-cpu"),
+            description: "Hotpath CPU attribution",
+            dependencies: "hotpath + hotpath/hotpath-cpu + RustFS crate hotpath-cpu features",
             default_enabled: false,
         },
     ]
@@ -661,7 +751,7 @@ struct DepsInfoJson {
 
 fn collect_deps_info_json() -> DepsInfoJson {
     let features: Vec<FeatureInfoJson> = feature_specs()
-        .into_iter()
+        .iter()
         .map(|feature| FeatureInfoJson {
             name: feature.name,
             enabled: feature.enabled,
@@ -786,6 +876,7 @@ fn format_protocol_config_info() -> String {
     const DEFAULT_FTPS_PASSIVE_PORTS: &str = "40000-50000";
     const DEFAULT_WEBDAV_MAX_BODY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
     const DEFAULT_WEBDAV_REQUEST_TIMEOUT_SECS: u64 = 300;
+    const DEFAULT_WEBDAV_MAX_CONNECTIONS: usize = 1024;
 
     let ftps_enable = rustfs_utils::get_env_bool(rustfs_config::ENV_FTPS_ENABLE, false);
     let ftps_address = rustfs_utils::get_env_str(rustfs_config::ENV_FTPS_ADDRESS, rustfs_config::DEFAULT_FTPS_ADDRESS);
@@ -808,6 +899,10 @@ fn format_protocol_config_info() -> String {
     let webdav_max_body_size = rustfs_utils::get_env_u64(rustfs_config::ENV_WEBDAV_MAX_BODY_SIZE, DEFAULT_WEBDAV_MAX_BODY_SIZE);
     let webdav_request_timeout =
         rustfs_utils::get_env_u64(rustfs_config::ENV_WEBDAV_REQUEST_TIMEOUT, DEFAULT_WEBDAV_REQUEST_TIMEOUT_SECS);
+    let webdav_max_connections =
+        rustfs_utils::get_env_usize(rustfs_config::ENV_WEBDAV_MAX_CONNECTIONS, DEFAULT_WEBDAV_MAX_CONNECTIONS);
+    let veeam_sosapi_enable =
+        rustfs_utils::get_env_bool(rustfs_config::ENV_VEEAM_SOSAPI_ENABLE, rustfs_config::DEFAULT_VEEAM_SOSAPI_ENABLE);
 
     format!(
         "| FTPS | --- |\n\
@@ -827,7 +922,10 @@ fn format_protocol_config_info() -> String {
          | WebDAV > Certs Dir (`{}`) | {} |\n\
          | WebDAV > CA File (`{}`) | {} |\n\
          | WebDAV > Max Body Size (`{}`) | {} bytes |\n\
-         | WebDAV > Request Timeout (`{}`) | {} seconds |",
+         | WebDAV > Request Timeout (`{}`) | {} seconds |\n\
+         | WebDAV > Max Connections (`{}`) | {} |\n\
+         | Veeam SOSAPI | --- |\n\
+         | Veeam SOSAPI > Enabled (`{}`) | {} |",
         if cfg!(feature = "ftps") { "enabled" } else { "disabled" },
         rustfs_config::ENV_FTPS_ENABLE,
         ftps_enable,
@@ -857,19 +955,23 @@ fn format_protocol_config_info() -> String {
         rustfs_config::ENV_WEBDAV_MAX_BODY_SIZE,
         webdav_max_body_size,
         rustfs_config::ENV_WEBDAV_REQUEST_TIMEOUT,
-        webdav_request_timeout
+        webdav_request_timeout,
+        rustfs_config::ENV_WEBDAV_MAX_CONNECTIONS,
+        webdav_max_connections,
+        rustfs_config::ENV_VEEAM_SOSAPI_ENABLE,
+        veeam_sosapi_enable
     )
 }
 
 /// Get workload profile information from global buffer config
 fn get_workload_profile_info() -> String {
-    use super::workload_profiles::{get_global_buffer_config, is_buffer_profile_enabled};
+    use super::workload_profiles::is_buffer_profile_enabled;
 
     if !is_buffer_profile_enabled() {
         return "| Workload Profile | (disabled) |".to_string();
     }
 
-    let config = get_global_buffer_config();
+    let config = current_buffer_config().unwrap_or_default();
     let profile = config.workload_profile();
     let name = config.workload_name();
     let buffer_config = profile.config();
@@ -901,7 +1003,7 @@ fn format_deps_info() -> String {
     output.push_str("### Feature Status\n\n");
     output.push_str("| Feature | Status | Description |\n");
     output.push_str("|---------|--------|-------------|\n");
-    for feature in &features {
+    for feature in features {
         let status = if feature.enabled { "✓" } else { "✗" };
         output.push_str(&format!("| {} | {} | {} |\n", feature.name, status, feature.description));
     }
@@ -916,7 +1018,7 @@ fn format_deps_info() -> String {
     output.push_str("\n### Feature Dependencies\n\n");
     output.push_str("| Feature | Dependencies |\n");
     output.push_str("|---------|-------------|\n");
-    for feature in &features {
+    for feature in features {
         output.push_str(&format!("| {} | {} |\n", feature.name, feature.dependencies));
     }
 
@@ -1001,11 +1103,23 @@ mod tests {
         let info = collect_deps_info_json();
         let feature_names: Vec<_> = info.features.iter().map(|feature| feature.name).collect();
 
-        assert_eq!(info.total_count, 8);
-        assert_eq!(info.features.len(), 8);
+        assert_eq!(info.total_count, 19);
+        assert_eq!(info.features.len(), 19);
+        assert!(feature_names.contains(&"default"));
         assert!(feature_names.contains(&"metrics-gpu"));
+        assert!(feature_names.contains(&"sftp"));
         assert!(feature_names.contains(&"io-scheduler-debug"));
-        assert!(feature_names.contains(&"manual-test-runners"));
+        assert!(feature_names.contains(&"tracing-chunk-debug"));
+        assert!(feature_names.contains(&"e2e-test-hooks"));
+        assert!(feature_names.contains(&"connect-e2e-short-credentials"));
+        assert!(feature_names.contains(&"offline-enrollment-e2e-root"));
+        assert!(feature_names.contains(&"rio-v2"));
+        assert!(feature_names.contains(&"pyroscope"));
+        assert!(feature_names.contains(&"dial9"));
+        assert!(feature_names.contains(&"hotpath"));
+        assert!(feature_names.contains(&"hotpath-alloc"));
+        assert!(feature_names.contains(&"hotpath-cpu"));
+        assert!(!feature_names.contains(&"manual-test-runners"));
         assert!(!feature_names.contains(&"metrics"));
         assert!(!feature_names.contains(&"direct-io"));
     }
@@ -1016,10 +1130,16 @@ mod tests {
 
         assert!(output.contains("| metrics-gpu |"));
         assert!(output.contains("| io-scheduler-debug |"));
-        assert!(output.contains("| manual-test-runners |"));
+        assert!(output.contains("| tracing-chunk-debug |"));
+        assert!(output.contains("| sftp |"));
+        assert!(output.contains("| rio-v2 |"));
+        assert!(output.contains("| dial9 |"));
+        assert!(output.contains("| hotpath-cpu |"));
+        assert!(output.contains("| default | enabled by default |"));
+        assert!(!output.contains("| manual-test-runners |"));
         assert!(output.contains("| ftps | enabled by default |"));
         assert!(output.contains("| webdav | enabled by default |"));
-        assert!(output.contains("| full | metrics-gpu + ftps + swift + webdav |"));
+        assert!(output.contains("| full | metrics-gpu + ftps + swift + webdav + sftp + pyroscope |"));
         assert!(!output.contains("| direct-io |"));
     }
 
@@ -1035,5 +1155,6 @@ mod tests {
         assert!(output.contains("| WebDAV > Enabled (`RUSTFS_WEBDAV_ENABLE`) |"));
         assert!(output.contains("| WebDAV > Address (`RUSTFS_WEBDAV_ADDRESS`) |"));
         assert!(output.contains("| WebDAV > Max Body Size (`RUSTFS_WEBDAV_MAX_BODY_SIZE`) |"));
+        assert!(output.contains("| Veeam SOSAPI > Enabled (`RUSTFS_VEEAM_SOSAPI_ENABLE`) |"));
     }
 }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{AppConfig, GlobalError, OtelConfig, OtelGuard, telemetry::init_telemetry};
+use crate::{GlobalError, OtelConfig, OtelGuard, telemetry::init_telemetry};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 use tracing::{info, warn};
@@ -22,7 +22,7 @@ const LOG_SUBSYSTEM_GLOBAL: &str = "global";
 const EVENT_OBS_GLOBAL_STATE: &str = "obs_global_state";
 
 /// Global guard for OpenTelemetry tracing
-static GLOBAL_GUARD: OnceCell<Arc<Mutex<OtelGuard>>> = OnceCell::const_new();
+static GLOBAL_GUARD: OnceCell<Arc<Mutex<Option<OtelGuard>>>> = OnceCell::const_new();
 
 /// Flag indicating if observability metric is enabled
 pub(crate) static OBSERVABILITY_METRIC_ENABLED: OnceCell<bool> = OnceCell::const_new();
@@ -68,10 +68,12 @@ pub(crate) fn set_observability_metric_enabled(enabled: bool) {
 /// Initialize the observability module
 ///
 /// # Parameters
-/// - `config`: Configuration information
+/// - `endpoint`: Optional root OTLP endpoint; falls back to `RUSTFS_OBS_ENDPOINT`.
+/// - `version`: Optional application build version used as the default OTel
+///   `service.version`; `RUSTFS_OBS_SERVICE_VERSION` takes precedence.
 ///
 /// # Returns
-/// A tuple containing the logger and the telemetry guard
+/// An [`OtelGuard`] that must remain alive for the lifetime of the application.
 ///
 /// # Example
 /// ```no_run
@@ -79,16 +81,15 @@ pub(crate) fn set_observability_metric_enabled(enabled: bool) {
 ///
 /// # #[tokio::main]
 /// # async fn main() {
-/// #    match init_obs(None).await {
+/// #    match init_obs(None, None).await {
 /// #         Ok(guard) => {}
 /// #         Err(e) => { eprintln!("Failed to initialize observability: {}", e); }
 /// #     }
 /// # }
 /// ```
-pub async fn init_obs(endpoint: Option<String>) -> Result<OtelGuard, GlobalError> {
-    // Load the configuration file
-    let config = AppConfig::new_with_endpoint(endpoint);
-    init_obs_with_config(&config.observability).await
+pub async fn init_obs(endpoint: Option<String>, version: Option<String>) -> Result<OtelGuard, GlobalError> {
+    let config = OtelConfig::extract_otel_config_from_env_with_version(endpoint, version);
+    init_obs_with_config(&config).await
 }
 
 /// Initialize the observability module with an explicit [`OtelConfig`].
@@ -142,7 +143,7 @@ pub async fn init_obs_with_config(config: &OtelConfig) -> Result<OtelGuard, Glob
 /// # use rustfs_obs::{ init_obs, set_global_guard};
 ///
 /// # async fn init() -> Result<(), Box<dyn std::error::Error>> {
-/// #    let guard = match init_obs(None).await{
+/// #    let guard = match init_obs(None, None).await{
 /// #         Ok(g) => g,
 /// #         Err(e) => { return Err(Box::new(e)); }
 /// #    };
@@ -158,13 +159,15 @@ pub fn set_global_guard(guard: OtelGuard) -> Result<(), GlobalError> {
         state = "guard_initializing",
         "obs global state changed"
     );
-    GLOBAL_GUARD.set(Arc::new(Mutex::new(guard))).map_err(GlobalError::SetError)
+    GLOBAL_GUARD
+        .set(Arc::new(Mutex::new(Some(guard))))
+        .map_err(GlobalError::SetError)
 }
 
 /// Get the global guard for OtelGuard
 ///
 /// # Returns
-/// * `Ok(Arc<Mutex<OtelGuard>>)` if guard exists
+/// * `Ok(Arc<Mutex<Option<OtelGuard>>>>)` if guard exists
 /// * `Err(GuardError)` if guard not initialized
 ///
 /// # Example
@@ -173,13 +176,26 @@ pub fn set_global_guard(guard: OtelGuard) -> Result<(), GlobalError> {
 ///
 /// # async fn trace_operation() -> Result<(), Box<dyn std::error::Error>> {
 /// #    let guard = get_global_guard()?;
-/// #    let _lock = guard.lock().unwrap();
+/// #    let _lock = guard.lock().expect("operation should succeed");
 /// #    // Perform traced operation
 /// #    Ok(())
 /// # }
 /// ```
-pub fn get_global_guard() -> Result<Arc<Mutex<OtelGuard>>, GlobalError> {
+pub fn get_global_guard() -> Result<Arc<Mutex<Option<OtelGuard>>>, GlobalError> {
     GLOBAL_GUARD.get().cloned().ok_or(GlobalError::NotInitialized)
+}
+
+/// Explicitly drop the global guard so telemetry providers can flush before exit.
+pub fn shutdown_global_guard() -> Result<(), GlobalError> {
+    let guard_handle = get_global_guard()?;
+    let guard = {
+        let mut slot = guard_handle
+            .lock()
+            .map_err(|_| GlobalError::GuardPoisoned("global observability guard"))?;
+        slot.take()
+    };
+    drop(guard);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -241,6 +257,31 @@ mod tests {
         assert!(GRAFANA_DASHBOARD.contains("rustfs_log_cleaner_runs_total"));
         assert!(GRAFANA_DASHBOARD.contains("rustfs_log_cleaner_rotation_failures_total"));
         assert!(GRAFANA_DASHBOARD.contains("rustfs_log_cleaner_active_file_size_bytes"));
+    }
+
+    #[test]
+    fn test_grafana_dashboard_scopes_and_deduplicates_cluster_bucket_usage() {
+        let dashboard: serde_json::Value = serde_json::from_str(GRAFANA_DASHBOARD).expect("dashboard must be valid JSON");
+        for (title, metric) in [
+            ("Bucket Objects", "rustfs_cluster_usage_buckets_objects_count"),
+            ("Bucket Size", "rustfs_cluster_usage_buckets_total_bytes"),
+        ] {
+            let panel = dashboard["panels"]
+                .as_array()
+                .expect("dashboard panels")
+                .iter()
+                .find(|panel| panel["title"] == title)
+                .expect("bucket usage panel");
+            assert_eq!(
+                panel["targets"][0]["expr"],
+                format!(
+                    "max by (rustfs_cluster_id, job, bucket) ({metric}{{rustfs_cluster_id=\"$storage_cluster\", job=~\"$job\", bucket=~\"$bucket\"}})"
+                ),
+                "{title} must select one cluster and deduplicate its reporting nodes"
+            );
+        }
+        assert!(!GRAFANA_DASHBOARD.contains("sum by (bucket) (rustfs_bucket_api_objects_total"));
+        assert!(!GRAFANA_DASHBOARD.contains("sum by (bucket) (rustfs_bucket_api_usage_bytes"));
     }
 
     #[test]

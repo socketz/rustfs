@@ -27,12 +27,18 @@ categories = ["web-programming", "development-tools"]
 [lib]
 doctest = false
 
+[features]
+default = []
+hotpath = []
+hotpath-alloc = ["hotpath"]
+hotpath-cpu = ["hotpath"]
+
 [dependencies]
-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 
 [lints]
 workspace = true

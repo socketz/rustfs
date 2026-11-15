@@ -23,21 +23,26 @@ use crate::global::{
     METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES, METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS,
     METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL, METRIC_LOG_CLEANER_ROTATION_TOTAL,
 };
+use chrono::{Local, TimeZone as _};
 use jiff::Zoned;
 use metrics::{counter, gauge, histogram};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Rotation {
     Minutely,
     Hourly,
     Daily,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "constructed only by this file's rolling-appender tests; the lib target cannot see them (backlog#1823)"
+    )]
     Never,
 }
 
@@ -45,6 +50,7 @@ pub enum Rotation {
 /// may otherwise collide when multiple rotations occur within the same
 /// timestamp tick.
 static ROLL_UNIQUIFIER: AtomicU64 = AtomicU64::new(0);
+const ROTATION_RETRY_COOLDOWN: Duration = Duration::from_secs(5);
 
 impl Rotation {
     fn check_should_roll(&self, last: i64, now: i64) -> bool {
@@ -52,10 +58,13 @@ impl Rotation {
             Rotation::Minutely => now / 60 != last / 60,
             Rotation::Hourly => now / 3600 != last / 3600,
             Rotation::Daily => {
-                // Align daily rotation with the local day boundary rather than UTC midnight.
-                // We shift both timestamps by the current local offset before bucketing into days.
-                let offset_secs = Zoned::now().offset().seconds() as i64;
-                (now + offset_secs) / 86400 != (last + offset_secs) / 86400
+                let last_day = Local.timestamp_opt(last, 0).single().map(|ts| ts.date_naive());
+                let now_day = Local.timestamp_opt(now, 0).single().map(|ts| ts.date_naive());
+
+                match (last_day, now_day) {
+                    (Some(last_day), Some(now_day)) => last_day != now_day,
+                    _ => now / 86400 != last / 86400,
+                }
             }
             Rotation::Never => false,
         }
@@ -73,6 +82,10 @@ pub struct RollingAppender {
     size: u64,
     // Store as seconds since Unix epoch
     last_roll_ts: i64,
+    rotation_retry_cooldown_until: Option<Instant>,
+    /// Woken after every successful roll so the cleaner can enforce the
+    /// directory budget on the file that was just rolled.
+    roll_signal: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl RollingAppender {
@@ -119,6 +132,8 @@ impl RollingAppender {
             file: None,
             size: 0,
             last_roll_ts: Zoned::now().timestamp().as_second(),
+            rotation_retry_cooldown_until: None,
+            roll_signal: None,
         };
         // Eagerly open the file to validate the path and capture accurate
         // initial size / last-roll timestamp.
@@ -126,8 +141,26 @@ impl RollingAppender {
         Ok(appender)
     }
 
-    fn active_file_path(&self) -> PathBuf {
+    /// Notify `signal` after every successful roll.
+    pub(crate) fn with_roll_signal(mut self, signal: Arc<tokio::sync::Notify>) -> Self {
+        self.roll_signal = Some(signal);
+        self
+    }
+
+    pub(crate) fn active_file_path(&self) -> PathBuf {
         self.dir.join(&self.filename)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn active_file_identity(&self) -> io::Result<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = self
+            .file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("rolling log file is not open"))?
+            .metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
     }
 
     fn open_file(&mut self) -> io::Result<()> {
@@ -177,6 +210,13 @@ impl RollingAppender {
     }
 
     fn should_roll(&self, write_len: u64) -> bool {
+        if self
+            .rotation_retry_cooldown_until
+            .is_some_and(|deadline| deadline > Instant::now())
+        {
+            return false;
+        }
+
         // 1. Size-based check (Cheap, check first)
         // If max_size is set (non-zero) and writing would exceed it, roll immediately.
         if self.max_size_bytes > 0 && (self.size + write_len) > self.max_size_bytes {
@@ -256,9 +296,13 @@ impl RollingAppender {
                     // This overrides whatever open_file() derived from mtime, ensuring
                     // we stick to the logical rotation time.
                     self.last_roll_ts = now.timestamp().as_second();
+                    self.rotation_retry_cooldown_until = None;
                     counter!(METRIC_LOG_CLEANER_ROTATION_TOTAL).increment(1);
                     histogram!(METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS).record(rotate_started.elapsed().as_secs_f64());
                     gauge!(METRIC_LOG_CLEANER_ACTIVE_FILE_SIZE_BYTES).set(self.size as f64);
+                    if let Some(signal) = &self.roll_signal {
+                        signal.notify_one();
+                    }
                     return Ok(());
                 }
                 Err(e) => {
@@ -290,6 +334,7 @@ impl RollingAppender {
             "RollingAppender: Failed to rotate log file after {} retries. Error: {:?}",
             MAX_RETRIES, last_error
         );
+        self.rotation_retry_cooldown_until = Some(Instant::now() + ROTATION_RETRY_COOLDOWN);
         counter!(METRIC_LOG_CLEANER_ROTATION_FAILURES_TOTAL).increment(1);
         histogram!(METRIC_LOG_CLEANER_ROTATION_DURATION_SECONDS).record(rotate_started.elapsed().as_secs_f64());
 
@@ -421,6 +466,80 @@ mod tests {
 
     // ── Size-based rotation ────────────────────────────────────────────────────
 
+    /// A storm with the shipped roll behavior: the appender rolls by size and
+    /// wakes the cleaner, and the directory stays within the byte budget plus
+    /// the active file although every rolled file is younger than the age gate.
+    #[test]
+    fn log_directory_stays_bounded_under_a_storm() -> io::Result<()> {
+        use crate::cleaner::LogCleaner;
+
+        const ROLL_SIZE: u64 = 4 * 1024;
+        const BUDGET: u64 = 16 * 1024;
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let mut appender =
+            RollingAppender::new(&dir, "rustfs.log".to_string(), Rotation::Never, ROLL_SIZE, FileMatchMode::Suffix)?
+                .with_roll_signal(signal.clone());
+        let cleaner = LogCleaner::builder(dir.clone(), "rustfs.log".to_string(), "rustfs.log".to_string())
+            .match_mode(FileMatchMode::Suffix)
+            .keep_files(30)
+            .max_total_size_bytes(BUDGET)
+            .compress_old_files(false)
+            .min_file_age_seconds(3600)
+            .build();
+        let directory_bytes = |dir: &Path| -> io::Result<u64> {
+            let mut total = 0;
+            for entry in fs::read_dir(dir)? {
+                total += entry?.metadata()?.len();
+            }
+            Ok(total)
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build()?;
+
+        let line = [b'x'; 512];
+        let mut passes = 0;
+        let mut peak = 0;
+        // 512 KiB of log lines, 32 times the budget.
+        for _ in 0..1024 {
+            appender.write_all(&line)?;
+            // The cleanup loop runs one pass per reported roll.
+            let rolled = runtime.block_on(async { tokio::time::timeout(Duration::ZERO, signal.notified()).await.is_ok() });
+            if rolled {
+                cleaner.cleanup()?;
+                passes += 1;
+            }
+            peak = peak.max(directory_bytes(&dir)?);
+        }
+        appender.flush()?;
+
+        assert!(passes > 100, "size rolls woke the cleaner {passes} times");
+        // One freshly rolled file may sit above the budget until its pass runs.
+        assert!(
+            peak <= BUDGET + 2 * ROLL_SIZE,
+            "peak directory size {peak} exceeded the budget {BUDGET} plus the active and one rolled file"
+        );
+        assert!(directory_bytes(&dir)? <= BUDGET + ROLL_SIZE);
+        Ok(())
+    }
+
+    #[test]
+    fn every_successful_roll_wakes_the_roll_signal() {
+        let tmp = TempDir::new().unwrap();
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let mut appender = RollingAppender::new(tmp.path(), "app.log".to_string(), Rotation::Never, 5, FileMatchMode::Suffix)
+            .unwrap()
+            .with_roll_signal(signal.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let woken = || runtime.block_on(async { tokio::time::timeout(Duration::ZERO, signal.notified()).await.is_ok() });
+
+        appender.write_all(b"12345").expect("write should succeed");
+        assert!(!woken(), "no roll yet");
+        appender.write_all(b"abcde").expect("write after rotation should succeed");
+        assert!(woken(), "the size roll is reported");
+        assert!(!woken(), "one roll is one wake-up");
+    }
+
     #[test]
     fn test_size_rotation_creates_archive() {
         let tmp = TempDir::new().unwrap();
@@ -540,5 +659,65 @@ mod tests {
             b"existing content".len() as u64,
             "size should reflect existing file content"
         );
+    }
+
+    /// Unix timestamp of a wall-clock time in the process-local time zone,
+    /// which is the zone `Rotation::Daily` uses to decide the calendar day.
+    ///
+    /// The fixtures below use mid-January dates, which sit on no DST or
+    /// offset transition in any zone, so every wall-clock time exists exactly once.
+    fn local_ts(year: i32, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> i64 {
+        Local
+            .with_ymd_and_hms(year, month, day, hour, min, sec)
+            .single()
+            .expect("fixture local time must exist exactly once")
+            .timestamp()
+    }
+
+    #[test]
+    fn test_daily_rotation_uses_calendar_day_boundaries() {
+        // Fixed timestamps so the result never depends on when the test runs
+        // (a `now()`-based version failed in the first minute after midnight).
+        let noon = local_ts(2026, 1, 15, 12, 0, 0);
+
+        // Same calendar day: no rotation.
+        assert!(!Rotation::Daily.check_should_roll(noon - 60, noon), "60s earlier on the same day");
+        assert!(
+            !Rotation::Daily.check_should_roll(local_ts(2026, 1, 15, 0, 0, 0), local_ts(2026, 1, 15, 23, 59, 59)),
+            "first and last second of the same day"
+        );
+
+        // Previous calendar day: rotate.
+        assert!(
+            Rotation::Daily.check_should_roll(local_ts(2026, 1, 14, 12, 0, 0), noon),
+            "same time of day, one day earlier"
+        );
+
+        // Crossing midnight by a single second: rotate.
+        let before_midnight = local_ts(2026, 1, 14, 23, 59, 59);
+        let midnight = local_ts(2026, 1, 15, 0, 0, 0);
+        assert_eq!(midnight - before_midnight, 1, "fixture must be exactly one second apart");
+        assert!(
+            Rotation::Daily.check_should_roll(before_midnight, midnight),
+            "23:59:59 -> 00:00:00 crosses the day boundary"
+        );
+
+        // One second on either side of the boundary stays within a day.
+        assert!(!Rotation::Daily.check_should_roll(midnight, midnight + 1), "00:00:00 -> 00:00:01");
+        assert!(
+            !Rotation::Daily.check_should_roll(before_midnight - 1, before_midnight),
+            "23:59:58 -> 23:59:59"
+        );
+    }
+
+    #[test]
+    fn test_rotation_cooldown_skips_immediate_retry() {
+        let tmp = TempDir::new().unwrap();
+        let mut appender =
+            RollingAppender::new(tmp.path(), "app.log".to_string(), Rotation::Never, 3, FileMatchMode::Suffix).unwrap();
+        appender.size = 4;
+        appender.rotation_retry_cooldown_until = Some(Instant::now() + Duration::from_secs(1));
+
+        assert!(!appender.should_roll(1));
     }
 }

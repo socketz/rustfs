@@ -38,7 +38,7 @@ pub mod types;
 // Re-export main types for easy access
 pub use crate::{
     // Client interfaces
-    client::{LockClient, local::LocalClient},
+    client::{BatchAcquireOutcome, LockCleanupOutcome, LockClient, local::LocalClient},
     distributed_lock::DistributedLockGuard,
     // Error types
     error::{LockError, Result},
@@ -51,8 +51,8 @@ pub use crate::{
     namespace::{NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper},
     // Core types
     types::{
-        HealthInfo, HealthStatus, LockId, LockInfo, LockMetadata, LockPriority, LockRequest, LockResponse, LockStats, LockStatus,
-        LockType,
+        HealthInfo, HealthStatus, LockId, LockInfo, LockLeaseInfo, LockMetadata, LockPriority, LockRequest, LockResponse,
+        LockStats, LockStatus, LockType,
     },
 };
 
@@ -271,6 +271,11 @@ static GLOBAL_LOCK_MANAGER: OnceLock<Arc<GlobalLockManager>> = OnceLock::new();
 /// the RUSTFS_LOCK_ENABLED environment variable.
 pub fn get_global_lock_manager() -> Arc<GlobalLockManager> {
     GLOBAL_LOCK_MANAGER.get_or_init(|| Arc::new(GlobalLockManager::new())).clone()
+}
+
+/// Return the global lock manager only when it is already initialized.
+pub fn get_initialized_global_lock_manager() -> Option<Arc<GlobalLockManager>> {
+    GLOBAL_LOCK_MANAGER.get().cloned()
 }
 
 /// Get the global shared FastLock manager instance (legacy)

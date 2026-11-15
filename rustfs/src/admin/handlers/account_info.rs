@@ -12,28 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::authenticate_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_object_store_handle;
+use crate::admin::auth::authenticate_envelope_credentials;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
+use crate::admin::runtime_sources::{current_action_credentials, object_store_from_envelope};
+use crate::admin::service::caller_identity::oidc_profile_fields;
+use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
+use crate::admin::storage_api::contract::admin::StorageAdminApi;
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
+use crate::admin::storage_api::data_usage::{apply_bucket_usage_memory_overlay, load_admin_data_usage_from_backend_cached};
+use crate::admin::storage_api::metadata_sys;
 use crate::auth::get_condition_values;
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_credentials::get_global_action_cred;
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::store_api::BucketOperations;
+use rustfs_data_usage::{BucketUsageInfo, DataUsageInfo};
+use rustfs_gateway_types::dto::Status;
+use rustfs_gateway_types::persistence::PersistedObjectLockConfiguration as ObjectLockConfiguration;
+use rustfs_gateway_types::persistence::PersistedReplicationConfiguration;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
-use rustfs_storage_api::{BucketOptions, StorageAdminApi};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[allow(dead_code)]
+const DATA_USAGE_LOAD_ERROR_MESSAGE: &str = "failed to load data usage";
+
+fn map_data_usage_result<E>(result: Result<DataUsageInfo, E>) -> S3Result<DataUsageInfo> {
+    result.map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, DATA_USAGE_LOAD_ERROR_MESSAGE))
+}
+
 #[derive(Debug, Serialize, Default)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct AccountInfo {
@@ -43,6 +55,16 @@ pub struct AccountInfo {
 }
 
 pub struct AccountInfoHandler {}
+
+#[derive(Debug, Serialize)]
+struct AccountInfoResponse {
+    #[serde(flatten)]
+    account: rustfs_madmin::AccountInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+}
 
 pub fn register_account_info_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -58,20 +80,68 @@ fn resolve_bucket_access(can_list_bucket: bool, can_get_bucket_location: bool, c
     (can_list_bucket || can_get_bucket_location, can_put_object)
 }
 
+fn apply_usage_to_bucket_access_info(bucket_info: &mut rustfs_madmin::BucketAccessInfo, usage: Option<&BucketUsageInfo>) {
+    // No snapshot coverage for this bucket: leave the stats absent so clients
+    // render "unknown" instead of confirmed zeros (rustfs/backlog#1306).
+    let Some(usage) = usage else {
+        return;
+    };
+
+    bucket_info.size = Some(usage.size);
+    bucket_info.objects = Some(usage.objects_count);
+    bucket_info.object_sizes_histogram = Some(usage.object_size_histogram.clone());
+    bucket_info.object_versions_histogram = Some(usage.object_versions_histogram.clone());
+}
+
+fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {
+    config
+        .object_lock_enabled
+        .as_ref()
+        .is_some_and(|enabled| enabled == "Enabled")
+}
+
+fn replication_config_enabled(config: &PersistedReplicationConfiguration) -> bool {
+    config
+        .rules
+        .iter()
+        .any(|rule| rule.status.as_str() == Status::ENABLED.as_str())
+}
+
+async fn bucket_locking_enabled(bucket: &str) -> bool {
+    metadata_sys::get_object_lock_config(bucket)
+        .await
+        .ok()
+        .is_some_and(|(config, _)| object_lock_config_enabled(&config))
+}
+
+async fn bucket_replication_enabled(bucket: &str) -> bool {
+    metadata_sys::get_replication_config(bucket)
+        .await
+        .ok()
+        .is_some_and(|(config, _)| replication_config_enabled(&config))
+}
+
+async fn bucket_quota_limit(bucket: &str) -> Option<u64> {
+    metadata_sys::get_quota_config(bucket)
+        .await
+        .ok()
+        .and_then(|(config, _)| config.get_quota_limit())
+}
+
 #[async_trait::async_trait]
 impl Operation for AccountInfoHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(store) = resolve_object_store_handle() else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(store) = object_store_from_envelope(req.envelope()) else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let (cred, owner) = authenticate_request(&req.headers, &req.uri, &input_cred).await?;
+        let (cred, owner) = authenticate_envelope_credentials(input_cred).await?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -79,8 +149,8 @@ impl Operation for AccountInfoHandler {
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
         let cred_clone = cred.clone();
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-        let conditions = get_condition_values(&req.headers, &cred_clone, None, None, remote_addr);
+        let remote_addr = req.policy_source_addr();
+        let conditions = get_condition_values(req.headers(), &cred_clone, None, None, remote_addr);
         let cred_clone = Arc::new(cred_clone);
         let conditions = Arc::new(conditions);
 
@@ -146,10 +216,10 @@ impl Operation for AccountInfoHandler {
             cred.access_key.clone()
         };
 
-        let Some(admin_cred) = get_global_action_cred() else {
+        let Some(admin_cred) = current_action_credentials() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
-                "get_global_action_cred failed".to_string(),
+                "action credentials are not initialized".to_string(),
             ));
         };
 
@@ -186,6 +256,7 @@ impl Operation for AccountInfoHandler {
         let policy_str = serde_json::to_string(&effective_policy)
             .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse policy failed"))?;
 
+        let (username, email) = oidc_profile_fields(&cred);
         let mut account_info = rustfs_madmin::AccountInfo {
             account_name,
             server: StorageAdminApi::backend_info(store.as_ref()).await,
@@ -202,40 +273,75 @@ impl Operation for AccountInfoHandler {
             .await
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
+        // Serve the last persisted scanner snapshot plus an authoritative
+        // single-process overlay. Distributed nodes must not promote their
+        // process-local absolute counters to cluster-wide bucket totals.
+        // This path never triggers a live full-version listing
+        // (rustfs/backlog#1306); freshness is owned by the scanner.
+        let mut data_usage_info = map_data_usage_result(load_admin_data_usage_from_backend_cached(store.clone()).await)?;
+        apply_bucket_usage_memory_overlay(&mut data_usage_info).await;
+        account_info.usage_snapshot_converged = data_usage_info.usage_snapshot_converged;
+
         for bucket in buckets.iter() {
             let (rd, wr) = is_allow(bucket.name.clone()).await;
             if rd || wr {
-                // TODO: BucketQuotaSys
-                // TODO: other attributes
-                account_info.buckets.push(rustfs_madmin::BucketAccessInfo {
+                let mut bucket_info = rustfs_madmin::BucketAccessInfo {
                     name: bucket.name.clone(),
                     details: Some(rustfs_madmin::BucketDetails {
                         versioning: BucketVersioningSys::enabled(bucket.name.as_str()).await,
                         versioning_suspended: BucketVersioningSys::suspended(bucket.name.as_str()).await,
-                        ..Default::default()
+                        locking: bucket_locking_enabled(bucket.name.as_str()).await,
+                        replication: bucket_replication_enabled(bucket.name.as_str()).await,
+                        quota: bucket_quota_limit(bucket.name.as_str()).await,
                     }),
                     created: bucket.created,
                     access: rustfs_madmin::AccountAccess { read: rd, write: wr },
                     ..Default::default()
-                });
+                };
+                apply_usage_to_bucket_access_info(&mut bucket_info, data_usage_info.buckets_usage.get(&bucket.name));
+                account_info.buckets.push(bucket_info);
             }
         }
 
-        let data = serde_json::to_vec(&account_info)
-            .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
+        let data = serde_json::to_vec(&AccountInfoResponse {
+            account: account_info,
+            username,
+            email,
+        })
+        .map_err(|_e| S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed"))?;
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustfs_gateway_types::persistence::{PersistedReplicationDestination, PersistedReplicationRule};
     use rustfs_madmin::BackendInfo;
     use rustfs_policy::policy::BucketPolicy;
+
+    #[test]
+    fn accountinfo_response_adds_optional_oidc_display_fields() {
+        let mut response = AccountInfoResponse {
+            account: rustfs_madmin::AccountInfo::default(),
+            username: Some("oidc-user".to_string()),
+            email: Some("oidc-user@example.test".to_string()),
+        };
+
+        let value = serde_json::to_value(&response).expect("serialize accountinfo response");
+        assert_eq!(value["username"], "oidc-user");
+        assert_eq!(value["email"], "oidc-user@example.test");
+
+        response.username = None;
+        response.email = None;
+        let legacy_shape = serde_json::to_value(&response).expect("serialize accountinfo response without OIDC fields");
+        assert!(!legacy_shape.as_object().unwrap().contains_key("username"));
+        assert!(!legacy_shape.as_object().unwrap().contains_key("email"));
+    }
 
     #[test]
     fn test_account_info_structure() {
@@ -267,5 +373,95 @@ mod tests {
         assert_eq!(resolve_bucket_access(true, false, false), (true, false));
         assert_eq!(resolve_bucket_access(false, true, false), (true, false));
         assert_eq!(resolve_bucket_access(false, false, true), (false, true));
+    }
+
+    #[test]
+    fn accountinfo_bucket_access_info_uses_data_usage_stats() {
+        let mut bucket_info = rustfs_madmin::BucketAccessInfo {
+            name: "agent".to_string(),
+            ..Default::default()
+        };
+        let usage = BucketUsageInfo {
+            size: 222 * 1024 * 1024,
+            objects_count: 109,
+            object_size_histogram: HashMap::from([("1MiB-10MiB".to_string(), 109)]),
+            object_versions_histogram: HashMap::from([("SINGLE_VERSION".to_string(), 109)]),
+            ..Default::default()
+        };
+
+        apply_usage_to_bucket_access_info(&mut bucket_info, Some(&usage));
+
+        assert_eq!(bucket_info.size, Some(usage.size));
+        assert_eq!(bucket_info.objects, Some(usage.objects_count));
+        assert_eq!(bucket_info.object_sizes_histogram.as_ref(), Some(&usage.object_size_histogram));
+        assert_eq!(bucket_info.object_versions_histogram.as_ref(), Some(&usage.object_versions_histogram));
+    }
+
+    /// Buckets without snapshot coverage keep their stats absent so the wire
+    /// omits the fields instead of reporting confirmed zeros
+    /// (rustfs/backlog#1306 contract decision, option A).
+    #[test]
+    fn accountinfo_bucket_access_info_leaves_stats_absent_without_usage() {
+        let mut bucket_info = rustfs_madmin::BucketAccessInfo {
+            name: "agent".to_string(),
+            ..Default::default()
+        };
+
+        apply_usage_to_bucket_access_info(&mut bucket_info, None);
+
+        assert_eq!(bucket_info.size, None);
+        assert_eq!(bucket_info.objects, None);
+        assert_eq!(bucket_info.object_sizes_histogram, None);
+        assert_eq!(bucket_info.object_versions_histogram, None);
+    }
+
+    #[test]
+    fn accountinfo_data_usage_error_message_is_generic() {
+        let err = map_data_usage_result::<&str>(Err("sensitive disk path")).expect_err("load failure must reach the response");
+
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert_eq!(err.message(), Some("failed to load data usage"));
+    }
+
+    #[test]
+    fn accountinfo_bucket_details_marks_object_lock_enabled() {
+        let enabled = ObjectLockConfiguration {
+            object_lock_enabled: Some("Enabled".to_owned()),
+            ..Default::default()
+        };
+        let disabled = ObjectLockConfiguration::default();
+
+        assert!(object_lock_config_enabled(&enabled));
+        assert!(!object_lock_config_enabled(&disabled));
+    }
+
+    #[test]
+    fn accountinfo_bucket_details_marks_replication_enabled_rules() {
+        let enabled = replication_config_with_status(Status::ENABLED.as_str());
+        let disabled = replication_config_with_status(Status::DISABLED.as_str());
+
+        assert!(replication_config_enabled(&enabled));
+        assert!(!replication_config_enabled(&disabled));
+    }
+
+    fn replication_config_with_status(status: &str) -> PersistedReplicationConfiguration {
+        PersistedReplicationConfiguration {
+            role: "arn:aws:iam::123456789012:role/replication".to_string(),
+            rules: vec![PersistedReplicationRule {
+                delete_marker_replication: None,
+                delete_replication: None,
+                destination: PersistedReplicationDestination {
+                    bucket: "arn:aws:s3:::target".to_string(),
+                    ..Default::default()
+                },
+                existing_object_replication: None,
+                filter: None,
+                id: None,
+                prefix: None,
+                priority: None,
+                source_selection_criteria: None,
+                status: status.to_owned(),
+            }],
+        }
     }
 }

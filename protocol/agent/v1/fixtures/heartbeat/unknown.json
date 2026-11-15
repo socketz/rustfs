@@ -1,0 +1,18 @@
+{
+  "protocolVersion": "v1",
+  "fixtureSet": "heartbeat",
+  "fixture": "unknown",
+  "description": "Unknown optional members and capabilities are accepted, discarded before hashing, and never stored or echoed.",
+  "requestAdditions": {
+    "telemetryProfile": "extended",
+    "authorization": "Bearer non-functional-example",
+    "capabilities": ["heartbeat", "inventory.environment@1", "inventory.environment@2", "future.capability"],
+    "coarseNodeSummary": {"rackNames": ["customer-rack"]}
+  },
+  "expected": {
+    "decision": "ACCEPT",
+    "storedCapabilities": ["heartbeat", "inventory.environment@1"],
+    "discarded": ["authorization", "future.capability", "inventory.environment@2", "telemetryProfile", "coarseNodeSummary.rackNames"],
+    "echoed": []
+  }
+}

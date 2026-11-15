@@ -1,0 +1,382 @@
+# Site Replication Operations
+
+**Use this when:** operating a site-replication deployment, diagnosing a peer
+outage or incomplete topology change, changing a site's address, pairing sites
+that already contain data, or planning an upgrade.
+
+**Source of truth:** `rustfs/src/admin/handlers/site_replication.rs`,
+`rustfs/src/site_replication/`, and the bucket-replication worker under
+`crates/ecstore/src/bucket/replication/`.
+
+Site replication combines two different convergence paths:
+
+- the control plane replicates buckets, bucket metadata, IAM, and topology;
+- ordinary bucket replication moves object versions and delete operations.
+
+An `enabled: true` response only says that a site has more than one configured
+peer. It does not prove that every peer is reachable or caught up. Always read
+`pendingOperation`, `retryStats`, `PeerErrors`, and `Metrics` as well.
+
+## Routine checks
+
+Run these commands from an admin workstation with one alias per site:
+
+```console
+mc admin replicate info site-a
+mc admin replicate status site-a
+```
+
+Check more than one site. A partition can leave each side with a different but
+locally valid view.
+
+`replicate info` is the compact control-plane view:
+
+| Field | Interpretation |
+|---|---|
+| `enabled` | More than one site is configured; this is not a health verdict. |
+| `sites` | The locally persisted topology. Compare deployment IDs and endpoints on every site. |
+| `retryStats.pending` | Collapsed peer deliveries waiting to be retried. |
+| `retryStats.failed` | Deliveries that crossed the escalation threshold and require attention. |
+| `retryStats.lastError` | A redacted summary of the most recent delivery failure. |
+| `pendingOperation` | A durable multi-step topology operation described below. Absence is the healthy steady state. |
+
+`replicate status` adds detailed convergence state:
+
+| Field | Interpretation |
+|---|---|
+| `Sites` / `PeerStates` | Configured peers and derived reachability/configuration state. |
+| `PeerErrors` | A peer could not be queried. Its detailed counters may be absent; do not read zeros as success. |
+| `BucketStats` | Per-bucket presence and versioning, replication, lifecycle, Object Lock, and metadata mismatches. |
+| `PolicyStats`, `UserStats`, `GroupStats` | IAM inventory mismatches. |
+| `RetryStats` | Durable control-plane retry backlog and escalation count. |
+| `Metrics.replMetrics` | Per-destination online state, downtime, replicated counts/bytes, and `failed` totals/windows. |
+| `Metrics.queued` / `Metrics.inProgress` | Object work waiting or active on the responding node. |
+| `Metrics.errors` | Node-level object-replication failures. When only queue statistics are available, RustFS synthesizes a node entry and preserves this counter rather than reporting zero. |
+| `Metrics.retries` | Redeliveries. Always zero today: a failed object is not retried by an event, it waits for the scanner pass described below. Read `errors` instead. |
+
+Healthy means: the same topology is visible on all sites, no pending operation,
+no peer error, no failed retry escalation, required bucket/IAM state is in sync,
+and queue/error counters are stable or falling. Counters are cumulative; alert on
+their rate and on a backlog that does not drain, not merely on a non-zero total.
+
+## Pending operations and recovery
+
+`pendingOperation` contains `operation`, an opaque `id`, `pendingPeers`, and
+`ackedPeers`. Do not edit the site-replication state object by hand. The marker
+is the crash-recovery journal and removing it can make a partially applied
+operation look complete.
+
+The heavyweight reconciler runs once at startup and every 600 seconds. The
+lightweight retry drain runs every 30 seconds. A restart is therefore a valid
+way to cause an immediate heavyweight pass after the underlying fault has been
+fixed, but it is not a substitute for fixing connectivity, credentials, TLS,
+or the remote endpoint.
+
+### `remove`
+
+The original topology and each peer acknowledgement are persisted before the
+operation finalizes. While peers remain in `pendingPeers`, restore access to
+them and wait for reconciliation. If a peer is permanently gone, a new remove
+request may remove all currently active unacknowledged peers; RustFS permits
+that request and then finalizes against the remaining topology. Removing the
+local site or all sites is also an explicit completion path.
+
+Do not re-add a site merely to hide this marker. First compare the topology on
+all reachable peers. If the same operation ID makes no progress for more than
+one heavyweight interval, collect `PeerErrors`, `RetryStats`, and the
+site-replication logs before retrying the remove.
+
+### `rotate-svc-acct`
+
+Service-account rotation keeps the candidate secrets and peer acknowledgements
+until every current remote peer accepts the rotation. Restore the failing peer
+and allow the reconciler to resume it. Do not manually delete either candidate
+credential during this window: doing so can remove the only credential that a
+not-yet-acknowledged peer accepts.
+
+After the marker clears, verify `replicate status` from every site, then retire
+any separately retained old credential material according to local policy.
+
+### `endpoint-refresh`
+
+An endpoint, CA, or TLS-verification edit first refreshes the replication
+target on every active peer and records acknowledgements. On startup and every
+heavyweight pass, RustFS probes peer capability, uses the endpoint-refresh API
+when supported (or the legacy peer-edit fallback), refreshes local bucket
+targets, and commits the edit only after every still-active peer acknowledges.
+
+If this marker is stuck:
+
+1. Confirm that the proposed endpoint and CA are correct and reachable from
+   every site, not only from the admin workstation.
+2. Restore the site-replication service account and TLS trust path.
+3. Wait for one 600-second pass or restart one healthy node to trigger the
+   startup pass.
+4. Re-run the identical edit only if the operation remains visible; a different
+   endpoint edit is rejected while the existing refresh is pending. The journal
+   pins the edit's payload, so a re-run without `--replicate-ilm-expiry` keeps
+   the value the first attempt recorded, and a re-run asking for a different
+   value is rejected. Finish or remove the pending refresh before changing it.
+
+A peer removed from the topology no longer blocks completion. A remove request
+is accepted when it removes every active unacknowledged peer.
+
+While this marker is present, control-plane retry replay to the other peers
+keeps running, but bucket wiring reconciliation waits: it rewrites the same
+targets the refresh is changing. Expect bucket-level drift on this site to
+persist until the refresh settles.
+
+## Outage recovery and convergence time
+
+Control-plane retry begins on the 30-second drain, while heavyweight snapshots,
+pending topology operations, and bucket wiring are revisited on the 600-second
+pass. Object MRF entries are persisted every 10 seconds by default and target
+health is probed every 5 seconds. The persisted MRF journal is replayed at
+startup and then once every 5 minutes across the cluster, so a delete-marker purge or an overflowed
+replication whose target was down converges within one replay interval after
+the target returns. These are scheduling bounds, not delivery
+SLAs: network timeouts and the amount of queued work add to them.
+
+Objects that must be rediscovered by the scanner have this conservative upper
+bound before discovery:
+
+```text
+RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES
+    × max(RUSTFS_SCANNER_CYCLE, actual duration of one scanner cycle)
+```
+
+The defaults re-descend a compacted directory every 16 cycles. A practical
+production starting point for a tighter recovery objective is
+`RUSTFS_DATA_USAGE_UPDATE_DIR_CYCLES=4`; `1` forces re-descent every cycle.
+Measure the additional disk and metadata load before lowering it further or
+tuning the scanner cadence. For an immediate operator-driven recovery, start a
+site resync with `rc admin replicate resync start` and monitor it with
+`rc admin replicate resync status` (see [Changing a site's address](#changing-a-sites-address)
+for the arguments; `mc admin replicate resync` does not work against RustFS).
+Transfer time after discovery remains proportional to backlog size, bandwidth,
+worker capacity, and target latency. Use queue depth and the rate of
+`Metrics.errors` rather than the formula alone to decide whether convergence is
+progressing.
+
+## Changing a site's address
+
+Every site stores each peer's endpoint, its own included. The local entry is
+recorded once, when the site joins, from the address the setup request used to
+reach it. Nothing re-derives it: after a server's IP or port changes, every site
+keeps the old endpoint, and the bucket targets the other sites derive from it
+keep pointing there. Replication toward the moved site stops; replication from
+it keeps working.
+
+Reads can hide the break. A `HEAD` or `GET` on the moved site may still succeed
+because it proxies to a peer that holds the object. Confirm with
+`replicate status` (`Metrics.replMetrics` online state and `failed` counters) or
+by listing a recently written key on the moved site.
+
+An endpoint edit must reach every other peer at its stored endpoint before it
+changes anything. The edited site itself is tried at its stored endpoint and
+then at the new one, so only that one site may be unreachable at its old
+address. When another peer cannot be reached, the edit fails with
+`probe endpoint target refresh on peer ... failed` and leaves every site's
+state unchanged.
+
+### Planned change: one site at a time
+
+The commands below use the RustFS CLI `rc` (`admin replicate edit` and
+`admin replicate resync` exist since rc 0.1.30). `site-a` is the moved site and
+`site-b` stands for each other site. An alias for the moved site must use its
+new address: `rc alias set` connects to the server before saving the alias.
+`--site` takes the exact deployment ID or a site name that is unique in
+`rc admin replicate info`, and every change runs only with `--yes`.
+
+Repeat for each site:
+
+1. Change the server address and start the site on the new address.
+2. Update its endpoint from any site, including the moved site itself:
+
+   ```console
+   rc alias set site-a https://<new-address>:9000 <ACCESS_KEY> <SECRET_KEY>
+   rc admin replicate info site-a
+   rc admin replicate edit site-a --site <ID-or-name> --endpoint https://<new-address>:9000 --yes
+   ```
+
+   In the Console, use **Edit Site** on that site's row in **Site Replication**.
+   Consoles that predate local-site editing only offer it on remote rows; use a
+   peer site's Console or `rc`.
+
+   `mc admin replicate update <alias> --deployment-id <ID> --endpoint <URL>`
+   also changes the endpoint, but it sends no site name, and RustFS then renames
+   the site after the new endpoint's host. Restore the name afterwards with
+   `rc admin replicate edit <alias> --site <ID> --name <name> --yes`.
+3. Check `rc --json admin replicate info` on every site: all of them list the
+   new endpoint and none reports `pendingOperation`.
+4. From every other site, resync toward the moved site to recover the writes
+   that missed it while its stored endpoint was stale:
+
+   ```console
+   rc admin replicate resync start site-b --site <ID-or-name-of-site-a> --yes
+   rc admin replicate resync status site-b --site <ID-or-name-of-site-a>
+   ```
+
+   The alias is the site that sends the objects; `rc` refuses a resync toward
+   the alias's own site. Consoles with local-site editing also offer
+   **Start Resync** in the dialog shown after **Edit Site** saves a new peer
+   endpoint.
+   `mc admin replicate resync` cannot be used: it reads the target's
+   deployment ID from `admin info`, which RustFS nests under `info`, so mc
+   reports that the alias is not part of the replication cluster.
+
+Only then move the next site.
+
+### Every site already moved
+
+When all sites changed address together, each edit needs the other peers'
+old addresses, so every edit fails. Make the old addresses reachable again for
+the duration of the repair, for example by keeping the old IP as a secondary
+address on each host or by forwarding the old address and port to the new one.
+Then, from any one site, update every site's endpoint (its own included) with
+`rc admin replicate edit`, confirm that all sites agree, remove the temporary
+addresses, and resync from each site toward every other site.
+
+Do not change a site-replication bucket target directly with bucket-level
+remote-target edits (`mc admin bucket remote edit` or the Console's bucket
+replication form). Those targets are derived from the site topology; RustFS
+rejects a connection change on them, and the endpoint must be updated through
+the site edit above.
+
+## Pairing sites that already contain data
+
+When more than one requested site is non-empty, preflight considers each bucket
+name held by more than one site:
+
+- versioning must be `Enabled` on every site holding the shared bucket;
+- Object Lock enablement must be identical on every holder.
+
+A bucket present on only one site is safe: post-add backfill creates it on the
+other peers. A shared unversioned bucket is rejected because merging can
+overwrite the only copy of an object. An Object Lock mismatch is rejected
+because lock enablement cannot be changed after bucket creation and convergence
+could otherwise strip a WORM guarantee.
+
+If preflight rejects the pair, keep the authoritative copy, delete the
+conflicting bucket (or its contents) from all other sites, run `replicate add`
+again, and then start `replicate resync` from the surviving site. Back up and
+validate the authoritative data before deleting anything.
+
+## IAM convergence and repair boundary
+
+Ordinary IAM changes are delivered to each peer. A successful bulk IAM import
+also schedules one collapsed full-IAM snapshot per remote peer. A failed IAM
+deletion is replayed before that snapshot so the snapshot cannot re-create a
+principal or grant that was already revoked.
+
+The safety state has two bounds:
+
+- deletion high-water marks are retained for 30 days;
+- deletion replay bodies are capped at 256 distinct entities per peer.
+
+Repeated deletion of the same entity replaces its saved body. When the per-peer
+cap is exceeded or the body cannot be serialized, the retry entry remains
+escalated rather than pretending the deletion is replayable. An item from an
+older sender without a source timestamp cannot install the 30-day high-water
+mark, so verify it explicitly after a prolonged split. A successful drain
+clears replay bodies; removing the peer prunes its bodies. For an escalated IAM
+retry, use the site-replication repair workflow for the affected peer and IAM
+family, then verify users, service accounts, groups, policies, and mappings on
+both sides. Repair is the operator's explicit accountability transfer and
+clears the saved deletion bodies only after the IAM repair succeeds.
+
+A group's status converges in one direction. An explicit disable is applied
+everywhere, including through a snapshot, but a membership change never
+carries an enable - it would otherwise re-enable a group frozen on the
+receiving site. If a group ended up disabled on one site only, re-enable it
+there explicitly with `mc admin group enable`; a snapshot or repair will not
+do it.
+
+The managed `site-replicator-0` service account carries an embedded policy
+that the server owns. It names `s3:ForceDeleteObject` explicitly because a
+replicated force-delete (Console folder delete, `x-rustfs-force-delete: true`)
+is authorized on the peer like any other force-delete and `s3:*` does not
+grant that action. The reconcile tick refreshes an account whose stored policy
+predates the grant; do not edit the policy by hand, the next repair rewrites
+it. A bucket-replication target configured with its own credentials needs the
+same `s3:ForceDeleteObject` grant on the target side, or its force-deletes are
+rejected and counted as replication failures.
+
+The same policy grants `kms:GenerateDataKey` on every key, because a site running with `RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY=true` authorizes each SSE-KMS replica write against the key it resolves to. An account whose stored policy predates this grant is refreshed the same way; until that happens SSE-KMS objects stay `FAILED` with `AccessDenied` from the peer and catch up afterwards. The account holds no `kms:Decrypt`, so a read proxied to a peer for an SSE-KMS object that has not arrived yet is refused under enforcement. See [Per-key KMS authorization](kms-per-key-authorization.md#sse-kms-data-path).
+
+Treat IAM divergence as a security incident: a user deleted on one site can
+remain usable on an unreachable peer until replay or repair completes. A peer
+whose IAM entry is escalated does not receive scheduled snapshots either -
+including the one a bulk import schedules - until the repair settles it.
+
+## Encrypted objects
+
+| Source form | Replication behavior | Fail-closed condition |
+|---|---|---|
+| SSE-S3 | The source decrypts the object; the request sends only `AES256` intent; the destination encrypts with its own KMS. Source envelope material never leaves the site. | The destination cannot satisfy the encryption request, or the source metadata is incomplete/unsupported. The replica is `FAILED`; plaintext is not silently stored. |
+| SSE-KMS | The source decrypts the object and the destination re-encrypts it; envelope material and the encryption context never leave the site. To a site-replication peer the request sends `aws:kms` and the name of the key the source object was sealed under, and the peer seals the replica under its own key of that name (see [KMS keys must carry the same name on every site](#kms-keys-must-carry-the-same-name-on-every-site)). To a bucket-replication remote target the request sends `aws:kms` intent only, and the destination selects its bucket default or site default key. | Either side cannot decrypt/encrypt, the peer holds no key of that name, or the metadata mixes incompatible encryption evidence. |
+| SSE-C | Stored ciphertext and the required SSE-C replication transport metadata pass through. RustFS verifies target evidence before accepting the replica. | The target does not echo the customer-algorithm evidence, required material/layout is absent, or the metadata is ambiguous. |
+
+Unknown MinIO/RustFS encryption markers are never forwarded as ordinary user
+metadata. They fail replication so an operator must migrate or repair the
+object with a supported format.
+
+### KMS keys must carry the same name on every site
+
+**Delivery requirement.** Site replication copies bucket default-encryption configuration verbatim, including `KMSMasterKeyID`, copies IAM policies verbatim, including key-scoped `kms:*` resources, and sends the key name of every SSE-KMS object with its replica write. It never copies KMS keys or KMS configuration. Each site therefore resolves a synchronized key name in its own KMS, so every key name that appears in a bucket default, in a policy, or in a write request must exist on every site before it is used. This is a deployment precondition; RustFS does not translate key names between sites.
+
+- Create each key in every site's KMS under the same name. The key material is independent per site: a replica is always re-encrypted under the receiving site's key of that name, as the table above describes. This holds whichever way the key was chosen on the source: a request header, the bucket default, or the site default. A caller scoped to one key name can therefore read the object on every site.
+- Give every site the same default key name (`RUSTFS_KMS_DEFAULT_KEY_ID`). An `aws:kms` object written without naming a key is sealed under the site default and replicated under that name, and a bucket default of `aws:kms` set without a `KMSMasterKeyID` is stored with the originating site's default key name and synchronized in that form, so differing default key names break the peer the same way a missing named key does.
+- A key-scoped policy statement needs one resource per key name, `arn:aws:kms:::key/<name>`; the synchronized policy then names the same key on every site.
+- When one site uses AWS KMS, AWS decides the names. AWS assigns key IDs and RustFS does not manage aliases, so the AWS site cannot adopt another site's key name. Create the key in AWS first, then create a key on every Vault site whose name is the AWS key ID (the bare UUID, not the ARN). Configure the AWS site's default key as the bare key ID too.
+
+What a missing key looks like on the site that lacks it, observed on a Vault and AWS KMS pair:
+
+| Request | Result |
+|---|---|
+| `PUT` with no SSE headers, or with `aws:kms` and no key ID, into a bucket whose synchronized default names the missing key | `400 KMS.NotFoundException`; no object is created. |
+| `PUT` with an explicit `AES256` header into the same bucket | `200`; the object is sealed under the local default key. |
+| SSE-KMS object written on the site that has the key, whether the key came from a request header, the bucket default, or the site default | The `PUT` returns `200`, but the source replication status stays `FAILED` and is retried every scanner cycle; the peer stores nothing. Creating the key on the peer lets the retry succeed. |
+| `GET` of that object on the peer | `200` with the correct bytes, proxied from the source site. This is not evidence of a replica: check `HEAD` for `x-amz-replication-status: REPLICA` (`GET` does not return that header). |
+
+The object-level failure is silent to the writer, so verify key names before enabling a bucket default rather than relying on client errors. Bucket replication through remote targets is not affected by this requirement: it synchronizes no bucket configuration and sends no key name, so the destination bucket's own default, or the destination's site default, decides the key.
+
+Replicas written before a site sent key names stay sealed under the key the peer selected at the time. They remain readable and are not rewritten.
+
+## Rolling upgrades and rollback
+
+Keep every node in one site on the same version whenever possible. Upgrade all
+nodes of one site consecutively, verify its startup reconciliation and status,
+then move to the next site. Do not intentionally leave a site mixed-version:
+admin requests can land on different nodes, and an older node may not resume a
+new pending-operation shape or expose its health fields.
+
+Current state additions are optional and defaulted, so older readers ignore
+them. The target-version ledger is stored as dual-prefixed internal object
+metadata and is also ignored by older readers; rollback does not corrupt the
+object format, but older code loses the assigned-version routing improvement.
+
+Before rolling back across the fix that retains the data directory of a version
+awaiting purge replication (rustfs/rustfs#7307), ensure no version purge is
+pending. Older code can free that retained version's data directory before the
+remote purge is acknowledged, leaving unreadable metadata and blocking bucket
+deletion. Drain or repair replication and take a metadata/data backup first.
+
+## Runtime knobs
+
+These values are read when the owning background task starts. Restart the
+server after changing them. The millisecond intervals have a 10 ms floor;
+invalid values fall back to the default with a warning.
+
+| Variable | Default | Effect |
+|---|---:|---|
+| `RUSTFS_REPL_HEALTH_CHECK_INTERVAL_MS` | `5000` | Remote-target health probe interval. Lowering it increases outbound probes. |
+| `RUSTFS_REPL_MRF_FLUSH_INTERVAL_MS` | `10000` | Maximum periodic interval between MRF persistence flushes; 1,000 new entries also trigger a flush. |
+| `RUSTFS_REPL_RESYNC_POLL_MAX_MS` | `60000` | Upper bound for randomized resync retry-poll sleep. |
+| `RUSTFS_REPL_RESYNC_MAX_JOBS` | `2` | Concurrent resync jobs; values are bounded to `1..=32`. |
+
+Transport-specific controls and target behavior are documented in
+[Replication outbound transport](replication-outbound-transport.md). Validate a
+new destination with [Replication target check](replication-check.md), and read
+[Replication object size limits](replication-object-size-limits.md) before
+moving large objects.

@@ -15,6 +15,7 @@
 use rustfs_s3_types::EventName;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(usize)]
 pub enum S3Operation {
     AbortMultipartUpload,
     CompleteMultipartUpload,
@@ -82,6 +83,9 @@ pub enum S3Operation {
     SelectObjectContent,
     UploadPart,
     UploadPartCopy,
+    GetBucketAccelerateConfiguration,
+    GetBucketRequestPayment,
+    GetBucketWebsite,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +129,83 @@ impl EventMapping {
 }
 
 impl S3Operation {
+    pub const ALL: [Self; 69] = [
+        Self::AbortMultipartUpload,
+        Self::CompleteMultipartUpload,
+        Self::CopyObject,
+        Self::CreateBucket,
+        Self::CreateMultipartUpload,
+        Self::DeleteBucket,
+        Self::DeleteBucketCors,
+        Self::DeleteBucketEncryption,
+        Self::DeleteBucketLifecycle,
+        Self::DeleteBucketPolicy,
+        Self::DeleteBucketReplication,
+        Self::DeleteBucketTagging,
+        Self::DeleteObject,
+        Self::DeleteObjectTagging,
+        Self::DeleteObjects,
+        Self::DeletePublicAccessBlock,
+        Self::GetBucketAcl,
+        Self::GetBucketCors,
+        Self::GetBucketEncryption,
+        Self::GetBucketLifecycleConfiguration,
+        Self::GetBucketLocation,
+        Self::GetBucketLogging,
+        Self::GetBucketNotificationConfiguration,
+        Self::GetBucketPolicy,
+        Self::GetBucketPolicyStatus,
+        Self::GetBucketReplication,
+        Self::GetBucketTagging,
+        Self::GetBucketVersioning,
+        Self::GetObject,
+        Self::GetObjectAcl,
+        Self::GetObjectAttributes,
+        Self::GetObjectLegalHold,
+        Self::GetObjectLockConfiguration,
+        Self::GetObjectRetention,
+        Self::GetObjectTagging,
+        Self::GetObjectTorrent,
+        Self::GetPublicAccessBlock,
+        Self::HeadBucket,
+        Self::HeadObject,
+        Self::ListBuckets,
+        Self::ListMultipartUploads,
+        Self::ListObjectVersions,
+        Self::ListObjects,
+        Self::ListObjectsV2,
+        Self::ListParts,
+        Self::PutBucketAcl,
+        Self::PutBucketCors,
+        Self::PutBucketEncryption,
+        Self::PutBucketLifecycleConfiguration,
+        Self::PutBucketLogging,
+        Self::PutBucketNotificationConfiguration,
+        Self::PutBucketPolicy,
+        Self::PutBucketReplication,
+        Self::PutBucketTagging,
+        Self::PutBucketVersioning,
+        Self::PutObject,
+        Self::PutObjectAcl,
+        Self::PutObjectLegalHold,
+        Self::PutObjectLockConfiguration,
+        Self::PutObjectRetention,
+        Self::PutObjectTagging,
+        Self::PutPublicAccessBlock,
+        Self::RestoreObject,
+        Self::SelectObjectContent,
+        Self::UploadPart,
+        Self::UploadPartCopy,
+        Self::GetBucketAccelerateConfiguration,
+        Self::GetBucketRequestPayment,
+        Self::GetBucketWebsite,
+    ];
+
+    #[inline]
+    pub const fn metric_index(self) -> usize {
+        self as usize
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AbortMultipartUpload => "s3:AbortMultipartUpload",
@@ -143,6 +224,7 @@ impl S3Operation {
             Self::DeleteObjectTagging => "s3:DeleteObjectTagging",
             Self::DeleteObjects => "s3:DeleteObjects",
             Self::DeletePublicAccessBlock => "s3:DeletePublicAccessBlock",
+            Self::GetBucketAccelerateConfiguration => "s3:GetBucketAccelerateConfiguration",
             Self::GetBucketAcl => "s3:GetBucketAcl",
             Self::GetBucketCors => "s3:GetBucketCors",
             Self::GetBucketEncryption => "s3:GetBucketEncryption",
@@ -153,8 +235,10 @@ impl S3Operation {
             Self::GetBucketPolicy => "s3:GetBucketPolicy",
             Self::GetBucketPolicyStatus => "s3:GetBucketPolicyStatus",
             Self::GetBucketReplication => "s3:GetBucketReplication",
+            Self::GetBucketRequestPayment => "s3:GetBucketRequestPayment",
             Self::GetBucketTagging => "s3:GetBucketTagging",
             Self::GetBucketVersioning => "s3:GetBucketVersioning",
+            Self::GetBucketWebsite => "s3:GetBucketWebsite",
             Self::GetObject => "s3:GetObject",
             Self::GetObjectAcl => "s3:GetObjectAcl",
             Self::GetObjectAttributes => "s3:GetObjectAttributes",
@@ -227,6 +311,7 @@ impl S3Operation {
             | Self::DeleteBucketReplication
             | Self::DeleteBucketTagging
             | Self::DeletePublicAccessBlock
+            | Self::GetBucketAccelerateConfiguration
             | Self::GetBucketAcl
             | Self::GetBucketCors
             | Self::GetBucketEncryption
@@ -237,8 +322,10 @@ impl S3Operation {
             | Self::GetBucketPolicy
             | Self::GetBucketPolicyStatus
             | Self::GetBucketReplication
+            | Self::GetBucketRequestPayment
             | Self::GetBucketTagging
             | Self::GetBucketVersioning
+            | Self::GetBucketWebsite
             | Self::GetObjectAcl
             | Self::GetObjectLockConfiguration
             | Self::GetObjectTagging
@@ -337,7 +424,7 @@ pub fn put_event_name_for_post_object(is_post_object: bool) -> EventName {
 /// that should omit size/etag metadata.
 #[inline]
 pub fn is_object_removed_event(event_name: EventName) -> bool {
-    matches!(event_name, EventName::ObjectRemovedDelete | EventName::ObjectRemovedDeleteMarkerCreated)
+    event_name.is_removed()
 }
 
 /// Returns the event mask that matches both PUT and POST object-created events.
@@ -416,9 +503,21 @@ mod tests {
 
     #[test]
     fn test_is_object_removed_event() {
+        // Every ObjectRemoved* variant must be recognized as a removal event.
         assert!(is_object_removed_event(EventName::ObjectRemovedDelete));
         assert!(is_object_removed_event(EventName::ObjectRemovedDeleteMarkerCreated));
+        assert!(is_object_removed_event(EventName::ObjectRemovedDeleteAllVersions));
+        assert!(is_object_removed_event(EventName::ObjectRemovedNoOP));
+        assert!(is_object_removed_event(EventName::ObjectRemovedAbortMultipartUpload));
+        assert!(is_object_removed_event(EventName::ObjectRemovedDeleteObjects));
+
+        // Non-removal events must be rejected.
         assert!(!is_object_removed_event(EventName::ObjectCreatedPut));
+        assert!(!is_object_removed_event(EventName::ObjectCreatedPost));
+        assert!(!is_object_removed_event(EventName::ObjectTaggingPut));
+        assert!(!is_object_removed_event(EventName::ObjectTaggingDelete));
+        assert!(!is_object_removed_event(EventName::ObjectAclPut));
+        assert!(!is_object_removed_event(EventName::ObjectAccessedGet));
     }
 
     #[test]
@@ -430,9 +529,22 @@ mod tests {
     }
 
     #[test]
+    fn metric_indexes_and_labels_identify_each_operation() {
+        let mut labels = std::collections::HashSet::new();
+        for (index, op) in S3Operation::ALL.into_iter().enumerate() {
+            assert_eq!(op.metric_index(), index, "metric index for {op:?}");
+            assert!(labels.insert(op.as_str()), "repeated metric label for {op:?}");
+        }
+        assert_eq!(S3Operation::UploadPartCopy.metric_index(), 65);
+    }
+
+    #[test]
     fn test_operations_without_event_mapping_remain_unmapped() {
         let unmapped = [
+            S3Operation::GetBucketAccelerateConfiguration,
             S3Operation::GetBucketAcl,
+            S3Operation::GetBucketRequestPayment,
+            S3Operation::GetBucketWebsite,
             S3Operation::ListObjectsV2,
             S3Operation::PutBucketNotificationConfiguration,
             S3Operation::UploadPart,

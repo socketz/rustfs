@@ -12,41 +12,65 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::StreamExt;
 use futures::future::BoxFuture;
 use hashbrown::HashSet as HbHashSet;
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE};
 use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{
     AMQP_QUEUE_DIR, ENABLE_KEY, EnableState, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS,
     MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC,
     MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
 };
-use rustfs_targets::SharedTarget;
+use rustfs_s3_types::{S3Result, s3_error};
 use rustfs_targets::{
-    BuiltinTargetAdminDescriptor, TargetAdminMetadata, TargetDomain, TargetError, TargetRequestValidator,
-    check_amqp_broker_available, check_kafka_broker_available, check_mqtt_broker_available_with_tls,
-    check_mysql_server_available, check_nats_server_available, check_postgres_server_available, check_pulsar_broker_available,
-    check_redis_server_available,
+    BuiltinTargetAdminDescriptor, SharedTarget, TargetAdminMetadata, TargetDomain, TargetError, TargetHealthReason,
+    TargetHealthState, TargetRequestValidator, check_amqp_broker_available, check_kafka_broker_available,
+    check_mqtt_broker_available_with_tls, check_mysql_server_available, check_nats_server_available,
+    check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
     config::{
         TargetPluginInstanceCompatDescriptor, TargetPluginInstanceRecord, build_amqp_args, build_kafka_args, build_mysql_args,
-        build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args, normalize_target_plugin_instances,
-        validate_redis_config,
+        build_nats_args, build_postgres_args, build_pulsar_args, build_redis_args, format_outbound_http_url_error,
+        try_normalize_target_plugin_instances, validate_redis_config,
     },
     manifest::builtin_target_manifest,
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
-use s3s::{Body, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use rustfs_utils::egress::OutboundPolicy;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::io::{Error, ErrorKind};
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, timeout};
 use url::Url;
 
 pub(crate) type EndpointKey = (String, String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeHealthStatus {
+    pub status: String,
+    pub state: String,
+    pub reason: String,
+}
+
+impl RuntimeHealthStatus {
+    fn disabled() -> Self {
+        Self {
+            status: TargetHealthState::Disabled.status().to_string(),
+            state: TargetHealthState::Disabled.as_str().to_string(),
+            reason: TargetHealthReason::Disabled.as_str().to_string(),
+        }
+    }
+
+    fn not_loaded() -> Self {
+        Self {
+            status: TargetHealthState::Offline.status().to_string(),
+            state: TargetHealthState::Offline.as_str().to_string(),
+            reason: TargetHealthReason::NotLoadedInRuntime.as_str().to_string(),
+        }
+    }
+}
+
 type AdminRequestValidatorFn =
     Arc<dyn for<'a> Fn(&'a HashMap<String, String>, &'a str) -> BoxFuture<'a, S3Result<()>> + Send + Sync>;
 type DomainScopedValidatorFn = for<'a> fn(&'a HashMap<String, String>, &'a str, TargetDomain) -> BoxFuture<'a, S3Result<()>>;
@@ -64,6 +88,8 @@ pub(crate) struct MergedTargetEndpoint {
     pub account_id: String,
     pub service: String,
     pub status: String,
+    pub health_state: String,
+    pub health_reason: String,
     pub source: TargetEndpointSource,
 }
 
@@ -76,7 +102,10 @@ pub(crate) struct TargetInstanceReadModel {
     pub account_id: String,
     pub service: String,
     pub status: String,
+    pub health_state: String,
+    pub health_reason: String,
     pub runtime_present: bool,
+    pub has_env_default: bool,
     pub source: TargetEndpointSource,
     pub enabled: bool,
     pub config: KVS,
@@ -94,6 +123,9 @@ pub(crate) struct AdminTargetSpec {
     pub subsystem: &'static str,
     pub service: &'static str,
     pub valid_keys: &'static [&'static str],
+    /// Config keys whose values are secrets, sourced from the plugin manifest
+    /// so redaction never depends on hand-maintained per-service tables.
+    pub secret_fields: &'static [&'static str],
     validator: AdminRequestValidatorFn,
 }
 
@@ -103,6 +135,7 @@ pub(crate) fn admin_target_spec_from_builtin(descriptor: &BuiltinTargetAdminDesc
         subsystem: admin.subsystem(),
         service: descriptor.manifest().target_type,
         valid_keys: descriptor.valid_fields(),
+        secret_fields: descriptor.manifest().secret_fields,
         validator: validator_from_metadata(admin),
     }
 }
@@ -219,11 +252,11 @@ pub(crate) fn endpoint_source(
     config: &Config,
     target_type: &str,
     target_name: &str,
-) -> TargetEndpointSource {
-    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config);
+) -> S3Result<TargetEndpointSource> {
+    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config)?;
     let service = target_service_name(specs, target_type).unwrap_or_default();
     let key = normalized_endpoint_key(target_name, service);
-    classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &key)
+    Ok(classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &key))
 }
 
 pub(crate) fn target_mutation_block_reason(
@@ -233,8 +266,8 @@ pub(crate) fn target_mutation_block_reason(
     target_type: &str,
     target_name: &str,
     target_label: &str,
-) -> Option<String> {
-    match endpoint_source(specs, route_prefix, config, target_type, target_name) {
+) -> S3Result<Option<String>> {
+    Ok(match endpoint_source(specs, route_prefix, config, target_type, target_name)? {
         TargetEndpointSource::Env => Some(format!(
             "{} '{}' is managed by environment variables and cannot be modified from the console",
             target_label, target_name
@@ -244,7 +277,7 @@ pub(crate) fn target_mutation_block_reason(
             target_label, target_name
         )),
         TargetEndpointSource::Config | TargetEndpointSource::Runtime => None,
-    }
+    })
 }
 
 pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, enabled: bool, action: &str) -> Option<String> {
@@ -255,56 +288,52 @@ pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, en
     })
 }
 
-pub(crate) fn build_json_response(
+/// Wrap an already-serialized JSON `body` as an admin response: `Content-Type:
+/// application/json`, plus the caller's `x-request-id` echoed back when the
+/// request carried one.
+pub(crate) fn owned_build_json_response(
     status: StatusCode,
-    body: Body,
+    body: rustfs_s3_types::Body,
     request_id: Option<&HeaderValue>,
-) -> S3Response<(StatusCode, Body)> {
+) -> crate::admin::operation::AdminResponse {
     let mut header = HeaderMap::new();
     header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Some(v) = request_id {
         header.insert("x-request-id", v.clone());
     }
-    S3Response::with_headers((status, body), header)
+    crate::admin::operation::AdminResponse::with_headers(status, body, header)
 }
 
-pub(crate) async fn collect_runtime_statuses<E>(targets: Vec<SharedTarget<E>>) -> HashMap<EndpointKey, String>
+pub(crate) async fn collect_runtime_statuses<E>(targets: Vec<SharedTarget<E>>) -> HashMap<EndpointKey, RuntimeHealthStatus>
 where
-    E: Send + Sync + 'static + Clone + serde::Serialize + serde::de::DeserializeOwned,
+    E: rustfs_targets::PluginEvent,
 {
-    let semaphore = Arc::new(Semaphore::new(10));
-    let mut futures = futures::stream::FuturesUnordered::new();
-
-    for target in targets {
-        let sem = Arc::clone(&semaphore);
-        futures.push(async move {
-            let _permit = sem.acquire().await;
-            let status = match tokio::time::timeout(Duration::from_secs(3), target.is_active()).await {
-                Ok(Ok(true)) => "online",
-                _ => "offline",
-            };
-            ((target.id().id, target.id().name), status.to_string())
-        });
-    }
-
-    let mut runtime_statuses = HashMap::new();
-    while let Some((key, status)) = futures.next().await {
-        runtime_statuses.insert(key, status);
-    }
-
-    runtime_statuses
+    rustfs_targets::health_snapshots_for_targets(targets)
+        .await
+        .into_iter()
+        .map(|snapshot| {
+            (
+                (snapshot.account_id, snapshot.target_type),
+                RuntimeHealthStatus {
+                    status: snapshot.state.status().to_string(),
+                    state: snapshot.state.as_str().to_string(),
+                    reason: snapshot.reason.as_str().to_string(),
+                },
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn merge_target_endpoints(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
     config: &Config,
-    runtime_statuses: HashMap<EndpointKey, String>,
-) -> Vec<MergedTargetEndpoint> {
+    runtime_statuses: HashMap<EndpointKey, RuntimeHealthStatus>,
+) -> S3Result<Vec<MergedTargetEndpoint>> {
     let mut endpoints = Vec::new();
     let mut seen = HashSet::new();
-    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config);
-    let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
+    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config)?;
+    let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, RuntimeHealthStatus)> = HashMap::new();
 
     for ((account_id, service), status) in runtime_statuses {
         let normalized = normalized_endpoint_key(&account_id, &service);
@@ -319,15 +348,17 @@ pub(crate) fn merge_target_endpoints(
             continue;
         }
 
-        let status = normalized_runtime_statuses
+        let health = normalized_runtime_statuses
             .remove(&normalized)
             .map(|(_, _, status)| status)
-            .unwrap_or_else(|| "offline".to_string());
+            .unwrap_or_else(RuntimeHealthStatus::not_loaded);
 
         endpoints.push(MergedTargetEndpoint {
             account_id: key.0,
             service: key.1,
-            status,
+            status: health.status,
+            health_state: health.state,
+            health_reason: health.reason,
             source: classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &normalized),
         });
     }
@@ -337,7 +368,9 @@ pub(crate) fn merge_target_endpoints(
             endpoints.push(MergedTargetEndpoint {
                 account_id,
                 service,
-                status,
+                status: status.status,
+                health_state: status.state,
+                health_reason: status.reason,
                 source: classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, &normalized),
             });
         }
@@ -352,12 +385,39 @@ pub(crate) fn merge_target_endpoints(
             account_id: key.0.clone(),
             service: key.1.clone(),
             status: "offline".to_string(),
+            health_state: TargetHealthState::Offline.as_str().to_string(),
+            health_reason: TargetHealthReason::NotLoadedInRuntime.as_str().to_string(),
             source: classify_endpoint_source(&snapshot.config_targets, &snapshot.env_targets, key),
         });
     }
 
     endpoints.sort_by(|a, b| a.service.cmp(&b.service).then_with(|| a.account_id.cmp(&b.account_id)));
-    endpoints
+    Ok(endpoints)
+}
+
+fn runtime_target_plugin_id(specs: &[AdminTargetSpec], service: &str) -> &'static str {
+    target_spec_by_service(specs, service)
+        .map(|spec| builtin_target_manifest(spec.service).plugin_id)
+        .unwrap_or("custom:target")
+}
+
+pub(crate) async fn collect_instance_runtime_statuses<E>(
+    targets: Vec<SharedTarget<E>>,
+    specs: &[AdminTargetSpec],
+    domain: TargetDomain,
+    instance_id: &str,
+) -> HashMap<EndpointKey, RuntimeHealthStatus>
+where
+    E: rustfs_targets::PluginEvent,
+{
+    let targets = targets
+        .into_iter()
+        .filter(|target| {
+            let id = target.id();
+            canonical_target_instance_id(runtime_target_plugin_id(specs, &id.name), domain, &id.id) == instance_id
+        })
+        .collect();
+    collect_runtime_statuses(targets).await
 }
 
 pub(crate) fn canonical_target_instance_id(plugin_id: &str, domain: TargetDomain, instance_id: &str) -> String {
@@ -368,13 +428,13 @@ pub(crate) fn collect_target_instances(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
     config: &Config,
-    runtime_statuses: HashMap<EndpointKey, String>,
-) -> Vec<TargetInstanceReadModel> {
+    runtime_statuses: HashMap<EndpointKey, RuntimeHealthStatus>,
+) -> S3Result<Vec<TargetInstanceReadModel>> {
     let mut instances = Vec::new();
     let mut seen = HashSet::new();
-    let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, String)> = HashMap::new();
+    let mut normalized_runtime_statuses: HashMap<EndpointKey, (String, String, RuntimeHealthStatus)> = HashMap::new();
     let domain = inferred_target_domain(route_prefix);
-    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config);
+    let snapshot = collect_endpoint_snapshot(specs, route_prefix, config)?;
 
     for ((account_id, service), status) in runtime_statuses {
         let normalized = normalized_endpoint_key(&account_id, &service);
@@ -390,10 +450,16 @@ pub(crate) fn collect_target_instances(
         }
 
         let runtime_present = normalized_runtime_statuses.contains_key(&key);
-        let status = normalized_runtime_statuses
+        let health = normalized_runtime_statuses
             .remove(&key)
             .map(|(_, _, status)| status)
-            .unwrap_or_else(|| "offline".to_string());
+            .unwrap_or_else(|| {
+                if instance.enabled {
+                    RuntimeHealthStatus::not_loaded()
+                } else {
+                    RuntimeHealthStatus::disabled()
+                }
+            });
         let source = classify_endpoint_source_flags(instance_has_config_entry(&instance), instance_has_env_entry(&instance));
 
         instances.push(TargetInstanceReadModel {
@@ -403,8 +469,11 @@ pub(crate) fn collect_target_instances(
             subsystem: instance.subsystem,
             account_id: instance.instance_id,
             service: instance.target_type,
-            status,
+            status: health.status,
+            health_state: health.state,
+            health_reason: health.reason,
             runtime_present,
+            has_env_default: instance.source_hints.has_env_default,
             source,
             enabled: instance.enabled,
             config: instance.effective_config,
@@ -416,9 +485,10 @@ pub(crate) fn collect_target_instances(
             continue;
         }
 
-        let (plugin_id, subsystem): (String, String) = target_spec_by_service(specs, &service)
-            .map(|spec| (builtin_target_manifest(spec.service).plugin_id.to_string(), spec.subsystem.to_string()))
-            .unwrap_or_else(|| ("custom:target".to_string(), format!("{}_{}", canonical_domain_label(domain), service)));
+        let plugin_id = runtime_target_plugin_id(specs, &service).to_owned();
+        let subsystem = target_spec_by_service(specs, &service)
+            .map(|spec| spec.subsystem.to_string())
+            .unwrap_or_else(|| format!("{}_{}", canonical_domain_label(domain), service));
         instances.push(TargetInstanceReadModel {
             canonical_id: canonical_target_instance_id(&plugin_id, domain, &account_id),
             plugin_id,
@@ -426,8 +496,11 @@ pub(crate) fn collect_target_instances(
             subsystem,
             account_id,
             service,
-            status,
+            status: status.status,
+            health_state: status.state,
+            health_reason: status.reason,
             runtime_present: true,
+            has_env_default: false,
             source: TargetEndpointSource::Runtime,
             enabled: true,
             config: KVS::new(),
@@ -435,19 +508,19 @@ pub(crate) fn collect_target_instances(
     }
 
     instances.sort_by(|a, b| a.service.cmp(&b.service).then_with(|| a.account_id.cmp(&b.account_id)));
-    instances
+    Ok(instances)
 }
 
 pub(crate) fn find_target_instance(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
     config: &Config,
-    runtime_statuses: HashMap<EndpointKey, String>,
+    runtime_statuses: HashMap<EndpointKey, RuntimeHealthStatus>,
     canonical_id: &str,
-) -> Option<TargetInstanceReadModel> {
-    collect_target_instances(specs, route_prefix, config, runtime_statuses)
+) -> S3Result<Option<TargetInstanceReadModel>> {
+    Ok(collect_target_instances(specs, route_prefix, config, runtime_statuses)?
         .into_iter()
-        .find(|instance| instance.canonical_id == canonical_id)
+        .find(|instance| instance.canonical_id == canonical_id))
 }
 
 pub(crate) fn allowed_target_keys(specs: &[AdminTargetSpec], target_type: &str) -> HashSet<&'static str> {
@@ -490,14 +563,17 @@ where
 }
 
 pub(crate) async fn validate_queue_dir(queue_dir: &str) -> S3Result<()> {
+    let queue_dir = rustfs_targets::store::resolve_queue_dir(queue_dir);
+    let queue_dir = queue_dir.as_ref();
     if !queue_dir.is_empty() {
         if !Path::new(queue_dir).is_absolute() {
             return Err(s3_error!(InvalidArgument, "queue_dir must be an absolute path"));
         }
-        retry_with_backoff(
+        rustfs_utils::retry::retry_with_backoff(
             || async { tokio::fs::metadata(queue_dir).await.map(|_| ()) },
             3,
             Duration::from_millis(100),
+            rustfs_utils::retry::DEFAULT_RETRY_CAP,
         )
         .await
         .map_err(|e| match e.kind() {
@@ -531,6 +607,15 @@ where
     let kv_map = collect_validated_key_values(key_values, &allowed_keys, target_type, target_label)?;
     let spec = target_spec(specs, target_type)
         .ok_or_else(|| s3_error!(InvalidArgument, "unsupported target type: '{}'", target_type))?;
+    build_validated_target_kvs(spec, kv_map, default_queue_dir).await
+}
+
+/// Validate and build from keys already checked against the target descriptor.
+pub(crate) async fn build_validated_target_kvs(
+    spec: &AdminTargetSpec,
+    kv_map: HashMap<String, String>,
+    default_queue_dir: &str,
+) -> S3Result<KVS> {
     timeout(Duration::from_secs(10), validate_target_request(spec, &kv_map, default_queue_dir))
         .await
         .map_err(|_| s3_error!(InvalidArgument, "target validation timed out after 10s"))??;
@@ -555,11 +640,11 @@ fn normalized_target_instances(
     specs: &[AdminTargetSpec],
     route_prefix: &str,
     config: &Config,
-) -> Vec<TargetPluginInstanceRecord> {
-    specs
-        .iter()
-        .flat_map(|spec| {
-            normalize_target_plugin_instances(
+) -> S3Result<Vec<TargetPluginInstanceRecord>> {
+    let mut instances = Vec::new();
+    for spec in specs {
+        instances.extend(
+            try_normalize_target_plugin_instances(
                 config,
                 &TargetPluginInstanceCompatDescriptor {
                     domain: inferred_target_domain(route_prefix),
@@ -570,8 +655,10 @@ fn normalized_target_instances(
                     valid_fields: spec.valid_keys,
                 },
             )
-        })
-        .collect()
+            .map_err(|err| s3_error!(InvalidRequest, "invalid {} target environment: {}", spec.service, err))?,
+        );
+    }
+    Ok(instances)
 }
 
 fn inferred_target_domain(route_prefix: &str) -> TargetDomain {
@@ -593,8 +680,8 @@ fn target_spec_by_service<'a>(specs: &'a [AdminTargetSpec], service: &str) -> Op
     specs.iter().find(|spec| spec.service == service)
 }
 
-fn collect_endpoint_snapshot(specs: &[AdminTargetSpec], route_prefix: &str, config: &Config) -> TargetEndpointSnapshot {
-    let normalized_instances = normalized_target_instances(specs, route_prefix, config);
+fn collect_endpoint_snapshot(specs: &[AdminTargetSpec], route_prefix: &str, config: &Config) -> S3Result<TargetEndpointSnapshot> {
+    let normalized_instances = normalized_target_instances(specs, route_prefix, config)?;
     let mut configured_keys = Vec::new();
     let mut config_targets = HbHashSet::new();
     let mut env_targets = HbHashSet::new();
@@ -614,37 +701,12 @@ fn collect_endpoint_snapshot(specs: &[AdminTargetSpec], route_prefix: &str, conf
         }
     }
 
-    TargetEndpointSnapshot {
+    Ok(TargetEndpointSnapshot {
         normalized_instances,
         configured_keys,
         config_targets,
         env_targets,
-    }
-}
-
-async fn retry_with_backoff<F, Fut, T>(mut operation: F, max_attempts: usize, base_delay: Duration) -> Result<T, Error>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, Error>>,
-{
-    let mut attempts = 0;
-    let mut delay = base_delay;
-    let mut last_err = None;
-
-    while attempts < max_attempts {
-        match operation().await {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                last_err = Some(e);
-                attempts += 1;
-                if attempts < max_attempts {
-                    sleep(delay).await;
-                    delay = delay.saturating_mul(2);
-                }
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| Error::other("retry_with_backoff: unknown error")))
+    })
 }
 
 async fn validate_webhook_request(kv_map: &HashMap<String, String>) -> S3Result<()> {
@@ -663,6 +725,11 @@ async fn validate_webhook_request(kv_map: &HashMap<String, String>) -> S3Result<
             ));
         }
     }
+    let outbound_policy =
+        OutboundPolicy::from_env_cached().map_err(|e| s3_error!(InvalidArgument, "invalid outbound policy: {}", e))?;
+    outbound_policy
+        .validate_url(&parsed_endpoint)
+        .map_err(|err| s3_error!(InvalidArgument, "{}", format_outbound_http_url_error("endpoint", &parsed_endpoint, &err)))?;
     if let Some(queue_dir) = kv_map.get("queue_dir") {
         validate_queue_dir(queue_dir.as_str()).await?;
     }
@@ -910,4 +977,183 @@ fn to_kvs(kv_map: &HashMap<String, String>) -> rustfs_config::server_config::KVS
         kvs.insert(key.clone(), value.clone());
     }
     kvs
+}
+
+#[cfg(test)]
+mod webhook_request_tests {
+    use super::validate_webhook_request;
+    use rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn private_webhook_request_is_rejected_with_operator_action() {
+        let config = HashMap::from([("endpoint".to_string(), "http://192.168.1.2:1880/webhook/rustfs".to_string())]);
+
+        let err = validate_webhook_request(&config)
+            .await
+            .expect_err("a private webhook must require an explicit outbound allowlist");
+        let message = err
+            .message()
+            .expect("the validation error should explain the operator action");
+
+        assert!(message.contains(&format!("add http://192.168.1.2:1880 to {ENV_OUTBOUND_ALLOW_ORIGINS}")));
+        assert!(message.contains("private address"));
+        assert!(message.contains("comma-separated"));
+        assert!(message.contains("restart RustFS"), "unexpected message: {message}");
+        assert!(!message.contains("/webhook/rustfs"));
+    }
+
+    #[tokio::test]
+    async fn metadata_webhook_request_does_not_offer_allowlist_override() {
+        let config = HashMap::from([("endpoint".to_string(), "http://169.254.169.254/latest/meta-data".to_string())]);
+
+        let err = validate_webhook_request(&config)
+            .await
+            .expect_err("the metadata endpoint must remain permanently blocked");
+        let message = err.message().expect("the validation error should explain the rejection");
+
+        assert!(message.contains("metadata endpoint"));
+        assert!(!message.contains(ENV_OUTBOUND_ALLOW_ORIGINS));
+    }
+
+    #[tokio::test]
+    async fn public_webhook_still_passes_outbound_preflight() {
+        let config = HashMap::from([("endpoint".to_string(), "https://hooks.example/webhook".to_string())]);
+
+        validate_webhook_request(&config)
+            .await
+            .expect("a public HTTPS webhook should pass outbound preflight");
+    }
+}
+
+#[cfg(test)]
+mod owned_response_tests {
+    use super::owned_build_json_response;
+
+    #[tokio::test]
+    async fn owned_build_json_response_sets_json_content_type_and_echoes_the_request_id() {
+        let request_id = http::HeaderValue::from_static("req-42");
+        for id in [None, Some(&request_id)] {
+            let (status, headers, mut body) =
+                owned_build_json_response(http::StatusCode::ACCEPTED, rustfs_s3_types::Body::from("{\"ok\":true}"), id)
+                    .into_parts();
+            assert_eq!(status, http::StatusCode::ACCEPTED);
+            assert_eq!(
+                headers.get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                Some("application/json")
+            );
+            assert_eq!(headers.get("x-request-id"), id);
+            assert_eq!(headers.len(), 1 + usize::from(id.is_some()));
+            assert_eq!(body.store_all_limited(64).await.expect("body reads").as_ref(), b"{\"ok\":true}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod instance_runtime_status_tests {
+    use super::{admin_target_spec_from_builtin, collect_instance_runtime_statuses};
+    use rustfs_targets::{
+        SharedTarget, TargetDomain, catalog::builtin::builtin_notify_target_admin_descriptors, testkit::MockTarget,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn instance_health_only_probes_matching_canonical_targets() {
+        let specs: Vec<_> = builtin_notify_target_admin_descriptors()
+            .iter()
+            .map(admin_target_spec_from_builtin)
+            .collect();
+        let wanted = MockTarget::new("Primary", "webhook");
+        let unrelated = MockTarget::new("Primary", "nats").with_health_gate(Arc::new(Notify::new()));
+        let unrelated_started = unrelated.health_started();
+        let targets: Vec<SharedTarget<rustfs_notify::Event>> = vec![Arc::new(wanted), Arc::new(unrelated)];
+        let statuses = tokio::time::timeout(
+            Duration::from_secs(1),
+            collect_instance_runtime_statuses(targets, &specs, TargetDomain::Notify, "builtin:webhook:notify:primary"),
+        )
+        .await
+        .expect("unrelated blocked health must not delay instance detail");
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses.contains_key(&("Primary".into(), "webhook".into())));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), unrelated_started.notified())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn instance_health_preserves_unknown_runtime_identity_collisions() {
+        let specs: Vec<_> = builtin_notify_target_admin_descriptors()
+            .iter()
+            .map(admin_target_spec_from_builtin)
+            .collect();
+        let targets: Vec<SharedTarget<rustfs_notify::Event>> = vec![
+            Arc::new(MockTarget::new("Primary", "custom-one")),
+            Arc::new(MockTarget::new("PRIMARY", "custom-two")),
+            Arc::new(MockTarget::new("Primary", "webhook")),
+        ];
+        let statuses =
+            collect_instance_runtime_statuses(targets, &specs, TargetDomain::Notify, "custom:target:notify:primary").await;
+        assert_eq!(statuses.len(), 2);
+        assert!(statuses.contains_key(&("Primary".into(), "custom-one".into())));
+        assert!(statuses.contains_key(&("PRIMARY".into(), "custom-two".into())));
+    }
+}
+
+#[cfg(test)]
+mod queue_dir_resolution_tests {
+    use super::validate_queue_dir;
+    use rustfs_config::server_config::KVS;
+    use rustfs_config::{AUDIT_DEFAULT_DIR, ENV_TARGET_STORE_DIR, EVENT_DEFAULT_DIR, REDIS_QUEUE_DIR, REDIS_URL};
+    use rustfs_targets::{config::build_redis_args, target::TargetType};
+    use serial_test::serial;
+
+    fn redis_config() -> KVS {
+        let mut config = KVS::new();
+        config.insert(REDIS_URL.to_string(), "redis://127.0.0.1:6379/".to_string());
+        config
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn default_queue_dirs_follow_the_target_store_root() {
+        let root = tempfile::tempdir().expect("queue store root");
+        let root_text = root.path().to_str().expect("UTF-8 queue store root").to_owned();
+        temp_env::async_with_vars([(ENV_TARGET_STORE_DIR, Some(root_text.as_str()))], async {
+            let notify = build_redis_args(&redis_config(), EVENT_DEFAULT_DIR, "events", TargetType::NotifyEvent)
+                .expect("default notify queue");
+            assert_eq!(notify.queue_dir, root.path().join("events").to_string_lossy());
+            let audit =
+                build_redis_args(&redis_config(), AUDIT_DEFAULT_DIR, "audit", TargetType::AuditLog).expect("default audit queue");
+            assert_eq!(audit.queue_dir, root.path().join("audit").to_string_lossy());
+
+            let explicit = root.path().join("operator-queue").to_string_lossy().into_owned();
+            let mut config = redis_config();
+            config.insert(REDIS_QUEUE_DIR.to_string(), explicit.clone());
+            let args = build_redis_args(&config, EVENT_DEFAULT_DIR, "events", TargetType::NotifyEvent).expect("explicit queue");
+            assert_eq!(args.queue_dir, explicit, "an operator path must not be relocated");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_logical_default_is_validated_at_its_resolved_directory() {
+        let root = tempfile::tempdir().expect("queue store root");
+        let root_text = root.path().to_str().expect("UTF-8 queue store root").to_owned();
+        temp_env::async_with_vars([(ENV_TARGET_STORE_DIR, Some(root_text.as_str()))], async {
+            let missing = validate_queue_dir(EVENT_DEFAULT_DIR)
+                .await
+                .expect_err("the resolved queue directory does not exist yet");
+            assert!(missing.message().is_some_and(|message| message.contains("does not exist")));
+            std::fs::create_dir(root.path().join("events")).expect("resolved queue directory");
+            validate_queue_dir(EVENT_DEFAULT_DIR)
+                .await
+                .expect("the logical default must be checked where this node stores it");
+        })
+        .await;
+    }
 }

@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(non_upper_case_globals)] // FIXME
-
-use chrono::{DateTime, Utc};
+use arc_swap::ArcSwap;
 use std::collections::HashMap;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
 
@@ -25,12 +23,127 @@ pub static GLOBAL_LOCAL_NODE_NAME: LazyLock<RwLock<String>> = LazyLock::new(|| R
 pub static GLOBAL_RUSTFS_HOST: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("".to_string()));
 pub static GLOBAL_RUSTFS_PORT: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("9000".to_string()));
 pub static GLOBAL_RUSTFS_ADDR: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new("".to_string()));
+static NEXT_GRPC_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_GRPC_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug)]
+struct GrpcConnectionStateInner {
+    channel_id: u64,
+    generation: AtomicU64,
+}
+
+/// Lock-free identity and physical-connection generation shared by every clone of one gRPC channel.
+#[derive(Clone, Debug)]
+pub struct GrpcConnectionState(Arc<GrpcConnectionStateInner>);
+
+/// A point-in-time identity for the physical connection currently used by a gRPC channel.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GrpcConnectionSnapshot {
+    pub channel_id: u64,
+    pub generation: u64,
+}
+
+impl GrpcConnectionState {
+    pub fn new() -> Self {
+        Self(Arc::new(GrpcConnectionStateInner {
+            channel_id: next_nonzero_id(&NEXT_GRPC_CHANNEL_ID),
+            generation: AtomicU64::new(0),
+        }))
+    }
+
+    /// Publish a successfully opened physical transport before tonic makes it request-ready.
+    pub fn record_connected(&self) -> GrpcConnectionSnapshot {
+        let generation = next_nonzero_id(&NEXT_GRPC_CONNECTION_GENERATION);
+        self.0.generation.store(generation, Ordering::Release);
+        GrpcConnectionSnapshot {
+            channel_id: self.0.channel_id,
+            generation,
+        }
+    }
+
+    /// Return `None` until the first physical transport has connected successfully.
+    pub fn snapshot(&self) -> Option<GrpcConnectionSnapshot> {
+        let generation = self.0.generation.load(Ordering::Acquire);
+        (generation != 0).then_some(GrpcConnectionSnapshot {
+            channel_id: self.0.channel_id,
+            generation,
+        })
+    }
+}
+
+impl Default for GrpcConnectionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn next_nonzero_id(counter: &AtomicU64) -> u64 {
+    loop {
+        let id = counter.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
 pub static GLOBAL_CONN_MAP: LazyLock<RwLock<HashMap<String, Channel>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+
+#[derive(Clone)]
+struct TrackedGrpcConnection {
+    channel: Channel,
+    connection_state: GrpcConnectionState,
+}
+
+static GLOBAL_TRACKED_CONN_MAP: LazyLock<RwLock<HashMap<String, TrackedGrpcConnection>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static GLOBAL_CONN_CACHE_WRITER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub static GLOBAL_ROOT_CERT: LazyLock<RwLock<Option<Vec<u8>>>> = LazyLock::new(|| RwLock::new(None));
 pub static GLOBAL_MTLS_IDENTITY: LazyLock<RwLock<Option<MtlsIdentityPem>>> = LazyLock::new(|| RwLock::new(None));
 pub static GLOBAL_OUTBOUND_TLS_GENERATION: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
-/// Global initialization time of the RustFS node.
-pub static GLOBAL_INIT_TIME: LazyLock<RwLock<Option<DateTime<Utc>>>> = LazyLock::new(|| RwLock::new(None));
+
+#[derive(Clone, Default)]
+pub struct OutboundTlsSnapshot {
+    pub generation: u64,
+    pub root_ca_pem: Option<Vec<u8>>,
+    pub mtls_identity: Option<MtlsIdentityPem>,
+}
+
+static GLOBAL_OUTBOUND_TLS_STATE: LazyLock<ArcSwap<OutboundTlsSnapshot>> =
+    LazyLock::new(|| ArcSwap::from_pointee(OutboundTlsSnapshot::default()));
+
+pub fn get_global_outbound_tls_snapshot() -> Arc<OutboundTlsSnapshot> {
+    GLOBAL_OUTBOUND_TLS_STATE.load_full()
+}
+
+/// Publish identity, trust and generation together; the individual globals are legacy views.
+pub async fn publish_global_outbound_tls_snapshot(snapshot: OutboundTlsSnapshot) -> u64 {
+    GLOBAL_OUTBOUND_TLS_STATE.rcu(|current| {
+        if current.generation != 0
+            && current.root_ca_pem == snapshot.root_ca_pem
+            && current.mtls_identity == snapshot.mtls_identity
+        {
+            return Arc::clone(current);
+        }
+        Arc::new(OutboundTlsSnapshot {
+            generation: snapshot.generation.max(current.generation.saturating_add(1)),
+            root_ca_pem: snapshot.root_ca_pem.clone(),
+            mtls_identity: snapshot.mtls_identity.clone(),
+        })
+    });
+    let accepted = get_global_outbound_tls_snapshot();
+    *GLOBAL_ROOT_CERT.write().await = accepted.root_ca_pem.clone();
+    *GLOBAL_MTLS_IDENTITY.write().await = accepted.mtls_identity.clone();
+    GLOBAL_OUTBOUND_TLS_GENERATION.store(accepted.generation, Ordering::Relaxed);
+    accepted.generation
+}
+
+/// Log level to use when reporting cached gRPC connection eviction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionEvictionLogLevel {
+    Warn,
+    Info,
+    Debug,
+}
 
 /// Set the global local node name.
 ///
@@ -48,18 +161,52 @@ pub async fn get_global_local_node_name() -> String {
     GLOBAL_LOCAL_NODE_NAME.read().await.clone()
 }
 
-/// Set the global RustFS initialization time to the current UTC time.
-pub async fn set_global_init_time_now() {
-    let now = Utc::now();
-    *GLOBAL_INIT_TIME.write().await = Some(now);
+/// Read the local node name without waiting for initialization or a writer.
+pub fn try_get_global_local_node_name() -> Option<String> {
+    GLOBAL_LOCAL_NODE_NAME
+        .try_read()
+        .ok()
+        .map(|name| name.clone())
+        .filter(|name| !name.is_empty())
 }
 
-/// Get the global RustFS initialization time.
-///
-/// # Returns
-/// * `Option<DateTime<Utc>>` - The initialization time if set.
-pub async fn get_global_init_time() -> Option<DateTime<Utc>> {
-    *GLOBAL_INIT_TIME.read().await
+/// Run a synchronous test callback while publishing a name under its writer lock.
+/// Call from a blocking worker; returning or unwinding releases the writer.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub fn with_local_node_name_write_lock_for_test<T>(name: &str, work: impl FnOnce() -> T) -> T {
+    let mut writer = GLOBAL_LOCAL_NODE_NAME.blocking_write();
+    *writer = name.to_string();
+    let result = work();
+    drop(writer);
+    result
+}
+
+#[cfg(test)]
+mod node_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_node_name_nonblocking_read_recovers_after_writer_release() {
+        let previous = get_global_local_node_name().await;
+        let (unavailable, published, panicked) = tokio::task::spawn_blocking(|| {
+            let unavailable = with_local_node_name_write_lock_for_test("published-node", try_get_global_local_node_name);
+            let published = try_get_global_local_node_name();
+            let panicked = std::panic::catch_unwind(|| {
+                with_local_node_name_write_lock_for_test("unwound-node", || panic!("identity callback failed"));
+            });
+            (unavailable, published, panicked)
+        })
+        .await
+        .expect("identity writer worker must complete");
+        let after_unwind = try_get_global_local_node_name();
+        set_global_local_node_name(&previous).await;
+
+        assert!(unavailable.is_none(), "a held writer must make the nonblocking getter unavailable");
+        assert_eq!(published.as_deref(), Some("published-node"));
+        assert!(panicked.is_err(), "the callback panic must propagate after releasing the lock");
+        assert_eq!(after_unwind.as_deref(), Some("unwound-node"));
+    }
 }
 
 /// Set the global RustFS address used for gRPC connections.
@@ -70,6 +217,16 @@ pub async fn set_global_addr(addr: &str) {
     *GLOBAL_RUSTFS_ADDR.write().await = addr.to_string();
 }
 
+/// Get the global RustFS host.
+pub async fn get_global_rustfs_host() -> String {
+    GLOBAL_RUSTFS_HOST.read().await.clone()
+}
+
+/// Get the global RustFS address used for gRPC connections.
+pub async fn get_global_addr() -> String {
+    GLOBAL_RUSTFS_ADDR.read().await.clone()
+}
+
 /// Set the global root CA certificate for outbound gRPC clients.
 /// This certificate is used to validate server TLS certificates.
 /// When set to None, clients use the system default root CAs.
@@ -77,7 +234,27 @@ pub async fn set_global_addr(addr: &str) {
 /// # Arguments
 /// * `cert` - A vector of bytes representing the PEM-encoded root CA certificate.
 pub async fn set_global_root_cert(cert: Vec<u8>) {
+    GLOBAL_OUTBOUND_TLS_STATE.rcu(|current| {
+        let mut next = (**current).clone();
+        next.root_ca_pem = Some(cert.clone());
+        Arc::new(next)
+    });
     *GLOBAL_ROOT_CERT.write().await = Some(cert);
+}
+
+/// Clear the global root CA certificate for outbound gRPC clients.
+pub async fn clear_global_root_cert() {
+    GLOBAL_OUTBOUND_TLS_STATE.rcu(|current| {
+        let mut next = (**current).clone();
+        next.root_ca_pem = None;
+        Arc::new(next)
+    });
+    *GLOBAL_ROOT_CERT.write().await = None;
+}
+
+/// Get the global root CA certificate for outbound gRPC clients.
+pub async fn get_global_root_cert() -> Option<Vec<u8>> {
+    get_global_outbound_tls_snapshot().root_ca_pem.clone()
 }
 
 /// Set the global mTLS identity (cert+key PEM) for outbound gRPC clients.
@@ -87,17 +264,32 @@ pub async fn set_global_root_cert(cert: Vec<u8>) {
 /// # Arguments
 /// * `identity` - An optional MtlsIdentityPem struct containing the cert and key PEM.
 pub async fn set_global_mtls_identity(identity: Option<MtlsIdentityPem>) {
+    GLOBAL_OUTBOUND_TLS_STATE.rcu(|current| {
+        let mut next = (**current).clone();
+        next.mtls_identity = identity.clone();
+        Arc::new(next)
+    });
     *GLOBAL_MTLS_IDENTITY.write().await = identity;
+}
+
+/// Get the global mTLS identity for outbound gRPC clients.
+pub async fn get_global_mtls_identity() -> Option<MtlsIdentityPem> {
+    get_global_outbound_tls_snapshot().mtls_identity.clone()
 }
 
 /// Set the global outbound TLS generation.
 pub fn set_global_outbound_tls_generation(generation: u64) {
+    GLOBAL_OUTBOUND_TLS_STATE.rcu(|current| {
+        let mut next = (**current).clone();
+        next.generation = generation;
+        Arc::new(next)
+    });
     GLOBAL_OUTBOUND_TLS_GENERATION.store(generation, Ordering::Relaxed);
 }
 
 /// Get the global outbound TLS generation.
 pub fn get_global_outbound_tls_generation() -> u64 {
-    GLOBAL_OUTBOUND_TLS_GENERATION.load(Ordering::Relaxed)
+    get_global_outbound_tls_snapshot().generation
 }
 
 /// Evict a stale/dead connection from the global connection cache.
@@ -107,13 +299,84 @@ pub fn get_global_outbound_tls_generation() -> u64 {
 /// # Arguments
 /// * `addr` - The address of the connection to evict.
 pub async fn evict_connection(addr: &str) {
+    evict_connection_with_log_level(addr, ConnectionEvictionLogLevel::Info).await;
+}
+
+/// Evict a stale/dead connection from the global connection cache with an explicit log level.
+pub async fn evict_connection_with_log_level(addr: &str, log_level: ConnectionEvictionLogLevel) {
+    let _ = remove_connection_with_log_level(addr, log_level).await;
+}
+
+/// Remove a cached connection and report whether it existed. Transport owners use this to
+/// attach a rebuild reason only to real cache transitions.
+pub async fn remove_connection_with_log_level(addr: &str, log_level: ConnectionEvictionLogLevel) -> bool {
+    // Writes are rare and serialized so the optimized tracked cache and public compatibility map
+    // cannot publish different channel clones for one key.
+    let _writer = GLOBAL_CONN_CACHE_WRITER.lock().await;
+    GLOBAL_TRACKED_CONN_MAP.write().await.remove(addr);
     let removed = GLOBAL_CONN_MAP.write().await.remove(addr);
     if removed.is_some() {
-        tracing::info!(
-            addr = %addr,
-            "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
-        );
+        match log_level {
+            ConnectionEvictionLogLevel::Warn => {
+                tracing::warn!(
+                    addr = %addr,
+                    "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
+                );
+            }
+            ConnectionEvictionLogLevel::Info => {
+                tracing::info!(
+                    addr = %addr,
+                    "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
+                );
+            }
+            ConnectionEvictionLogLevel::Debug => {
+                tracing::debug!(
+                    addr = %addr,
+                    "Removed cached gRPC connection so future RPCs will attempt to establish a fresh channel"
+                );
+            }
+        }
     }
+    removed.is_some()
+}
+
+/// Get a cached gRPC connection for the given address.
+pub async fn cached_connection(addr: &str) -> Option<Channel> {
+    GLOBAL_CONN_MAP.read().await.get(addr).cloned()
+}
+
+/// Get a cached channel together with its shared physical-connection state, when tracked.
+pub async fn cached_connection_with_state(addr: &str) -> Option<(Channel, Option<GrpcConnectionState>)> {
+    if let Some(cached) = GLOBAL_TRACKED_CONN_MAP.read().await.get(addr).cloned() {
+        return Some((cached.channel, Some(cached.connection_state)));
+    }
+    // A miss may race a low-frequency publish/evict. Serialize only this fallback, recheck the
+    // tracked map, then consult legacy entries injected through the compatibility API.
+    let _writer = GLOBAL_CONN_CACHE_WRITER.lock().await;
+    if let Some(cached) = GLOBAL_TRACKED_CONN_MAP.read().await.get(addr).cloned() {
+        return Some((cached.channel, Some(cached.connection_state)));
+    }
+    cached_connection(addr).await.map(|channel| (channel, None))
+}
+
+/// Cache a gRPC connection for the given address.
+pub async fn cache_connection(addr: String, channel: Channel) {
+    let _writer = GLOBAL_CONN_CACHE_WRITER.lock().await;
+    GLOBAL_TRACKED_CONN_MAP.write().await.remove(&addr);
+    GLOBAL_CONN_MAP.write().await.insert(addr, channel);
+}
+
+/// Cache a gRPC channel and its physical-connection state as one coherent entry.
+pub async fn cache_connection_with_state(addr: String, channel: Channel, connection_state: GrpcConnectionState) {
+    let _writer = GLOBAL_CONN_CACHE_WRITER.lock().await;
+    GLOBAL_TRACKED_CONN_MAP.write().await.insert(
+        addr.clone(),
+        TrackedGrpcConnection {
+            channel: channel.clone(),
+            connection_state,
+        },
+    );
+    GLOBAL_CONN_MAP.write().await.insert(addr, channel);
 }
 
 /// Check if a connection exists in the cache for the given address.
@@ -129,6 +392,8 @@ pub async fn has_cached_connection(addr: &str) -> bool {
 
 /// Clear all cached connections. Useful for full cluster reset/recovery.
 pub async fn clear_all_connections() {
+    let _writer = GLOBAL_CONN_CACHE_WRITER.lock().await;
+    GLOBAL_TRACKED_CONN_MAP.write().await.clear();
     let mut map = GLOBAL_CONN_MAP.write().await;
     let count = map.len();
     map.clear();
@@ -140,8 +405,119 @@ pub async fn clear_all_connections() {
 ///
 /// When present, gRPC clients will present this identity to servers requesting/requiring mTLS.
 /// When absent, clients proceed with standard server-authenticated TLS.
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MtlsIdentityPem {
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
+}
+
+impl std::fmt::Debug for MtlsIdentityPem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MtlsIdentityPem")
+            .field("cert_bytes", &self.cert_pem.len())
+            .field("key_pem", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tls_snapshot_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn outbound_snapshot_publication_is_coherent_and_skips_unchanged_material() {
+        let start = get_global_outbound_tls_generation().saturating_add(1);
+        let snapshot = OutboundTlsSnapshot {
+            generation: start,
+            root_ca_pem: Some(vec![1]),
+            mtls_identity: Some(MtlsIdentityPem {
+                cert_pem: vec![1],
+                key_pem: vec![1],
+            }),
+        };
+        let first = publish_global_outbound_tls_snapshot(snapshot.clone()).await;
+        assert_eq!(
+            publish_global_outbound_tls_snapshot(OutboundTlsSnapshot {
+                generation: first.saturating_add(1),
+                ..snapshot
+            })
+            .await,
+            first
+        );
+        let writer = tokio::spawn(async move {
+            for tag in 2_u8..=255 {
+                publish_global_outbound_tls_snapshot(OutboundTlsSnapshot {
+                    generation: start.saturating_add(u64::from(tag)),
+                    root_ca_pem: Some(vec![tag]),
+                    mtls_identity: Some(MtlsIdentityPem {
+                        cert_pem: vec![tag],
+                        key_pem: vec![tag],
+                    }),
+                })
+                .await;
+                tokio::task::yield_now().await;
+            }
+        });
+        while !writer.is_finished() {
+            let state = get_global_outbound_tls_snapshot();
+            let identity = state.mtls_identity.as_ref().expect("identity in complete snapshot");
+            assert_eq!(state.root_ca_pem.as_ref().expect("roots in complete snapshot"), &identity.cert_pem);
+            assert_eq!(identity.cert_pem, identity.key_pem);
+            tokio::task::yield_now().await;
+        }
+        writer.await.expect("writer completes");
+    }
+
+    #[test]
+    fn mtls_identity_debug_redacts_private_key() {
+        let identity = MtlsIdentityPem {
+            cert_pem: b"public certificate".to_vec(),
+            key_pem: b"PRIVATE-KEY-MARKER".to_vec(),
+        };
+        let debug = format!("{identity:?}");
+        assert!(!debug.contains("PRIVATE-KEY-MARKER"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn conditional_connection_removal_preserves_legacy_evict_api() {
+        let key = "http://conditional-eviction-test.invalid";
+        cache_connection(
+            key.to_owned(),
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        )
+        .await;
+        assert!(remove_connection_with_log_level(key, ConnectionEvictionLogLevel::Debug).await);
+        assert!(!remove_connection_with_log_level(key, ConnectionEvictionLogLevel::Debug).await);
+        let _: () = evict_connection_with_log_level(key, ConnectionEvictionLogLevel::Debug).await;
+    }
+
+    #[tokio::test]
+    async fn cached_connection_keeps_channel_and_transport_state_coherent() {
+        let key = "http://tracked-connection-test.invalid";
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let state = GrpcConnectionState::new();
+        assert!(state.snapshot().is_none());
+        let first = state.record_connected();
+        cache_connection_with_state(key.to_owned(), channel, state.clone()).await;
+
+        let (_, cached_state) = cached_connection_with_state(key).await.expect("tracked cache entry");
+        let cached_state = cached_state.expect("tracked cache state");
+        assert_eq!(cached_state.snapshot(), Some(first));
+        let second = state.record_connected();
+        assert_eq!(cached_state.snapshot(), Some(second));
+        assert_eq!(first.channel_id, second.channel_id);
+        assert_ne!(first.generation, second.generation);
+
+        cache_connection(
+            key.to_owned(),
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:2").connect_lazy(),
+        )
+        .await;
+        let (_, replacement_state) = cached_connection_with_state(key).await.expect("legacy replacement entry");
+        assert!(replacement_state.is_none(), "legacy replacement must remove stale tracked state");
+
+        assert!(remove_connection_with_log_level(key, ConnectionEvictionLogLevel::Debug).await);
+        assert!(cached_connection_with_state(key).await.is_none());
+    }
 }

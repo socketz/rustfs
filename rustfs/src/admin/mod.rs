@@ -16,24 +16,33 @@ pub(crate) mod access_key_identity;
 mod auth;
 pub mod console;
 pub mod handlers;
+pub(crate) mod operation;
 mod plugin_contract;
+pub(crate) mod plugin_runner;
+pub(crate) mod replication_metrics_wire;
 // Contract inventory is validated by tests before later runtime integration.
-#[allow(dead_code)]
 pub(crate) mod route_policy;
+pub(crate) mod route_table;
 pub mod router;
+pub(crate) mod runtime_sources;
 pub mod service;
-pub mod site_replication_identity;
+pub(crate) mod storage_api;
 pub mod utils;
 
 #[cfg(test)]
 mod console_test;
 #[cfg(test)]
+mod kms_contract;
+#[cfg(test)]
 mod route_registration_test;
 
 use handlers::{
-    audit, bucket_meta, config_admin, extensions, heal, health, kms, module_switch, object_zip_download, oidc, plugins_catalog,
-    plugins_instances, pools, profile_admin, quota, rebalance, replication, scanner, site_replication, sts, system,
-    table_catalog, tier, tls_debug, user,
+    account, audit, batch_job, bucket_meta, bucket_recovery, cluster_snapshot, config_admin, diagnostics,
+    durability as durability_handler, etag as etag_handler, extensions, gateway_key_inventory, heal, health, idp_compat,
+    ilm_transition, inspect_archive, integrity, kms, mfa, module_switch, object_data_cache, object_zip_download, oidc,
+    on_demand_migration, plugins_catalog, plugins_instances, pools, profile_admin, quota as quota_handler, rebalance,
+    replication as replication_handler, scanner, site_replication, sts, system, table_catalog, tier, tls_debug, usage_prefix,
+    user,
 };
 use router::{AdminOperation, S3Router};
 use s3s::route::S3Route;
@@ -45,8 +54,12 @@ use s3s::route::S3Route;
 ///
 /// # Returns
 /// An instance of S3Route for admin operations
-pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> {
+pub fn make_admin_route(
+    console_enabled: bool,
+    server_ctx: std::sync::Arc<crate::admin::runtime_sources::ServerContextSlot>,
+) -> std::io::Result<impl S3Route> {
     let mut r: S3Router<AdminOperation> = S3Router::new(console_enabled);
+    r.set_server_ctx(server_ctx);
     register_admin_routes(&mut r)?;
     Ok(r)
 }
@@ -54,7 +67,12 @@ pub fn make_admin_route(console_enabled: bool) -> std::io::Result<impl S3Route> 
 fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     health::register_health_route(r)?;
     sts::register_admin_auth_route(r)?;
+    handlers::plugin_delegation::register_plugin_delegation_route(r)?;
+    handlers::plugin_attempt::register_plugin_attempt_route(r)?;
 
+    account::register_account_route(r)?;
+    handlers::account_permissions::register_account_permissions_route(r)?;
+    mfa::register_mfa_route(r)?;
     user::register_user_route(r)?;
     system::register_system_route(r)?;
     pools::register_pool_route(r)?;
@@ -64,23 +82,39 @@ fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()
 
     tier::register_tier_route(r)?;
 
-    quota::register_quota_route(r)?;
+    quota_handler::register_quota_route(r)?;
+    durability_handler::register_durability_route(r)?;
+    etag_handler::register_etag_route(r)?;
+    bucket_recovery::register_bucket_recovery_route(r)?;
+    on_demand_migration::register_on_demand_migration_route(r)?;
     bucket_meta::register_bucket_meta_route(r)?;
     config_admin::register_config_route(r)?;
     scanner::register_scanner_route(r)?;
+    usage_prefix::register_usage_prefix_route(r)?;
+    ilm_transition::register_ilm_transition_route(r)?;
+    object_data_cache::register_object_data_cache_route(r)?;
     audit::register_audit_target_route(r)?;
     module_switch::register_module_switch_route(r)?;
+    cluster_snapshot::register_cluster_snapshot_route(r)?;
     extensions::register_extension_route(r)?;
     object_zip_download::register_object_zip_download_route(r)?;
     plugins_catalog::register_plugin_catalog_route(r)?;
     plugins_instances::register_plugin_instance_route(r)?;
 
-    replication::register_replication_route(r)?;
+    replication_handler::register_replication_route(r)?;
+    handlers::s3_extension::register_s3_extension_routes(r)?;
+    batch_job::register_batch_job_route(r)?;
+    integrity::register_integrity_routes(r)?;
     site_replication::register_site_replication_route(r)?;
     profile_admin::register_profiling_route(r)?;
+    diagnostics::register_diagnostics_route(r)?;
+    inspect_archive::register_inspect_archive_route(r)?;
+    gateway_key_inventory::register_gateway_key_inventory_route(r)?;
     tls_debug::register_tls_debug_route(r)?;
+    handlers::tls_certificate::register_tls_certificate_routes(r)?;
     kms::register_kms_route(r)?;
     oidc::register_oidc_route(r)?;
+    idp_compat::register_idp_compat_route(r)?;
     table_catalog::register_table_catalog_route(r)?;
 
     Ok(())

@@ -23,8 +23,24 @@ on:
       - 'deny.toml'
       - '.github/actions/**'
       - '.github/workflows/**'
+      - 'scripts/release/**'
+      - 'scripts/security/generate_release_supply_chain_assets.py'
+      - '.config/release-validation-plan.json'
+      - '.github/scheduled-validations.json'
+      - 'scripts/test_helm_release_workflow.py'
+      - 'scripts/test_release_packages.py'
+      - 'scripts/test_release_images.py'
+      - 'Dockerfile*'
+      - 'entrypoint.sh'
+      - 'bootstrap/**'
+      - 'scripts/test_package_service_scripts.sh'
+      - 'scripts/test_package_versions.sh'
+      - 'scripts/test_docker_workflow.py'
+      - 'scripts/security/check_preview_release_workflow.sh'
+      - 'scripts/security/check_tier_artifact_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
   pull_request:
+    types: [ opened, synchronize, reopened, closed ]
     branches: [ main ]
     paths:
       - '**/Cargo.toml'
@@ -32,58 +48,93 @@ on:
       - 'deny.toml'
       - '.github/actions/**'
       - '.github/workflows/**'
+      - 'scripts/release/**'
+      - 'scripts/security/generate_release_supply_chain_assets.py'
+      - '.config/release-validation-plan.json'
+      - '.github/scheduled-validations.json'
+      - 'scripts/test_helm_release_workflow.py'
+      - 'scripts/test_release_packages.py'
+      - 'scripts/test_release_images.py'
+      - 'Dockerfile*'
+      - 'entrypoint.sh'
+      - 'bootstrap/**'
+      - 'scripts/test_package_service_scripts.sh'
+      - 'scripts/test_package_versions.sh'
+      - 'scripts/test_docker_workflow.py'
+      - 'scripts/security/check_preview_release_workflow.sh'
+      - 'scripts/security/check_tier_artifact_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
   schedule:
-    - cron: '0 0 * * 0' # Weekly on Sunday at midnight UTC
+    # Daily, not weekly. This schedule exists to catch RustSec advisories
+    # published against an unchanged dependency tree; at weekly cadence a new
+    # advisory could sit unnoticed for seven days. The check list is unchanged —
+    # splitting it into a light daily advisories-only run and a weekly full run
+    # would create runs where sources/bans/licenses go unverified.
+    - cron: '23 3 * * *' # Daily 03:23 UTC
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Event-scoped groups: merges to main must not cancel the weekly scheduled
+# run (same rationale as ci.yml).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  security-audit:
-    name: Security Audit
+  cancel-closed-pr-runs:
+    name: Cancel Closed PR Runs
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - name: Explain cancellation run
+        run: echo "PR closed; this run only cancels older runs in the same concurrency group."
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-
-      - name: Run security audit
-        run: |
-          cargo audit -D warnings --json | tee audit-results.json
-
-      - name: Upload audit results
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: security-audit-results-${{ github.run_number }}
-          path: audit-results.json
-          retention-days: 30
-
+  # RustSec advisory scanning is covered by the `advisories` check of
+  # cargo-deny below; a separate cargo-audit job would duplicate the same
+  # database lookup with a second ignore list to maintain.
   cargo-deny:
     name: Cargo Deny
+    if: github.repository == 'rustfs/rustfs' && (github.event_name != 'pull_request' || github.event.action != 'closed')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
-          cache-shared-key: rustfs-cargo-deny
+          persist-credentials: false
+
+      # cargo-deny compiles nothing, so the full setup composite (apt packages,
+      # protoc, flatc, nextest, rustfmt/clippy) was pure overhead here. It does
+      # still need a real cargo: `cargo deny check` runs `cargo metadata`, and
+      # Cargo.toml pins datafusion and s3s as git dependencies, which must be
+      # materialised into ~/.cargo/git — a cold clone is hundreds of MB, so the
+      # cache stays.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      # Was relying on the composite's default, which used to be "true": every
+      # PR touching Cargo.toml/Cargo.lock saved a second, PR-scoped copy of this
+      # cache and pushed the main-scoped lanes out of the 10GB quota. The
+      # default is now "false", but state it explicitly — see
+      # scripts/security/check_cache_save_if.sh.
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # Same reasoning as the setup composite: true archives every
+          # dependency's unpacked source tree.
+          cache-all-crates: false
+          cache-on-failure: true
+          shared-key: rustfs-cargo-deny
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
         with:
           tool: cargo-deny
 
@@ -92,28 +143,213 @@ jobs:
 
   workflow-pin-report:
     name: Workflow Pin Report
+    if: github.repository == 'rustfs/rustfs' && (github.event_name != 'pull_request' || github.event.action != 'closed')
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      release_changed: ${{ steps.scope.outputs.release_changed }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scope native packaging checks to release changes
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess
+          event, base = os.environ['GITHUB_EVENT_NAME'], os.environ.get('BASE_SHA', '')
+          changed = event == 'workflow_dispatch'
+          if event in ('push', 'pull_request'):
+              if not re.fullmatch(r'[0-9a-f]{40}', base) or base == '0' * 40:
+                  changed = True
+              else:
+                  paths = subprocess.check_output(['git', 'diff', '--name-only', base, os.environ['GITHUB_SHA']], text=True).splitlines()
+                  pattern = r'^(scripts/release/|scripts/test_release_|Dockerfile|entrypoint.sh$|bootstrap/|\.dockerignore$|\.config/release-validation-plan.json$|\.github/workflows/(audit|build|docker|package|helm-package|release-[^.]+)\.yml$)'
+                  changed = any(re.match(pattern, path) for path in paths)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'release_changed={str(changed).lower()}\n')
+          PY
 
       - name: Report unpinned GitHub Actions
-        run: ./scripts/security/check_workflow_pins.sh
+        run: ./scripts/security/check_workflow_pins.sh --enforce
+
+      - name: Check setup cache-save-if is explicit
+        run: ./scripts/security/check_cache_save_if.sh
+
+      - name: Check every job declares a timeout
+        run: ./scripts/security/check_job_timeouts.sh
+
+      - name: Check checkouts clear their credentials
+        run: ./scripts/security/check_persist_credentials.sh
+
+      - name: Check release candidate and promotion contracts
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py'
+
+      - name: Prepare artifact transport rehearsal
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-transport"
+          printf '{"purpose":"transport contract, not release evidence"}\n' > "$RUNNER_TEMP/release-transport/transport.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-transport-contract-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-transport/transport.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Verify actual GitHub artifact metadata and downloaded bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/release')
+          import candidate as c
+          run = c.github(f"repos/{c.REPOSITORY}/actions/runs/{os.environ['GITHUB_RUN_ID']}")
+          destination = Path(os.environ['RUNNER_TEMP']) / 'release-transport-downloaded'
+          c.download_artifact(run, f"release-transport-contract-{os.environ['GITHUB_RUN_ATTEMPT']}", destination)
+          c.require(c.read_json(destination / 'transport.json') == {'purpose': 'transport contract, not release evidence'}, 'artifact round trip changed')
+          PY
+
+      - name: Check tier evidence workflow isolation
+        run: ./scripts/security/check_tier_artifact_workflow.sh
+
+      - name: Check package version contract
+        run: ./scripts/test_package_versions.sh
+
+      - name: Check package service lifecycle contract
+        run: ./scripts/test_package_service_scripts.sh
+
+  release-package-contract:
+    name: Release package contract
+    needs: workflow-pin-report
+    if: needs.workflow-pin-report.outputs.release_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - name: Install real package managers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm fakeroot cpio
+          sudo gem install fpm --version 1.17.0 --no-document
+      - name: Exercise accepted and substituted payloads through both recipes
+        run: python3 scripts/test_release_packages.py
+
+  release-image-contract:
+    name: Release image contract (${{ matrix.variant }})
+    needs: workflow-pin-report
+    if: needs.workflow-pin-report.outputs.release_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [musl, gnu]
+    env:
+      RELEASE_IMAGE_VARIANT: ${{ matrix.variant }}
+      NO_PROXY: 127.0.0.1,localhost,::1
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - name: Install OCI tools
+        run: |
+          echo "RELEASE_IMAGE_OUTPUT=$RUNNER_TEMP/image-contract" >> "$GITHUB_ENV"
+          echo 'no_proxy=127.0.0.1,localhost,::1' >> "$GITHUB_ENV"
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+          go version
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Exercise real OCI packaging, startup, registry retry and conflicts
+        run: python3 scripts/test_release_images.py
+      - name: Exercise amd64 OCI archive scanning
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          input: ${{ runner.temp }}/image-contract-scan/image-${{ matrix.variant }}-amd64.tar
+          format: sarif
+          output: ${{ runner.temp }}/image-contract/scan-${{ matrix.variant }}-amd64.sarif
+          exit-code: "0"
+      - name: Exercise arm64 OCI archive scanning
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          input: ${{ runner.temp }}/image-contract-scan/image-${{ matrix.variant }}-arm64.tar
+          format: sarif
+          output: ${{ runner.temp }}/image-contract/scan-${{ matrix.variant }}-arm64.sarif
+          exit-code: "0"
+      - name: Verify scan receipts before recording the archive
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/release')
+          import deliver, test_candidate
+          deliver.image_record(test_candidate.inputs(), os.environ['RELEASE_IMAGE_VARIANT'], Path(os.environ['RELEASE_IMAGE_OUTPUT']))
+          PY
 
   dependency-review:
     name: Dependency Review
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    timeout-minutes: 30
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
     permissions:
       contents: read
       pull-requests: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
 
       - name: Dependency Review
-        uses: actions/dependency-review-action@v5
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5
         with:
           fail-on-severity: moderate
+          allow-ghsas: GHSA-2f9f-gq7v-9h6m
+          # rustfs-uring is a first-party Apache-2.0 crate, now published on
+          # crates.io (backlog#1104) rather than pulled as a git dependency.
+          # Scope the allow to the exact pinned version so a version bump forces a
+          # conscious re-review of the license/provenance claim (backlog#1181).
+          allow-dependencies-licenses: pkg:cargo/rustfs-uring@0.1.0
           comment-summary-in-pr: always
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    # dependency-review is deliberately excluded: it only runs on pull_request,
+    # so it can never contribute a failure to a scheduled run.
+    needs: [cargo-deny, workflow-pin-report]
+    # A scheduled cargo-deny failure usually means the dependency tree just
+    # matched a newly published advisory — the single most important signal this
+    # workflow produces, and until now it was only visible to whoever happened to
+    # open the Actions tab. Same ci-8 mechanism coverage.yml and
+    # e2e-replication-nightly.yml already use.
+    if: github.repository == 'rustfs/rustfs' && (always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}

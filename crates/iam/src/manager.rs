@@ -13,19 +13,19 @@
 // limitations under the License.
 
 use crate::error::{Error, Result, is_err_config_not_found};
+use crate::is_iam_first_cluster_node_local;
 use crate::sys::{get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp};
 use crate::{
     cache::{Cache, CacheEntity, LockedCache},
     error::{Error as IamError, is_err_no_such_group, is_err_no_such_policy, is_err_no_such_user},
     store::{GroupInfo, MappedPolicy, Store, UserType, object::IAM_CONFIG_PREFIX},
     sys::{
-        MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, STATUS_DISABLED, STATUS_ENABLED,
-        UpdateServiceAccountOpts,
+        MAX_SVCSESSION_POLICY_SIZE, SESSION_POLICY_NAME, SESSION_POLICY_NAME_EXTRACTED, SITE_REPLICATOR_CLAIM,
+        SITE_REPLICATOR_SERVICE_ACCOUNT, STATUS_DISABLED, STATUS_ENABLED, UpdateServiceAccountOpts,
     },
 };
 use futures::future::join_all;
-use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
-use rustfs_ecstore::global::is_first_cluster_node_local;
+use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE};
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
     arn::ARN,
@@ -56,12 +56,21 @@ use tokio::{
 use tracing::warn;
 use tracing::{debug, error};
 
+const EVENT_USER_UPDATE_EXISTING: &str = "iam.user.update_existing";
+const LOG_COMPONENT_IAM: &str = "iam";
+const LOG_SUBSYSTEM_USERS: &str = "users";
+
 const IAM_FORMAT_FILE: &str = "format.json";
 const IAM_FORMAT_VERSION_1: i32 = 1;
 #[cfg(not(test))]
 const INITIAL_LOAD_RETRY_DELAY: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const INITIAL_LOAD_RETRY_DELAY: Duration = Duration::from_millis(1);
+#[cfg(not(test))]
+const TEMP_USER_PERSISTENCE_VERIFY_RETRY_DELAY: Duration = Duration::from_millis(200);
+#[cfg(test)]
+const TEMP_USER_PERSISTENCE_VERIFY_RETRY_DELAY: Duration = Duration::from_millis(1);
+const TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES: usize = 5;
 
 #[derive(Serialize, Deserialize)]
 struct IAMFormat {
@@ -114,6 +123,30 @@ impl<T> IamCache<T>
 where
     T: Store,
 {
+    async fn verify_temp_user_persistence(&self, access_key: &str) -> Result<()> {
+        for attempt in 0..=TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES {
+            match self.api.load_user_identity(access_key, UserType::Sts).await {
+                Ok(_) => return Ok(()),
+                Err(err)
+                    if attempt < TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES
+                        && (is_err_no_such_user(&err) || is_err_config_not_found(&err)) =>
+                {
+                    warn!(
+                        access_key,
+                        attempt = attempt + 1,
+                        max_retries = TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES,
+                        error = ?err,
+                        "temporary IAM user not yet visible after save; retrying persistence verification"
+                    );
+                    tokio::time::sleep(TEMP_USER_PERSISTENCE_VERIFY_RETRY_DELAY).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        unreachable!("temp-user persistence verification loop should return on success or terminal error")
+    }
+
     /// Create a new IAM system instance
     /// # Arguments
     /// * `api` - The storage backend implementing the Store trait
@@ -264,6 +297,8 @@ where
     }
 
     pub async fn load_user(&self, access_key: &str) -> Result<()> {
+        let sts_mutation_lock = self.cache.sts_account_mutation_lock(access_key);
+        let _sts_mutation_guard = sts_mutation_lock.lock().await;
         let mut users_map: HashMap<String, UserIdentity> = HashMap::new();
         let mut user_policy_map = HashMap::new();
         let mut sts_users_map = HashMap::new();
@@ -355,7 +390,6 @@ where
         Ok(())
     }
 
-    // TODO: Check if exists, whether retry is possible
     #[tracing::instrument(level = "debug", skip(self))]
     async fn save_iam_formatter(self: Arc<Self>) -> Result<()> {
         let path = get_iam_format_file_path();
@@ -375,12 +409,22 @@ where
             return Ok(());
         }
 
-        if !is_first_cluster_node_local().await {
+        if !is_iam_first_cluster_node_local().await {
             return Ok(());
         }
 
         self.api.save_iam_config(IAMFormat::new_version_1(), path).await
     }
+    /// Current built-in IAM group membership, independent of credential snapshots.
+    pub fn user_group_memberships(&self, name: &str) -> Vec<String> {
+        self.cache
+            .snapshot()
+            .user_group_memberships
+            .get(name)
+            .map(|groups| groups.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub async fn get_user(&self, access_key: &str) -> Option<UserIdentity> {
         let cache = self.cache.snapshot();
         cache
@@ -397,6 +441,27 @@ where
         } else {
             cache.user_policies.get(name).cloned()
         }
+    }
+
+    /// The cached mapping record for one user or group, looked up in the same
+    /// cache partition `policy_db_set` writes it to (group / STS / regular+service
+    /// user). `None` when no mapping is stored.
+    pub async fn get_mapped_policy_record(&self, name: &str, user_type: UserType, is_group: bool) -> Option<MappedPolicy> {
+        let cache = self.cache.snapshot();
+        if is_group {
+            cache.group_policies.get(name).cloned()
+        } else if user_type == UserType::Sts {
+            cache.sts_policies.get(name).cloned()
+        } else {
+            cache.user_policies.get(name).cloned()
+        }
+    }
+
+    /// The cached group record (members, status, own timestamp) without the
+    /// mapped-policy overlay `get_group_description` applies. `None` when the
+    /// group does not exist.
+    pub async fn get_group_info(&self, name: &str) -> Option<GroupInfo> {
+        self.cache.snapshot().groups.get(name).cloned()
     }
 
     pub async fn get_policy(&self, name: &str) -> Result<Policy> {
@@ -438,6 +503,27 @@ where
             .get(name)
             .cloned()
             .ok_or(Error::NoSuchPolicy)
+    }
+
+    /// Reports whether `name` is a stored policy, consulting storage on a cache miss.
+    ///
+    /// Unlike [`Self::merge_policies`], which drops names whose load fails, only a confirmed
+    /// `NoSuchPolicy` yields `false`; storage and decode errors are returned so callers that skip
+    /// absent policies can fail closed instead of mistaking an unreadable policy for a missing one.
+    pub async fn policy_exists(&self, name: &str) -> Result<bool> {
+        if name.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+        if self.cache.snapshot().policy_docs.contains_key(name) {
+            return Ok(true);
+        }
+
+        let mut m = HashMap::new();
+        match self.api.load_policy_doc(name, &mut m).await {
+            Ok(()) => Ok(true),
+            Err(err) if is_err_no_such_policy(&err) => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn delete_policy(&self, name: &str, is_from_notify: bool) -> Result<()> {
@@ -485,12 +571,16 @@ where
             }
 
             if let Err(err) = self.api.delete_policy_doc(name).await {
+                // A real backend failure (disk IO, insufficient quorum, etc.) means the on-disk
+                // policy was NOT removed: propagate the error so callers do not report a phantom
+                // success and evict a policy that is still persisted (it would reappear on the
+                // next full IAM reload).
                 if !is_err_no_such_policy(&err) {
-                    self.cache.delete_policy_doc(name, OffsetDateTime::now_utc());
-                    return Ok(());
+                    return Err(err);
                 }
 
-                return Err(err);
+                // NoSuchPolicy means the doc is already gone on the backend; treat the delete as
+                // idempotently successful and fall through to evict any stale cache entry below.
             }
         }
 
@@ -500,6 +590,17 @@ where
     }
 
     pub async fn set_policy(&self, name: &str, policy: Policy) -> Result<OffsetDateTime> {
+        self.set_policy_at(name, policy, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::set_policy`] stamping the document with `updated_at` instead
+    /// of the local clock.
+    ///
+    /// A site-replication receiver passes the edit's source time: the next
+    /// incoming revision is judged against the stored `UpdateDate`, so a
+    /// local stamp would reject a newer source edit that was merely delivered
+    /// later (backlog#2291). The returned stamp is the one persisted.
+    pub async fn set_policy_at(&self, name: &str, policy: Policy, updated_at: OffsetDateTime) -> Result<OffsetDateTime> {
         if name.is_empty() || policy.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -510,21 +611,20 @@ where
             .get(name)
             .map(|v| {
                 let mut p = v.clone();
-                p.update(policy.clone());
+                p.update_at(policy.clone(), updated_at);
                 p
             })
-            .unwrap_or_else(|| PolicyDoc::new(policy));
+            .unwrap_or_else(|| PolicyDoc::new_at(policy, updated_at));
 
         self.api.save_policy_doc(name, policy_doc.clone()).await?;
 
-        let now = OffsetDateTime::now_utc();
+        self.cache
+            .add_or_update_policy_doc(name, &policy_doc, OffsetDateTime::now_utc());
 
-        self.cache.add_or_update_policy_doc(name, &policy_doc, now);
-
-        Ok(now)
+        Ok(updated_at)
     }
 
-    pub async fn list_polices(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
+    pub async fn list_policies(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
         let mut m = HashMap::new();
 
         self.api.load_policy_docs(&mut m).await?;
@@ -554,6 +654,15 @@ where
             .collect();
 
         Ok(filtered)
+    }
+
+    /// Backward-compatible misspelling retained until the next breaking release.
+    #[deprecated(
+        since = "1.0.0",
+        note = "use list_policies instead; this alias will be removed in the next breaking release"
+    )]
+    pub async fn list_polices(&self, bucket_name: &str) -> Result<HashMap<String, Policy>> {
+        self.list_policies(bucket_name).await
     }
 
     pub async fn merge_policies(&self, name: &str) -> (String, Policy) {
@@ -663,7 +772,7 @@ where
         let mut user_exists = false;
         let mut ret = Vec::new();
 
-        for (_, v) in users.iter() {
+        for v in users.values() {
             let is_derived = v.credentials.is_service_account() || v.credentials.is_temp();
 
             if !is_derived && v.credentials.access_key.as_str() == access_key {
@@ -681,7 +790,7 @@ where
         }
 
         let sts_accounts = Arc::clone(&cache.sts_accounts);
-        for (_, v) in sts_accounts.iter() {
+        for v in sts_accounts.values() {
             if v.credentials.parent_user == access_key {
                 user_exists = true;
                 if v.credentials.is_temp() && !v.credentials.is_service_account() {
@@ -746,21 +855,93 @@ where
 
     /// create a service account and update cache
     pub async fn add_service_account(&self, cred: Credentials) -> Result<OffsetDateTime> {
+        self.add_service_account_at(cred, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::add_service_account`] stamping the identity with `updated_at`
+    /// instead of the local clock; see [`Self::set_policy_at`] (backlog#2291).
+    pub async fn add_service_account_at(&self, cred: Credentials, updated_at: OffsetDateTime) -> Result<OffsetDateTime> {
         if cred.access_key.is_empty() || cred.parent_user.is_empty() {
             return Err(Error::InvalidArgument);
         }
 
-        let cache = self.cache.snapshot();
-        let users = Arc::clone(&cache.users);
-        if let Some(x) = users.get(&cred.access_key)
-            && x.credentials.is_service_account()
+        let _mutation_guard = self.cache.service_account_mutation_lock().lock().await;
+        self.save_new_service_account_locked(cred, updated_at).await
+    }
+
+    /// Order a cross-user issue with changes to either identity. Parent locks
+    /// are acquired by name, then the service-account lock, then the caller's
+    /// STS lock, matching user updates. Hold them through durable publication.
+    pub(crate) async fn add_delegated_service_account(&self, cred: &Credentials, caller: &Credentials) -> Result<OffsetDateTime> {
+        use subtle::ConstantTimeEq;
+
+        let target = cred.parent_user.as_str();
+        let principal = if caller.parent_user.is_empty() {
+            caller.access_key.as_str()
+        } else {
+            caller.parent_user.as_str()
+        };
+        if target == principal || target == caller.access_key || crate::is_root_access_key(target) {
+            return Err(Error::IAMActionNotAllowed);
+        }
+        let mut parents = [principal, target];
+        parents.sort_unstable();
+        let _first = self.cache.parent_mutation_lock(parents[0]).lock_owned().await;
+        let _second = self.cache.parent_mutation_lock(parents[1]).lock_owned().await;
+        let _service = self.cache.service_account_mutation_lock().lock().await;
+        let _session = if !caller.session_token.is_empty() && !caller.is_service_account() {
+            Some(self.cache.sts_account_mutation_lock(&caller.access_key).lock_owned().await)
+        } else {
+            None
+        };
+
+        let active_local_user = |user: &UserIdentity| {
+            user.credentials.is_valid() && user.credentials.parent_user.is_empty() && user.credentials.session_token.is_empty()
+        };
+        let snapshot = self.cache.snapshot();
+        if !snapshot.users.get(target).is_some_and(active_local_user) {
+            return Err(Error::IAMActionNotAllowed);
+        }
+        let root = crate::root_credentials::credentials().ok_or(Error::IAMActionNotAllowed)?;
+        let current = if caller.access_key == root.access_key {
+            &root
+        } else {
+            &snapshot
+                .users
+                .get(&caller.access_key)
+                .or_else(|| snapshot.sts_accounts.get(&caller.access_key))
+                .ok_or(Error::IAMActionNotAllowed)?
+                .credentials
+        };
+        if !current.is_valid()
+            || current.parent_user != caller.parent_user
+            || !bool::from(current.secret_key.as_bytes().ct_eq(caller.secret_key.as_bytes()))
+            || !bool::from(current.session_token.as_bytes().ct_eq(caller.session_token.as_bytes()))
         {
             return Err(Error::IAMActionNotAllowed);
         }
-        drop(cache);
-        drop(users);
+        if !caller.parent_user.is_empty()
+            && principal != root.access_key
+            && !crate::sys::is_rustfs_oidc_claims(caller.claims_or_empty())
+            && !snapshot.users.get(principal).is_some_and(active_local_user)
+        {
+            return Err(Error::IAMActionNotAllowed);
+        }
+        drop(snapshot);
+        self.save_new_service_account_locked(cred.clone(), OffsetDateTime::now_utc())
+            .await
+    }
 
-        let u = UserIdentity::new(cred);
+    /// The caller holds the service-account mutation lock through cache publication.
+    async fn save_new_service_account_locked(&self, cred: Credentials, updated_at: OffsetDateTime) -> Result<OffsetDateTime> {
+        let cache = self.cache.snapshot();
+        if cache.users.contains_key(&cred.access_key) || cache.sts_accounts.contains_key(&cred.access_key) {
+            return Err(Error::AccessKeyAlreadyExists);
+        }
+        drop(cache);
+
+        let mut u = UserIdentity::new(cred);
+        u.update_at = Some(updated_at);
 
         self.api
             .save_user_identity(&u.credentials.access_key, UserType::Svc, u.clone(), None)
@@ -768,10 +949,23 @@ where
 
         self.update_user_with_claims(&u.credentials.access_key, u.clone())?;
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(updated_at)
     }
 
     pub async fn update_service_account(&self, name: &str, opts: UpdateServiceAccountOpts) -> Result<OffsetDateTime> {
+        self.update_service_account_at(name, opts, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::update_service_account`] stamping the identity with
+    /// `updated_at` instead of the local clock; see [`Self::set_policy_at`]
+    /// (backlog#2291).
+    pub async fn update_service_account_at(
+        &self,
+        name: &str,
+        opts: UpdateServiceAccountOpts,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        let _mutation_guard = self.cache.service_account_mutation_lock().lock().await;
         let cache = self.cache.snapshot();
         let Some(ui) = cache.users.get(name).cloned() else {
             return Err(Error::NoSuchServiceAccount(name.to_string()));
@@ -792,6 +986,15 @@ where
             cr.secret_key = secret;
         }
 
+        if let Some(parent_user) = opts.parent_user {
+            // Same gate as the account itself: a rebind grants the account whatever the new
+            // parent can do, so only the site-replication repair path may ask for one.
+            if parent_user.is_empty() || !opts.allow_site_replicator_account || name != SITE_REPLICATOR_SERVICE_ACCOUNT {
+                return Err(Error::IAMActionNotAllowed);
+            }
+            cr.parent_user = parent_user;
+        }
+
         if opts.name.is_some() {
             cr.name = opts.name;
         }
@@ -808,13 +1011,7 @@ where
         }
 
         if let Some(status) = opts.status {
-            match status.as_str() {
-                val if val == AccountStatus::Enabled.as_ref() => cr.status = auth::ACCOUNT_ON.to_owned(),
-                val if val == AccountStatus::Disabled.as_ref() => cr.status = auth::ACCOUNT_OFF.to_owned(),
-                auth::ACCOUNT_ON => cr.status = auth::ACCOUNT_ON.to_owned(),
-                auth::ACCOUNT_OFF => cr.status = auth::ACCOUNT_OFF.to_owned(),
-                _ => cr.status = auth::ACCOUNT_OFF.to_owned(),
-            }
+            cr.status = account_status_flag(&status).to_owned();
         }
 
         let mut m: HashMap<String, Value> = if token_without_expiration {
@@ -856,16 +1053,24 @@ where
         }
 
         m.insert("accessKey".to_owned(), Value::String(name.to_owned()));
+        if name == SITE_REPLICATOR_SERVICE_ACCOUNT && opts.allow_site_replicator_account {
+            m.insert(SITE_REPLICATOR_CLAIM.to_owned(), Value::Bool(true));
+        }
+        // The parent lives in the token as well, and `prepare_service_account_auth` denies the
+        // request when the two disagree — a rebind that updated only the credential would
+        // lock the account out.
+        m.insert("parent".to_owned(), Value::String(cr.parent_user.clone()));
 
         cr.session_token = jwt_sign(&m, &cr.secret_key)?;
 
-        let u = UserIdentity::new(cr);
+        let mut u = UserIdentity::new(cr);
+        u.update_at = Some(updated_at);
         self.api
             .save_user_identity(&u.credentials.access_key, UserType::Svc, u.clone(), None)
             .await?;
         self.update_user_with_claims(&u.credentials.access_key, u.clone())?;
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(updated_at)
     }
 
     pub async fn policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
@@ -873,7 +1078,55 @@ where
             return Err(Error::InvalidArgument);
         }
 
-        let (mut policies, _) = self.policy_db_get_internal(name, false, false).await?;
+        let (policies, _) = self.policy_db_get_internal(name, false, false).await?;
+        self.policy_db_get_with_groups(policies, groups).await
+    }
+
+    pub async fn sts_policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
+        self.sts_policy_db_get_with_identity_mapping(name, groups)
+            .await
+            .map(|(policies, _)| policies)
+    }
+
+    /// Resolve STS policies and whether that same lookup found a nonempty identity mapping.
+    pub async fn sts_policy_db_get_with_identity_mapping(
+        &self,
+        name: &str,
+        groups: &Option<Vec<String>>,
+    ) -> Result<(Vec<String>, bool)> {
+        if name.is_empty() {
+            return Err(Error::InvalidArgument);
+        }
+
+        let cache = self.cache.snapshot();
+        let sts_policies = Arc::clone(&cache.sts_policies);
+        drop(cache);
+        let mapped_policy = match sts_policies.get(name) {
+            Some(policy) => policy.clone(),
+            None => {
+                let mut policies = HashMap::new();
+                if let Err(err) = self.api.load_mapped_policy(name, UserType::Sts, false, &mut policies).await
+                    && !is_err_no_such_policy(&err)
+                {
+                    return Err(err);
+                }
+                match policies.get(name) {
+                    Some(policy) => {
+                        self.cache.add_or_update_sts_policy(name, policy, OffsetDateTime::now_utc());
+                        policy.clone()
+                    }
+                    None => MappedPolicy::default(),
+                }
+            }
+        };
+
+        let direct_policies = mapped_policy.to_slice();
+        let has_identity_mapping = !direct_policies.is_empty();
+        let policies = self.policy_db_get_with_groups(direct_policies, groups).await?;
+        Ok((policies, has_identity_mapping))
+    }
+
+    async fn policy_db_get_with_groups(&self, mut policies: Vec<String>, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
         let present = !policies.is_empty();
 
         if let Some(groups) = groups {
@@ -997,7 +1250,7 @@ where
         if let Some(groups) = u.credentials.groups.as_ref() {
             for group in groups.iter() {
                 if groups_cache.get(group).filter(|v| v.status == STATUS_DISABLED).is_some() {
-                    return Ok((Vec::new(), OffsetDateTime::now_utc()));
+                    continue;
                 }
 
                 let mp = match group_policies.get(group) {
@@ -1028,7 +1281,7 @@ where
 
         for group in user_group_memberships.get(name).cloned().unwrap_or_default().iter() {
             if groups_cache.get(group).filter(|v| v.status == STATUS_DISABLED).is_some() {
-                return Ok((Vec::new(), OffsetDateTime::now_utc()));
+                continue;
             }
 
             let mp = match group_policies.get(group) {
@@ -1057,6 +1310,20 @@ where
         Ok((policies.into_iter().collect(), update_at))
     }
     pub async fn policy_db_set(&self, name: &str, user_type: UserType, is_group: bool, policy: &str) -> Result<OffsetDateTime> {
+        self.policy_db_set_at(name, user_type, is_group, policy, OffsetDateTime::now_utc())
+            .await
+    }
+
+    /// [`Self::policy_db_set`] stamping the mapping with `updated_at` instead
+    /// of the local clock; see [`Self::set_policy_at`] (backlog#2291).
+    pub async fn policy_db_set_at(
+        &self,
+        name: &str,
+        user_type: UserType,
+        is_group: bool,
+        policy: &str,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         if name.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -1076,10 +1343,11 @@ where
                 self.cache.delete_user_policy(name, OffsetDateTime::now_utc());
             }
 
-            return Ok(OffsetDateTime::now_utc());
+            return Ok(updated_at);
         }
 
-        let mp = MappedPolicy::new(policy);
+        let mut mp = MappedPolicy::new(policy);
+        mp.update_at = updated_at;
 
         let cache = self.cache.snapshot();
         let policy_docs_cache = Arc::clone(&cache.policy_docs);
@@ -1102,7 +1370,7 @@ where
             self.cache.add_or_update_user_policy(name, &mp, OffsetDateTime::now_utc());
         }
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(updated_at)
     }
 
     pub async fn set_temp_user(&self, access_key: &str, cred: &Credentials, policy_name: Option<&str>) -> Result<OffsetDateTime> {
@@ -1116,6 +1384,9 @@ where
             );
             return Err(Error::InvalidArgument);
         }
+
+        let mutation_lock = self.cache.sts_account_mutation_lock(access_key);
+        let _mutation_guard = mutation_lock.lock().await;
 
         let sts_policy_update = if let Some(policy) = policy_name {
             let mp = MappedPolicy::new(policy);
@@ -1137,6 +1408,7 @@ where
         self.api
             .save_user_identity(access_key, UserType::Sts, u.clone(), None)
             .await?;
+        self.verify_temp_user_persistence(access_key).await?;
 
         let now = self.cache.with_write_lock(|cache| {
             let now = OffsetDateTime::now_utc();
@@ -1295,14 +1567,54 @@ where
     }
 
     pub async fn add_user(&self, access_key: &str, args: &AddOrUpdateUserReq) -> Result<OffsetDateTime> {
+        self.add_user_at(access_key, args, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::add_user`] stamping the identity with `updated_at` instead of
+    /// the local clock; see [`Self::set_policy_at`] (backlog#2291).
+    pub async fn add_user_at(
+        &self,
+        access_key: &str,
+        args: &AddOrUpdateUserReq,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        self.add_user_at_with_secret_change(access_key, args, updated_at)
+            .await
+            .map(|(updated_at, _, _guard)| updated_at)
+    }
+
+    /// Return whether this write replaced a different regular-user secret.
+    pub(crate) async fn add_user_at_with_secret_change(
+        &self,
+        access_key: &str,
+        args: &AddOrUpdateUserReq,
+        updated_at: OffsetDateTime,
+    ) -> Result<(OffsetDateTime, bool, tokio::sync::OwnedMutexGuard<crate::cache::MutationLockState>)> {
+        let parent_lock = self.cache.parent_mutation_lock(access_key);
+        let parent_guard = parent_lock.lock_owned().await;
+        let _service_guard = self.cache.service_account_mutation_lock().lock().await;
+        let sts_lock = self.cache.sts_account_mutation_lock(access_key);
+        let _sts_guard = sts_lock.lock().await;
         let cache = self.cache.snapshot();
+        if cache.sts_accounts.contains_key(access_key) {
+            return Err(Error::AccessKeyAlreadyExists);
+        }
         let users = Arc::clone(&cache.users);
         if let Some(x) = users.get(access_key) {
-            warn!(error = ?x, "IAM user already exists");
-            if x.credentials.is_temp() {
-                return Err(Error::IAMActionNotAllowed);
+            debug!(
+                event = EVENT_USER_UPDATE_EXISTING,
+                component = LOG_COMPONENT_IAM,
+                subsystem = LOG_SUBSYSTEM_USERS,
+                state = "existing",
+                "Updating existing IAM user"
+            );
+            if x.credentials.is_temp() || x.credentials.is_service_account() {
+                return Err(Error::AccessKeyAlreadyExists);
             }
         }
+        let secret_changed = users
+            .get(access_key)
+            .is_some_and(|user| user.credentials.secret_key != args.secret_key);
         drop(cache);
         drop(users);
 
@@ -1312,12 +1624,13 @@ where
                 _ => auth::ACCOUNT_OFF,
             }
         };
-        let user_entry = UserIdentity::from(Credentials {
+        let mut user_entry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: args.secret_key.to_string(),
             status: status.to_owned(),
             ..Default::default()
         });
+        user_entry.update_at = Some(updated_at);
 
         self.api
             .save_user_identity(access_key, UserType::Reg, user_entry.clone(), None)
@@ -1325,13 +1638,38 @@ where
 
         self.update_user_with_claims(access_key, user_entry)?;
 
-        Ok(OffsetDateTime::now_utc())
+        Ok((updated_at, secret_changed, parent_guard))
     }
 
     pub async fn delete_user(&self, access_key: &str, utype: UserType) -> Result<()> {
+        self.delete_user_with_revision(access_key, utype).await?;
+        Ok(())
+    }
+
+    pub async fn delete_service_account_with_revision(&self, access_key: &str) -> Result<OffsetDateTime> {
+        self.delete_user_with_revision(access_key, UserType::Svc).await
+    }
+
+    async fn delete_user_with_revision(&self, access_key: &str, utype: UserType) -> Result<OffsetDateTime> {
         if access_key.is_empty() {
             return Err(Error::InvalidArgument);
         }
+
+        let parent_lock = (utype == UserType::Reg).then(|| self.cache.parent_mutation_lock(access_key));
+        let _parent_guard = match &parent_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let sts_mutation_lock = (utype == UserType::Sts).then(|| self.cache.sts_account_mutation_lock(access_key));
+        let _sts_mutation_guard = match &sts_mutation_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let _service_account_guard = if matches!(utype, UserType::Svc | UserType::Reg) {
+            Some(self.cache.service_account_mutation_lock().lock().await)
+        } else {
+            None
+        };
 
         if utype == UserType::Reg {
             let cache = self.cache.snapshot();
@@ -1348,7 +1686,7 @@ where
             let mut service_accounts_to_delete = Vec::new();
             let mut temp_accounts_to_delete = HashSet::new();
             let cache = self.cache.snapshot();
-            for (_, v) in cache.users.iter() {
+            for v in cache.users.values() {
                 let u = &v.credentials;
                 if u.parent_user.as_str() == access_key {
                     if u.is_service_account() {
@@ -1360,7 +1698,7 @@ where
                     }
                 }
             }
-            for (_, v) in cache.sts_accounts.iter() {
+            for v in cache.sts_accounts.values() {
                 let u = &v.credentials;
                 if u.parent_user.as_str() == access_key {
                     temp_accounts_to_delete.insert(u.access_key.clone());
@@ -1387,9 +1725,13 @@ where
             });
         }
 
-        let _ = self.api.delete_mapped_policy(access_key, utype, false).await;
+        if utype != UserType::Sts {
+            let _ = self.api.delete_mapped_policy(access_key, utype, false).await;
+        }
 
-        self.cache.delete_user_policy(access_key, OffsetDateTime::now_utc());
+        if utype != UserType::Sts {
+            self.cache.delete_user_policy(access_key, OffsetDateTime::now_utc());
+        }
 
         if let Err(err) = self.api.delete_user_identity(access_key, utype).await
             && !is_err_no_such_user(&err)
@@ -1397,33 +1739,80 @@ where
             return Err(err);
         }
 
+        let deleted_at = OffsetDateTime::now_utc();
         self.cache.with_write_lock(|cache| {
-            let now = OffsetDateTime::now_utc();
             if utype == UserType::Sts {
-                cache.delete_sts_account(access_key, now);
+                cache.delete_sts_account(access_key, deleted_at);
+                if cache
+                    .state()
+                    .users
+                    .get(access_key)
+                    .is_some_and(|identity| identity.credentials.is_temp())
+                {
+                    cache.delete_user(access_key, deleted_at);
+                }
+            } else {
+                cache.delete_user(access_key, deleted_at);
             }
-            cache.delete_user(access_key, now);
         });
 
-        Ok(())
+        Ok(deleted_at)
     }
 
-    pub async fn update_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<()> {
+    pub async fn update_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<(OffsetDateTime, AccountStatus)> {
+        self.update_user_secret_key_with_guard(access_key, secret_key, None)
+            .await
+            .map(|(updated_at, status, _guard)| (updated_at, status))
+    }
+
+    pub(crate) async fn update_user_secret_key_with_guard(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        expected_secret: Option<&str>,
+    ) -> Result<(
+        OffsetDateTime,
+        AccountStatus,
+        tokio::sync::OwnedMutexGuard<crate::cache::MutationLockState>,
+    )> {
         if access_key.is_empty() || secret_key.is_empty() {
             return Err(Error::InvalidArgument);
         }
 
+        let parent_lock = self.cache.parent_mutation_lock(access_key);
+        let parent_guard = parent_lock.lock_owned().await;
         let cache = self.cache.snapshot();
         let users = Arc::clone(&cache.users);
         let u = match users.get(access_key) {
             Some(u) => u,
+            None if expected_secret.is_some() => return Err(Error::IAMActionNotAllowed),
             None => return Err(Error::NoSuchUser(access_key.to_string())),
         };
+
+        if let Some(expected) = expected_secret {
+            use subtle::ConstantTimeEq as _;
+            if !u.credentials.is_valid()
+                || u.credentials.is_temp()
+                || u.credentials.is_service_account()
+                || !bool::from(u.credentials.secret_key.as_bytes().ct_eq(expected.as_bytes()))
+            {
+                return Err(Error::IAMActionNotAllowed);
+            }
+        }
 
         let mut cred = u.credentials.clone();
         cred.secret_key = secret_key.to_string();
 
+        // Status is captured from the same credential snapshot the new secret
+        // is persisted with, so a caller replicating the rotation broadcasts
+        // exactly what was written rather than re-reading racily.
+        let status = if cred.is_valid() {
+            AccountStatus::Enabled
+        } else {
+            AccountStatus::Disabled
+        };
         let u = UserIdentity::from(cred);
+        let updated_at = u.update_at.unwrap_or_else(OffsetDateTime::now_utc);
         drop(cache);
         drop(users);
 
@@ -1431,7 +1820,8 @@ where
             .save_user_identity(access_key, UserType::Reg, u.clone(), None)
             .await?;
 
-        self.update_user_with_claims(access_key, u)
+        self.update_user_with_claims(access_key, u)?;
+        Ok((updated_at, status, parent_guard))
     }
 
     /// Add SSH public key for a user (for SFTP authentication)
@@ -1440,6 +1830,8 @@ where
             return Err(Error::InvalidArgument);
         }
 
+        let parent_lock = self.cache.parent_mutation_lock(access_key);
+        let _parent_guard = parent_lock.lock().await;
         let cache = self.cache.snapshot();
         let users = Arc::clone(&cache.users);
         let u = match users.get(access_key) {
@@ -1460,6 +1852,17 @@ where
     }
 
     pub async fn set_user_status(&self, access_key: &str, status: AccountStatus) -> Result<OffsetDateTime> {
+        self.set_user_status_at(access_key, status, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::set_user_status`] stamping the identity with `updated_at`
+    /// instead of the local clock; see [`Self::set_policy_at`] (backlog#2291).
+    pub async fn set_user_status_at(
+        &self,
+        access_key: &str,
+        status: AccountStatus,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         if access_key.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -1468,6 +1871,8 @@ where
             return Err(Error::InvalidArgument);
         }
 
+        let parent_lock = self.cache.parent_mutation_lock(access_key);
+        let _parent_guard = parent_lock.lock().await;
         let cache = self.cache.snapshot();
         let users = Arc::clone(&cache.users);
         let u = match users.get(access_key) {
@@ -1486,12 +1891,13 @@ where
             }
         };
 
-        let user_entry = UserIdentity::from(Credentials {
+        let mut user_entry = UserIdentity::from(Credentials {
             access_key: access_key.to_string(),
             secret_key: u.credentials.secret_key.clone(),
             status: status.to_owned(),
             ..Default::default()
         });
+        user_entry.update_at = Some(updated_at);
         drop(cache);
         drop(users);
 
@@ -1501,7 +1907,7 @@ where
 
         self.update_user_with_claims(access_key, user_entry)?;
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(updated_at)
     }
 
     fn update_user_with_claims(&self, k: &str, u: UserIdentity) -> Result<()> {
@@ -1537,6 +1943,17 @@ where
     }
 
     pub async fn add_users_to_group(&self, group: &str, members: Vec<String>) -> Result<OffsetDateTime> {
+        self.add_users_to_group_at(group, members, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::add_users_to_group`] stamping the group with `updated_at`
+    /// instead of the local clock; see [`Self::set_policy_at`] (backlog#2291).
+    pub async fn add_users_to_group_at(
+        &self,
+        group: &str,
+        members: Vec<String>,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         if group.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -1554,6 +1971,14 @@ where
             }
         }
 
+        // The group's own timestamp moves with every membership or status
+        // change: site replication judges an incoming group item against it
+        // (backlog#2291), so it must reflect the last change, not creation.
+        // `updated_at` is the record's stamp only; the cache is published
+        // with the local clock, because `LockedCache::exec` drops a write
+        // whose time predates the entity's load time — a replicated edit
+        // whose source time is older than this node's startup would
+        // otherwise never reach the cache.
         let gi = match cache.groups.get(group) {
             Some(res) => {
                 let mut gi = res.clone();
@@ -1562,15 +1987,20 @@ where
                 uniq_set.extend(members.iter().cloned());
 
                 gi.members = uniq_set.into_iter().collect();
+                gi.update_at = Some(updated_at);
                 gi
             }
-            None => GroupInfo::new(members.clone()),
+            None => {
+                let mut gi = GroupInfo::new(members.clone());
+                gi.update_at = Some(updated_at);
+                gi
+            }
         };
         drop(cache);
 
         self.api.save_group_info(group, gi.clone()).await?;
 
-        let now = self.cache.with_write_lock(|cache| {
+        self.cache.with_write_lock(|cache| {
             let now = OffsetDateTime::now_utc();
             cache.add_or_update_group(group, &gi, now);
 
@@ -1580,13 +2010,18 @@ where
                 m.insert(group.to_string());
                 cache.add_or_update_user_group_membership(member, &m, now);
             });
-            now
         });
 
-        Ok(now)
+        Ok(updated_at)
     }
 
     pub async fn set_group_status(&self, name: &str, enable: bool) -> Result<OffsetDateTime> {
+        self.set_group_status_at(name, enable, OffsetDateTime::now_utc()).await
+    }
+
+    /// [`Self::set_group_status`] stamping the group with `updated_at` instead
+    /// of the local clock; see [`Self::set_policy_at`] (backlog#2291).
+    pub async fn set_group_status_at(&self, name: &str, enable: bool, updated_at: OffsetDateTime) -> Result<OffsetDateTime> {
         if name.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -1604,12 +2039,15 @@ where
         } else {
             gi.status = STATUS_DISABLED.to_owned();
         }
+        gi.update_at = Some(updated_at);
 
         self.api.save_group_info(name, gi.clone()).await?;
 
+        // Cache publication time is the local clock, not the record stamp
+        // (see `add_users_to_group_at`).
         self.cache.add_or_update_group(name, &gi, OffsetDateTime::now_utc());
 
-        Ok(OffsetDateTime::now_utc())
+        Ok(updated_at)
     }
 
     pub async fn get_group_description(&self, name: &str) -> Result<GroupDesc> {
@@ -1680,6 +2118,20 @@ where
         members: Vec<String>,
         update_cache_only: bool,
     ) -> Result<OffsetDateTime> {
+        self.remove_members_from_group_at(name, members, update_cache_only, OffsetDateTime::now_utc())
+            .await
+    }
+
+    /// [`Self::remove_members_from_group`] stamping the group with
+    /// `updated_at` instead of the local clock; see [`Self::set_policy_at`]
+    /// (backlog#2291).
+    pub async fn remove_members_from_group_at(
+        &self,
+        name: &str,
+        members: Vec<String>,
+        update_cache_only: bool,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         let cache = self.cache.snapshot();
         let mut gi = cache
             .groups
@@ -1691,12 +2143,14 @@ where
         let s: HashSet<&String> = HashSet::from_iter(gi.members.iter());
         let d: HashSet<&String> = HashSet::from_iter(members.iter());
         gi.members = s.difference(&d).map(|v| v.to_string()).collect::<Vec<String>>();
-
+        gi.update_at = Some(updated_at);
         if !update_cache_only {
             self.api.save_group_info(name, gi.clone()).await?;
         }
 
-        let now = self.cache.with_write_lock(|cache| {
+        self.cache.with_write_lock(|cache| {
+            // Sample after storage completes so a concurrent reload cannot
+            // make this publication older than the cache it must update.
             let now = OffsetDateTime::now_utc();
             cache.add_or_update_group(name, &gi, now);
 
@@ -1708,13 +2162,25 @@ where
                     cache.add_or_update_user_group_membership(member, &m, now);
                 }
             });
-            now
         });
 
-        Ok(now)
+        Ok(updated_at)
     }
 
     pub async fn remove_users_from_group(&self, group: &str, members: Vec<String>) -> Result<OffsetDateTime> {
+        self.remove_users_from_group_at(group, members, OffsetDateTime::now_utc())
+            .await
+    }
+
+    /// [`Self::remove_users_from_group`] stamping the group with `updated_at`
+    /// instead of the local clock; a group delete (no members) leaves no
+    /// record and returns the stamp unchanged (backlog#2291).
+    pub async fn remove_users_from_group_at(
+        &self,
+        group: &str,
+        members: Vec<String>,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
         if group.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -1763,18 +2229,17 @@ where
                 return Err(err);
             }
 
-            let now = self.cache.with_write_lock(|cache| {
+            self.cache.with_write_lock(|cache| {
                 let now = OffsetDateTime::now_utc();
                 self.remove_group_from_memberships_map_unlocked(cache, group, now);
                 cache.delete_group(group, now);
                 cache.delete_group_policy(group, now);
-                now
             });
 
-            return Ok(now);
+            return Ok(updated_at);
         }
 
-        self.remove_members_from_group(group, members, false).await
+        self.remove_members_from_group_at(group, members, false, updated_at).await
     }
 
     fn remove_group_from_memberships_map_unlocked(&self, cache: &mut LockedCache, group: &str, now: OffsetDateTime) {
@@ -1811,7 +2276,7 @@ where
 
     pub async fn group_notification_handler(&self, group: &str) -> Result<()> {
         let mut m = HashMap::new();
-        if let Err(err) = self.api.load_group(group, &mut m).await {
+        if let Err(err) = self.api.load_group_no_lock(group, &mut m).await {
             if !is_err_no_such_group(&err) {
                 return Err(err);
             }
@@ -1840,7 +2305,7 @@ where
 
     pub async fn policy_notification_handler(&self, policy: &str) -> Result<()> {
         let mut m = HashMap::new();
-        if let Err(err) = self.api.load_policy_doc(policy, &mut m).await {
+        if let Err(err) = self.api.load_policy_doc_no_lock(policy, &mut m).await {
             if !is_err_no_such_policy(&err) {
                 return Err(err);
             }
@@ -1891,7 +2356,7 @@ where
 
     pub async fn policy_mapping_notification_handler(&self, name: &str, user_type: UserType, is_group: bool) -> Result<()> {
         let mut m = HashMap::new();
-        if let Err(err) = self.api.load_mapped_policy(name, user_type, is_group, &mut m).await {
+        if let Err(err) = self.api.load_mapped_policy_no_lock(name, user_type, is_group, &mut m).await {
             if !is_err_no_such_policy(&err) {
                 return Err(err);
             }
@@ -1926,8 +2391,23 @@ where
         Ok(())
     }
     pub async fn user_notification_handler(&self, name: &str, user_type: UserType) -> Result<()> {
+        let parent_lock = (user_type == UserType::Reg).then(|| self.cache.parent_mutation_lock(name));
+        let _parent_guard = match &parent_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let sts_mutation_lock = (user_type == UserType::Sts).then(|| self.cache.sts_account_mutation_lock(name));
+        let _sts_mutation_guard = match &sts_mutation_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let _service_account_guard = if user_type == UserType::Svc {
+            Some(self.cache.service_account_mutation_lock().lock().await)
+        } else {
+            None
+        };
         let mut m = HashMap::new();
-        if let Err(err) = self.api.load_user(name, user_type, &mut m).await {
+        if let Err(err) = self.api.load_user_no_lock(name, user_type, &mut m).await {
             if !is_err_no_such_user(&err) {
                 return Err(err);
             }
@@ -1936,14 +2416,14 @@ where
             let mut temp_accounts_to_delete = HashSet::new();
             if user_type == UserType::Reg {
                 let cache = self.cache.snapshot();
-                for (_, v) in cache.users.iter() {
+                for v in cache.users.values() {
                     let u = &v.credentials;
                     if u.parent_user.as_str() == name && u.is_service_account() {
                         service_accounts_to_delete.push(u.access_key.clone());
                     }
                 }
 
-                for (_, u) in cache.sts_accounts.iter() {
+                for u in cache.sts_accounts.values() {
                     let u = &u.credentials;
                     if u.parent_user.as_str() == name {
                         temp_accounts_to_delete.insert(u.access_key.clone());
@@ -1966,7 +2446,9 @@ where
                     UserType::Reg | UserType::Svc => cache.delete_user(name, now),
                     UserType::None => {}
                 }
-                self.remove_user_from_cached_groups(cache, name, now);
+                if user_type != UserType::Sts {
+                    self.remove_user_from_cached_groups(cache, name, now);
+                }
                 if user_type == UserType::Reg {
                     for access_key in service_accounts_to_delete.iter() {
                         cache.delete_user(access_key, now);
@@ -1976,7 +2458,9 @@ where
                         cache.delete_user(access_key, now);
                     }
                 }
-                cache.delete_user_policy(name, now);
+                if user_type != UserType::Sts {
+                    cache.delete_user_policy(name, now);
+                }
             });
 
             return Ok(());
@@ -1992,7 +2476,7 @@ where
                 let mut policies = HashMap::new();
                 if let Err(err) = self
                     .api
-                    .load_mapped_policy(&parent_user, user_type, false, &mut policies)
+                    .load_mapped_policy_no_lock(&parent_user, user_type, false, &mut policies)
                     .await
                 {
                     if !is_err_no_such_policy(&err) {
@@ -2004,7 +2488,11 @@ where
             }
             UserType::Reg => {
                 let mut policies = HashMap::new();
-                if let Err(err) = self.api.load_mapped_policy(name, user_type, false, &mut policies).await {
+                if let Err(err) = self
+                    .api
+                    .load_mapped_policy_no_lock(name, user_type, false, &mut policies)
+                    .await
+                {
                     if !is_err_no_such_policy(&err) {
                         return Err(err);
                     }
@@ -2027,7 +2515,7 @@ where
                     let mut policies = HashMap::new();
                     if let Err(err) = self
                         .api
-                        .load_mapped_policy(&parent_user, UserType::Reg, false, &mut policies)
+                        .load_mapped_policy_no_lock(&parent_user, UserType::Reg, false, &mut policies)
                         .await
                     {
                         if !is_err_no_such_policy(&err) {
@@ -2040,7 +2528,7 @@ where
                     let mut policies = HashMap::new();
                     if let Err(err) = self
                         .api
-                        .load_mapped_policy(&parent_user, UserType::Sts, false, &mut policies)
+                        .load_mapped_policy_no_lock(&parent_user, UserType::Sts, false, &mut policies)
                         .await
                     {
                         if !is_err_no_such_policy(&err) {
@@ -2078,7 +2566,20 @@ where
     }
 }
 
-pub fn get_default_policyes() -> HashMap<String, PolicyDoc> {
+/// The stored `status` flag for a service-account status given on the admin
+/// or replication wire: the madmin `enabled` / `disabled` words and the stored
+/// `on` / `off` flags are both accepted; anything else disables the account.
+pub(crate) fn account_status_flag(status: &str) -> &'static str {
+    match status {
+        val if val == AccountStatus::Enabled.as_ref() => auth::ACCOUNT_ON,
+        val if val == AccountStatus::Disabled.as_ref() => auth::ACCOUNT_OFF,
+        auth::ACCOUNT_ON => auth::ACCOUNT_ON,
+        auth::ACCOUNT_OFF => auth::ACCOUNT_OFF,
+        _ => auth::ACCOUNT_OFF,
+    }
+}
+
+pub fn get_default_policies() -> HashMap<String, PolicyDoc> {
     let default_policies = &DEFAULT_POLICIES;
     default_policies
         .iter()
@@ -2095,6 +2596,15 @@ pub fn get_default_policyes() -> HashMap<String, PolicyDoc> {
         .collect()
 }
 
+/// Backward-compatible misspelling retained until the next breaking release.
+#[deprecated(
+    since = "1.0.0",
+    note = "use get_default_policies instead; this alias will be removed in the next breaking release"
+)]
+pub fn get_default_policyes() -> HashMap<String, PolicyDoc> {
+    get_default_policies()
+}
+
 fn set_default_canned_policies(policies: &mut HashMap<String, PolicyDoc>) {
     let default_policies = &DEFAULT_POLICIES;
     for (k, v) in default_policies.iter() {
@@ -2104,11 +2614,7 @@ fn set_default_canned_policies(policies: &mut HashMap<String, PolicyDoc>) {
 }
 
 pub fn get_token_signing_key() -> Option<String> {
-    if let Some(s) = get_global_action_cred() {
-        Some(s.secret_key)
-    } else {
-        None
-    }
+    crate::root_credentials::token_signing_key()
 }
 
 pub fn extract_jwt_claims(u: &UserIdentity) -> Result<HashMap<String, Value>> {
@@ -2168,9 +2674,13 @@ fn filter_policies_from_docs(policy_docs: &CacheEntity<PolicyDoc>, policy_name: 
 }
 
 fn build_group_desc(name: &str, group_info: GroupInfo, mapped_policy: Option<MappedPolicy>) -> GroupDesc {
+    // A group without a mapped policy must report the group's own stored
+    // timestamp, not the wall clock: this value feeds content-addressed
+    // consumers (the site-replication repair plan hashes it), and a fresh
+    // clock on every read makes equal states hash differently.
     let (policy, updated_at) = mapped_policy
         .map(|policy| (policy.policies, Some(policy.update_at)))
-        .unwrap_or_else(|| (String::new(), Some(OffsetDateTime::now_utc())));
+        .unwrap_or_else(|| (String::new(), group_info.update_at));
 
     GroupDesc {
         name: name.to_string(),
@@ -2186,7 +2696,54 @@ mod tests {
     use super::*;
     use rustfs_policy::policy::{Policy, PolicyDoc};
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
+    use tokio::sync::Notify;
+
+    #[test]
+    fn test_build_group_desc_without_mapping_reports_the_stored_group_timestamp() {
+        let stamp = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
+        let group_info = GroupInfo {
+            version: 1,
+            status: "enabled".to_string(),
+            members: vec!["alice".to_string()],
+            update_at: Some(stamp),
+        };
+
+        let first = build_group_desc("team", group_info.clone(), None);
+        let second = build_group_desc("team", group_info, None);
+
+        assert_eq!(first.updated_at, Some(stamp));
+        assert_eq!(first.updated_at, second.updated_at);
+        assert!(first.policy.is_empty());
+    }
+
+    #[test]
+    fn test_build_group_desc_with_mapping_reports_the_mapping_timestamp() {
+        let group_stamp = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
+        let mapping_stamp = OffsetDateTime::from_unix_timestamp(1_700_000_500).expect("valid timestamp");
+        let group_info = GroupInfo {
+            version: 1,
+            status: "enabled".to_string(),
+            members: vec![],
+            update_at: Some(group_stamp),
+        };
+        let mapping = MappedPolicy {
+            version: 1,
+            policies: "readwrite".to_string(),
+            update_at: mapping_stamp,
+        };
+
+        let desc = build_group_desc("team", group_info, Some(mapping));
+
+        assert_eq!(desc.updated_at, Some(mapping_stamp));
+        assert_eq!(desc.policy, "readwrite");
+    }
 
     #[derive(Clone)]
     struct FailingInitialLoadStore;
@@ -2314,6 +2871,688 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct DelayedTempUserVisibilityStore {
+        saved_user: Arc<Mutex<Option<UserIdentity>>>,
+        load_attempts: Arc<AtomicUsize>,
+        visible_after_attempt: usize,
+        block_account_save: Arc<AtomicBool>,
+        account_save_started: Arc<Notify>,
+        release_account_save: Arc<Notify>,
+        block_account_load: Arc<AtomicBool>,
+        account_load_started: Arc<Notify>,
+        release_account_load: Arc<Notify>,
+    }
+
+    impl DelayedTempUserVisibilityStore {
+        fn new(visible_after_attempt: usize) -> Self {
+            Self {
+                saved_user: Arc::new(Mutex::new(None)),
+                load_attempts: Arc::new(AtomicUsize::new(0)),
+                visible_after_attempt,
+                block_account_save: Arc::new(AtomicBool::new(false)),
+                account_save_started: Arc::new(Notify::new()),
+                release_account_save: Arc::new(Notify::new()),
+                block_account_load: Arc::new(AtomicBool::new(false)),
+                account_load_started: Arc::new(Notify::new()),
+                release_account_load: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Store for DelayedTempUserVisibilityStore {
+        fn has_watcher(&self) -> bool {
+            false
+        }
+
+        async fn save_iam_config<Item: Serialize + Send>(&self, _item: Item, _path: impl AsRef<str> + Send) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load_iam_config<Item: serde::de::DeserializeOwned>(&self, _path: impl AsRef<str> + Send) -> Result<Item> {
+            Err(Error::ConfigNotFound)
+        }
+
+        async fn delete_iam_config(&self, _path: impl AsRef<str> + Send) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_user_identity(
+            &self,
+            _name: &str,
+            user_type: UserType,
+            item: UserIdentity,
+            _ttl: Option<usize>,
+        ) -> Result<()> {
+            if matches!(user_type, UserType::Svc | UserType::Sts) && self.block_account_save.load(Ordering::SeqCst) {
+                self.account_save_started.notify_one();
+                self.release_account_save.notified().await;
+            }
+            *self.saved_user.lock().expect("saved_user mutex poisoned") = Some(item);
+            Ok(())
+        }
+
+        async fn delete_user_identity(&self, _name: &str, _user_type: UserType) -> Result<()> {
+            *self.saved_user.lock().expect("saved_user mutex poisoned") = None;
+            Ok(())
+        }
+
+        async fn load_user_identity(&self, name: &str, _user_type: UserType) -> Result<UserIdentity> {
+            let attempt = self.load_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= self.visible_after_attempt {
+                return Err(Error::NoSuchUser(name.to_string()));
+            }
+
+            self.saved_user
+                .lock()
+                .expect("saved_user mutex poisoned")
+                .clone()
+                .ok_or_else(|| Error::NoSuchUser(name.to_string()))
+        }
+
+        async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            let loaded = self
+                .saved_user
+                .lock()
+                .expect("saved_user mutex poisoned")
+                .clone()
+                .ok_or_else(|| Error::NoSuchUser(name.to_string()))?;
+            let matches_user_type = match user_type {
+                UserType::Sts => loaded.credentials.is_temp(),
+                UserType::Svc => loaded.credentials.is_service_account(),
+                UserType::Reg => !loaded.credentials.is_temp() && !loaded.credentials.is_service_account(),
+                UserType::None => false,
+            };
+            if !matches_user_type {
+                return Err(Error::NoSuchUser(name.to_string()));
+            }
+            if self.block_account_load.load(Ordering::SeqCst) {
+                self.account_load_started.notify_one();
+                self.release_account_load.notified().await;
+            }
+            m.insert(name.to_string(), loaded);
+            Ok(())
+        }
+
+        async fn load_users(&self, _user_type: UserType, _m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_secret_key(&self, _name: &str, _user_type: UserType) -> Result<String> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_group_info(&self, _name: &str, _item: GroupInfo) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_group_info(&self, _name: &str) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_group(&self, _name: &str, _m: &mut HashMap<String, GroupInfo>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_groups(&self, _m: &mut HashMap<String, GroupInfo>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_policy_doc(&self, _name: &str, _item: PolicyDoc) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_policy_doc(&self, _name: &str) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy(&self, _name: &str) -> Result<PolicyDoc> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy_doc(&self, _name: &str, _m: &mut HashMap<String, PolicyDoc>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy_docs(&self, _m: &mut HashMap<String, PolicyDoc>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _item: MappedPolicy,
+            _ttl: Option<usize>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_mapped_policy(&self, _name: &str, _user_type: UserType, _is_group: bool) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> Result<()> {
+            Err(Error::NoSuchPolicy)
+        }
+
+        async fn load_mapped_policies(
+            &self,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_all(&self, _cache: &Cache) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn build_test_temp_credentials() -> Credentials {
+        Credentials {
+            access_key: "STSACCESS123".to_string(),
+            secret_key: "test-secret-key".to_string(),
+            session_token: "test-session-token".to_string(),
+            expiration: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+            status: STATUS_ENABLED.to_string(),
+            parent_user: "parent-user".to_string(),
+            groups: Some(vec!["console-admins".to_string()]),
+            claims: None,
+            name: None,
+            description: None,
+        }
+    }
+
+    fn build_test_iam_cache<T: Store>(api: T) -> IamCache<T> {
+        let (sender, _receiver) = mpsc::channel::<i64>(1);
+        IamCache {
+            cache: Cache::default(),
+            api,
+            state: Arc::new(AtomicU8::new(IamState::Ready as u8)),
+            loading: Arc::new(AtomicBool::new(false)),
+            roles: HashMap::new(),
+            send_chan: sender,
+            last_timestamp: AtomicI64::new(0),
+            sync_failures: AtomicU64::new(0),
+            sync_successes: AtomicU64::new(0),
+            last_sync_duration_millis: AtomicU64::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_boundary_existing_user_logs_omit_credentials() {
+        use tracing::instrument::WithSubscriber;
+
+        let cache = build_test_iam_cache(FailingInitialLoadStore);
+        let identity = UserIdentity::new(Credentials {
+            access_key: "LOGACCESS-PRIVATE-TAIL".to_string(),
+            secret_key: "Qstored-secret-valueZ".to_string(),
+            status: STATUS_ENABLED.to_string(),
+            ..Default::default()
+        });
+        cache
+            .cache
+            .add_or_update_user(&identity.credentials.access_key, &identity, OffsetDateTime::now_utc());
+        let log = tempfile::NamedTempFile::new().expect("capture file");
+        let writer = log.reopen().expect("capture writer");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.try_clone().expect("clone capture writer"))
+            .finish();
+        let result = cache
+            .add_user(
+                &identity.credentials.access_key,
+                &AddOrUpdateUserReq {
+                    secret_key: "replacement-secret".to_string(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .with_subscriber(subscriber)
+            .await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument)),
+            "the test store rejects persistence after the existing-user path"
+        );
+        let captured = std::fs::read_to_string(log.path()).expect("read captured logs");
+        assert!(
+            captured.contains(EVENT_USER_UPDATE_EXISTING) || captured.contains("IAM user already exists"),
+            "the existing-user diagnostic must be captured"
+        );
+        for forbidden in [
+            &identity.credentials.access_key,
+            &identity.credentials.secret_key,
+            "Q***Z|20",
+            "secret_key",
+            "session_token",
+            "credentials",
+        ] {
+            assert!(!captured.contains(forbidden), "credential material must not appear in logs: {forbidden}");
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_group_preserves_direct_and_other_group_policies() {
+        for credential_groups in [false, true] {
+            let iam = build_test_iam_cache(FailingInitialLoadStore);
+            let groups = vec!["disabled".to_string(), "enabled".to_string()];
+            let user = UserIdentity::new(Credentials {
+                access_key: "alice".to_string(),
+                secret_key: "alice-secret".to_string(),
+                status: STATUS_ENABLED.to_string(),
+                groups: credential_groups.then(|| groups.clone()),
+                ..Default::default()
+            });
+            let now = OffsetDateTime::now_utc();
+            iam.cache.add_or_update_user("alice", &user, now);
+            iam.cache
+                .add_or_update_user_policy("alice", &MappedPolicy::new("direct-deny"), now);
+            if !credential_groups {
+                iam.cache
+                    .add_or_update_user_group_membership("alice", &groups.iter().cloned().collect(), now);
+            }
+            for (group, status, policy) in [
+                ("disabled", STATUS_DISABLED, "disabled-grant"),
+                ("enabled", STATUS_ENABLED, "other-group-deny"),
+            ] {
+                iam.cache.add_or_update_group(
+                    group,
+                    &GroupInfo {
+                        status: status.to_string(),
+                        members: vec!["alice".to_string()],
+                        ..Default::default()
+                    },
+                    now,
+                );
+                iam.cache.add_or_update_group_policy(group, &MappedPolicy::new(policy), now);
+            }
+            let policies: HashSet<_> = iam
+                .policy_db_get("alice", &None)
+                .await
+                .expect("user policy lookup")
+                .into_iter()
+                .collect();
+            assert_eq!(policies, HashSet::from(["direct-deny".to_string(), "other-group-deny".to_string()]));
+            assert!(
+                iam.policy_db_get_internal("disabled", true, false)
+                    .await
+                    .expect("disabled group lookup")
+                    .0
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sts_policy_lookup_ignores_colliding_regular_user_mapping() {
+        let iam = build_test_iam_cache(FailingInitialLoadStore);
+        let parent = "TwyekekG2eMes0qk9Tgh7KXEitwGi1z2W1f2KccrXGA";
+        let user = UserIdentity::new(Credentials {
+            access_key: parent.to_string(),
+            secret_key: "regular-user-secret".to_string(),
+            status: STATUS_ENABLED.to_string(),
+            ..Default::default()
+        });
+        let now = OffsetDateTime::now_utc();
+        iam.cache.add_or_update_user(parent, &user, now);
+        iam.cache
+            .add_or_update_user_policy(parent, &MappedPolicy::new("regular-policy"), now);
+        iam.cache
+            .add_or_update_sts_policy(parent, &MappedPolicy::new("oidc-policy"), now);
+
+        assert_eq!(
+            iam.policy_db_get(parent, &None).await.expect("regular lookup should succeed"),
+            vec!["regular-policy"]
+        );
+        assert_eq!(
+            iam.sts_policy_db_get(parent, &None).await.expect("STS lookup should succeed"),
+            vec!["oidc-policy"]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_temp_user_retries_until_sts_identity_becomes_visible() {
+        let store = DelayedTempUserVisibilityStore::new(2);
+        let cache = build_test_iam_cache(store.clone());
+        let cred = build_test_temp_credentials();
+
+        let updated_at = cache
+            .set_temp_user(&cred.access_key, &cred, None)
+            .await
+            .expect("temp user should succeed once persistence becomes visible");
+
+        assert!(updated_at <= OffsetDateTime::now_utc());
+        assert_eq!(store.load_attempts.load(Ordering::SeqCst), 3);
+
+        let snapshot = cache.cache.snapshot();
+        let sts_identity = snapshot
+            .sts_accounts
+            .get(&cred.access_key)
+            .expect("verified temp user should be cached");
+        assert_eq!(sts_identity.credentials.parent_user, cred.parent_user);
+    }
+
+    #[tokio::test]
+    async fn set_temp_user_fails_when_sts_identity_never_becomes_visible() {
+        let store = DelayedTempUserVisibilityStore::new(TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES + 1);
+        let cache = build_test_iam_cache(store.clone());
+        let cred = build_test_temp_credentials();
+
+        let err = cache
+            .set_temp_user(&cred.access_key, &cred, None)
+            .await
+            .expect_err("temp user should fail when persistence never becomes visible");
+
+        assert!(matches!(err, Error::NoSuchUser(user) if user == cred.access_key));
+        assert_eq!(store.load_attempts.load(Ordering::SeqCst), TEMP_USER_PERSISTENCE_VERIFY_MAX_RETRIES + 1);
+
+        let snapshot = cache.cache.snapshot();
+        assert!(
+            !snapshot.sts_accounts.contains_key(&cred.access_key),
+            "cache must not publish a temp user that was not durably visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_account_notification_cannot_overwrite_concurrent_update() {
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("TESTROOTACCESSKEY".to_string()),
+            Some("TESTROOTSECRET123".to_string()),
+        );
+        let store = DelayedTempUserVisibilityStore::new(0);
+        let cache = Arc::new(build_test_iam_cache(store.clone()));
+        let access_key = "SERIALIZEDSERVICE01";
+        let secret_key = "serializedServiceSecret123";
+        let metadata = HashMap::from([
+            ("parent".to_string(), Value::String("parent-user".to_string())),
+            (iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_string())),
+        ]);
+        let credentials = Credentials {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            session_token: jwt_sign(&metadata, secret_key).expect("sign service account token"),
+            status: auth::ACCOUNT_ON.to_string(),
+            parent_user: "parent-user".to_string(),
+            claims: Some(metadata),
+            description: Some("old".to_string()),
+            ..Default::default()
+        };
+        cache.add_service_account(credentials).await.expect("seed service account");
+
+        store.block_account_load.store(true, Ordering::SeqCst);
+        let notification = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.user_notification_handler(access_key, UserType::Svc).await })
+        };
+        store.account_load_started.notified().await;
+
+        let update = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .update_service_account(
+                        access_key,
+                        UpdateServiceAccountOpts {
+                            session_policy: None,
+                            secret_key: None,
+                            name: None,
+                            description: Some("new".to_string()),
+                            expiration: None,
+                            status: None,
+                            parent_user: None,
+                            allow_site_replicator_account: false,
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!update.is_finished(), "update must wait for the in-flight cache refresh");
+
+        store.release_account_load.notify_one();
+        notification.await.expect("notification task").expect("notification refresh");
+        update.await.expect("update task").expect("service account update");
+
+        let snapshot = cache.cache.snapshot();
+        assert_eq!(
+            snapshot
+                .users
+                .get(access_key)
+                .and_then(|identity| identity.credentials.description.as_deref()),
+            Some("new")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_service_account_create_cannot_overwrite_first_writer() {
+        let store = DelayedTempUserVisibilityStore::new(0);
+        store.block_account_save.store(true, Ordering::SeqCst);
+        let cache = Arc::new(build_test_iam_cache(store.clone()));
+        let access_key = "SERIALIZEDSERVICE00";
+        let credentials = |secret_key: &str| Credentials {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            status: auth::ACCOUNT_ON.to_string(),
+            parent_user: "parent-user".to_string(),
+            ..Default::default()
+        };
+
+        let first = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.add_service_account(credentials("firstServiceSecret123")).await })
+        };
+        store.account_save_started.notified().await;
+
+        let second = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.add_service_account(credentials("secondServiceSecret234")).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished(), "second create must wait for the first writer");
+
+        store.block_account_save.store(false, Ordering::SeqCst);
+        store.release_account_save.notify_waiters();
+        first.await.expect("first create task").expect("first create");
+        let err = second
+            .await
+            .expect("second create task")
+            .expect_err("duplicate create must fail");
+
+        assert_eq!(err, Error::AccessKeyAlreadyExists);
+        assert_eq!(
+            cache
+                .cache
+                .snapshot()
+                .users
+                .get(access_key)
+                .map(|identity| identity.credentials.secret_key.as_str()),
+            Some("firstServiceSecret123")
+        );
+    }
+
+    #[tokio::test]
+    async fn service_account_notification_cannot_restore_concurrent_delete() {
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("TESTROOTACCESSKEY".to_string()),
+            Some("TESTROOTSECRET123".to_string()),
+        );
+        let store = DelayedTempUserVisibilityStore::new(0);
+        let cache = Arc::new(build_test_iam_cache(store.clone()));
+        let access_key = "SERIALIZEDSERVICE02";
+        let secret_key = "serializedServiceSecret234";
+        let metadata = HashMap::from([
+            ("parent".to_string(), Value::String("parent-user".to_string())),
+            (iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_string())),
+        ]);
+        let credentials = Credentials {
+            access_key: access_key.to_string(),
+            secret_key: secret_key.to_string(),
+            session_token: jwt_sign(&metadata, secret_key).expect("sign service account token"),
+            status: auth::ACCOUNT_ON.to_string(),
+            parent_user: "parent-user".to_string(),
+            claims: Some(metadata),
+            ..Default::default()
+        };
+        cache.add_service_account(credentials).await.expect("seed service account");
+
+        store.block_account_load.store(true, Ordering::SeqCst);
+        let notification = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.user_notification_handler(access_key, UserType::Svc).await })
+        };
+        store.account_load_started.notified().await;
+
+        let delete = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.delete_service_account_with_revision(access_key).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!delete.is_finished(), "delete must wait for the in-flight cache refresh");
+
+        store.release_account_load.notify_one();
+        notification.await.expect("notification task").expect("notification refresh");
+        delete.await.expect("delete task").expect("service account delete");
+
+        assert!(!cache.cache.snapshot().users.contains_key(access_key));
+        assert!(store.saved_user.lock().expect("saved_user mutex poisoned").is_none());
+    }
+
+    #[tokio::test]
+    async fn sts_notification_cannot_restore_concurrent_delete() {
+        let store = DelayedTempUserVisibilityStore::new(0);
+        let cache = Arc::new(build_test_iam_cache(store.clone()));
+        let credentials = build_test_temp_credentials();
+        let access_key = credentials.access_key.clone();
+        cache
+            .set_temp_user(&access_key, &credentials, None)
+            .await
+            .expect("seed temporary account");
+
+        store.block_account_load.store(true, Ordering::SeqCst);
+        let notification = {
+            let cache = Arc::clone(&cache);
+            let access_key = access_key.clone();
+            tokio::spawn(async move { cache.user_notification_handler(&access_key, UserType::Sts).await })
+        };
+        store.account_load_started.notified().await;
+
+        let delete_started = Arc::new(Notify::new());
+        let delete = {
+            let cache = Arc::clone(&cache);
+            let access_key = access_key.clone();
+            let delete_started = Arc::clone(&delete_started);
+            tokio::spawn(async move {
+                delete_started.notify_one();
+                cache.delete_user(&access_key, UserType::Sts).await
+            })
+        };
+        delete_started.notified().await;
+        tokio::task::yield_now().await;
+        let delete_waited_for_notification = !delete.is_finished();
+
+        store.release_account_load.notify_one();
+        notification.await.expect("notification task").expect("notification refresh");
+        delete.await.expect("delete task").expect("temporary account delete");
+
+        assert!(delete_waited_for_notification, "delete must wait for the in-flight STS cache refresh");
+        assert!(!cache.cache.snapshot().sts_accounts.contains_key(&access_key));
+        assert!(store.saved_user.lock().expect("saved_user mutex poisoned").is_none());
+    }
+
+    #[tokio::test]
+    async fn sts_auth_reload_cannot_restore_concurrent_delete() {
+        let store = DelayedTempUserVisibilityStore::new(0);
+        let cache = Arc::new(build_test_iam_cache(store.clone()));
+        let credentials = build_test_temp_credentials();
+        let access_key = credentials.access_key.clone();
+        cache
+            .set_temp_user(&access_key, &credentials, None)
+            .await
+            .expect("seed temporary account");
+        cache.cache.delete_sts_account(&access_key, OffsetDateTime::now_utc());
+
+        store.block_account_load.store(true, Ordering::SeqCst);
+        let reload = {
+            let cache = Arc::clone(&cache);
+            let access_key = access_key.clone();
+            tokio::spawn(async move { cache.load_user(&access_key).await })
+        };
+        store.account_load_started.notified().await;
+
+        let delete_started = Arc::new(Notify::new());
+        let delete = {
+            let cache = Arc::clone(&cache);
+            let access_key = access_key.clone();
+            let delete_started = Arc::clone(&delete_started);
+            tokio::spawn(async move {
+                delete_started.notify_one();
+                cache.delete_user(&access_key, UserType::Sts).await
+            })
+        };
+        delete_started.notified().await;
+        tokio::task::yield_now().await;
+        let delete_waited_for_reload = !delete.is_finished();
+
+        store.release_account_load.notify_one();
+        reload.await.expect("reload task").expect("authentication cache reload");
+        delete.await.expect("delete task").expect("temporary account delete");
+
+        assert!(delete_waited_for_reload, "delete must wait for the in-flight authentication reload");
+        assert!(!cache.cache.snapshot().sts_accounts.contains_key(&access_key));
+        assert!(store.saved_user.lock().expect("saved_user mutex poisoned").is_none());
+    }
+
+    #[tokio::test]
+    async fn sts_create_cannot_restore_concurrent_delete() {
+        let store = DelayedTempUserVisibilityStore::new(0);
+        store.block_account_save.store(true, Ordering::SeqCst);
+        let cache = Arc::new(build_test_iam_cache(store.clone()));
+        let credentials = build_test_temp_credentials();
+        let access_key = credentials.access_key.clone();
+
+        let create = {
+            let cache = Arc::clone(&cache);
+            let access_key = access_key.clone();
+            tokio::spawn(async move { cache.set_temp_user(&access_key, &credentials, None).await })
+        };
+        store.account_save_started.notified().await;
+
+        let delete_started = Arc::new(Notify::new());
+        let delete = {
+            let cache = Arc::clone(&cache);
+            let access_key = access_key.clone();
+            let delete_started = Arc::clone(&delete_started);
+            tokio::spawn(async move {
+                delete_started.notify_one();
+                cache.delete_user(&access_key, UserType::Sts).await
+            })
+        };
+        delete_started.notified().await;
+        tokio::task::yield_now().await;
+        let delete_waited_for_create = !delete.is_finished();
+
+        store.block_account_save.store(false, Ordering::SeqCst);
+        store.release_account_save.notify_one();
+        create.await.expect("create task").expect("temporary account create");
+        delete.await.expect("delete task").expect("temporary account delete");
+
+        assert!(delete_waited_for_create, "delete must wait for the in-flight STS create");
+        assert!(!cache.cache.snapshot().sts_accounts.contains_key(&access_key));
+        assert!(store.saved_user.lock().expect("saved_user mutex poisoned").is_none());
+    }
+
     #[tokio::test]
     async fn test_init_keeps_error_state_when_initial_load_fails() {
         let (sender, receiver) = mpsc::channel::<i64>(1);
@@ -2339,13 +3578,6 @@ mod tests {
     }
 
     #[test]
-    fn test_iam_format_new_version_1() {
-        let format = IAMFormat::new_version_1();
-        assert_eq!(format.version, IAM_FORMAT_VERSION_1);
-        assert_eq!(format.version, 1);
-    }
-
-    #[test]
     fn test_get_iam_format_file_path() {
         let path = get_iam_format_file_path();
         assert!(path.contains(IAM_FORMAT_FILE));
@@ -2355,7 +3587,7 @@ mod tests {
 
     #[test]
     fn test_get_default_policies() {
-        let policies = get_default_policyes();
+        let policies = get_default_policies();
 
         // Should contain some default policies
         assert!(!policies.is_empty());
@@ -2366,6 +3598,12 @@ mod tests {
             // PolicyDoc.version is i64, not String
             assert!(policy_doc.version >= 0);
         }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_get_default_policyes_matches_current_api() {
+        assert_eq!(get_default_policyes().len(), get_default_policies().len());
     }
 
     #[test]
@@ -2456,26 +3694,6 @@ mod tests {
         // When cache is empty, should return empty name and empty policy regardless of bucket
         assert_eq!(name, "");
         assert!(policy.statements.is_empty());
-    }
-
-    #[test]
-    fn test_constants() {
-        // Test that constants are properly defined
-        assert_eq!(IAM_FORMAT_FILE, "format.json");
-        assert_eq!(IAM_FORMAT_VERSION_1, 1);
-    }
-
-    #[test]
-    fn test_iam_format_serialization() {
-        let format = IAMFormat::new_version_1();
-
-        // Test serialization
-        let serialized = serde_json::to_string(&format).unwrap();
-        assert!(serialized.contains("\"version\":1"));
-
-        // Test deserialization
-        let deserialized: IAMFormat = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.version, format.version);
     }
 
     #[test]
@@ -2586,6 +3804,8 @@ mod tests {
             description: Some("Updated service account".to_string()),
             expiration: None,
             session_policy: Some(policy),
+            parent_user: None,
+            allow_site_replicator_account: false,
         };
 
         assert_eq!(opts.secret_key, Some("new-secret-key".to_string()));
@@ -2692,5 +3912,40 @@ mod tests {
         assert_eq!(desc.policy, "readonly");
         assert_eq!(desc.members, vec!["alice".to_string()]);
         assert!(desc.updated_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_policy_propagates_backend_error_and_keeps_cache() {
+        // Regression: on the admin delete path (is_from_notify = true), a real backend delete
+        // failure (here Error::InvalidArgument, standing in for disk IO / insufficient quorum)
+        // must propagate — NOT be swallowed as Ok(()) while evicting the still-persisted policy.
+        let cache = build_test_iam_cache(FailingInitialLoadStore);
+
+        let policy = Policy {
+            id: Default::default(),
+            version: "2012-10-17".to_string(),
+            statements: vec![],
+        };
+        let policy_doc = PolicyDoc {
+            version: 1,
+            policy,
+            create_date: Some(OffsetDateTime::now_utc()),
+            update_date: Some(OffsetDateTime::now_utc()),
+        };
+        cache
+            .cache
+            .add_or_update_policy_doc("permissive-policy", &policy_doc, OffsetDateTime::now_utc());
+
+        let result = cache.delete_policy("permissive-policy", true).await;
+
+        // Pre-fix this returned Ok(()) (phantom success) and evicted the cache entry.
+        assert!(
+            result.is_err(),
+            "delete_policy must surface a real backend delete failure instead of reporting success"
+        );
+        assert!(
+            cache.cache.snapshot().policy_docs.contains_key("permissive-policy"),
+            "cache must not evict a policy whose backend delete failed"
+        );
     }
 }

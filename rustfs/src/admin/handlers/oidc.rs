@@ -12,31 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::sts::create_oidc_sts_credentials;
-use crate::admin::auth::validate_admin_request;
-use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_object_store_handle;
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
+use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{AdminOperation, S3Router};
+use crate::admin::runtime_sources::current_federated_identity_service;
+use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
+use crate::admin::service::oidc_config;
+use crate::admin::utils::owned_json_response;
+use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, console_prefix};
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
-use rustfs_config::oidc::{
-    IDENTITY_OPENID_SUB_SYS, OIDC_CLAIM_NAME, OIDC_CLAIM_PREFIX, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_CONFIG_URL,
-    OIDC_DEFAULT_CLAIM_NAME, OIDC_DEFAULT_EMAIL_CLAIM, OIDC_DEFAULT_GROUPS_CLAIM, OIDC_DEFAULT_ROLES_CLAIM, OIDC_DEFAULT_SCOPES,
-    OIDC_DEFAULT_USERNAME_CLAIM, OIDC_DISPLAY_NAME, OIDC_EMAIL_CLAIM, OIDC_GROUPS_CLAIM, OIDC_HIDE_FROM_UI, OIDC_OTHER_AUDIENCES,
-    OIDC_REDIRECT_URI, OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_ROLES_CLAIM, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
-};
-use rustfs_config::server_config::Config as ServerConfig;
-use rustfs_config::server_config::get_global_server_config;
-use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
-use rustfs_ecstore::config::com::{read_config_without_migrate, save_server_config};
+use rustfs_config::{ENV_RUSTFS_BROWSER_REDIRECT_URL, MAX_ADMIN_REQUEST_BODY_SIZE};
+use rustfs_iam::federation::{FederatedSessionBindingError, FederationError};
+use rustfs_iam::oidc::{OidcProviderConfigInput, OidcProviderValidationInput, console_session_duration_secs};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 use url::Url;
 
 const LOG_COMPONENT_ADMIN: &str = "admin";
@@ -47,6 +42,41 @@ const OIDC_PUBLIC_PROVIDERS_SUFFIX: &str = "/v3/oidc/providers";
 const OIDC_AUTHORIZE_SUFFIX: &str = "/v3/oidc/authorize/";
 const OIDC_CALLBACK_SUFFIX: &str = "/v3/oidc/callback/";
 const OIDC_LOGOUT_SUFFIX: &str = "/v3/oidc/logout";
+const CONSOLE_OIDC_CALLBACK_SUFFIX: &str = "/auth/oidc-callback/";
+const CONSOLE_LOGIN_SUFFIX: &str = "/auth/login";
+const OIDC_STATE_LB_HINT: &str =
+    "check load balancer session affinity for OIDC authorize/callback requests or configure RUSTFS_BROWSER_REDIRECT_URL";
+
+fn callback_federation_error(error: FederationError) -> S3Error {
+    match error {
+        FederationError::CodeExchange(message) => {
+            S3Error::with_message(S3ErrorCode::AccessDenied, format!("code exchange failed: {message}"))
+        }
+        FederationError::Logout(message) => {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("logout session creation failed: {message}"))
+        }
+        FederationError::Binding(FederatedSessionBindingError::InvalidRequest(message)) => {
+            S3Error::with_message(S3ErrorCode::InvalidRequest, message)
+        }
+        FederationError::Binding(FederatedSessionBindingError::Internal(message)) => {
+            S3Error::with_message(S3ErrorCode::InternalError, message)
+        }
+        other => S3Error::with_message(S3ErrorCode::InternalError, other.to_string()),
+    }
+}
+
+fn config_service_error(error: oidc_config::OidcAdminConfigError) -> S3Error {
+    use oidc_config::OidcAdminConfigError;
+    let code = match &error {
+        OidcAdminConfigError::Config(rustfs_iam::oidc::OidcConfigError::EnvironmentManaged) => S3ErrorCode::AccessDenied,
+        OidcAdminConfigError::Config(_) | OidcAdminConfigError::Validation(_) => S3ErrorCode::InvalidRequest,
+        OidcAdminConfigError::StorageUnavailable
+        | OidcAdminConfigError::Load(_)
+        | OidcAdminConfigError::Save(_)
+        | OidcAdminConfigError::Task(_) => S3ErrorCode::InternalError,
+    };
+    S3Error::with_message(code, error.to_string())
+}
 
 /// Validate that a provider ID contains only safe characters (alphanumeric, underscore, hyphen).
 fn is_valid_provider_id(id: &str) -> bool {
@@ -135,6 +165,7 @@ struct OidcConfigView {
     enabled: bool,
     display_name: String,
     config_url: String,
+    issuer: Option<String>,
     client_id: String,
     client_secret_configured: bool,
     scopes: Vec<String>,
@@ -167,117 +198,22 @@ struct OidcValidationResponse {
     token_endpoint: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct OidcConfigUpsertRequest {
-    enabled: bool,
-    display_name: String,
-    config_url: String,
-    client_id: String,
-    client_secret: Option<String>,
-    scopes: Vec<String>,
-    other_audiences: Vec<String>,
-    redirect_uri: Option<String>,
-    redirect_uri_dynamic: bool,
-    claim_name: String,
-    claim_prefix: String,
-    role_policy: String,
-    groups_claim: String,
-    roles_claim: String,
-    email_claim: String,
-    username_claim: String,
-    hide_from_ui: bool,
-}
-
-impl Default for OidcConfigUpsertRequest {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            display_name: String::new(),
-            config_url: String::new(),
-            client_id: String::new(),
-            client_secret: None,
-            scopes: OIDC_DEFAULT_SCOPES.split(',').map(ToString::to_string).collect(),
-            other_audiences: Vec::new(),
-            redirect_uri: None,
-            redirect_uri_dynamic: true,
-            claim_name: OIDC_DEFAULT_CLAIM_NAME.to_string(),
-            claim_prefix: String::new(),
-            role_policy: String::new(),
-            groups_claim: OIDC_DEFAULT_GROUPS_CLAIM.to_string(),
-            roles_claim: OIDC_DEFAULT_ROLES_CLAIM.to_string(),
-            email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
-            username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
-            hide_from_ui: false,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct OidcConfigValidateRequest {
-    provider_id: String,
-    enabled: bool,
-    display_name: String,
-    config_url: String,
-    client_id: String,
-    client_secret: Option<String>,
-    scopes: Vec<String>,
-    other_audiences: Vec<String>,
-    redirect_uri: Option<String>,
-    redirect_uri_dynamic: bool,
-    claim_name: String,
-    claim_prefix: String,
-    role_policy: String,
-    groups_claim: String,
-    roles_claim: String,
-    email_claim: String,
-    username_claim: String,
-    hide_from_ui: bool,
-}
-
-impl Default for OidcConfigValidateRequest {
-    fn default() -> Self {
-        Self {
-            provider_id: "default".to_string(),
-            enabled: true,
-            display_name: String::new(),
-            config_url: String::new(),
-            client_id: String::new(),
-            client_secret: None,
-            scopes: OIDC_DEFAULT_SCOPES.split(',').map(ToString::to_string).collect(),
-            other_audiences: Vec::new(),
-            redirect_uri: None,
-            redirect_uri_dynamic: true,
-            claim_name: OIDC_DEFAULT_CLAIM_NAME.to_string(),
-            claim_prefix: String::new(),
-            role_policy: String::new(),
-            groups_claim: OIDC_DEFAULT_GROUPS_CLAIM.to_string(),
-            roles_claim: OIDC_DEFAULT_ROLES_CLAIM.to_string(),
-            email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
-            username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
-            hide_from_ui: false,
-        }
-    }
-}
-
 /// Handler: GET /rustfs/admin/v3/oidc/providers
 /// Returns list of configured OIDC providers for the login page.
 pub struct ListOidcProvidersHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ListOidcProvidersHandler {
-    async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let oidc_sys = rustfs_iam::get_oidc().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
+    async fn call(&self, _req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let federation = current_federated_identity_service().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
-        let providers = oidc_sys.list_visible_providers();
+        let providers = federation.list_visible_providers();
         let json_body = serde_json::to_vec(&providers)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
 
-        let mut resp = S3Response::new((StatusCode::OK, Body::from(json_body)));
-        resp.headers
-            .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
-        Ok(resp)
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(json_body), headers))
     }
 }
 
@@ -285,12 +221,13 @@ pub struct GetOidcConfigHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetOidcConfigHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_oidc_config_request(&req, AdminAction::ServerInfoAdminAction).await?;
 
-        let config = load_server_config_from_store().await?;
-        let restart_required = oidc_restart_required(&config);
-        let providers = rustfs_iam::oidc::load_effective_oidc_provider_configs(Some(&config))
+        let config = oidc_config::list_config().await.map_err(config_service_error)?;
+        let providers = config
+            .snapshot
+            .into_providers()
             .into_iter()
             .map(|provider| OidcConfigView {
                 provider_id: provider.config.id.clone(),
@@ -299,6 +236,7 @@ impl Operation for GetOidcConfigHandler {
                 enabled: provider.config.enabled,
                 display_name: provider.config.display_name.clone(),
                 config_url: provider.config.config_url.clone(),
+                issuer: provider.config.issuer.clone(),
                 client_id: provider.config.client_id.clone(),
                 client_secret_configured: provider.config.client_secret.is_some(),
                 scopes: provider.config.scopes.clone(),
@@ -316,11 +254,11 @@ impl Operation for GetOidcConfigHandler {
             })
             .collect();
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &OidcConfigListResponse {
                 providers,
-                restart_required,
+                restart_required: config.restart_required,
             },
         )
     }
@@ -330,27 +268,21 @@ pub struct PutOidcConfigHandler {}
 
 #[async_trait::async_trait]
 impl Operation for PutOidcConfigHandler {
-    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_oidc_config_request(&req, AdminAction::ConfigUpdateAdminAction).await?;
 
         let provider_id = params
             .get("provider_id")
             .ok_or_else(|| s3_error!(InvalidRequest, "missing provider_id"))?;
-        if !is_valid_provider_id(provider_id) {
-            return Err(s3_error!(InvalidRequest, "invalid provider_id"));
-        }
-        if is_env_managed_provider(provider_id) {
-            return Err(s3_error!(AccessDenied, "provider is managed by environment variables"));
-        }
+        oidc_config::ensure_mutable_provider_id(provider_id).map_err(config_service_error)?;
+        let provider_id = provider_id.to_owned();
 
-        let request: OidcConfigUpsertRequest = parse_json_body(&mut req).await?;
-        let mut config = load_server_config_from_store().await?;
-        let existing_secret = persisted_provider_secret(&config, provider_id);
-        let provider_config = build_provider_config_from_upsert(provider_id, request, existing_secret)?;
-        upsert_persisted_provider_config(&mut config, &provider_config);
-        save_server_config_to_store(&config).await?;
+        let request: OidcProviderConfigInput = parse_json_body(&mut req).await?;
+        oidc_config::upsert_config(provider_id, request)
+            .await
+            .map_err(config_service_error)?;
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &OidcMutationResponse {
                 success: true,
@@ -365,24 +297,17 @@ pub struct DeleteOidcConfigHandler {}
 
 #[async_trait::async_trait]
 impl Operation for DeleteOidcConfigHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_oidc_config_request(&req, AdminAction::ConfigUpdateAdminAction).await?;
 
         let provider_id = params
             .get("provider_id")
             .ok_or_else(|| s3_error!(InvalidRequest, "missing provider_id"))?;
-        if !is_valid_provider_id(provider_id) {
-            return Err(s3_error!(InvalidRequest, "invalid provider_id"));
-        }
-        if is_env_managed_provider(provider_id) {
-            return Err(s3_error!(AccessDenied, "provider is managed by environment variables"));
-        }
+        oidc_config::ensure_mutable_provider_id(provider_id).map_err(config_service_error)?;
+        let provider_id = provider_id.to_owned();
+        oidc_config::delete_config(provider_id).await.map_err(config_service_error)?;
 
-        let mut config = load_server_config_from_store().await?;
-        delete_persisted_provider_config(&mut config, provider_id)?;
-        save_server_config_to_store(&config).await?;
-
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &OidcMutationResponse {
                 success: true,
@@ -397,27 +322,19 @@ pub struct ValidateOidcConfigHandler {}
 
 #[async_trait::async_trait]
 impl Operation for ValidateOidcConfigHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_oidc_config_request(&req, AdminAction::ServerInfoAdminAction).await?;
 
-        let request: OidcConfigValidateRequest = parse_json_body(&mut req).await?;
-        let provider_id = if request.provider_id.trim().is_empty() {
-            "default".to_string()
-        } else {
-            request.provider_id.trim().to_string()
-        };
-        let provider_config = build_provider_config_from_validate(request, &provider_id)?;
-        let validation = rustfs_iam::oidc::validate_oidc_provider_config(&provider_config)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("validation failed: {e}")))?;
+        let request: OidcProviderValidationInput = parse_json_body(&mut req).await?;
+        let validation = oidc_config::validate_config(request).await.map_err(config_service_error)?;
 
-        json_response(
+        owned_json_response(
             StatusCode::OK,
             &OidcValidationResponse {
                 valid: true,
                 message: "OIDC configuration is valid".to_string(),
                 issuer: Some(validation.issuer),
-                authorization_endpoint: Some(validation.authorization_endpoint),
+                authorization_endpoint: validation.authorization_endpoint,
                 token_endpoint: validation.token_endpoint,
             },
         )
@@ -430,7 +347,7 @@ pub struct OidcAuthorizeHandler {}
 
 #[async_trait::async_trait]
 impl Operation for OidcAuthorizeHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let provider_id = params
             .get("provider_id")
             .ok_or_else(|| s3_error!(InvalidRequest, "missing provider_id"))?;
@@ -439,37 +356,54 @@ impl Operation for OidcAuthorizeHandler {
             return Err(s3_error!(InvalidRequest, "invalid provider_id"));
         }
 
-        let oidc_sys = rustfs_iam::get_oidc().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
+        let federation = current_federated_identity_service().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
         // Derive the callback redirect URI from the request
         let redirect_uri = derive_callback_uri(&req, provider_id)?;
 
         // Optional: redirect_after query parameter (must be a safe relative path)
-        let redirect_after = extract_safe_redirect_after(&req.uri)?;
+        let redirect_after = extract_safe_redirect_after(req.uri())?;
+        let redirect_after_log = redirect_after.clone();
 
-        let auth_url = oidc_sys
+        let auth_url = federation
             .authorize_url(provider_id, &redirect_uri, redirect_after)
             .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("authorize failed: {e}")))?;
+            .map_err(|e| {
+                error!(
+                    event = EVENT_ADMIN_OIDC_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "authorize_url_failed",
+                    provider_id = %provider_id,
+                    redirect_uri = %redirect_uri,
+                    redirect_after = ?redirect_after_log,
+                    error = %e,
+                    "admin oidc state"
+                );
+                S3Error::with_message(S3ErrorCode::InvalidRequest, format!("authorize failed: {e}"))
+            })?;
 
-        info!(
+        debug!(
             event = EVENT_ADMIN_OIDC_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
             provider_id = %provider_id,
+            redirect_uri = %redirect_uri,
+            redirect_after = ?redirect_after_log,
+            auth_url = %auth_url,
             state = "authorize_redirect",
             "admin oidc state"
         );
 
         // Return 302 redirect
-        let mut resp = S3Response::new((StatusCode::FOUND, Body::empty()));
-        resp.headers.insert(
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
             http::header::LOCATION,
             auth_url
                 .parse()
                 .map_err(|_| s3_error!(InternalError, "failed to construct authorization URL"))?,
         );
-        Ok(resp)
+        Ok(AdminResponse::with_headers(StatusCode::FOUND, Body::empty(), headers))
     }
 }
 
@@ -479,7 +413,7 @@ pub struct OidcCallbackHandler {}
 
 #[async_trait::async_trait]
 impl Operation for OidcCallbackHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let provider_id = params
             .get("provider_id")
             .ok_or_else(|| s3_error!(InvalidRequest, "missing provider_id"))?;
@@ -488,20 +422,14 @@ impl Operation for OidcCallbackHandler {
             return Err(s3_error!(InvalidRequest, "invalid provider_id"));
         }
 
-        // Extract code and state from query parameters
-        let code =
-            extract_query_param(&req.uri, "code").ok_or_else(|| s3_error!(InvalidRequest, "missing 'code' query parameter"))?;
-        let state =
-            extract_query_param(&req.uri, "state").ok_or_else(|| s3_error!(InvalidRequest, "missing 'state' query parameter"))?;
-
         // Check for error response from IdP
-        if let Some(error) = extract_query_param(&req.uri, "error") {
-            let desc = extract_query_param(&req.uri, "error_description").unwrap_or_default();
+        if let Some((error, desc)) = extract_idp_callback_error(req.uri()) {
             warn!(
                 event = EVENT_ADMIN_OIDC_STATE,
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_OIDC,
                 result = "idp_callback_error",
+                provider_id = %provider_id,
                 error_code = %error,
                 error_description = %desc,
                 "admin oidc state"
@@ -512,25 +440,47 @@ impl Operation for OidcCallbackHandler {
             ));
         }
 
-        let oidc_sys = rustfs_iam::get_oidc().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
+        // Extract code and state from query parameters
+        let code =
+            extract_query_param(req.uri(), "code").ok_or_else(|| s3_error!(InvalidRequest, "missing 'code' query parameter"))?;
+        let state = extract_query_param(req.uri(), "state")
+            .ok_or_else(|| s3_error!(InvalidRequest, "missing 'state' query parameter"))?;
+
+        let federation = current_federated_identity_service().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
         let redirect_uri = derive_callback_uri(&req, provider_id)?;
 
-        // Exchange authorization code for tokens and extract claims
-        let (claims, actual_provider_id, session, id_token) =
-            oidc_sys.exchange_code(&state, &code, &redirect_uri).await.map_err(|e| {
-                error!(
-                    event = EVENT_ADMIN_OIDC_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_OIDC,
-                    result = "code_exchange_failed",
-                    error = %e,
-                    "admin oidc state"
-                );
-                S3Error::with_message(S3ErrorCode::AccessDenied, format!("code exchange failed: {e}"))
+        let session_duration_seconds = console_session_duration_secs();
+        let login = federation
+            .complete_authorization_code(&state, &code, &redirect_uri, session_duration_seconds, &DefaultFederatedSessionBinding)
+            .await
+            .map_err(|error| {
+                if let FederationError::CodeExchange(message) = &error {
+                    let lb_hint = if is_invalid_oidc_state_error(message) {
+                        OIDC_STATE_LB_HINT
+                    } else {
+                        ""
+                    };
+                    error!(
+                        event = EVENT_ADMIN_OIDC_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "code_exchange_failed",
+                        requested_provider_id = %provider_id,
+                        redirect_uri = %redirect_uri,
+                        code_len = code.len(),
+                        state_len = state.len(),
+                        error = %message,
+                        lb_hint = %lb_hint,
+                        "admin oidc state"
+                    );
+                }
+                callback_federation_error(error)
             })?;
+        let authorization = &login.session.authorization;
+        let actual_provider_id = authorization.provider_id();
 
-        info!(
+        debug!(
             event = EVENT_ADMIN_OIDC_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
@@ -539,30 +489,20 @@ impl Operation for OidcCallbackHandler {
             "admin oidc state"
         );
 
-        // Map claims to policies and groups
-        let (policies, groups) = oidc_sys.map_claims_to_policies(&actual_provider_id, &claims);
-
-        info!(
+        debug!(
             event = EVENT_ADMIN_OIDC_STATE,
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_OIDC,
             provider_id = %actual_provider_id,
-            policy_count = policies.len(),
-            group_count = groups.len(),
+            policy_count = authorization.policies().len(),
+            group_count = authorization.mapped_iam_groups().len(),
+            policies = ?authorization.policies(),
+            groups = ?authorization.mapped_iam_groups(),
             state = "claims_mapped",
             "admin oidc state"
         );
 
-        // Generate STS credentials using the shared helper.
-        // Console/OIDC sessions use a fixed 1-hour duration as a security/UX choice.
-        // Longer-lived credentials (15 min to 12 hours) can be requested via CLI/SDK
-        // through AssumeRoleWithWebIdentity.
-        let new_cred = create_oidc_sts_credentials(&claims, &actual_provider_id, &policies, &groups, 3600, None).await?;
-
-        let logout_token = oidc_sys
-            .create_logout_token(&actual_provider_id, &id_token)
-            .await
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("logout session creation failed: {e}")))?;
+        let new_cred = &login.session.credentials;
 
         // Build redirect URL to console with credentials in the fragment
         let console_redirect = build_console_redirect(
@@ -571,18 +511,18 @@ impl Operation for OidcCallbackHandler {
             &new_cred.secret_key,
             &new_cred.session_token,
             new_cred.expiration,
-            session.redirect_after.as_deref(),
-            Some(logout_token.as_str()),
+            login.redirect_after.as_deref(),
+            Some(login.logout_token.as_str()),
         )?;
 
-        let mut resp = S3Response::new((StatusCode::FOUND, Body::empty()));
-        resp.headers.insert(
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
             http::header::LOCATION,
             console_redirect
                 .parse()
                 .map_err(|_| s3_error!(InternalError, "failed to construct console redirect URL"))?,
         );
-        Ok(resp)
+        Ok(AdminResponse::with_headers(StatusCode::FOUND, Body::empty(), headers))
     }
 }
 
@@ -593,14 +533,14 @@ pub struct OidcLogoutHandler {}
 
 #[async_trait::async_trait]
 impl Operation for OidcLogoutHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let fallback_location = build_console_login_redirect(&req)?;
-        let Some(logout_token) = extract_query_param(&req.uri, "logout_token") else {
+        let Some(logout_token) = extract_query_param(req.uri(), "logout_token") else {
             return redirect_response(&fallback_location);
         };
 
-        let location = match rustfs_iam::get_oidc() {
-            Some(oidc_sys) => match oidc_sys.build_logout_url(&logout_token, &fallback_location).await {
+        let location = match current_federated_identity_service() {
+            Some(federation) => match federation.build_logout_url(&logout_token, &fallback_location).await {
                 Ok(Some(url)) => url,
                 Ok(None) => fallback_location.clone(),
                 Err(err) => {
@@ -626,31 +566,46 @@ impl Operation for OidcLogoutHandler {
 /// Uses the provider's configured redirect_uri if set, otherwise derives dynamically
 /// from request headers. For production deployments behind a reverse proxy, configuring
 /// an explicit redirect_uri is recommended to prevent header manipulation.
-fn derive_callback_uri(req: &S3Request<Body>, provider_id: &str) -> S3Result<String> {
-    // Use explicitly configured redirect_uri if available
-    if let Some(oidc_sys) = rustfs_iam::get_oidc()
-        && let Some(config) = oidc_sys.get_provider_config(provider_id)
-    {
-        if let Some(ref uri) = config.redirect_uri {
-            let parsed = Url::parse(uri).map_err(|_| s3_error!(InvalidRequest, "invalid configured redirect_uri"))?;
-            if !is_valid_scheme(parsed.scheme()) || parsed.host_str().is_none() {
-                return Err(s3_error!(InvalidRequest, "configured redirect_uri must be absolute http/https URL"));
-            }
-            return Ok(uri.clone());
-        }
+fn derive_callback_uri(req: &AdminRequest, provider_id: &str) -> S3Result<String> {
+    let policy = current_federated_identity_service().and_then(|federation| federation.redirect_policy(provider_id));
 
-        if !config.redirect_uri_dynamic {
-            return Err(s3_error!(
-                InvalidRequest,
-                "provider requires explicit redirect_uri because redirect_uri_dynamic is disabled"
-            ));
+    derive_callback_uri_with_redirect_policy(req, provider_id, policy.as_ref())
+}
+
+fn derive_callback_uri_with_redirect_policy(
+    req: &AdminRequest,
+    provider_id: &str,
+    policy: Option<&rustfs_iam::federation::FederatedRedirectPolicy>,
+) -> S3Result<String> {
+    if let Some(policy) = policy
+        && let Some(ref uri) = policy.redirect_uri
+    {
+        let parsed = Url::parse(uri).map_err(|_| s3_error!(InvalidRequest, "invalid configured redirect_uri"))?;
+        if !is_valid_scheme(parsed.scheme()) || parsed.host_str().is_none() {
+            return Err(s3_error!(InvalidRequest, "configured redirect_uri must be absolute http/https URL"));
         }
+        return Ok(uri.clone());
+    }
+
+    if let Some(url) = browser_redirect_url(&oidc_callback_path(provider_id))? {
+        return Ok(url);
+    }
+
+    if policy.is_some_and(|policy| !policy.allow_request_origin) {
+        return Err(s3_error!(
+            InvalidRequest,
+            "provider requires explicit redirect_uri because redirect_uri_dynamic is disabled"
+        ));
     }
 
     let scheme = extract_request_scheme(req)?;
     let host = extract_request_host(req)?;
 
-    Ok(format!("{scheme}://{host}/rustfs/admin/v3/oidc/callback/{provider_id}"))
+    Ok(format!("{scheme}://{host}{}", oidc_callback_path(provider_id)))
+}
+
+fn oidc_callback_path(provider_id: &str) -> String {
+    format!("{ADMIN_PREFIX}{OIDC_CALLBACK_SUFFIX}{provider_id}")
 }
 
 /// Extract a query parameter from the URI.
@@ -670,6 +625,12 @@ fn extract_query_param(uri: &http::Uri, key: &str) -> Option<String> {
             })
             .next()
     })
+}
+
+fn extract_idp_callback_error(uri: &http::Uri) -> Option<(String, String)> {
+    let error = extract_query_param(uri, "error")?;
+    let desc = extract_query_param(uri, "error_description").unwrap_or_default();
+    Some((error, desc))
 }
 
 fn extract_safe_redirect_after(uri: &http::Uri) -> S3Result<Option<String>> {
@@ -714,7 +675,7 @@ fn build_console_callback_fragment(
 
 /// Build the console redirect URL with STS credentials in the hash fragment.
 fn build_console_redirect(
-    req: &S3Request<Body>,
+    req: &AdminRequest,
     access_key: &str,
     secret_key: &str,
     session_token: &str,
@@ -722,54 +683,58 @@ fn build_console_redirect(
     redirect_after: Option<&str>,
     logout_token: Option<&str>,
 ) -> S3Result<String> {
-    let scheme = extract_request_scheme(req)?;
-    let host = extract_request_host(req)?;
-    let console_prefix = "/rustfs/console";
     let fragment =
         build_console_callback_fragment(access_key, secret_key, session_token, expiration, redirect_after, logout_token);
 
-    Ok(format!("{scheme}://{host}{console_prefix}/auth/oidc-callback/#{fragment}"))
-}
+    let console_prefix = console_prefix();
+    let callback_path = format!("{console_prefix}{CONSOLE_OIDC_CALLBACK_SUFFIX}");
+    if let Some(base_url) = browser_redirect_url(&callback_path)? {
+        return Ok(format!("{base_url}#{fragment}"));
+    }
 
-fn build_console_login_redirect(req: &S3Request<Body>) -> S3Result<String> {
     let scheme = extract_request_scheme(req)?;
     let host = extract_request_host(req)?;
-    Ok(format!("{scheme}://{host}/rustfs/console/auth/login"))
+
+    Ok(format!("{scheme}://{host}{callback_path}#{fragment}"))
 }
 
-fn redirect_response(location: &str) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let mut resp = S3Response::new((StatusCode::FOUND, Body::empty()));
-    resp.headers.insert(
+fn build_console_login_redirect(req: &AdminRequest) -> S3Result<String> {
+    let console_prefix = console_prefix();
+    let login_path = format!("{console_prefix}{CONSOLE_LOGIN_SUFFIX}");
+    if let Some(url) = browser_redirect_url(&login_path)? {
+        return Ok(url);
+    }
+
+    let scheme = extract_request_scheme(req)?;
+    let host = extract_request_host(req)?;
+    Ok(format!("{scheme}://{host}{login_path}"))
+}
+
+fn redirect_response(location: &str) -> S3Result<AdminResponse> {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
         http::header::LOCATION,
         location
             .parse()
             .map_err(|_| s3_error!(InternalError, "failed to construct redirect URL"))?,
     );
-    Ok(resp)
+    Ok(AdminResponse::with_headers(StatusCode::FOUND, Body::empty(), headers))
 }
 
-async fn authorize_oidc_config_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+/// The pre-check keeps this endpoint family's historical missing-credentials
+/// message; the shared gate reports "get cred failed".
+async fn authorize_oidc_config_request(req: &AdminRequest, action: AdminAction) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(action)],
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-    )
-    .await
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
+    Ok(())
 }
 
-async fn parse_json_body<T: DeserializeOwned>(req: &mut S3Request<Body>) -> S3Result<T> {
+async fn parse_json_body<T: DeserializeOwned>(req: &mut AdminRequest) -> S3Result<T> {
     let body = req
-        .input
+        .take_body()
         .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
         .await
         .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
@@ -781,303 +746,15 @@ async fn parse_json_body<T: DeserializeOwned>(req: &mut S3Request<Body>) -> S3Re
     serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))
 }
 
-fn json_response<T: Serialize>(status: StatusCode, payload: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let body = serde_json::to_vec(payload)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
-
-    let mut resp = S3Response::new((status, Body::from(body)));
-    resp.headers
-        .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
-    Ok(resp)
-}
-
-async fn load_server_config_from_store() -> S3Result<ServerConfig> {
-    let Some(store) = resolve_object_store_handle() else {
-        return Err(s3_error!(InternalError, "storage layer not initialized"));
-    };
-
-    read_config_without_migrate(store)
-        .await
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to load server config: {e}")))
-}
-
-async fn save_server_config_to_store(config: &ServerConfig) -> S3Result<()> {
-    let Some(store) = resolve_object_store_handle() else {
-        return Err(s3_error!(InternalError, "storage layer not initialized"));
-    };
-
-    save_server_config(store, config)
-        .await
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to save server config: {e}")))
-}
-
-fn is_env_managed_provider(provider_id: &str) -> bool {
-    rustfs_iam::oidc::load_oidc_provider_configs_from_env()
-        .iter()
-        .any(|config| config.id == provider_id)
-}
-
-fn provider_instance_key(provider_id: &str) -> String {
-    if provider_id == "default" {
-        DEFAULT_DELIMITER.to_string()
-    } else {
-        provider_id.to_string()
-    }
-}
-
-fn oidc_restart_required(config: &ServerConfig) -> bool {
-    let active_config = get_global_server_config();
-    oidc_restart_required_from_active_config(config, active_config.as_ref())
-}
-
-fn oidc_restart_required_from_active_config(config: &ServerConfig, active_config: Option<&ServerConfig>) -> bool {
-    rustfs_iam::oidc::load_effective_oidc_provider_configs(Some(config))
-        != rustfs_iam::oidc::load_effective_oidc_provider_configs(active_config)
-}
-
-fn default_oidc_kvs() -> s3s::S3Result<rustfs_config::server_config::KVS> {
-    ServerConfig::new()
-        .get_value(IDENTITY_OPENID_SUB_SYS, DEFAULT_DELIMITER)
-        .ok_or_else(|| s3_error!(InternalError, "default OIDC configuration missing"))
-}
-
-fn set_kvs_value(kvs: &mut rustfs_config::server_config::KVS, key: &str, value: String) {
-    if let Some(existing) = kvs.0.iter_mut().find(|kv| kv.key == key) {
-        existing.value = value;
-        return;
-    }
-
-    kvs.insert(key.to_string(), value);
-}
-
-fn normalize_scopes(scopes: &[String]) -> Vec<String> {
-    scopes
-        .iter()
-        .map(|scope| scope.trim().to_string())
-        .filter(|scope| !scope.is_empty())
-        .collect()
-}
-
-fn normalize_optional(value: Option<String>) -> Option<String> {
-    value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
-}
-
-fn validate_absolute_http_url(value: &str, field_name: &str) -> S3Result<()> {
-    let parsed = Url::parse(value).map_err(|_| s3_error!(InvalidRequest, "{} must be an absolute http/https URL", field_name))?;
-
-    if !is_valid_scheme(parsed.scheme()) || parsed.host_str().is_none() {
-        return Err(s3_error!(InvalidRequest, "{} must be an absolute http/https URL", field_name));
-    }
-
-    Ok(())
-}
-
-fn validate_provider_config_fields(config: &rustfs_iam::oidc::OidcProviderConfig) -> S3Result<()> {
-    if !is_valid_provider_id(&config.id) {
-        return Err(s3_error!(InvalidRequest, "invalid provider_id"));
-    }
-    if config.config_url.trim().is_empty() {
-        return Err(s3_error!(InvalidRequest, "config_url is required"));
-    }
-    validate_absolute_http_url(&config.config_url, "config_url")?;
-
-    if config.client_id.trim().is_empty() {
-        return Err(s3_error!(InvalidRequest, "client_id is required"));
-    }
-
-    if !config.redirect_uri_dynamic {
-        let redirect_uri = config
-            .redirect_uri
-            .as_deref()
-            .ok_or_else(|| s3_error!(InvalidRequest, "redirect_uri is required when redirect_uri_dynamic is off"))?;
-        validate_absolute_http_url(redirect_uri, "redirect_uri")?;
-    } else if let Some(redirect_uri) = config.redirect_uri.as_deref() {
-        validate_absolute_http_url(redirect_uri, "redirect_uri")?;
-    }
-
-    if !config.scopes.iter().any(|scope| scope == "openid") {
-        return Err(s3_error!(InvalidRequest, "scopes must include openid"));
-    }
-
-    Ok(())
-}
-
-fn or_default(value: &str, default: &str) -> String {
-    if value.trim().is_empty() {
-        default.to_string()
-    } else {
-        value.trim().to_string()
-    }
-}
-
-/// Normalize an `OidcProviderConfig` by trimming strings and applying defaults.
-fn normalize_provider_config(mut config: rustfs_iam::oidc::OidcProviderConfig) -> rustfs_iam::oidc::OidcProviderConfig {
-    config.config_url = config.config_url.trim().to_string();
-    config.client_id = config.client_id.trim().to_string();
-    config.scopes = normalize_scopes(&config.scopes);
-    config.redirect_uri = normalize_optional(config.redirect_uri);
-    config.claim_name = or_default(&config.claim_name, OIDC_DEFAULT_CLAIM_NAME);
-    config.claim_prefix = config.claim_prefix.trim().to_string();
-    config.role_policy = config.role_policy.trim().to_string();
-    config.display_name = or_default(&config.display_name, &config.id);
-    config.groups_claim = or_default(&config.groups_claim, OIDC_DEFAULT_GROUPS_CLAIM);
-    config.roles_claim = or_default(&config.roles_claim, OIDC_DEFAULT_ROLES_CLAIM);
-    config.email_claim = or_default(&config.email_claim, OIDC_DEFAULT_EMAIL_CLAIM);
-    config.username_claim = or_default(&config.username_claim, OIDC_DEFAULT_USERNAME_CLAIM);
-    config
-}
-
-fn build_provider_config_from_upsert(
-    provider_id: &str,
-    request: OidcConfigUpsertRequest,
-    existing_secret: Option<String>,
-) -> S3Result<rustfs_iam::oidc::OidcProviderConfig> {
-    let client_secret = match request.client_secret {
-        Some(value) if !value.trim().is_empty() => Some(value),
-        _ => existing_secret.filter(|value| !value.trim().is_empty()),
-    };
-
-    let config = normalize_provider_config(rustfs_iam::oidc::OidcProviderConfig {
-        id: provider_id.to_string(),
-        enabled: request.enabled,
-        config_url: request.config_url,
-        client_id: request.client_id,
-        client_secret,
-        scopes: request.scopes,
-        other_audiences: request.other_audiences,
-        redirect_uri: request.redirect_uri,
-        redirect_uri_dynamic: request.redirect_uri_dynamic,
-        claim_name: request.claim_name,
-        claim_prefix: request.claim_prefix,
-        role_policy: request.role_policy,
-        display_name: request.display_name,
-        groups_claim: request.groups_claim,
-        roles_claim: request.roles_claim,
-        email_claim: request.email_claim,
-        username_claim: request.username_claim,
-        hide_from_ui: request.hide_from_ui,
-    });
-
-    validate_provider_config_fields(&config)?;
-    Ok(config)
-}
-
-fn build_provider_config_from_validate(
-    request: OidcConfigValidateRequest,
-    provider_id: &str,
-) -> S3Result<rustfs_iam::oidc::OidcProviderConfig> {
-    let config = normalize_provider_config(rustfs_iam::oidc::OidcProviderConfig {
-        id: provider_id.to_string(),
-        enabled: request.enabled,
-        config_url: request.config_url,
-        client_id: request.client_id,
-        client_secret: request.client_secret.filter(|value| !value.trim().is_empty()),
-        scopes: request.scopes,
-        other_audiences: request.other_audiences,
-        redirect_uri: request.redirect_uri,
-        redirect_uri_dynamic: request.redirect_uri_dynamic,
-        claim_name: request.claim_name,
-        claim_prefix: request.claim_prefix,
-        role_policy: request.role_policy,
-        display_name: request.display_name,
-        groups_claim: request.groups_claim,
-        roles_claim: request.roles_claim,
-        email_claim: request.email_claim,
-        username_claim: request.username_claim,
-        hide_from_ui: request.hide_from_ui,
-    });
-
-    validate_provider_config_fields(&config)?;
-    Ok(config)
-}
-
-fn persisted_provider_secret(config: &ServerConfig, provider_id: &str) -> Option<String> {
-    config
-        .0
-        .get(IDENTITY_OPENID_SUB_SYS)
-        .and_then(|subsystem| subsystem.get(&provider_instance_key(provider_id)))
-        .and_then(|kvs| kvs.lookup(OIDC_CLIENT_SECRET))
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn upsert_persisted_provider_config(config: &mut ServerConfig, provider_config: &rustfs_iam::oidc::OidcProviderConfig) {
-    let instance_key = provider_instance_key(&provider_config.id);
-    let mut kvs = default_oidc_kvs().unwrap_or_default();
-
-    set_kvs_value(
-        &mut kvs,
-        ENABLE_KEY,
-        if provider_config.enabled {
-            EnableState::On.to_string()
-        } else {
-            EnableState::Off.to_string()
-        },
-    );
-    set_kvs_value(&mut kvs, OIDC_CONFIG_URL, provider_config.config_url.clone());
-    set_kvs_value(&mut kvs, OIDC_CLIENT_ID, provider_config.client_id.clone());
-    set_kvs_value(&mut kvs, OIDC_CLIENT_SECRET, provider_config.client_secret.clone().unwrap_or_default());
-    set_kvs_value(&mut kvs, OIDC_SCOPES, provider_config.scopes.join(","));
-    set_kvs_value(&mut kvs, OIDC_OTHER_AUDIENCES, provider_config.other_audiences.join(","));
-    set_kvs_value(&mut kvs, OIDC_REDIRECT_URI, provider_config.redirect_uri.clone().unwrap_or_default());
-    set_kvs_value(
-        &mut kvs,
-        OIDC_REDIRECT_URI_DYNAMIC,
-        if provider_config.redirect_uri_dynamic {
-            EnableState::On.to_string()
-        } else {
-            EnableState::Off.to_string()
-        },
-    );
-    set_kvs_value(&mut kvs, OIDC_CLAIM_NAME, provider_config.claim_name.clone());
-    set_kvs_value(&mut kvs, OIDC_CLAIM_PREFIX, provider_config.claim_prefix.clone());
-    set_kvs_value(&mut kvs, OIDC_ROLE_POLICY, provider_config.role_policy.clone());
-    set_kvs_value(&mut kvs, OIDC_DISPLAY_NAME, provider_config.display_name.clone());
-    set_kvs_value(&mut kvs, OIDC_GROUPS_CLAIM, provider_config.groups_claim.clone());
-    set_kvs_value(&mut kvs, OIDC_ROLES_CLAIM, provider_config.roles_claim.clone());
-    set_kvs_value(&mut kvs, OIDC_EMAIL_CLAIM, provider_config.email_claim.clone());
-    set_kvs_value(&mut kvs, OIDC_USERNAME_CLAIM, provider_config.username_claim.clone());
-    set_kvs_value(
-        &mut kvs,
-        OIDC_HIDE_FROM_UI,
-        if provider_config.hide_from_ui {
-            EnableState::On.to_string()
-        } else {
-            EnableState::Off.to_string()
-        },
-    );
-
-    config
-        .0
-        .entry(IDENTITY_OPENID_SUB_SYS.to_string())
-        .or_default()
-        .insert(instance_key, kvs);
-}
-
-fn delete_persisted_provider_config(config: &mut ServerConfig, provider_id: &str) -> S3Result<()> {
-    let Some(subsystem) = config.0.get_mut(IDENTITY_OPENID_SUB_SYS) else {
-        return Err(s3_error!(InvalidRequest, "provider not found"));
-    };
-
-    if subsystem.remove(&provider_instance_key(provider_id)).is_none() {
-        return Err(s3_error!(InvalidRequest, "provider not found"));
-    }
-
-    if subsystem.is_empty() {
-        config.0.remove(IDENTITY_OPENID_SUB_SYS);
-    }
-
-    Ok(())
-}
-
-fn extract_request_scheme(req: &S3Request<Body>) -> S3Result<String> {
+fn extract_request_scheme(req: &AdminRequest) -> S3Result<String> {
     let raw_scheme = req
-        .headers
+        .headers()
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.split(',').next().map(str::trim).unwrap_or(""))
         .filter(|v| !v.is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| req.uri.scheme_str().map(str::to_owned))
+        .or_else(|| req.uri().scheme_str().map(str::to_owned))
         .unwrap_or_else(|| "http".to_owned())
         .to_ascii_lowercase();
 
@@ -1088,16 +765,16 @@ fn extract_request_scheme(req: &S3Request<Body>) -> S3Result<String> {
     Ok(raw_scheme)
 }
 
-fn extract_request_host(req: &S3Request<Body>) -> S3Result<String> {
+fn extract_request_host(req: &AdminRequest) -> S3Result<String> {
     let host = req
-        .headers
+        .headers()
         .get(http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| {
             let v = v.trim();
             if v.is_empty() { None } else { Some(v.to_owned()) }
         })
-        .or_else(|| req.uri.authority().map(|a| a.as_str().to_owned()))
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_owned()))
         .ok_or_else(|| s3_error!(InvalidRequest, "cannot determine host for redirect URI"))?;
 
     parse_host_authority(&host)
@@ -1125,9 +802,175 @@ fn parse_host_authority(raw_host: &str) -> S3Result<String> {
     Ok(parsed.authority().to_string())
 }
 
+fn browser_redirect_url(path: &str) -> S3Result<Option<String>> {
+    let Some(base) = browser_redirect_base()? else {
+        return Ok(None);
+    };
+    Ok(Some(format!("{base}{path}")))
+}
+
+fn browser_redirect_base() -> S3Result<Option<String>> {
+    let Some(raw) = rustfs_utils::get_env_opt_str(ENV_RUSTFS_BROWSER_REDIRECT_URL) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    validate_browser_redirect_base(trimmed).map(Some)
+}
+
+fn validate_browser_redirect_base(raw_url: &str) -> S3Result<String> {
+    let parsed = Url::parse(raw_url).map_err(|_| s3_error!(InvalidRequest, "invalid browser redirect URL"))?;
+    if !is_valid_scheme(parsed.scheme()) || parsed.host_str().is_none() {
+        return Err(s3_error!(InvalidRequest, "browser redirect URL must be an absolute http/https URL"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(s3_error!(InvalidRequest, "browser redirect URL must not contain userinfo"));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(s3_error!(InvalidRequest, "browser redirect URL must not contain query or fragment"));
+    }
+    if !matches!(parsed.path(), "" | "/") {
+        return Err(s3_error!(InvalidRequest, "browser redirect URL must not contain a path"));
+    }
+
+    Ok(format!("{}://{}", parsed.scheme(), parsed.authority()))
+}
+
+fn is_invalid_oidc_state_error(error: &str) -> bool {
+    error.contains("invalid or expired OIDC state")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::{Extensions, HeaderMap, HeaderValue, Uri};
+    use temp_env::with_var;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn validate_handler_preserves_workload_null_and_console_endpoints() {
+        use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
+        use http_body_util::BodyExt as _;
+        use rustfs_iam::store::{Store as _, object::IAM_CONFIG_PREFIX};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // The admin URL boundary rejects literal loopback hosts. A local proxy
+        // serves the public-shaped test origin without external DNS or traffic.
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let base = "http://oidc-handler.example.invalid".to_string();
+        temp_env::async_with_vars(
+            [("RUSTFS_OUTBOUND_ALLOW_ORIGINS", Some(base.as_str())),
+             ("HTTP_PROXY", Some(proxy.as_str())), ("http_proxy", Some(proxy.as_str())),
+             ("HTTPS_PROXY", None), ("https_proxy", None), ("ALL_PROXY", None), ("all_proxy", None),
+             ("NO_PROXY", Some("")), ("no_proxy", Some(""))],
+            async {
+                let _ = rustfs_credentials::init_global_action_credentials(Some("OIDCVALIDATEROOT".into()), Some("oidcValidateRootSecret123".into()));
+                let env = rustfs_test_utils::TestECStoreEnv::builder().prefix("oidc_validate_handler")
+                    .disk_count(1).init_bucket_metadata(false).build().await;
+                rustfs_iam::store::object::ObjectStore::new(Arc::clone(&env.ecstore))
+                    .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX)).await.unwrap();
+                let iam = rustfs_iam::init_iam_sys(Arc::clone(&env.ecstore)).await.unwrap();
+                publish_test_app_context(Arc::new(AppContext::with_default_interfaces(
+                    Arc::clone(&env.ecstore), iam, Arc::new(rustfs_kms::KmsServiceManager::new()),
+                )));
+                let server_base = base.clone();
+                let server = tokio::spawn(async move {
+                    for path in ["/.well-known/openid-configuration", "/jwks", "/.well-known/openid-configuration", "/complete/.well-known/openid-configuration", "/complete/jwks"] {
+                        let (mut stream, _) = tokio::time::timeout(std::time::Duration::from_secs(15), listener.accept()).await.unwrap().unwrap();
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") {
+                            request.push(stream.read_u8().await.unwrap());
+                            assert!(request.len() < 8192);
+                        }
+                        let request = String::from_utf8(request).unwrap();
+                        let target = Url::parse(request.lines().next().unwrap().split_whitespace().nth(1).unwrap()).unwrap();
+                        assert_eq!(target.origin().ascii_serialization(), server_base);
+                        assert_eq!(target.path(), path);
+                        let mut body = if path.ends_with("/jwks") { serde_json::json!({"keys": []}) } else {
+                            serde_json::json!({"issuer": server_base, "jwks_uri": format!("{server_base}/jwks"), "id_token_signing_alg_values_supported": ["RS256"]})
+                        };
+                        if path == "/complete/.well-known/openid-configuration" {
+                            body["authorization_endpoint"] = serde_json::json!(format!("{server_base}/authorize"));
+                            body["token_endpoint"] = serde_json::json!(format!("{server_base}/token"));
+                            body["response_types_supported"] = serde_json::json!(["code"]);
+                            body["subject_types_supported"] = serde_json::json!(["public"]);
+                        }
+                        let body = body.to_string();
+                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    }
+                });
+                for (hidden, complete) in [(true, false), (false, false), (false, true)] {
+                    let document = serde_json::json!({"provider_id": "workload", "client_id": "rustfs-test", "issuer": base,
+                        "config_url": format!("{base}{}/.well-known/openid-configuration", if complete { "/complete" } else { "" }), "hide_from_ui": hidden});
+                    let request = |credentials: Option<(&str, &str)>| {
+                        let request = crate::admin::operation::test_support::TestRequest::new(Method::POST, "/rustfs/admin/v3/oidc/validate")
+                            .body(Body::from(document.to_string()));
+                        match credentials {
+                            Some((access_key, secret_key)) => request.credentials(access_key, secret_key, None),
+                            None => request,
+                        }
+                        .build()
+                    };
+                    let denied = ValidateOidcConfigHandler {}.call(request(None), Params::new()).await.unwrap_err();
+                    assert_eq!(denied.code(), &S3ErrorCode::InvalidRequest);
+                    assert_eq!(denied.message(), Some("authentication required"));
+                    let req = request(Some(("OIDCVALIDATEROOT", "oidcValidateRootSecret123")));
+                    let result = ValidateOidcConfigHandler {}.call(req, Params::new()).await;
+                    if !hidden && !complete {
+                        let err = result.unwrap_err();
+                        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+                        assert!(err.message().unwrap().contains("authorization_endpoint"));
+                        continue;
+                    }
+                    let (status, _headers, body) = result.unwrap().into_parts();
+                    assert_eq!(status, StatusCode::OK);
+                    let body = body.collect().await.unwrap().to_bytes();
+                    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(response["valid"], true);
+                    assert_eq!(response["issuer"], base);
+                    if complete {
+                        assert_eq!(response["authorization_endpoint"], format!("{base}/authorize"));
+                        assert_eq!(response["token_endpoint"], format!("{base}/token"));
+                    } else {
+                        assert_eq!(response.get("authorization_endpoint"), Some(&serde_json::Value::Null));
+                        assert_eq!(response.get("token_endpoint"), Some(&serde_json::Value::Null));
+                    }
+                }
+                server.await.unwrap();
+            },
+        ).await;
+    }
+
+    fn build_oidc_request(uri: &'static str, host: Option<&'static str>, forwarded_proto: Option<&'static str>) -> AdminRequest {
+        let mut headers = HeaderMap::new();
+        if let Some(host) = host {
+            headers.insert(http::header::HOST, HeaderValue::from_static(host));
+        }
+        if let Some(proto) = forwarded_proto {
+            headers.insert("x-forwarded-proto", HeaderValue::from_static(proto));
+        }
+
+        crate::admin::operation::test_support::TestRequest::new(Method::GET, Uri::from_static(uri))
+            .headers(headers)
+            .extensions(Extensions::new())
+            .body(Body::empty())
+            .build()
+    }
+
+    fn test_redirect_policy(
+        redirect_uri: Option<&str>,
+        allow_request_origin: bool,
+    ) -> rustfs_iam::federation::FederatedRedirectPolicy {
+        rustfs_iam::federation::FederatedRedirectPolicy {
+            redirect_uri: redirect_uri.map(ToString::to_string),
+            allow_request_origin,
+        }
+    }
 
     #[test]
     fn test_is_oidc_path() {
@@ -1154,6 +997,38 @@ mod tests {
     }
 
     #[test]
+    fn callback_errors_preserve_existing_s3_semantics() {
+        let cases = [
+            (
+                FederationError::CodeExchange("invalid state".to_string()),
+                S3ErrorCode::AccessDenied,
+                "code exchange failed: invalid state",
+            ),
+            (
+                FederationError::Logout("session unavailable".to_string()),
+                S3ErrorCode::InternalError,
+                "logout session creation failed: session unavailable",
+            ),
+            (
+                FederationError::Binding(FederatedSessionBindingError::InvalidRequest("invalid policy".to_string())),
+                S3ErrorCode::InvalidRequest,
+                "invalid policy",
+            ),
+            (
+                FederationError::Binding(FederatedSessionBindingError::Internal("failed to store temp user".to_string())),
+                S3ErrorCode::InternalError,
+                "failed to store temp user",
+            ),
+        ];
+
+        for (error, expected_code, expected_message) in cases {
+            let error = callback_federation_error(error);
+            assert_eq!(error.code(), &expected_code);
+            assert_eq!(error.message(), Some(expected_message));
+        }
+    }
+
+    #[test]
     fn test_extract_query_param_empty() {
         let uri: http::Uri = "http://localhost/callback".parse().unwrap();
         assert_eq!(extract_query_param(&uri, "code"), None);
@@ -1163,6 +1038,18 @@ mod tests {
     fn test_extract_query_param_encoded() {
         let uri: http::Uri = "http://localhost/callback?redirect_after=%2Fdashboard".parse().unwrap();
         assert_eq!(extract_query_param(&uri, "redirect_after"), Some("/dashboard".to_string()));
+    }
+
+    #[test]
+    fn test_extract_idp_callback_error_without_code() {
+        let uri: http::Uri = "http://localhost/callback?error=access_denied&error_description=Denied%20by%20IdP&state=xyz789"
+            .parse()
+            .expect("valid callback URI should parse");
+
+        let (error, desc) = extract_idp_callback_error(&uri).expect("IdP callback error should be detected");
+        assert_eq!(error, "access_denied");
+        assert_eq!(desc, "Denied by IdP");
+        assert_eq!(extract_query_param(&uri, "code"), None);
     }
 
     #[test]
@@ -1214,6 +1101,155 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_browser_redirect_base_accepts_origin() {
+        assert_eq!(
+            validate_browser_redirect_base("https://console.example.com/").expect("browser redirect origin should be valid"),
+            "https://console.example.com"
+        );
+        assert_eq!(
+            validate_browser_redirect_base("http://20.78.1.4:9000").expect("browser redirect origin should be valid"),
+            "http://20.78.1.4:9000"
+        );
+    }
+
+    #[test]
+    fn test_validate_browser_redirect_base_rejects_unsafe_parts() {
+        assert!(validate_browser_redirect_base("ftp://console.example.com").is_err());
+        assert!(validate_browser_redirect_base("https://user:pass@console.example.com").is_err());
+        assert!(validate_browser_redirect_base("https://console.example.com/proxy").is_err());
+        assert!(validate_browser_redirect_base("https://console.example.com?next=/").is_err());
+        assert!(validate_browser_redirect_base("https://console.example.com/#fragment").is_err());
+    }
+
+    #[test]
+    fn test_derive_callback_uri_uses_browser_redirect_url() {
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/authorize/default", Some("internal:9000"), None);
+
+        let callback = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, Some("https://console.example.com"), || {
+            derive_callback_uri(&req, "default").expect("callback URI should use browser redirect URL")
+        });
+
+        assert_eq!(callback, "https://console.example.com/rustfs/admin/v3/oidc/callback/default");
+    }
+
+    #[test]
+    fn test_derive_callback_uri_missing_provider_falls_back_to_request_headers() {
+        let req = build_oidc_request(
+            "http://internal/rustfs/admin/v3/oidc/authorize/default",
+            Some("internal:9000"),
+            Some("https"),
+        );
+
+        let callback = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, None::<&str>, || {
+            derive_callback_uri_with_redirect_policy(&req, "missing", None)
+                .expect("a missing provider should keep the request-header fallback")
+        });
+
+        assert_eq!(callback, "https://internal:9000/rustfs/admin/v3/oidc/callback/missing");
+    }
+
+    #[test]
+    fn test_derive_callback_uri_configured_redirect_uri_wins() {
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/authorize/default", Some("internal:9000"), None);
+        let policy = test_redirect_policy(Some("https://configured.example.com/rustfs/admin/v3/oidc/callback/default"), false);
+
+        let callback = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, Some("https://console.example.com"), || {
+            derive_callback_uri_with_redirect_policy(&req, "default", Some(&policy))
+                .expect("configured redirect_uri should be preferred")
+        });
+
+        assert_eq!(callback, "https://configured.example.com/rustfs/admin/v3/oidc/callback/default");
+    }
+
+    #[test]
+    fn test_derive_callback_uri_browser_redirect_url_satisfies_static_provider() {
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/authorize/default", Some("internal:9000"), None);
+        let policy = test_redirect_policy(None, false);
+
+        let callback = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, Some("https://console.example.com"), || {
+            derive_callback_uri_with_redirect_policy(&req, "default", Some(&policy))
+                .expect("browser redirect URL should satisfy a non-dynamic provider")
+        });
+
+        assert_eq!(callback, "https://console.example.com/rustfs/admin/v3/oidc/callback/default");
+    }
+
+    #[test]
+    fn test_derive_callback_uri_static_provider_requires_redirect_source() {
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/authorize/default", Some("internal:9000"), None);
+        let policy = test_redirect_policy(None, false);
+
+        let err = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, None::<&str>, || {
+            derive_callback_uri_with_redirect_policy(&req, "default", Some(&policy))
+                .expect_err("non-dynamic provider without redirect source should fail")
+        });
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn test_derive_callback_uri_dynamic_provider_falls_back_to_request_headers() {
+        let req = build_oidc_request(
+            "http://internal/rustfs/admin/v3/oidc/authorize/default",
+            Some("internal:9000"),
+            Some("https"),
+        );
+        let policy = test_redirect_policy(None, true);
+
+        let callback = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, None::<&str>, || {
+            derive_callback_uri_with_redirect_policy(&req, "default", Some(&policy))
+                .expect("dynamic provider should fall back to request headers")
+        });
+
+        assert_eq!(callback, "https://internal:9000/rustfs/admin/v3/oidc/callback/default");
+    }
+
+    #[test]
+    fn console_prefix_process_case_oidc() {
+        if std::env::var_os("RUSTFS_TEST_CONSOLE_PREFIX_PROCESS").is_none() {
+            return;
+        }
+        crate::server::init_console_prefix().expect("initialize console prefix");
+        let prefix = console_prefix();
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/callback/default", Some("internal:9000"), None);
+        assert_eq!(
+            build_console_login_redirect(&req).expect("login URL"),
+            format!("https://console.example.com{prefix}/auth/login")
+        );
+        let redirect = build_console_redirect(&req, "access", "secret", "token", None, None, None).expect("console callback URL");
+        assert!(redirect.starts_with(&format!("https://console.example.com{prefix}/auth/oidc-callback/#")));
+        assert_eq!(
+            derive_callback_uri(&req, "default").expect("admin callback URL"),
+            "https://console.example.com/rustfs/admin/v3/oidc/callback/default"
+        );
+    }
+
+    #[test]
+    fn test_build_console_redirect_uses_browser_redirect_url() {
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/callback/default", Some("internal:9000"), None);
+
+        let redirect = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, Some("https://console.example.com/"), || {
+            build_console_redirect(&req, "access", "secret", "token", None, Some("/buckets"), Some("logout-token"))
+                .expect("console redirect should use browser redirect URL")
+        });
+
+        assert!(redirect.starts_with(&format!("https://console.example.com{}/auth/oidc-callback/#", console_prefix())));
+        assert!(redirect.contains("redirect=%2Fbuckets"));
+        assert!(redirect.contains("logoutToken=logout-token"));
+    }
+
+    #[test]
+    fn test_build_console_login_redirect_uses_browser_redirect_url() {
+        let req = build_oidc_request("http://internal/rustfs/admin/v3/oidc/logout", Some("internal:9000"), None);
+
+        let redirect = with_var(ENV_RUSTFS_BROWSER_REDIRECT_URL, Some("https://console.example.com"), || {
+            build_console_login_redirect(&req).expect("login redirect should use browser redirect URL")
+        });
+
+        assert_eq!(redirect, format!("https://console.example.com{}/auth/login", console_prefix()));
+    }
+
+    #[test]
     fn test_is_oidc_path_includes_logout() {
         assert!(is_oidc_path("/rustfs/admin/v3/oidc/logout"));
         assert!(is_oidc_path("/minio/admin/v3/oidc/logout"));
@@ -1254,145 +1290,122 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_instance_key() {
-        assert_eq!(provider_instance_key("default"), "_");
-        assert_eq!(provider_instance_key("okta"), "okta");
-    }
+    fn oidc_config_errors_keep_admin_codes() {
+        let error = config_service_error(oidc_config::OidcAdminConfigError::Config(
+            rustfs_iam::oidc::OidcConfigError::EnvironmentManaged,
+        ));
+        assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(error.message(), Some("provider is managed by environment variables"));
 
-    #[test]
-    fn test_build_provider_config_requires_openid_scope() {
-        let req = OidcConfigUpsertRequest {
-            scopes: vec!["profile".to_string()],
-            config_url: "https://example.com/.well-known/openid-configuration".to_string(),
-            client_id: "client-id".to_string(),
-            ..Default::default()
-        };
+        let error = config_service_error(oidc_config::OidcAdminConfigError::Config(
+            rustfs_iam::oidc::OidcConfigError::ProviderNotFound,
+        ));
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(error.message(), Some("provider not found"));
 
-        assert!(build_provider_config_from_upsert("default", req, None).is_err());
-    }
+        let error = config_service_error(oidc_config::OidcAdminConfigError::Task("cancelled"));
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        assert_eq!(error.message(), Some("OIDC config update task cancelled"));
 
-    #[test]
-    fn test_build_provider_config_preserves_existing_secret_when_request_is_empty() {
-        let req = OidcConfigUpsertRequest {
-            config_url: "https://example.com/.well-known/openid-configuration".to_string(),
-            client_id: "client-id".to_string(),
-            client_secret: Some("".to_string()),
-            ..Default::default()
-        };
-
-        let config =
-            build_provider_config_from_upsert("default", req, Some("existing-secret".to_string())).expect("config should build");
-
-        assert_eq!(config.client_secret.as_deref(), Some("existing-secret"));
-        assert_eq!(config.roles_claim, OIDC_DEFAULT_ROLES_CLAIM);
-    }
-
-    #[test]
-    fn test_oidc_config_upsert_request_rejects_unknown_fields() {
-        let err = serde_json::from_str::<OidcConfigUpsertRequest>(
-            r#"{"config_url":"https://example.com/.well-known/openid-configuration","client_id":"client","unexpected_field":true}"#,
+        let error = rustfs_iam::oidc::build_upsert_provider_config(
+            "default",
+            rustfs_iam::oidc::OidcProviderConfigInput {
+                config_url: "https://127.0.0.1/.well-known/openid-configuration".to_string(),
+                client_id: "client".to_string(),
+                ..Default::default()
+            },
+            None,
         )
-        .expect_err("unknown upsert field should fail");
+        .expect_err("loopback config URL should be rejected");
+        let error = config_service_error(oidc_config::OidcAdminConfigError::Config(error));
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert!(error.message().unwrap_or_default().contains("not allowed"));
+    }
 
-        assert!(err.to_string().contains("unknown field"));
+    /// The OIDC config gate now authorizes through the shared admin gate, which
+    /// reports "get cred failed"; its pre-check keeps the message these endpoints
+    /// have always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn oidc_config_gate_keeps_its_missing_credentials_message() {
+        for action in [AdminAction::ServerInfoAdminAction, AdminAction::ConfigUpdateAdminAction] {
+            let err = authorize_oidc_config_request(&build_oidc_request("/rustfs/admin/v3/idp/openid", None, None), action)
+                .await
+                .expect_err("a request without credentials must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(err.message(), Some("authentication required"));
+        }
     }
 
     #[test]
-    fn test_oidc_config_validate_request_rejects_unknown_fields() {
-        let err = serde_json::from_str::<OidcConfigValidateRequest>(
-            r#"{"provider_id":"default","config_url":"https://example.com/.well-known/openid-configuration","client_id":"client","unexpected_field":true}"#,
-        )
-        .expect_err("unknown validate field should fail");
+    fn oidc_config_gate_routes_through_the_shared_gate() {
+        let production = include_str!("oidc.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+        let wrapper = production
+            .split_once("async fn authorize_oidc_config_request")
+            .expect("the OIDC config gate must exist")
+            .1
+            .split_once("\nasync fn parse_json_body")
+            .expect("the OIDC config gate must be followed by parse_json_body")
+            .0;
 
-        assert!(err.to_string().contains("unknown field"));
+        assert_eq!(
+            wrapper.matches("authorize_admin_envelope(").count(),
+            1,
+            "the OIDC config gate must use exactly one shared gate"
+        );
+        assert!(
+            wrapper.contains("authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)])"),
+            "the OIDC config gate must forward its parameterized action unchanged"
+        );
+        assert!(
+            !wrapper.contains("let cred = authorize_admin_envelope("),
+            "the OIDC config gate does not need the authenticated credentials"
+        );
+
+        for (handler, action) in [
+            ("GetOidcConfigHandler", "AdminAction::ServerInfoAdminAction"),
+            ("PutOidcConfigHandler", "AdminAction::ConfigUpdateAdminAction"),
+            ("DeleteOidcConfigHandler", "AdminAction::ConfigUpdateAdminAction"),
+            ("ValidateOidcConfigHandler", "AdminAction::ServerInfoAdminAction"),
+        ] {
+            let marker = format!("impl Operation for {handler}");
+            let block = production
+                .split_once(marker.as_str())
+                .unwrap_or_else(|| panic!("{handler} should exist"))
+                .1;
+            let block = &block[..block.find("\npub struct ").unwrap_or(block.len())];
+            assert!(
+                block.contains(&format!("authorize_oidc_config_request(&req, {action})")),
+                "{handler} must keep authorizing with {action}"
+            );
+        }
     }
 
     #[test]
-    fn test_build_provider_config_uses_custom_roles_claim() {
-        let req = OidcConfigUpsertRequest {
-            config_url: "https://example.com/.well-known/openid-configuration".to_string(),
-            client_id: "client-id".to_string(),
-            roles_claim: "app_roles".to_string(),
-            ..Default::default()
-        };
+    fn console_callback_uses_the_configured_session_duration() {
+        let production = include_str!("oidc.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+        let callback = production
+            .split_once("impl Operation for OidcCallbackHandler")
+            .expect("the OIDC callback handler must exist")
+            .1;
+        let callback = callback.split_whitespace().collect::<String>();
 
-        let config = build_provider_config_from_upsert("default", req, None).expect("config should build");
-        assert_eq!(config.roles_claim, "app_roles");
-    }
-
-    #[test]
-    fn test_oidc_restart_required_detects_persisted_changes() {
-        let active_config = ServerConfig::new();
-        let mut persisted_config = ServerConfig::new();
-        let provider_config = rustfs_iam::oidc::OidcProviderConfig {
-            id: "default".to_string(),
-            enabled: true,
-            config_url: "https://example.com/.well-known/openid-configuration".to_string(),
-            client_id: "console".to_string(),
-            client_secret: Some("secret".to_string()),
-            scopes: vec!["openid".to_string(), "profile".to_string()],
-            other_audiences: vec![],
-            redirect_uri: None,
-            redirect_uri_dynamic: true,
-            claim_name: OIDC_DEFAULT_CLAIM_NAME.to_string(),
-            claim_prefix: String::new(),
-            role_policy: String::new(),
-            display_name: "default".to_string(),
-            groups_claim: OIDC_DEFAULT_GROUPS_CLAIM.to_string(),
-            roles_claim: OIDC_DEFAULT_ROLES_CLAIM.to_string(),
-            email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
-            username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
-            hide_from_ui: false,
-        };
-
-        upsert_persisted_provider_config(&mut persisted_config, &provider_config);
-
-        assert!(oidc_restart_required_from_active_config(&persisted_config, Some(&active_config)));
-        assert!(!oidc_restart_required_from_active_config(&persisted_config, Some(&persisted_config)));
-    }
-
-    #[test]
-    fn test_upsert_persists_hide_from_ui_on() {
-        let mut config = ServerConfig::new();
-        let mut provider_config = rustfs_iam::oidc::OidcProviderConfig {
-            id: "kubernetes".to_string(),
-            enabled: true,
-            config_url: "https://example.com/.well-known/openid-configuration".to_string(),
-            client_id: "test".to_string(),
-            client_secret: None,
-            scopes: vec!["openid".to_string()],
-            other_audiences: vec![],
-            redirect_uri: None,
-            redirect_uri_dynamic: true,
-            claim_name: "sub".to_string(),
-            claim_prefix: String::new(),
-            role_policy: String::new(),
-            display_name: "Kubernetes".to_string(),
-            groups_claim: OIDC_DEFAULT_GROUPS_CLAIM.to_string(),
-            roles_claim: OIDC_DEFAULT_ROLES_CLAIM.to_string(),
-            email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
-            username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
-            hide_from_ui: true,
-        };
-
-        upsert_persisted_provider_config(&mut config, &provider_config);
-
-        let kvs = config
-            .0
-            .get(IDENTITY_OPENID_SUB_SYS)
-            .and_then(|m| m.get("kubernetes"))
-            .expect("provider KVS should exist");
-        assert_eq!(kvs.get(OIDC_HIDE_FROM_UI), EnableState::On.to_string());
-
-        // Flip to false and verify
-        provider_config.hide_from_ui = false;
-        upsert_persisted_provider_config(&mut config, &provider_config);
-
-        let kvs = config
-            .0
-            .get(IDENTITY_OPENID_SUB_SYS)
-            .and_then(|m| m.get("kubernetes"))
-            .expect("provider KVS should exist");
-        assert_eq!(kvs.get(OIDC_HIDE_FROM_UI), EnableState::Off.to_string());
+        assert!(
+            callback.contains("session_duration_seconds=console_session_duration_secs()"),
+            "the callback must resolve the Console session duration from the environment"
+        );
+        assert!(
+            callback.contains(".complete_authorization_code(&state,&code,&redirect_uri,session_duration_seconds,"),
+            "the callback must hand the resolved session duration to the code exchange"
+        );
+        assert!(
+            !callback.contains(".complete_authorization_code(&state,&code,&redirect_uri,3600,"),
+            "the callback must not hard-code the session duration"
+        );
     }
 }

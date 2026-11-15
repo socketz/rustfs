@@ -9,6 +9,7 @@ WebDAV (Web Distributed Authoring and Versioning) protocol implementation for Ru
 - Directory (bucket/prefix) creation and deletion
 - File upload, download, and deletion
 - Property queries (PROPFIND) for metadata
+- Quota reporting (PROPFIND `quota-available-bytes` / `quota-used-bytes`) so drive mounts show capacity
 - TLS support with multi-certificate SNI
 - Integration with RustFS IAM for access control
 
@@ -29,6 +30,27 @@ WebDAV (Web Distributed Authoring and Versioning) protocol implementation for Ru
 |--------|-------------|--------|
 | `MOVE` | Move/rename file | Returns 501 Not Implemented |
 | `COPY` | Copy file | Returns 501 Not Implemented |
+
+## Quota Reporting
+
+WebDAV clients (RaiDrive, Mountain Duck, Windows Explorer, macOS Finder) read
+drive capacity from the `quota-available-bytes` and `quota-used-bytes`
+properties. dav-server queries quota once per request without a path, so the
+reported value is a single filesystem-wide pair rather than per-bucket:
+
+- If every bucket visible to the authenticated session has a hard quota
+  configured, the server reports the summed cached bucket usage against the
+  summed quota limits. A bucket whose usage cache has no scanner snapshot yet
+  (fresh deployment, new bucket) counts as zero until the first complete
+  scanner cycle lands.
+- Otherwise the server falls back to the cluster's usable capacity — the same
+  erasure-aware used/total numbers the console dashboard shows — refreshed at
+  most every 30 seconds.
+- If neither source is available, quota properties are omitted from the
+  response and clients fall back to their own placeholder capacity.
+
+All inputs are cache or snapshot reads; quota reporting never triggers a
+scanner cycle or a live object listing.
 
 ## Enable Feature
 
@@ -59,6 +81,23 @@ Configure WebDAV via environment variables:
 | `RUSTFS_WEBDAV_CA_FILE` | CA file for client verification | - |
 | `RUSTFS_WEBDAV_MAX_BODY_SIZE` | Max upload size (bytes) | 5GB |
 | `RUSTFS_WEBDAV_REQUEST_TIMEOUT` | Request timeout (seconds) | 300 |
+| `RUSTFS_WEBDAV_MAX_CONNECTIONS` | Max concurrently served connections | 1024 |
+| `RUSTFS_CORS_ALLOWED_ORIGINS` | Browser origins allowed by the S3 and WebDAV listeners | empty |
+
+## Browser Access and CORS
+
+WebDAV reads `RUSTFS_CORS_ALLOWED_ORIGINS` at server startup. Set a comma-separated list of exact frontend origins to allow browser clients, for example `https://dav-console.example,https://files.example`. Explicit origins allow credentialed requests. The default empty value disables cross-origin access. A standalone `*` permits any origin with credentials mode `omit` and emits no `Access-Control-Allow-Credentials` header.
+
+Valid `OPTIONS` preflight requests from an allowed origin receive `204 No Content` without Basic authentication. Actual WebDAV requests and ordinary `OPTIONS` requests still use Basic authentication and the existing IAM checks. Allowed origins receive CORS headers on success and error responses. Preflights allow WebDAV methods and explicitly echo valid requested header names, including `Authorization`, `Depth`, `Destination`, and `If-Match`. Responses expose `ETag`, `DAV`, `Allow`, `Lock-Token`, and range headers to browser code.
+
+```bash
+curl -i -X OPTIONS http://localhost:8080/ \
+  -H 'Origin: https://dav-console.example' \
+  -H 'Access-Control-Request-Method: PROPFIND' \
+  -H 'Access-Control-Request-Headers: authorization,depth,content-type'
+```
+
+Configure an explicit HTTPS frontend origin for credentialed browser access and use HTTPS on the WebDAV listener when sending access keys and secret keys. This listener-wide policy applies across WebDAV paths. S3 bucket CORS rules remain scoped to the S3 API.
 
 ## Quick Start
 

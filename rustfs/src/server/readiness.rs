@@ -12,21 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::server::runtime_sources;
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
+use crate::storage_api::cluster::control_plane::ClusterControlPlane;
+use crate::storage_api::error::StorageError;
+use crate::storage_api::server::readiness::contract::admin::{DiskSetSelector, StorageAdminApi};
+use crate::storage_api::server::readiness::{DiskStore, Endpoint, EndpointServerPools, disk_endpoint_snapshot, is_dist_erasure};
+#[cfg(test)]
+use crate::storage_api::server::readiness::{Endpoints, PoolEndpoints};
+use crate::storage_api::startup::shutdown::mark_get_metadata_read_version_coalescing_service_ready;
 use bytes::Bytes;
+use http::HeaderValue;
 use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use rustfs_common::GlobalReadiness;
-use rustfs_ecstore::global::is_dist_erasure;
-use rustfs_ecstore::global::{get_global_endpoints_opt, get_global_lock_clients};
-use rustfs_ecstore::resolve_object_store_handle;
-use rustfs_iam::get_global_iam_sys;
-use rustfs_madmin::{Disk, StorageInfo};
-use rustfs_storage_api::StorageAdminApi;
+use rustfs_madmin::{BackendInfo, Disk, StorageInfo};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -41,53 +44,53 @@ use tokio::sync::Mutex;
 use tower::{Layer, Service};
 use tracing::{debug, info};
 
-pub const STARTUP_RUNTIME_READINESS_MAX_WAIT: Duration = Duration::from_secs(30);
+mod cluster_health;
+mod peer_readmission;
+pub(crate) use peer_readmission::observe_peer_drive_admission;
+
+/// Default upper bound for the startup runtime-readiness wait.
+///
+/// This is the compile-time fallback used when
+/// [`rustfs_config::ENV_STARTUP_READINESS_MAX_WAIT_SECS`] is unset or `0`. The
+/// effective value is resolved at runtime by [`startup_runtime_readiness_max_wait`],
+/// which lets slow multi-node cold starts (Docker/K8s/NAS) extend the budget past
+/// the internal DNS-retry and format-load windows without a rebuild.
+pub const STARTUP_RUNTIME_READINESS_MAX_WAIT: Duration =
+    Duration::from_secs(rustfs_config::DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS);
 pub const STARTUP_RUNTIME_READINESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const METRIC_RUNTIME_READINESS_READY: &str = "rustfs_runtime_readiness_ready";
-const METRIC_RUNTIME_READINESS_DEGRADED_TOTAL: &str = "rustfs_runtime_readiness_degraded_total";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DependencyReadiness {
-    pub storage_ready: bool,
-    pub iam_ready: bool,
-    pub lock_quorum_ready: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadinessDegradedReason {
-    StorageQuorumUnavailable,
-    IamNotReady,
-    LockQuorumUnavailable,
-    KmsNotReady,
-    StorageAndIamUnavailable,
-    StorageAndLockUnavailable,
-    IamAndLockUnavailable,
-    StorageIamAndLockUnavailable,
-}
-
-impl ReadinessDegradedReason {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ReadinessDegradedReason::StorageQuorumUnavailable => "storage_quorum_unavailable",
-            ReadinessDegradedReason::IamNotReady => "iam_not_ready",
-            ReadinessDegradedReason::LockQuorumUnavailable => "lock_quorum_unavailable",
-            ReadinessDegradedReason::KmsNotReady => "kms_not_ready",
-            ReadinessDegradedReason::StorageAndIamUnavailable => "storage_and_iam_unavailable",
-            ReadinessDegradedReason::StorageAndLockUnavailable => "storage_and_lock_unavailable",
-            ReadinessDegradedReason::IamAndLockUnavailable => "iam_and_lock_unavailable",
-            ReadinessDegradedReason::StorageIamAndLockUnavailable => "storage_iam_and_lock_unavailable",
-        }
+/// Resolve the effective startup runtime-readiness wait.
+///
+/// Reads `RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS`, falling back to
+/// [`STARTUP_RUNTIME_READINESS_MAX_WAIT`] when unset. A configured value of `0`
+/// is treated as "use the default" rather than an instant timeout, so an empty or
+/// misconfigured env var can never make the server give up on readiness immediately.
+fn startup_runtime_readiness_max_wait() -> Duration {
+    let secs = rustfs_utils::get_env_u64(
+        rustfs_config::ENV_STARTUP_READINESS_MAX_WAIT_SECS,
+        rustfs_config::DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS,
+    );
+    if secs == 0 {
+        STARTUP_RUNTIME_READINESS_MAX_WAIT
+    } else {
+        Duration::from_secs(secs)
     }
 }
+const EVENT_STARTUP_RUNTIME_READINESS: &str = "startup_runtime_readiness";
+const LOG_COMPONENT_SERVER: &str = "server";
+const LOG_SUBSYSTEM_READINESS: &str = "readiness";
+const METRIC_RUNTIME_READINESS_READY: &str = "rustfs_runtime_readiness_ready";
+const METRIC_RUNTIME_READINESS_DEGRADED_TOTAL: &str = "rustfs_runtime_readiness_degraded_total";
+const METRIC_CLUSTER_HEALTH_READY: &str = "rustfs_cluster_health_ready";
+const METRIC_CLUSTER_HEALTH_DURATION_SECONDS: &str = "rustfs_cluster_health_duration_seconds";
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DependencyReadinessReport {
-    pub readiness: DependencyReadiness,
-    pub degraded_reasons: Vec<ReadinessDegradedReason>,
-}
+pub use crate::shared_types::{
+    DependencyReadiness, DependencyReadinessReport, MissingReadinessDrive, ReadinessDegradedReason, StorageReadinessDetails,
+    UnavailableReadinessDrive,
+};
 
 /// ReadinessGateLayer ensures that the system components (IAM, Storage)
-/// are fully initialized before allowing any request to proceed.
+/// are fully initialized before allowing S3 data-plane requests to proceed.
 #[derive(Clone)]
 pub struct ReadinessGateLayer {
     readiness: Arc<GlobalReadiness>,
@@ -135,13 +138,17 @@ fn is_probe_path(path: &str) -> bool {
             | crate::server::HEALTH_PREFIX
             | crate::server::HEALTH_COMPAT_LIVE_PATH
             | crate::server::HEALTH_READY_PATH
+            | crate::server::MINIO_HEALTH_LIVE_PATH
+            | crate::server::MINIO_HEALTH_READY_PATH
+            | crate::server::MINIO_HEALTH_CLUSTER_PATH
+            | crate::server::MINIO_HEALTH_CLUSTER_READ_PATH
             | crate::server::FAVICON_PATH
     );
 
     let is_prefix_probe = has_path_prefix(path, crate::server::RUSTFS_ADMIN_PREFIX)
         || has_path_prefix(path, crate::server::MINIO_ADMIN_V3_PREFIX)
         || is_table_catalog_path(path)
-        || has_path_prefix(path, crate::server::CONSOLE_PREFIX)
+        || has_path_prefix(path, crate::server::console_prefix())
         || has_path_prefix(path, crate::server::RPC_PREFIX)
         || has_path_prefix(path, crate::server::ADMIN_PREFIX)
         || has_path_prefix(path, crate::server::MINIO_ADMIN_PREFIX)
@@ -150,13 +157,55 @@ fn is_probe_path(path: &str) -> bool {
     is_exact_probe || is_prefix_probe
 }
 
+fn readiness_gate_blocks_path(path: &str, readiness: &GlobalReadiness) -> bool {
+    !is_probe_path(path) && !readiness.is_ready()
+}
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
-impl<S, B> Service<HttpRequest<Incoming>> for ReadinessGateService<S>
+
+/// Header exposing which startup dependency the readiness gate is waiting
+/// on, so operators can diagnose a 503 without shell access (rustfs#4304).
+const READINESS_PENDING_HEADER: &str = "x-rustfs-readiness-pending";
+
+/// Maps the current startup stage to the dependency the gate is waiting on.
+fn readiness_pending_dependency(stage: rustfs_common::SystemStage) -> &'static str {
+    match stage {
+        rustfs_common::SystemStage::Booting => "storage_quorum",
+        rustfs_common::SystemStage::StorageReady => "iam",
+        rustfs_common::SystemStage::IamReady | rustfs_common::SystemStage::FullReady => "startup_finalization",
+    }
+}
+
+fn service_not_ready_response(stage: rustfs_common::SystemStage) -> Response<BoxBody> {
+    let pending = readiness_pending_dependency(stage);
+    let body: BoxBody = Full::new(Bytes::from(format!("Service not ready: waiting for {pending}")))
+        .map_err(|never| match never {})
+        .boxed_unsync();
+
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    response
+        .headers_mut()
+        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
+        .headers_mut()
+        .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+    response
+        .headers_mut()
+        .insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(READINESS_PENDING_HEADER, HeaderValue::from_static(pending));
+    response
+}
+
+impl<S, ReqBody, B> Service<HttpRequest<ReqBody>> for ReadinessGateService<S>
 where
-    S: Service<HttpRequest<Incoming>, Response = Response<B>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<B>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
+    ReqBody: Send + 'static,
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<BoxError> + Send + 'static,
 {
@@ -168,26 +217,20 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: HttpRequest<Incoming>) -> Self::Future {
+    fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
         let mut inner = self.inner.clone();
         let readiness = self.readiness.clone();
         Box::pin(async move {
             let path = req.uri().path();
             debug!("ReadinessGateService: Received request for path: {}", path);
-            let is_probe = is_probe_path(path);
-            if !is_probe && !readiness.is_ready() {
-                let body: BoxBody = Full::new(Bytes::from_static(b"Service not ready"))
-                    .map_err(|e| -> BoxError { Box::new(e) })
-                    .boxed_unsync();
-
-                let resp = Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header(http::header::RETRY_AFTER, "5")
-                    .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                    .header(http::header::CACHE_CONTROL, "no-store")
-                    .body(body)
-                    .expect("failed to build not ready response");
-                return Ok(resp);
+            // Control services must reach the authenticated gRPC router while
+            // their storage owners are still initializing.
+            let grpc_request = crate::server::hybrid::is_grpc_request(&req);
+            if !grpc_request && readiness_gate_blocks_path(path, &readiness) {
+                return Ok(service_not_ready_response(readiness.current_stage()));
+            }
+            if !grpc_request && !is_probe_path(path) && readiness.is_ready() {
+                mark_get_metadata_read_version_coalescing_service_ready();
             }
             let resp = inner.call(req).await?;
             // System is ready, forward to the actual S3/RPC handlers
@@ -203,55 +246,131 @@ pub async fn publish_ready_when_runtime_ready(
     readiness: &GlobalReadiness,
     state_manager: Option<&ServiceStateManager>,
 ) -> Result<(), std::io::Error> {
+    let max_wait = startup_runtime_readiness_max_wait();
+    let startup_deadline = tokio::time::Instant::now() + max_wait;
+    let mut local_readiness = None;
     wait_for_runtime_readiness_with(
-        STARTUP_RUNTIME_READINESS_MAX_WAIT,
+        max_wait,
         STARTUP_RUNTIME_READINESS_POLL_INTERVAL,
-        collect_dependency_readiness_uncached,
-        |dependency_readiness| {
-            readiness.mark_stage(rustfs_common::SystemStage::FullReady);
-            if let Some(state_manager) = state_manager {
-                state_manager.update(ServiceState::Ready);
-            }
-            info!(
-                target: "rustfs::server::readiness",
-                storage_ready = dependency_readiness.storage_ready,
-                iam_ready = dependency_readiness.iam_ready,
-                "Runtime readiness reached write quorum; publishing ready state"
-            );
-        },
+        // Publish service readiness at the same per-set read and shared-lock
+        // boundary reported by the node probe. Mutation paths independently
+        // require write quorum and a writable pool-metadata state.
+        || async { collect_node_readiness_report().await.readiness },
+        |dependency_readiness| local_readiness = Some(dependency_readiness),
     )
-    .await
+    .await?;
+
+    // This node's own view is ready. Hold the startup FullReady transition until
+    // the peers count this node's drives online too (rustfs#8669). The gate
+    // shares the startup budget and always ends in publication.
+    let readmission = peer_readmission::wait_for_startup_peer_readmission(startup_deadline).await;
+    peer_readmission::log_readmission_outcome(&readmission);
+
+    let dependency_readiness = local_readiness.unwrap_or_default();
+    readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+    mark_get_metadata_read_version_coalescing_service_ready();
+    if let Some(state_manager) = state_manager {
+        state_manager.update(ServiceState::Ready);
+    }
+    info!(
+        target: "rustfs::server::readiness",
+        storage_ready = dependency_readiness.storage_ready,
+        iam_ready = dependency_readiness.iam_ready,
+        lock_quorum_ready = dependency_readiness.lock_quorum_ready,
+        peer_health_ready = dependency_readiness.peer_health_ready,
+        "Runtime node readiness reached; publishing ready state"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
 struct StorageReadinessCacheEntry {
     captured_at: Instant,
-    storage_ready: bool,
+    status: StorageWriteReadinessStatus,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StorageWriteReadinessStatus {
+    ready: bool,
+    pool_metadata_reason: Option<ReadinessDegradedReason>,
+}
+
+fn pool_metadata_write_readiness(result: Result<(), StorageError>) -> StorageWriteReadinessStatus {
+    match result {
+        Ok(()) => StorageWriteReadinessStatus {
+            ready: true,
+            pool_metadata_reason: None,
+        },
+        Err(error) => {
+            let pool_metadata_reason = error
+                .pool_metadata_failure()
+                .map(|_| ReadinessDegradedReason::PoolMetaWriteBlocked);
+            StorageWriteReadinessStatus {
+                ready: false,
+                pool_metadata_reason,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct LockQuorumCacheEntry {
     captured_at: Instant,
+    observation: LockQuorumObservation,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LockQuorumObservation {
     status: LockQuorumStatus,
+    online_hosts: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ClusterHealthReportCacheEntry {
+    generation: u64,
+    captured_at: Instant,
+    report: DependencyReadinessReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClusterHealthProbeKind {
+    Write,
+    Read,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LockQuorumStatus {
+    /// Exclusive-lock quorum. Cluster write probes and startup publication use this.
     pub ready: bool,
+    /// Shared-lock quorum. Node `/health/ready` uses this so a readable survivor
+    /// stays in the Service after exclusive locks are no longer obtainable.
+    pub read_ready: bool,
     pub connected_clients: usize,
     pub total_clients: usize,
     pub required_quorum: usize,
+    pub required_read_quorum: usize,
 }
 
 const DISK_STATE_OK: &str = "ok";
 const DISK_STATE_UNFORMATTED: &str = "unformatted";
 const RUNTIME_STATE_RETURNING: &str = "returning";
+const NODE_STORAGE_READINESS_TIMEOUT: Duration = Duration::from_millis(100);
 
 fn health_readiness_cache_ttl() -> Duration {
     Duration::from_millis(rustfs_utils::get_env_u64(
         rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS,
         rustfs_config::DEFAULT_HEALTH_READINESS_CACHE_TTL_MS,
     ))
+}
+
+fn health_cluster_timeout() -> Duration {
+    Duration::from_millis(
+        rustfs_utils::get_env_u64(
+            rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS,
+            rustfs_config::DEFAULT_HEALTH_CLUSTER_TIMEOUT_MS,
+        )
+        .max(1),
+    )
 }
 
 fn storage_readiness_cache() -> &'static Mutex<Option<StorageReadinessCacheEntry>> {
@@ -264,7 +383,47 @@ fn lock_quorum_status_cache() -> &'static Mutex<Option<LockQuorumCacheEntry>> {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
-async fn load_cached_storage_readiness() -> Option<bool> {
+fn cluster_write_health_report_cache() -> &'static Mutex<Option<ClusterHealthReportCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<ClusterHealthReportCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cluster_read_health_report_cache() -> &'static Mutex<Option<ClusterHealthReportCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<ClusterHealthReportCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cluster_write_health_singleflight() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn cluster_read_health_singleflight() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn cluster_health_report_cache(kind: ClusterHealthProbeKind) -> &'static Mutex<Option<ClusterHealthReportCacheEntry>> {
+    match kind {
+        ClusterHealthProbeKind::Write => cluster_write_health_report_cache(),
+        ClusterHealthProbeKind::Read => cluster_read_health_report_cache(),
+    }
+}
+
+fn cluster_health_singleflight(kind: ClusterHealthProbeKind) -> &'static Mutex<()> {
+    match kind {
+        ClusterHealthProbeKind::Write => cluster_write_health_singleflight(),
+        ClusterHealthProbeKind::Read => cluster_read_health_singleflight(),
+    }
+}
+
+#[cfg(test)]
+async fn reset_cluster_health_report_caches() {
+    *cluster_write_health_report_cache().lock().await = None;
+    *cluster_read_health_report_cache().lock().await = None;
+}
+
+async fn load_cached_storage_readiness() -> Option<StorageWriteReadinessStatus> {
     let ttl = health_readiness_cache_ttl();
     if ttl.is_zero() {
         return None;
@@ -273,13 +432,41 @@ async fn load_cached_storage_readiness() -> Option<bool> {
     let cache = storage_readiness_cache().lock().await;
     let entry = cache.as_ref()?;
     if entry.captured_at.elapsed() <= ttl {
-        return Some(entry.storage_ready);
+        return Some(entry.status);
     }
 
     None
 }
 
-async fn update_storage_readiness_cache(storage_ready: bool) {
+fn cluster_health_report_is_fresh(entry: &ClusterHealthReportCacheEntry) -> bool {
+    let ttl = health_readiness_cache_ttl();
+    !ttl.is_zero() && entry.captured_at.elapsed() <= ttl
+}
+
+#[cfg(test)]
+async fn load_cached_cluster_health_report(kind: ClusterHealthProbeKind) -> Option<DependencyReadinessReport> {
+    let cache = cluster_health_report_cache(kind).lock().await;
+    cache
+        .as_ref()
+        .filter(|entry| cluster_health_report_is_fresh(entry))
+        .map(|entry| entry.report.clone())
+}
+
+fn publish_cluster_health_report(cache: &mut Option<ClusterHealthReportCacheEntry>, report: DependencyReadinessReport) {
+    let generation = cache.as_ref().map_or(1, |entry| entry.generation.wrapping_add(1));
+    *cache = Some(ClusterHealthReportCacheEntry {
+        generation,
+        captured_at: Instant::now(),
+        report,
+    });
+}
+
+async fn update_cluster_health_report_cache(kind: ClusterHealthProbeKind, report: DependencyReadinessReport) {
+    let mut cache = cluster_health_report_cache(kind).lock().await;
+    publish_cluster_health_report(&mut cache, report);
+}
+
+async fn update_storage_readiness_cache(status: StorageWriteReadinessStatus) {
     if health_readiness_cache_ttl().is_zero() {
         return;
     }
@@ -287,11 +474,11 @@ async fn update_storage_readiness_cache(storage_ready: bool) {
     let mut cache = storage_readiness_cache().lock().await;
     *cache = Some(StorageReadinessCacheEntry {
         captured_at: Instant::now(),
-        storage_ready,
+        status,
     });
 }
 
-async fn load_cached_lock_quorum_status() -> Option<LockQuorumStatus> {
+async fn load_cached_lock_quorum_status() -> Option<LockQuorumObservation> {
     let ttl = health_readiness_cache_ttl();
     if ttl.is_zero() {
         return None;
@@ -300,13 +487,13 @@ async fn load_cached_lock_quorum_status() -> Option<LockQuorumStatus> {
     let cache = lock_quorum_status_cache().lock().await;
     let entry = cache.as_ref()?;
     if entry.captured_at.elapsed() <= ttl {
-        return Some(entry.status);
+        return Some(entry.observation.clone());
     }
 
     None
 }
 
-async fn update_lock_quorum_status_cache(status: LockQuorumStatus) {
+async fn update_lock_quorum_status_cache(observation: LockQuorumObservation) {
     if health_readiness_cache_ttl().is_zero() {
         return;
     }
@@ -314,7 +501,7 @@ async fn update_lock_quorum_status_cache(status: LockQuorumStatus) {
     let mut cache = lock_quorum_status_cache().lock().await;
     *cache = Some(LockQuorumCacheEntry {
         captured_at: Instant::now(),
-        status,
+        observation,
     });
 }
 
@@ -332,44 +519,106 @@ fn disk_is_online_for_readiness(disk: &Disk) -> bool {
     state_is_acceptable
 }
 
-fn pool_write_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> usize {
+fn pool_erasure_layout(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> Option<(usize, usize)> {
     if set_drive_count == 0 {
-        return 1;
+        return None;
     }
 
-    let data_drives = info
-        .backend
-        .standard_sc_data
-        .get(pool_idx)
-        .copied()
-        .filter(|count| *count > 0)
-        .unwrap_or_else(|| (set_drive_count / 2).max(1));
+    if !info.backend.drives_per_set.is_empty() {
+        if info.backend.drives_per_set.get(pool_idx).copied() != Some(set_drive_count) {
+            return None;
+        }
+        if (!info.backend.standard_sc_data.is_empty() && info.backend.standard_sc_data.len() != info.backend.drives_per_set.len())
+            || (!info.backend.standard_sc_parities.is_empty()
+                && info.backend.standard_sc_parities.len() != info.backend.drives_per_set.len())
+        {
+            return None;
+        }
+    }
 
-    let parity_drives = if let Some(drives_per_set) = info.backend.drives_per_set.get(pool_idx).copied() {
-        drives_per_set.saturating_sub(data_drives)
-    } else if let Some(parity) = info.backend.standard_sc_parities.get(pool_idx).copied() {
-        parity
-    } else if let Some(parity) = info.backend.standard_sc_parity {
-        parity
-    } else {
-        set_drive_count.saturating_sub(data_drives)
+    let has_data = !info.backend.standard_sc_data.is_empty();
+    let has_parities = !info.backend.standard_sc_parities.is_empty();
+    let (data_drives, parity_drives) = match (has_data, has_parities) {
+        (true, true) => (
+            info.backend.standard_sc_data.get(pool_idx).copied()?,
+            info.backend.standard_sc_parities.get(pool_idx).copied()?,
+        ),
+        (true, false) => {
+            let data = info.backend.standard_sc_data.get(pool_idx).copied()?;
+            // The per-pool data vector is exact. A legacy scalar may be stale
+            // for a heterogeneous topology, so derive the matching parity from
+            // the pool drive count instead of combining two representations.
+            let parity = set_drive_count.checked_sub(data)?;
+            (data, parity)
+        }
+        (false, true) => {
+            let parity = info.backend.standard_sc_parities.get(pool_idx).copied()?;
+            (set_drive_count.checked_sub(parity)?, parity)
+        }
+        (false, false) => {
+            let parity = info.backend.standard_sc_parity?;
+            (set_drive_count.checked_sub(parity)?, parity)
+        }
     };
 
-    let mut write_quorum = data_drives;
-    if data_drives == parity_drives {
-        write_quorum += 1;
+    if data_drives == 0 || parity_drives > data_drives || data_drives.checked_add(parity_drives) != Some(set_drive_count) {
+        return None;
     }
-    write_quorum.max(1)
+
+    Some((data_drives, parity_drives))
 }
 
-fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
+fn pool_write_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> Option<usize> {
+    let (data_drives, parity_drives) = pool_erasure_layout(info, pool_idx, set_drive_count)?;
+    if data_drives == parity_drives {
+        data_drives.checked_add(1)
+    } else {
+        Some(data_drives)
+    }
+}
+
+fn pool_read_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> Option<usize> {
+    pool_erasure_layout(info, pool_idx, set_drive_count).map(|(data_drives, _)| data_drives)
+}
+
+/// Exclusive namespace locks use a strict majority of lock clients.
+fn exclusive_lock_quorum(total_clients: usize) -> usize {
+    if total_clients > 1 { (total_clients / 2) + 1 } else { 1 }
+}
+
+/// Shared namespace locks use the same client threshold as `DistributedLock::read_quorum`.
+fn shared_lock_quorum(total_clients: usize) -> usize {
+    if total_clients > 1 {
+        total_clients - (total_clients / 2)
+    } else {
+        1
+    }
+}
+
+fn configured_readiness_topology(info: &StorageInfo) -> Option<(&[usize], &[usize])> {
+    if info.backend.total_sets.is_empty()
+        || info.backend.total_sets.len() != info.backend.drives_per_set.len()
+        || info.backend.total_sets.contains(&0)
+        || info.backend.drives_per_set.contains(&0)
+    {
+        return None;
+    }
+
+    Some((&info.backend.total_sets, &info.backend.drives_per_set))
+}
+
+fn storage_ready_from_runtime_state_with_quorum<F>(info: &StorageInfo, quorum_for_set: F) -> bool
+where
+    F: Fn(&StorageInfo, usize, usize) -> Option<usize>,
+{
     if info.disks.is_empty() {
         return false;
     }
 
+    let configured_topology_present = !info.backend.total_sets.is_empty() || !info.backend.drives_per_set.is_empty();
     let mut total_online = 0usize;
     let mut set_online_counts: HashMap<(usize, usize), usize> = HashMap::new();
-    let mut set_drive_counts: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut observed_set_drive_counts: HashMap<(usize, usize), usize> = HashMap::new();
     let mut seen_disks: HashSet<(String, String, i32, i32, i32)> = HashSet::new();
 
     for disk in &info.disks {
@@ -391,7 +640,9 @@ fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
         let pool_idx = disk.pool_index as usize;
         let set_idx = disk.set_index as usize;
         let key = (pool_idx, set_idx);
-        *set_drive_counts.entry(key).or_default() += 1;
+        if !configured_topology_present {
+            *observed_set_drive_counts.entry(key).or_default() += 1;
+        }
 
         if disk_is_online_for_readiness(disk) {
             total_online += 1;
@@ -399,18 +650,87 @@ fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
         }
     }
 
-    if total_online == 0 || set_drive_counts.is_empty() {
+    if total_online == 0 {
         return false;
     }
 
-    set_drive_counts.into_iter().all(|((pool_idx, set_idx), set_drive_count)| {
-        let online = set_online_counts.get(&(pool_idx, set_idx)).copied().unwrap_or_default();
-        let write_quorum = pool_write_quorum(info, pool_idx, set_drive_count);
-        online >= write_quorum
-    })
+    if configured_topology_present {
+        let Some((total_sets, drives_per_set)) = configured_readiness_topology(info) else {
+            return false;
+        };
+
+        return total_sets
+            .iter()
+            .zip(drives_per_set)
+            .enumerate()
+            .all(|(pool_idx, (&set_count, &configured_drive_count))| {
+                (0..set_count).all(|set_idx| {
+                    let online = set_online_counts.get(&(pool_idx, set_idx)).copied().unwrap_or_default();
+                    quorum_for_set(info, pool_idx, configured_drive_count).is_some_and(|quorum| online >= quorum)
+                })
+            });
+    }
+
+    if observed_set_drive_counts.is_empty() {
+        return false;
+    }
+
+    observed_set_drive_counts
+        .into_iter()
+        .all(|((pool_idx, set_idx), observed_drive_count)| {
+            let online = set_online_counts.get(&(pool_idx, set_idx)).copied().unwrap_or_default();
+            let layout_drive_count = info
+                .backend
+                .drives_per_set
+                .get(pool_idx)
+                .copied()
+                .unwrap_or(observed_drive_count);
+            quorum_for_set(info, pool_idx, layout_drive_count).is_some_and(|quorum| online >= quorum)
+        })
 }
 
-fn degraded_reasons(storage_ready: bool, iam_ready_raw: bool, lock_quorum_ready: bool) -> Vec<ReadinessDegradedReason> {
+fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
+    storage_ready_from_runtime_state_with_pool_meta(info, true)
+}
+
+fn storage_ready_from_runtime_state_with_pool_meta(info: &StorageInfo, pool_meta_ready: bool) -> bool {
+    pool_meta_ready && storage_ready_from_runtime_state_with_quorum(info, pool_write_quorum)
+}
+
+fn storage_read_ready_from_runtime_state(info: &StorageInfo) -> bool {
+    storage_ready_from_runtime_state_with_quorum(info, pool_read_quorum)
+}
+
+fn peer_health_ready_check_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_HEALTH_PEER_READY_CHECK_ENABLE,
+        rustfs_config::DEFAULT_HEALTH_PEER_READY_CHECK_ENABLE,
+    )
+}
+
+fn peer_health_ready_from_endpoint_pools(endpoint_pools: &EndpointServerPools) -> bool {
+    if !peer_health_ready_check_enabled() {
+        return true;
+    }
+
+    ClusterControlPlane::new(endpoint_pools.clone())
+        .peer_health_snapshot()
+        .peers
+        .iter()
+        .all(|peer| peer.status.state.is_supported())
+}
+
+fn collect_peer_health_readiness() -> bool {
+    if !peer_health_ready_check_enabled() {
+        return true;
+    }
+
+    runtime_sources::current_endpoints_handle()
+        .as_ref()
+        .is_some_and(peer_health_ready_from_endpoint_pools)
+}
+
+fn base_degraded_reasons(storage_ready: bool, iam_ready_raw: bool, lock_quorum_ready: bool) -> Vec<ReadinessDegradedReason> {
     match (storage_ready, iam_ready_raw, lock_quorum_ready) {
         (true, true, true) => Vec::new(),
         (false, false, false) => vec![ReadinessDegradedReason::StorageIamAndLockUnavailable],
@@ -423,86 +743,381 @@ fn degraded_reasons(storage_ready: bool, iam_ready_raw: bool, lock_quorum_ready:
     }
 }
 
+fn degraded_reasons(readiness: DependencyReadiness) -> Vec<ReadinessDegradedReason> {
+    let mut reasons = base_degraded_reasons(readiness.storage_ready, readiness.iam_ready, readiness.lock_quorum_ready);
+    if !readiness.peer_health_ready {
+        reasons.push(ReadinessDegradedReason::PeerHealthUnavailable);
+    }
+    reasons
+}
+
+fn degraded_reasons_with_pool_meta_status(
+    readiness: DependencyReadiness,
+    pool_metadata_reason: Option<ReadinessDegradedReason>,
+) -> Vec<ReadinessDegradedReason> {
+    let mut reasons = degraded_reasons(readiness);
+    if let Some(reason) = pool_metadata_reason {
+        reasons.retain(|reason| *reason != ReadinessDegradedReason::StorageQuorumUnavailable);
+        reasons.insert(0, reason);
+    }
+    reasons
+}
+
 fn record_readiness_report(report: &DependencyReadinessReport) {
-    let ready = report.readiness.storage_ready && report.readiness.iam_ready && report.readiness.lock_quorum_ready;
+    let ready = report.readiness.storage_ready
+        && report.readiness.iam_ready
+        && report.readiness.lock_quorum_ready
+        && report.readiness.peer_health_ready;
     gauge!(METRIC_RUNTIME_READINESS_READY).set(if ready { 1.0 } else { 0.0 });
     for reason in &report.degraded_reasons {
         counter!(METRIC_RUNTIME_READINESS_DEGRADED_TOTAL, "reason" => reason.as_str()).increment(1);
     }
 }
 
-pub async fn collect_dependency_readiness() -> DependencyReadiness {
-    collect_dependency_readiness_report().await.readiness
+pub(crate) fn record_readiness_overlay_reason(reason: ReadinessDegradedReason) {
+    gauge!(METRIC_RUNTIME_READINESS_READY).set(0.0);
+    counter!(METRIC_RUNTIME_READINESS_DEGRADED_TOTAL, "reason" => reason.as_str()).increment(1);
+}
+
+#[cfg(test)]
+fn dependency_readiness_report_from_readiness(readiness: DependencyReadiness) -> DependencyReadinessReport {
+    DependencyReadinessReport {
+        degraded_reasons: degraded_reasons(readiness),
+        readiness,
+        storage_details: None,
+    }
+}
+
+fn dependency_readiness_report_from_write_status(
+    readiness: DependencyReadiness,
+    storage: StorageWriteReadinessStatus,
+) -> DependencyReadinessReport {
+    DependencyReadinessReport {
+        degraded_reasons: degraded_reasons_with_pool_meta_status(readiness, storage.pool_metadata_reason),
+        readiness,
+        storage_details: None,
+    }
+}
+
+/// `/health/ready` reports whether this process can serve reads. Write quorum,
+/// the pool-metadata writer, and exclusive locks stay on `/minio/health/cluster`.
+fn apply_node_service_readiness(
+    mut storage: StorageWriteReadinessStatus,
+    mut details: StorageReadinessDetails,
+    lock_read_ready: bool,
+    iam_ready: bool,
+    peer_health_ready: bool,
+) -> (DependencyReadiness, StorageWriteReadinessStatus, StorageReadinessDetails) {
+    details.pool_metadata_write_ready = storage.ready;
+    storage.ready = details.read_quorum_ready;
+    storage.pool_metadata_reason = None;
+    let readiness = DependencyReadiness {
+        storage_ready: storage.ready,
+        iam_ready,
+        lock_quorum_ready: lock_read_ready,
+        peer_health_ready,
+    };
+    (readiness, storage, details)
 }
 
 pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport {
-    let iam_ready_raw = get_global_iam_sys().is_some_and(|sys| sys.is_ready());
-    let storage_ready = if let Some(cached) = load_cached_storage_readiness().await {
+    let iam_ready_raw = runtime_sources::current_iam_ready();
+    let storage = if let Some(cached) = load_cached_storage_readiness().await {
         cached
     } else {
-        let computed = collect_storage_readiness_uncached().await;
+        let computed = collect_storage_write_readiness_uncached().await;
         update_storage_readiness_cache(computed).await;
         computed
     };
     let lock_quorum_status = collect_lock_quorum_status().await;
 
     let readiness = DependencyReadiness {
-        storage_ready,
+        storage_ready: storage.ready,
         iam_ready: iam_ready_raw,
         lock_quorum_ready: lock_quorum_status.ready,
+        peer_health_ready: collect_peer_health_readiness(),
     };
-    let report = DependencyReadinessReport {
-        degraded_reasons: degraded_reasons(readiness.storage_ready, iam_ready_raw, readiness.lock_quorum_ready),
-        readiness,
-    };
+    let report = dependency_readiness_report_from_write_status(readiness, storage);
     record_readiness_report(&report);
     report
 }
 
+pub async fn collect_cluster_write_health_report() -> DependencyReadinessReport {
+    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || {
+        cluster_health::collect_cluster_probe_report(ClusterHealthProbeKind::Write)
+    })
+    .await
+}
+
+pub async fn collect_cluster_read_health_report() -> DependencyReadinessReport {
+    collect_cluster_health_report_with(ClusterHealthProbeKind::Read, || {
+        cluster_health::collect_cluster_probe_report(ClusterHealthProbeKind::Read)
+    })
+    .await
+}
+
+pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
+    let lock_observation = collect_lock_quorum_observation().await;
+    let mut storage = StorageWriteReadinessStatus::default();
+    let mut details = StorageReadinessDetails::default();
+    let mut storage_check_timed_out = false;
+    if let Some(store) = runtime_sources::current_object_store_handle() {
+        let pool_metadata_status = store.pool_meta_write_status().await;
+        storage = pool_metadata_write_readiness(pool_metadata_status);
+        match node_storage_snapshot(store.as_ref(), &lock_observation.online_hosts).await {
+            Ok((info, unavailable_drives, missing_drives)) => {
+                details.unavailable_drives = unavailable_drives;
+                details.missing_drives = missing_drives;
+                details.read_quorum_ready = storage_read_ready_from_runtime_state(&info);
+                details.write_quorum_ready = storage_ready_from_runtime_state(&info);
+            }
+            Err(StorageError::Timeout) => storage_check_timed_out = true,
+            Err(_) => {}
+        }
+    }
+    // The HTTP layer still returns 503 until startup publishes `FullReady`.
+    let (readiness, storage, details) = apply_node_service_readiness(
+        storage,
+        details,
+        lock_observation.status.read_ready,
+        runtime_sources::current_iam_ready(),
+        collect_peer_health_readiness(),
+    );
+    let mut report = dependency_readiness_report_from_write_status(readiness, storage);
+    report.storage_details = Some(details);
+    if storage_check_timed_out {
+        report
+            .degraded_reasons
+            .push(ReadinessDegradedReason::StorageReadinessCheckTimeout);
+    }
+    record_readiness_report(&report);
+    report
+}
+
+async fn node_storage_snapshot<S>(
+    store: &S,
+    online_hosts: &HashSet<String>,
+) -> Result<(StorageInfo, Vec<UnavailableReadinessDrive>, Vec<MissingReadinessDrive>), StorageError>
+where
+    S: StorageAdminApi<BackendInfo = BackendInfo, Disk = DiskStore, Error = StorageError>,
+{
+    tokio::time::timeout(NODE_STORAGE_READINESS_TIMEOUT, async {
+        let mut info = StorageInfo {
+            backend: store.backend_info().await,
+            ..Default::default()
+        };
+        let mut unavailable_drives = Vec::new();
+        let mut missing_drives = Vec::new();
+        if configured_readiness_topology(&info).is_none() {
+            return Ok((info, unavailable_drives, missing_drives));
+        }
+
+        // Inventory and runtime health are local snapshots. Reuse the lock probe's
+        // peer reachability so an idle remote disk cannot outlive its failed host.
+        // Do not perform disk-info RPCs or filesystem probes in node readiness.
+        for (pool_idx, &set_count) in info.backend.total_sets.iter().enumerate() {
+            for set_idx in 0..set_count {
+                let inventory = store.disk_set_inventory(DiskSetSelector::new(pool_idx, set_idx)).await?;
+                for disk_idx in 0..info.backend.drives_per_set[pool_idx] {
+                    if inventory.get(disk_idx).is_none_or(Option::is_none) {
+                        missing_drives.push(MissingReadinessDrive {
+                            pool_index: pool_idx,
+                            set_index: set_idx,
+                            disk_index: disk_idx,
+                        });
+                    }
+                }
+                // Missing-slot diagnostics do not normalize the inventory:
+                // preserve every Some entry, including duplicates and extras,
+                // for the existing quorum validation and unavailable reasons.
+                for disk in inventory.into_iter().flatten() {
+                    let (snapshot, unavailable) =
+                        node_disk_snapshot(disk_endpoint_snapshot(&disk), disk.runtime_state().as_str(), online_hosts);
+                    if let Some(unavailable) = unavailable {
+                        unavailable_drives.push(unavailable);
+                    }
+                    info.disks.push(snapshot);
+                }
+            }
+        }
+        Ok((info, unavailable_drives, missing_drives))
+    })
+    .await
+    .map_err(|_| StorageError::Timeout)?
+}
+
+fn node_disk_snapshot(
+    endpoint: Endpoint,
+    runtime_state: &str,
+    online_hosts: &HashSet<String>,
+) -> (Disk, Option<UnavailableReadinessDrive>) {
+    let reachable = endpoint.is_local || online_hosts.contains(&endpoint.host_port());
+    // Returning drives can still reject data I/O as faulty. Without a fresh
+    // disk-info probe, only an Online runtime observation can supply quorum.
+    let online = reachable && runtime_state == rustfs_madmin::ITEM_ONLINE;
+    let unavailable = (!online).then(|| UnavailableReadinessDrive {
+        pool_index: endpoint.pool_idx,
+        set_index: endpoint.set_idx,
+        disk_index: endpoint.disk_idx,
+        runtime_state: runtime_state.to_string(),
+        host_online: reachable,
+    });
+    let disk = Disk {
+        endpoint: endpoint.to_string(),
+        drive_path: endpoint.get_file_path(),
+        pool_index: endpoint.pool_idx,
+        set_index: endpoint.set_idx,
+        disk_index: endpoint.disk_idx,
+        state: if online { DISK_STATE_OK } else { "offline" }.to_string(),
+        runtime_state: Some(runtime_state.to_string()),
+        ..Default::default()
+    };
+    (disk, unavailable)
+}
+
+async fn collect_cluster_health_report_with<LoadFn, Fut>(
+    kind: ClusterHealthProbeKind,
+    mut load_report: LoadFn,
+) -> DependencyReadinessReport
+where
+    LoadFn: FnMut() -> Fut,
+    Fut: Future<Output = DependencyReadinessReport>,
+{
+    let started_at = tokio::time::Instant::now();
+    let deadline = started_at + health_cluster_timeout();
+    let mut collection_started = None;
+    // Retain flight ownership through timeout publication so an expired leader
+    // cannot overwrite the next collector's newer cache entry.
+    let mut singleflight = None;
+    let outcome = tokio::time::timeout_at(deadline, async {
+        let previous_generation = {
+            let cache = cluster_health_report_cache(kind).lock().await;
+            if let Some(entry) = cache.as_ref()
+                && cluster_health_report_is_fresh(entry)
+            {
+                return (entry.report.clone(), false);
+            }
+            cache.as_ref().map(|entry| entry.generation)
+        };
+
+        // Completed-cache reuse and sharing an overlapping flight are separate:
+        // TTL=0 still joins a round that finished while this caller was waiting.
+        singleflight = Some(cluster_health_singleflight(kind).lock().await);
+        {
+            let cache = cluster_health_report_cache(kind).lock().await;
+            if let Some(entry) = cache.as_ref()
+                && (Some(entry.generation) != previous_generation || cluster_health_report_is_fresh(entry))
+            {
+                return (entry.report.clone(), false);
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return (cluster_health_timeout_report(), true);
+        }
+        collection_started = Some(tokio::time::Instant::now());
+        let report = load_report().await;
+        update_cluster_health_report_cache(kind, report.clone()).await;
+        (report, true)
+    })
+    .await;
+
+    let (report, record_observation) = match outcome {
+        Ok(result) => result,
+        Err(_) => {
+            let report = cluster_health_timeout_report();
+            // A waiting caller must not overwrite a leader's healthy result.
+            // Publishing a failed collection is best-effort after its deadline.
+            if collection_started.is_some()
+                && singleflight.is_some()
+                && let Ok(mut cache) = cluster_health_report_cache(kind).try_lock()
+            {
+                publish_cluster_health_report(&mut cache, report.clone());
+            }
+            (report, true)
+        }
+    };
+    if record_observation {
+        record_readiness_report(&report);
+    }
+    let probe = match kind {
+        ClusterHealthProbeKind::Write => "write",
+        ClusterHealthProbeKind::Read => "read",
+    };
+    let ready = report.degraded_reasons.is_empty()
+        && report.readiness.storage_ready
+        && report.readiness.iam_ready
+        && report.readiness.lock_quorum_ready
+        && report.readiness.peer_health_ready;
+    gauge!(METRIC_CLUSTER_HEALTH_READY, "probe" => probe).set(if ready { 1.0 } else { 0.0 });
+    let wait_duration = collection_started.unwrap_or_else(tokio::time::Instant::now) - started_at;
+    histogram!(METRIC_CLUSTER_HEALTH_DURATION_SECONDS, "probe" => probe, "phase" => "wait").record(wait_duration.as_secs_f64());
+    if let Some(collection_started) = collection_started {
+        histogram!(METRIC_CLUSTER_HEALTH_DURATION_SECONDS, "probe" => probe, "phase" => "collect")
+            .record(collection_started.elapsed().as_secs_f64());
+    }
+    report
+}
+
+fn cluster_health_timeout_report() -> DependencyReadinessReport {
+    DependencyReadinessReport {
+        readiness: DependencyReadiness {
+            storage_ready: false,
+            iam_ready: false,
+            lock_quorum_ready: false,
+            peer_health_ready: false,
+        },
+        degraded_reasons: vec![ReadinessDegradedReason::ClusterHealthTimeout],
+        storage_details: None,
+    }
+}
+
+pub(crate) async fn snapshot_dependency_readiness_report() -> DependencyReadinessReport {
+    let storage = collect_storage_write_readiness_uncached().await;
+    let readiness = DependencyReadiness {
+        storage_ready: storage.ready,
+        iam_ready: runtime_sources::current_iam_ready(),
+        lock_quorum_ready: collect_lock_quorum_status_uncached().await.ready,
+        peer_health_ready: collect_peer_health_readiness(),
+    };
+
+    dependency_readiness_report_from_write_status(readiness, storage)
+}
+
 async fn collect_lock_quorum_status() -> LockQuorumStatus {
+    collect_lock_quorum_observation().await.status
+}
+
+async fn collect_lock_quorum_observation() -> LockQuorumObservation {
     if let Some(cached) = load_cached_lock_quorum_status().await {
         cached
     } else {
-        let computed = collect_lock_quorum_status_uncached().await;
-        update_lock_quorum_status_cache(computed).await;
+        let computed = collect_lock_quorum_observation_uncached().await;
+        update_lock_quorum_status_cache(computed.clone()).await;
         computed
     }
 }
 
-async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
-    let iam_ready_raw = get_global_iam_sys().is_some_and(|sys| sys.is_ready());
-    let storage_ready = collect_storage_readiness_uncached().await;
-    let lock_quorum_status = collect_lock_quorum_status_uncached().await;
-
-    let readiness = DependencyReadiness {
-        storage_ready,
-        iam_ready: iam_ready_raw,
-        lock_quorum_ready: lock_quorum_status.ready,
-    };
-    let report = DependencyReadinessReport {
-        degraded_reasons: degraded_reasons(readiness.storage_ready, iam_ready_raw, readiness.lock_quorum_ready),
-        readiness,
-    };
-    record_readiness_report(&report);
-    report.readiness
-}
-
-async fn collect_storage_readiness_uncached() -> bool {
-    if let Some(store) = resolve_object_store_handle() {
+async fn collect_storage_write_readiness_uncached() -> StorageWriteReadinessStatus {
+    if let Some(store) = runtime_sources::current_object_store_handle() {
+        let metadata = pool_metadata_write_readiness(store.pool_meta_write_status().await);
+        if !metadata.ready {
+            return metadata;
+        }
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
-        storage_ready_from_runtime_state(&storage_info)
+        StorageWriteReadinessStatus {
+            ready: storage_ready_from_runtime_state(&storage_info),
+            pool_metadata_reason: None,
+        }
     } else {
-        false
+        StorageWriteReadinessStatus::default()
     }
 }
 
-fn set_lock_quorum_status(
-    online_hosts: &HashSet<String>,
-    set_endpoints: &[rustfs_ecstore::disk::endpoint::Endpoint],
-) -> LockQuorumStatus {
+fn set_lock_quorum_status(online_hosts: &HashSet<String>, set_endpoints: &[Endpoint]) -> LockQuorumStatus {
     let total_clients = set_endpoints
         .iter()
-        .map(rustfs_ecstore::disk::endpoint::Endpoint::host_port)
+        .map(Endpoint::host_port)
         .filter(|host| !host.is_empty())
         .collect::<HashSet<_>>();
     let total_clients_len = total_clients.len();
@@ -511,27 +1126,27 @@ fn set_lock_quorum_status(
     }
 
     let connected_clients = total_clients.iter().filter(|host| online_hosts.contains(*host)).count();
-    let required_quorum = if total_clients_len > 1 {
-        (total_clients_len / 2) + 1
-    } else {
-        1
-    };
+    let required_quorum = exclusive_lock_quorum(total_clients_len);
+    let required_read_quorum = shared_lock_quorum(total_clients_len);
 
     LockQuorumStatus {
         ready: connected_clients >= required_quorum,
+        read_ready: connected_clients >= required_read_quorum,
         connected_clients,
         total_clients: total_clients_len,
         required_quorum,
+        required_read_quorum,
     }
 }
 
-fn aggregate_lock_quorum_status(
-    pool_endpoints: &rustfs_ecstore::endpoints::EndpointServerPools,
-    online_hosts: &HashSet<String>,
-) -> LockQuorumStatus {
+fn aggregate_lock_quorum_status(pool_endpoints: &EndpointServerPools, online_hosts: &HashSet<String>) -> LockQuorumStatus {
     let mut connected_clients = 0usize;
     let mut total_clients = 0usize;
     let mut required_quorum = 0usize;
+    let mut required_read_quorum = 0usize;
+    let mut write_ready = true;
+    let mut read_ready = true;
+    let mut saw_set = false;
 
     for pool in pool_endpoints.as_ref() {
         for set_idx in 0..pool.set_count {
@@ -548,48 +1163,54 @@ fn aggregate_lock_quorum_status(
                 return LockQuorumStatus::default();
             }
 
+            saw_set = true;
             connected_clients += status.connected_clients;
             total_clients += status.total_clients;
             required_quorum += status.required_quorum;
-
-            if !status.ready {
-                return LockQuorumStatus {
-                    ready: false,
-                    connected_clients,
-                    total_clients,
-                    required_quorum,
-                };
-            }
+            required_read_quorum += status.required_read_quorum;
+            write_ready &= status.ready;
+            read_ready &= status.read_ready;
         }
     }
 
-    if total_clients == 0 {
+    if !saw_set {
         LockQuorumStatus::default()
     } else {
         LockQuorumStatus {
-            ready: true,
+            ready: write_ready,
+            read_ready,
             connected_clients,
             total_clients,
             required_quorum,
+            required_read_quorum,
         }
     }
 }
 
 async fn collect_lock_quorum_status_uncached() -> LockQuorumStatus {
+    collect_lock_quorum_observation_uncached().await.status
+}
+
+async fn collect_lock_quorum_observation_uncached() -> LockQuorumObservation {
     if !is_dist_erasure().await {
-        return LockQuorumStatus {
-            ready: true,
-            connected_clients: 1,
-            total_clients: 1,
-            required_quorum: 1,
+        return LockQuorumObservation {
+            status: LockQuorumStatus {
+                ready: true,
+                read_ready: true,
+                connected_clients: 1,
+                total_clients: 1,
+                required_quorum: 1,
+                required_read_quorum: 1,
+            },
+            online_hosts: HashSet::new(),
         };
     }
 
-    let Some(pool_endpoints) = get_global_endpoints_opt() else {
-        return LockQuorumStatus::default();
+    let Some(pool_endpoints) = runtime_sources::current_endpoints_handle() else {
+        return LockQuorumObservation::default();
     };
-    let Some(lock_clients) = get_global_lock_clients() else {
-        return LockQuorumStatus::default();
+    let Some(lock_clients) = runtime_sources::current_lock_clients_handle() else {
+        return LockQuorumObservation::default();
     };
 
     let online_hosts = futures::future::join_all(lock_clients.iter().map(|(host, client)| {
@@ -602,9 +1223,21 @@ async fn collect_lock_quorum_status_uncached() -> LockQuorumStatus {
     .filter_map(|(host, online)| online.then_some(host))
     .collect::<HashSet<_>>();
 
-    aggregate_lock_quorum_status(&pool_endpoints, &online_hosts)
+    LockQuorumObservation {
+        status: aggregate_lock_quorum_status(&pool_endpoints, &online_hosts),
+        online_hosts,
+    }
 }
 
+/// Wait for local runtime dependencies without exceeding the observation budget.
+///
+/// The budget covers both observations and polling sleeps. An immediately ready
+/// observation can succeed with a zero budget. Cancellation drops the in-flight
+/// observation; only success invokes `on_ready`.
+///
+/// # Errors
+/// Returns an error on expiry, retaining the last completed observation when
+/// available. The readiness callback is never invoked after a timeout.
 pub async fn wait_for_runtime_readiness_with<F, Fut, ReadyFn>(
     max_wait: Duration,
     poll_interval: Duration,
@@ -617,47 +1250,921 @@ where
     ReadyFn: FnMut(DependencyReadiness),
 {
     let startup_deadline = tokio::time::Instant::now() + max_wait;
-
-    loop {
-        let readiness = load_readiness().await;
-        if readiness.storage_ready && readiness.iam_ready && readiness.lock_quorum_ready {
-            on_ready(readiness);
-            return Ok(());
-        }
-
-        if tokio::time::Instant::now() >= startup_deadline {
-            let reason = format!(
-                "startup readiness timed out after {}s: storage_ready={}, iam_ready={}, lock_quorum_ready={}",
-                max_wait.as_secs(),
-                readiness.storage_ready,
-                readiness.iam_ready,
-                readiness.lock_quorum_ready
+    let mut last_readiness = None;
+    let result = tokio::time::timeout_at(startup_deadline, async {
+        loop {
+            // Tokio timeouts poll the observation first. Keep the initial
+            // zero-budget observation, but start no later one at expiry.
+            if last_readiness.is_some() && tokio::time::Instant::now() >= startup_deadline {
+                return None;
+            }
+            let readiness = load_readiness().await;
+            last_readiness = Some(readiness);
+            if readiness.storage_ready
+                && readiness.iam_ready
+                && readiness.lock_quorum_ready
+                && readiness.peer_health_ready
+                && (max_wait.is_zero() || tokio::time::Instant::now() < startup_deadline)
+            {
+                return Some(readiness);
+            }
+            if tokio::time::Instant::now() >= startup_deadline {
+                return None;
+            }
+            info!(
+                event = EVENT_STARTUP_RUNTIME_READINESS,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_READINESS,
+                state = "waiting",
+                storage_ready = readiness.storage_ready,
+                iam_ready = readiness.iam_ready,
+                lock_quorum_ready = readiness.lock_quorum_ready,
+                peer_health_ready = readiness.peer_health_ready,
+                "Runtime node readiness has not been reached yet; delaying ready state publication"
             );
-            return Err(std::io::Error::other(reason));
+            tokio::time::sleep(poll_interval).await;
         }
-
-        info!(
-            target: "rustfs::server::readiness",
-            storage_ready = readiness.storage_ready,
-            iam_ready = readiness.iam_ready,
-            lock_quorum_ready = readiness.lock_quorum_ready,
-            "Runtime readiness has not reached write quorum yet; delaying ready state publication"
-        );
-        tokio::time::sleep(poll_interval).await;
+    })
+    .await;
+    match result {
+        Ok(Some(readiness)) => {
+            on_ready(readiness);
+            Ok(())
+        }
+        Ok(None) | Err(_) => {
+            let detail = match last_readiness {
+                Some(readiness) => format!(
+                    "storage_ready={}, iam_ready={}, lock_quorum_ready={}, peer_health_ready={}",
+                    readiness.storage_ready, readiness.iam_ready, readiness.lock_quorum_ready, readiness.peer_health_ready
+                ),
+                None => "no readiness observation completed".to_string(),
+            };
+            Err(std::io::Error::other(format!(
+                "startup readiness timed out after {}s: {detail}",
+                max_wait.as_secs()
+            )))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn console_prefix_process_case_classification() {
+        if std::env::var_os("RUSTFS_TEST_CONSOLE_PREFIX_PROCESS").is_none() {
+            return;
+        }
+        crate::server::init_console_prefix().expect("initialize console prefix");
+        let prefix = crate::server::console_prefix();
+        assert!(is_probe_path(&format!("{prefix}/index.html")));
+        assert!(!is_probe_path(&format!("{prefix}-other/index.html")));
+        assert!(!is_probe_path("/bucket/object"));
+    }
+
     use super::*;
+    use crate::storage_api::server::readiness::{DiskOption, new_disk};
+    use metrics_util::MetricKind;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use rustfs_madmin::{BackendInfo, Disk};
+    use serial_test::serial;
     use std::future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temp_env::{async_with_vars, with_var};
+
+    #[derive(Debug, Default)]
+    struct RuntimeInventory {
+        backend: BackendInfo,
+        disks: HashMap<DiskSetSelector, Vec<Option<DiskStore>>>,
+        pending_set: Option<DiskSetSelector>,
+        failed_set: Option<DiskSetSelector>,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageAdminApi for RuntimeInventory {
+        type BackendInfo = BackendInfo;
+        type StorageInfo = StorageInfo;
+        type Disk = DiskStore;
+        type Error = StorageError;
+
+        async fn backend_info(&self) -> BackendInfo {
+            self.backend.clone()
+        }
+
+        async fn storage_info(&self) -> StorageInfo {
+            panic!("node readiness must not perform a cluster storage-info probe")
+        }
+
+        async fn local_storage_info(&self) -> StorageInfo {
+            panic!("node readiness must not perform local disk-info I/O")
+        }
+
+        async fn disk_set_inventory(&self, selector: DiskSetSelector) -> Result<Vec<Option<DiskStore>>, StorageError> {
+            if self.pending_set == Some(selector) {
+                return future::pending().await;
+            }
+            if self.failed_set == Some(selector) {
+                return Err(StorageError::other("inventory unavailable"));
+            }
+            Ok(self.disks.get(&selector).cloned().unwrap_or_default())
+        }
+
+        fn set_drive_counts(&self) -> Vec<usize> {
+            self.backend.drives_per_set.clone()
+        }
+    }
+
+    async fn runtime_inventory(layouts: &[(usize, usize, usize)]) -> RuntimeInventory {
+        let mut store = RuntimeInventory::default();
+        for (pool_idx, &(set_count, drive_count, parity)) in layouts.iter().enumerate() {
+            store.backend.total_sets.push(set_count);
+            store.backend.drives_per_set.push(drive_count);
+            store.backend.standard_sc_data.push(drive_count - parity);
+            store.backend.standard_sc_parities.push(parity);
+            for set_idx in 0..set_count {
+                let mut disks = Vec::new();
+                for disk_idx in 0..drive_count {
+                    let endpoint = Endpoint {
+                        url: url::Url::parse(&format!("http://node-{disk_idx}:9000/pool-{pool_idx}-set-{set_idx}"))
+                            .expect("valid test endpoint"),
+                        is_local: false,
+                        pool_idx: i32::try_from(pool_idx).expect("test pool index"),
+                        set_idx: i32::try_from(set_idx).expect("test set index"),
+                        disk_idx: i32::try_from(disk_idx).expect("test disk index"),
+                    };
+                    disks.push(Some(
+                        new_disk(&endpoint, &DiskOption::default())
+                            .await
+                            .expect("create runtime disk handle"),
+                    ));
+                }
+                store.disks.insert(DiskSetSelector::new(pool_idx, set_idx), disks);
+            }
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn node_storage_snapshot_tracks_read_write_quorum_and_recovery() {
+        for (drive_count, parity) in [(4, 2), (4, 1), (8, 2)] {
+            let store = runtime_inventory(&[(1, drive_count, parity)]).await;
+            let data = drive_count - parity;
+            let write_quorum = data + usize::from(data == parity);
+            for survivors in (0..=drive_count).rev().chain(std::iter::once(drive_count)) {
+                let online_hosts = (0..survivors).map(|idx| format!("node-{idx}:9000")).collect();
+                let (info, unavailable_drives, missing_drives) = node_storage_snapshot(&store, &online_hosts)
+                    .await
+                    .expect("read local runtime inventory");
+                assert_eq!(info.disks.len(), drive_count, "offline members retain their topology slots");
+                assert_eq!(unavailable_drives.len(), drive_count - survivors);
+                assert!(missing_drives.is_empty(), "inventoried offline drives are not missing slots");
+                assert!(
+                    unavailable_drives
+                        .iter()
+                        .all(|disk| !disk.host_online && disk.runtime_state == "online")
+                );
+                assert_eq!(
+                    storage_read_ready_from_runtime_state(&info),
+                    survivors >= data,
+                    "layout={drive_count}/{parity}, survivors={survivors}"
+                );
+                assert_eq!(
+                    storage_ready_from_runtime_state(&info),
+                    survivors >= write_quorum,
+                    "layout={drive_count}/{parity}, survivors={survivors}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn node_storage_snapshot_reports_none_and_short_inventory_slots_without_changing_quorum() {
+        let mut store = runtime_inventory(&[(1, 4, 2)]).await;
+        let selector = DiskSetSelector::new(0, 0);
+        let full_inventory = store.disks.get(&selector).expect("configured set").clone();
+        let online_hosts = (0..4).map(|idx| format!("node-{idx}:9000")).collect();
+        for explicit_none in [true, false] {
+            let mut partial = full_inventory[..3].to_vec();
+            if explicit_none {
+                partial.push(None);
+            }
+            store.disks.insert(selector, partial);
+            let (info, unavailable, missing) = node_storage_snapshot(&store, &online_hosts)
+                .await
+                .expect("inspect configured slot domain");
+            assert_eq!(info.disks.len(), 3, "missing diagnostics must not invent a disk health state");
+            assert!(unavailable.is_empty(), "missing slots have no observed reachability or runtime state");
+            assert_eq!(
+                missing,
+                vec![MissingReadinessDrive {
+                    pool_index: 0,
+                    set_index: 0,
+                    disk_index: 3
+                }]
+            );
+            assert!(storage_read_ready_from_runtime_state(&info), "three online disks retain read quorum");
+            assert!(storage_ready_from_runtime_state(&info), "three online disks retain write quorum");
+        }
+        store.disks.insert(selector, full_inventory);
+        let (info, unavailable, missing) = node_storage_snapshot(&store, &online_hosts)
+            .await
+            .expect("fully restored inventory");
+        assert_eq!(info.disks.len(), 4);
+        assert!(unavailable.is_empty());
+        assert!(missing.is_empty());
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(storage_ready_from_runtime_state(&info));
+    }
+
+    #[tokio::test]
+    async fn node_storage_snapshot_retains_extra_and_duplicate_inventory_entries() {
+        let mut store = runtime_inventory(&[(1, 4, 2)]).await;
+        let selector = DiskSetSelector::new(0, 0);
+        let duplicate = store.disks[&selector][0].clone();
+        let invalid_endpoint = Endpoint {
+            url: url::Url::parse("http://extra:9000/unassigned").expect("extra endpoint"),
+            is_local: false,
+            pool_idx: -1,
+            set_idx: 0,
+            disk_idx: 5,
+        };
+        let extra = new_disk(&invalid_endpoint, &DiskOption::default())
+            .await
+            .expect("extra runtime disk handle");
+        store
+            .disks
+            .get_mut(&selector)
+            .expect("configured set")
+            .extend([duplicate, Some(extra)]);
+        let mut online_hosts: HashSet<_> = (0..4).map(|idx| format!("node-{idx}:9000")).collect();
+        online_hosts.insert("extra:9000".to_owned());
+        let (info, unavailable, missing) = node_storage_snapshot(&store, &online_hosts)
+            .await
+            .expect("inspect unnormalized inventory");
+        assert_eq!(info.disks.len(), 6, "diagnostics must preserve all Some entries");
+        assert_eq!(
+            info.disks[4].endpoint, info.disks[0].endpoint,
+            "duplicate entries reach the existing quorum validator"
+        );
+        assert_eq!(info.disks[4].disk_index, info.disks[0].disk_index);
+        assert_eq!(info.disks[5].pool_index, -1, "invalid extra entries must not vanish");
+        assert!(unavailable.is_empty());
+        assert!(missing.is_empty());
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn node_disk_snapshot_requires_online_runtime_before_counting_recovered_drives() {
+        for is_local in [false, true] {
+            for reachable in [false, true] {
+                let online_hosts = if reachable {
+                    HashSet::from(["node-0:9000".to_string()])
+                } else {
+                    HashSet::new()
+                };
+                for runtime_state in ["online", "suspect", "offline", "returning", "unknown"] {
+                    let endpoint = Endpoint {
+                        url: url::Url::parse("http://node-0:9000/data").expect("valid test endpoint"),
+                        is_local,
+                        pool_idx: 0,
+                        set_idx: 0,
+                        disk_idx: 2,
+                    };
+                    let mut disks = online_readiness_disks(0, 2);
+                    let (disk, unavailable) = node_disk_snapshot(endpoint, runtime_state, &online_hosts);
+                    if (is_local || reachable) && runtime_state == "online" {
+                        assert!(unavailable.is_none());
+                    } else {
+                        assert_eq!(
+                            unavailable,
+                            Some(UnavailableReadinessDrive {
+                                pool_index: 0,
+                                set_index: 0,
+                                disk_index: 2,
+                                runtime_state: runtime_state.to_string(),
+                                host_online: is_local || reachable,
+                            })
+                        );
+                    }
+                    disks.push(disk);
+                    let info = StorageInfo {
+                        backend: BackendInfo {
+                            total_sets: vec![1],
+                            drives_per_set: vec![4],
+                            standard_sc_data: vec![2],
+                            standard_sc_parities: vec![2],
+                            ..Default::default()
+                        },
+                        disks,
+                        ..Default::default()
+                    };
+                    assert!(storage_read_ready_from_runtime_state(&info));
+                    assert_eq!(
+                        storage_ready_from_runtime_state(&info),
+                        runtime_state == "online" && (is_local || reachable),
+                        "runtime_state={runtime_state}, local={is_local}, reachable={reachable}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn node_storage_snapshot_requires_each_configured_set_and_distinct_drives() {
+        let mut store = runtime_inventory(&[(2, 4, 2), (1, 8, 2)]).await;
+        let online_hosts = (0..8).map(|idx| format!("node-{idx}:9000")).collect();
+        let (info, _, _) = node_storage_snapshot(&store, &online_hosts)
+            .await
+            .expect("healthy mixed layout");
+        assert!(storage_ready_from_runtime_state(&info));
+
+        let selector = DiskSetSelector::new(0, 1);
+        let original = store.disks.remove(&selector).expect("second configured set");
+        let (info, _, _) = node_storage_snapshot(&store, &online_hosts)
+            .await
+            .expect("missing set snapshot");
+        assert!(!storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+
+        store.disks.insert(selector, vec![original[0].clone(); 4]);
+        let (info, _, _) = node_storage_snapshot(&store, &online_hosts)
+            .await
+            .expect("duplicate drive snapshot");
+        assert!(!storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+
+        store.disks.insert(selector, original);
+        assert!(storage_ready_from_runtime_state(
+            &node_storage_snapshot(&store, &online_hosts)
+                .await
+                .expect("restored inventory")
+                .0
+        ));
+    }
+
+    /// Two-node model of rustfs#8669: `node-2` restarts while the survivor's
+    /// lock client still cannot dial it. The restarted node must keep the
+    /// startup readiness gate closed until the survivor's own readiness
+    /// predicate counts node-2's drive online, then publish.
+    #[tokio::test(start_paused = true)]
+    async fn restarted_node_stays_unready_until_survivor_counts_its_drive_online() {
+        use futures::StreamExt;
+        use peer_readmission::{
+            PeerDriveView, PeerProbe, ReadmissionOutcome, UNREACHABLE_PEER_GRACE, host_drive_observations, readmission_plan,
+            wait_for_peer_readmission_with,
+        };
+        use std::sync::atomic::AtomicBool;
+
+        // Survivor side: the shared 3-drive set, one drive per node.
+        let survivor = runtime_inventory(&[(1, 3, 1)]).await;
+        // Restarted side: the same topology seen from node-2.
+        let restarted_topology = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 3,
+            endpoints: Endpoints::from(
+                (0..3)
+                    .map(|disk_idx| Endpoint {
+                        url: url::Url::parse(&format!("http://node-{disk_idx}:9000/pool-0-set-0")).expect("valid test endpoint"),
+                        is_local: disk_idx == 2,
+                        pool_idx: 0,
+                        set_idx: 0,
+                        disk_idx,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }]);
+        let plan = readmission_plan(&restarted_topology).expect("restarted node plan");
+        assert_eq!(plan.local_host, "node-2:9000");
+
+        let survivor_reaches_restarted = AtomicBool::new(false);
+        let readiness = GlobalReadiness::new();
+        readiness.mark_stage(rustfs_common::SystemStage::IamReady);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+
+        let gate = async {
+            let outcome = wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || {
+                futures::stream::once(async {
+                    let mut online_hosts = HashSet::from(["node-0:9000".to_string(), "node-1:9000".to_string()]);
+                    if survivor_reaches_restarted.load(Ordering::SeqCst) {
+                        online_hosts.insert("node-2:9000".to_string());
+                    }
+                    let drives = host_drive_observations(&survivor, &plan.local_host, &online_hosts)
+                        .await
+                        .expect("survivor inventory");
+                    assert_eq!(drives.len(), 1, "the survivor reports only the restarted host's drives");
+                    let view = PeerProbe::Answered(
+                        drives
+                            .into_iter()
+                            .map(|drive| PeerDriveView {
+                                pool_index: drive.pool_index,
+                                set_index: drive.set_index,
+                                disk_index: drive.disk_index,
+                                online: drive.online,
+                            })
+                            .collect(),
+                    );
+                    HashMap::from([("node-0:9000".to_string(), view.clone()), ("node-1:9000".to_string(), view)])
+                })
+                .flat_map(futures::stream::iter)
+            })
+            .await;
+            readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+            outcome
+        };
+        let survivor_recovers = async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            assert!(!readiness.is_ready(), "the survivor still counts node-2 unavailable");
+            assert!(readiness_gate_blocks_path("/bucket/object", &readiness));
+            survivor_reaches_restarted.store(true, Ordering::SeqCst);
+        };
+
+        let (outcome, ()) = tokio::join!(gate, survivor_recovers);
+        let ReadmissionOutcome::Admitted { waited } = outcome else {
+            panic!("expected re-admission, got {outcome:?}");
+        };
+        assert!(waited >= Duration::from_secs(10), "published after {waited:?}");
+        assert!(readiness.is_ready());
+        assert!(!readiness_gate_blocks_path("/bucket/object", &readiness));
+    }
+
+    #[tokio::test]
+    async fn node_storage_snapshot_bounds_waits_and_propagates_inventory_failure() {
+        let mut store = runtime_inventory(&[(1, 4, 2)]).await;
+        let online_hosts = (0..4).map(|idx| format!("node-{idx}:9000")).collect();
+        let selector = DiskSetSelector::new(0, 0);
+        store.pending_set = Some(selector);
+        let result = tokio::time::timeout(Duration::from_secs(1), node_storage_snapshot(&store, &online_hosts))
+            .await
+            .expect("node storage inspection must honor its own 100 ms budget");
+        assert!(matches!(result, Err(StorageError::Timeout)));
+
+        store.pending_set = None;
+        store.failed_set = Some(selector);
+        assert!(node_storage_snapshot(&store, &online_hosts).await.is_err());
+        store.failed_set = None;
+        assert!(storage_ready_from_runtime_state(
+            &node_storage_snapshot(&store, &online_hosts)
+                .await
+                .expect("inspection recovered")
+                .0
+        ));
+    }
+
+    fn online_readiness_disks(set_idx: i32, count: i32) -> Vec<Disk> {
+        (0..count)
+            .map(|disk_index| Disk {
+                endpoint: format!("node-{set_idx}-{disk_index}:9000"),
+                drive_path: format!("/set{set_idx}/data{disk_index}"),
+                pool_index: 0,
+                set_index: set_idx,
+                disk_index,
+                state: "ok".to_string(),
+                runtime_state: Some("online".to_string()),
+                ..Default::default()
+            })
+            .collect()
+    }
 
     #[test]
     fn startup_runtime_readiness_wait_constants_are_ordered() {
         assert!(STARTUP_RUNTIME_READINESS_MAX_WAIT > STARTUP_RUNTIME_READINESS_POLL_INTERVAL);
-        assert_eq!(STARTUP_RUNTIME_READINESS_MAX_WAIT.as_secs(), 30);
+        assert_eq!(
+            STARTUP_RUNTIME_READINESS_MAX_WAIT.as_secs(),
+            rustfs_config::DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS
+        );
         assert_eq!(STARTUP_RUNTIME_READINESS_POLL_INTERVAL.as_secs(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn startup_runtime_readiness_max_wait_reads_env_override() {
+        // An explicit override extends (or shortens) the budget.
+        with_var(rustfs_config::ENV_STARTUP_READINESS_MAX_WAIT_SECS, Some("240"), || {
+            assert_eq!(startup_runtime_readiness_max_wait(), Duration::from_secs(240));
+        });
+
+        // Unset falls back to the compile-time default.
+        with_var(rustfs_config::ENV_STARTUP_READINESS_MAX_WAIT_SECS, None::<&str>, || {
+            assert_eq!(startup_runtime_readiness_max_wait(), STARTUP_RUNTIME_READINESS_MAX_WAIT);
+        });
+
+        // Zero is treated as "use default", never an instant timeout.
+        with_var(rustfs_config::ENV_STARTUP_READINESS_MAX_WAIT_SECS, Some("0"), || {
+            assert_eq!(startup_runtime_readiness_max_wait(), STARTUP_RUNTIME_READINESS_MAX_WAIT);
+        });
+    }
+
+    fn peer_health_test_pools() -> EndpointServerPools {
+        EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(vec![
+                Endpoint {
+                    url: url::Url::parse("http://node1:9000/data1").expect("test endpoint url"),
+                    is_local: true,
+                    pool_idx: 0,
+                    set_idx: 0,
+                    disk_idx: 0,
+                },
+                Endpoint {
+                    url: url::Url::parse("http://node2:9000/data2").expect("test endpoint url"),
+                    is_local: false,
+                    pool_idx: 0,
+                    set_idx: 0,
+                    disk_idx: 1,
+                },
+            ]),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }])
+    }
+
+    #[test]
+    fn peer_health_gate_defaults_to_ready() {
+        with_var(rustfs_config::ENV_HEALTH_PEER_READY_CHECK_ENABLE, Some("false"), || {
+            assert!(peer_health_ready_from_endpoint_pools(&peer_health_test_pools()));
+        });
+    }
+
+    #[test]
+    fn peer_health_gate_degrades_unknown_peer_health_when_enabled() {
+        with_var(rustfs_config::ENV_HEALTH_PEER_READY_CHECK_ENABLE, Some("true"), || {
+            assert!(!peer_health_ready_from_endpoint_pools(&peer_health_test_pools()));
+        });
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cluster_health_report_singleflight_reuses_inflight_result() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("1000")),
+            ],
+            async {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let ready_report = DependencyReadinessReport {
+                    readiness: DependencyReadiness {
+                        storage_ready: true,
+                        iam_ready: true,
+                        lock_quorum_ready: true,
+                        peer_health_ready: true,
+                    },
+                    degraded_reasons: Vec::new(),
+                    storage_details: None,
+                };
+
+                let first_calls = calls.clone();
+                let first_report = ready_report.clone();
+                let first = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, move || {
+                    let first_calls = first_calls.clone();
+                    let first_report = first_report.clone();
+                    async move {
+                        first_calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        first_report
+                    }
+                });
+
+                let second_calls = calls.clone();
+                let second_report = ready_report.clone();
+                let second = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, move || {
+                    let second_calls = second_calls.clone();
+                    let second_report = second_report.clone();
+                    async move {
+                        second_calls.fetch_add(1, Ordering::SeqCst);
+                        second_report
+                    }
+                });
+
+                let (first, second) = tokio::join!(first, second);
+
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(first, ready_report);
+                assert_eq!(second, ready_report);
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_deadline_includes_uncached_concurrent_waiters() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let calls = AtomicUsize::new(0);
+                let started_at = tokio::time::Instant::now();
+                let request = || {
+                    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        future::pending().await
+                    })
+                };
+                let (first, second, third) = tokio::join!(request(), request(), request());
+                assert_eq!(first, cluster_health_timeout_report());
+                assert_eq!(second, first);
+                assert_eq!(third, first);
+                assert_eq!(tokio::time::Instant::now() - started_at, Duration::from_millis(20));
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "expired waiters must not begin another collection");
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_uncached_burst_shares_one_round_but_later_request_is_fresh() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0"))], async {
+            let calls = AtomicUsize::new(0);
+            let ready = dependency_readiness_report_from_readiness(DependencyReadiness {
+                storage_ready: true,
+                iam_ready: true,
+                lock_quorum_ready: true,
+                peer_health_ready: true,
+            });
+            let request = || {
+                collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ready.clone()
+                })
+            };
+            let reports = futures::future::join_all((0..100).map(|_| request())).await;
+            assert!(reports.iter().all(|report| report == &ready));
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "overlapping uncached callers must share the same round");
+            assert_eq!(request().await, ready);
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "a later uncached caller must start a new observation");
+        })
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_uncached_waiter_shares_failure_before_starting_a_fresh_round() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let calls = AtomicUsize::new(0);
+                let request = || {
+                    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        future::pending().await
+                    })
+                };
+                let started_at = tokio::time::Instant::now();
+                let mut leader = Box::pin(request());
+                assert!(futures::poll!(leader.as_mut()).is_pending());
+                tokio::time::advance(Duration::from_millis(10)).await;
+                let mut waiter = Box::pin(request());
+                assert!(futures::poll!(waiter.as_mut()).is_pending());
+                tokio::time::advance(Duration::from_millis(10)).await;
+                let (first, shared) = tokio::join!(leader, waiter);
+                assert_eq!(first, cluster_health_timeout_report());
+                assert_eq!(shared, first);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(started_at.elapsed(), Duration::from_millis(20));
+
+                let ready = dependency_readiness_report_from_readiness(DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                    peer_health_ready: true,
+                });
+                let recovered =
+                    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async { ready.clone() }).await;
+                assert_eq!(recovered, ready, "a later request must not inherit the completed failed round");
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_waiter_timeout_does_not_poison_the_cache() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let _leader = cluster_health_singleflight(ClusterHealthProbeKind::Write).lock().await;
+                let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                    panic!("waiter must expire before entering the collector")
+                })
+                .await;
+                assert_eq!(report, cluster_health_timeout_report());
+                assert!(
+                    load_cached_cluster_health_report(ClusterHealthProbeKind::Write)
+                        .await
+                        .is_none()
+                );
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_cancelled_leader_releases_the_flight() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0"))], async {
+            let started = AtomicUsize::new(0);
+            let mut leader = Box::pin(collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                started.fetch_add(1, Ordering::SeqCst);
+                future::pending().await
+            }));
+            assert!(futures::poll!(leader.as_mut()).is_pending());
+            assert_eq!(started.load(Ordering::SeqCst), 1);
+            drop(leader);
+
+            let expected = dependency_readiness_report_from_readiness(DependencyReadiness {
+                storage_ready: true,
+                iam_ready: true,
+                lock_quorum_ready: true,
+                peer_health_ready: true,
+            });
+            let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async { expected.clone() }).await;
+            assert_eq!(report, expected);
+        })
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_timeout_publication_retains_flight_ownership() {
+        use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+        use std::sync::atomic::AtomicBool;
+
+        #[derive(Default)]
+        struct PublicationRecorder(AtomicBool);
+
+        impl Recorder for PublicationRecorder {
+            fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+            fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+
+            fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
+                if key.name() == METRIC_RUNTIME_READINESS_DEGRADED_TOTAL
+                    && key
+                        .labels()
+                        .any(|label| label.key() == "reason" && label.value() == "cluster_health_timeout")
+                {
+                    assert!(
+                        cluster_health_singleflight(ClusterHealthProbeKind::Write).try_lock().is_err(),
+                        "an expired leader must retain the flight through timeout publication"
+                    );
+                    let cache = cluster_health_report_cache(ClusterHealthProbeKind::Write)
+                        .try_lock()
+                        .expect("timeout cache must have been published without retaining its mutex");
+                    assert_eq!(cache.as_ref().expect("published timeout").report, cluster_health_timeout_report());
+                    self.0.store(true, Ordering::SeqCst);
+                }
+                Counter::noop()
+            }
+
+            fn register_gauge(&self, _: &Key, _: &Metadata<'_>) -> Gauge {
+                Gauge::noop()
+            }
+
+            fn register_histogram(&self, _: &Key, _: &Metadata<'_>) -> Histogram {
+                Histogram::noop()
+            }
+        }
+
+        reset_cluster_health_report_caches().await;
+        let recorder = PublicationRecorder::default();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, future::pending).await;
+                assert_eq!(report, cluster_health_timeout_report());
+                assert!(recorder.0.load(Ordering::SeqCst), "the recorder must observe timeout publication");
+                assert!(
+                    cluster_health_singleflight(ClusterHealthProbeKind::Write).try_lock().is_ok(),
+                    "the completed caller must release the flight"
+                );
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn cluster_health_report_timeout_records_once_and_cached_failure_is_not_recounted() {
+        reset_cluster_health_report_caches().await;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("20")),
+            ],
+            async {
+                let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, future::pending).await;
+                assert_eq!(report, cluster_health_timeout_report());
+                let cached = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, || async {
+                    panic!("fresh cached timeout must avoid another collection")
+                })
+                .await;
+                assert_eq!(cached, report);
+
+                let read_ready = dependency_readiness_report_from_readiness(DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                    peer_health_ready: true,
+                });
+                assert_eq!(
+                    collect_cluster_health_report_with(ClusterHealthProbeKind::Read, || async { read_ready.clone() }).await,
+                    read_ready,
+                    "read and write caches and flights must remain separate"
+                );
+            },
+        )
+        .await;
+        let entries = snapshotter.snapshot().into_vec();
+        let timeout_count = entries.iter().find_map(|(key, _, _, value)| {
+            (key.key().name() == METRIC_RUNTIME_READINESS_DEGRADED_TOTAL
+                && key
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "reason" && label.value() == "cluster_health_timeout"))
+            .then_some(value)
+        });
+        assert!(matches!(timeout_count, Some(DebugValue::Counter(1))));
+        for (probe, expected) in [("write", 0.0), ("read", 1.0)] {
+            let ready = entries.iter().find_map(|(key, _, _, value)| {
+                (key.key().name() == METRIC_CLUSTER_HEALTH_READY
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "probe" && label.value() == probe))
+                .then_some(value)
+            });
+            assert!(matches!(ready, Some(DebugValue::Gauge(value)) if value.into_inner() == expected));
+        }
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cluster_health_report_timeout_is_sanitized() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("1")),
+            ],
+            async {
+                let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Read, || async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    DependencyReadinessReport {
+                        readiness: DependencyReadiness {
+                            storage_ready: true,
+                            iam_ready: true,
+                            lock_quorum_ready: true,
+                            peer_health_ready: true,
+                        },
+                        degraded_reasons: Vec::new(),
+                        storage_details: None,
+                    }
+                })
+                .await;
+
+                assert_eq!(report, cluster_health_timeout_report());
+                assert_eq!(report.degraded_reasons, vec![ReadinessDegradedReason::ClusterHealthTimeout]);
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
     }
 
     #[tokio::test]
@@ -673,6 +2180,7 @@ mod tests {
                     storage_ready: false,
                     iam_ready: false,
                     lock_quorum_ready: false,
+                    peer_health_ready: true,
                 })
             },
             |_| {
@@ -689,7 +2197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_runtime_readiness_with_does_not_publish_ready_when_lock_quorum_is_not_reached() {
+    async fn wait_for_runtime_readiness_with_does_not_publish_ready_without_lock_quorum() {
         let readiness = GlobalReadiness::new();
         let state_manager = ServiceStateManager::new();
 
@@ -701,6 +2209,7 @@ mod tests {
                     storage_ready: true,
                     iam_ready: true,
                     lock_quorum_ready: false,
+                    peer_health_ready: true,
                 })
             },
             |_| {
@@ -709,11 +2218,183 @@ mod tests {
             },
         )
         .await
-        .expect_err("lock quorum should block readiness publication");
+        .expect_err("startup readiness should require lock quorum");
 
         assert!(err.to_string().contains("lock_quorum_ready=false"));
         assert!(!readiness.is_ready());
         assert_eq!(state_manager.current_state(), ServiceState::Starting);
+    }
+
+    #[tokio::test]
+    async fn wait_for_runtime_readiness_with_publishes_ready_when_dependencies_are_ready() {
+        let readiness = GlobalReadiness::new();
+        let state_manager = ServiceStateManager::new();
+
+        let result = wait_for_runtime_readiness_with(
+            Duration::ZERO,
+            Duration::from_millis(1),
+            || {
+                future::ready(DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                    peer_health_ready: true,
+                })
+            },
+            |_| {
+                readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+                state_manager.update(ServiceState::Ready);
+            },
+        )
+        .await;
+
+        assert!(result.is_ok(), "all runtime dependencies should publish readiness");
+        assert!(readiness.is_ready());
+        assert_eq!(state_manager.current_state(), ServiceState::Ready);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_cancels_a_suspended_observation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ObservationDrop(Arc<AtomicUsize>);
+        impl Drop for ObservationDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let published = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let wait = wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            || {
+                let guard = ObservationDrop(Arc::clone(&dropped));
+                async move {
+                    let _guard = guard;
+                    std::future::pending::<DependencyReadiness>().await
+                }
+            },
+            |_| {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let err = tokio::time::timeout(Duration::from_secs(3), wait)
+            .await
+            .expect("startup budget bounds a suspended dependency observation")
+            .expect_err("no dependency observation completed");
+        assert!(err.to_string().contains("no readiness observation completed"));
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(published.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_bounds_the_poll_sleep() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let wait = wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+            || {
+                polls.fetch_add(1, Ordering::SeqCst);
+                future::ready(DependencyReadiness::default())
+            },
+            |_| panic!("an unready observation must never publish"),
+        );
+        let err = tokio::time::timeout(Duration::from_secs(3), wait)
+            .await
+            .expect("startup budget bounds the poll sleep")
+            .expect_err("unready observation");
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(polls.load(Ordering::SeqCst), 1, "expiry must not start another observation");
+        assert!(err.to_string().contains("lock_quorum_ready=false"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_publishes_once_before_the_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        let published = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            || {
+                let ready = polls.fetch_add(1, Ordering::SeqCst) > 0;
+                future::ready(DependencyReadiness {
+                    storage_ready: ready,
+                    iam_ready: ready,
+                    lock_quorum_ready: ready,
+                    peer_health_ready: ready,
+                })
+            },
+            |_| {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("dependencies recovered before expiry");
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_starts_no_observation_at_expiry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        let published = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            || {
+                let ready = polls.fetch_add(1, Ordering::SeqCst) >= 2;
+                future::ready(DependencyReadiness {
+                    storage_ready: ready,
+                    iam_ready: ready,
+                    lock_quorum_ready: ready,
+                    peer_health_ready: ready,
+                })
+            },
+            |_| {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("expiry must prevent a third observation even when immediately ready");
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(published.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_does_not_publish_an_observation_at_expiry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let published = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            || async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                    peer_health_ready: true,
+                }
+            },
+            |_| {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("an observation completing at the deadline must not publish");
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(published.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -722,10 +2403,354 @@ mod tests {
         assert!(is_probe_path("/rustfs/admin/v3/info"));
         assert!(is_probe_path(&format!("{}/config", crate::server::TABLE_CATALOG_PREFIX)));
         assert!(is_probe_path("/_iceberg/v1/config"));
-        assert!(is_probe_path("/rustfs/console/"));
+        assert!(is_probe_path(&format!("{}/", crate::server::console_prefix())));
         assert!(!is_probe_path("/minio/adminx/object"));
         assert!(!is_probe_path("/rustfs/adminx/object"));
         assert!(!is_probe_path("/bucket/object"));
+    }
+
+    #[test]
+    fn readiness_gate_blocks_normal_paths_until_runtime_ready() {
+        let readiness = GlobalReadiness::new();
+
+        assert!(readiness_gate_blocks_path("/bucket/object", &readiness));
+        assert!(!readiness_gate_blocks_path(crate::server::HEALTH_READY_PATH, &readiness));
+        assert!(!readiness_gate_blocks_path("/minio/admin/v3/info", &readiness));
+
+        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+        assert!(!readiness_gate_blocks_path("/bucket/object", &readiness));
+    }
+
+    #[tokio::test]
+    async fn grpc_bootstrap_follows_protocol_routing_without_opening_rest() {
+        let readiness = Arc::new(GlobalReadiness::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let inner = tower::service_fn(move |_: HttpRequest<Full<Bytes>>| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::new()))) }
+        });
+        let mut service = ReadinessGateLayer::new(readiness).layer(inner);
+        for path in [
+            "/node_service.HealControlService/HealControl",
+            "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck",
+            "/node_service.ScannerControlService/ScannerUsageWatch",
+            "/node_service.TierMutationControlService/PrepareTierMutation",
+        ] {
+            let response = service
+                .call(
+                    HttpRequest::builder()
+                        .method(http::Method::POST)
+                        .version(http::Version::HTTP_2)
+                        .uri(path)
+                        .header(http::header::CONTENT_TYPE, "application/grpc")
+                        .body(Full::new(Bytes::new()))
+                        .expect("control request"),
+                )
+                .await
+                .expect("control routing");
+            assert_eq!(response.status(), StatusCode::OK, "gRPC bootstrap must reach the authenticated router");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        for (version, content_type, path) in [
+            (
+                http::Version::HTTP_11,
+                Some("application/grpc"),
+                "/node_service.HealControlService/HealControl",
+            ),
+            (
+                http::Version::HTTP_2,
+                Some("application/json"),
+                "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck",
+            ),
+            (
+                http::Version::HTTP_2,
+                Some("application/json"),
+                "/node_service.ScannerControlService/ScannerUsageWatch",
+            ),
+            (http::Version::HTTP_2, None, "/bucket/object"),
+        ] {
+            let mut request = HttpRequest::builder().version(version).uri(path);
+            if let Some(content_type) = content_type {
+                request = request.header(http::header::CONTENT_TYPE, content_type);
+            }
+            let response = service
+                .call(request.body(Full::new(Bytes::new())).expect("REST request"))
+                .await
+                .expect("REST readiness response");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()[http::header::RETRY_AFTER], "5");
+            assert_eq!(response.headers()[READINESS_PENDING_HEADER], "storage_quorum");
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "REST requests must remain outside their handlers"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_not_ready_response_preserves_observable_contract() {
+        let response = service_not_ready_response(rustfs_common::SystemStage::Booting);
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("5")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(READINESS_PENDING_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("storage_quorum")
+        );
+        let body = match response.into_body().collect().await {
+            Ok(body) => body.to_bytes(),
+            Err(err) => panic!("not-ready body should collect: {err}"),
+        };
+        assert_eq!(body, Bytes::from_static(b"Service not ready: waiting for storage_quorum"));
+    }
+
+    /// rustfs#4304: operators must be able to tell from the 503 alone which
+    /// startup dependency the node is blocked on.
+    #[test]
+    fn readiness_pending_dependency_maps_every_stage() {
+        assert_eq!(readiness_pending_dependency(rustfs_common::SystemStage::Booting), "storage_quorum");
+        assert_eq!(readiness_pending_dependency(rustfs_common::SystemStage::StorageReady), "iam");
+        assert_eq!(readiness_pending_dependency(rustfs_common::SystemStage::IamReady), "startup_finalization");
+    }
+
+    #[test]
+    fn pool_quorum_uses_exact_heterogeneous_backend_layout() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![2, 1],
+                standard_sc_parities: vec![2, 1],
+                // Deliberately stale: exact per-pool vectors must take precedence.
+                standard_sc_parity: Some(2),
+                drives_per_set: vec![4, 2],
+                ..Default::default()
+            },
+            disks: Vec::new(),
+            ..Default::default()
+        };
+
+        assert_eq!(pool_erasure_layout(&info, 0, 4), Some((2, 2)));
+        assert_eq!(pool_erasure_layout(&info, 1, 2), Some((1, 1)));
+        assert_eq!(pool_write_quorum(&info, 0, 4), Some(3));
+        assert_eq!(pool_write_quorum(&info, 1, 2), Some(2));
+        assert_eq!(pool_read_quorum(&info, 0, 4), Some(2));
+        assert_eq!(pool_read_quorum(&info, 1, 2), Some(1));
+    }
+
+    #[test]
+    fn pool_write_quorum_does_not_fall_back_to_half_when_exact_data_exists() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![6],
+                standard_sc_parities: vec![2],
+                drives_per_set: vec![8],
+                ..Default::default()
+            },
+            disks: Vec::new(),
+            ..Default::default()
+        };
+
+        assert_eq!(pool_write_quorum(&info, 0, 8), Some(6));
+    }
+
+    #[test]
+    fn exact_data_vector_ignores_stale_scalar_for_runtime_readiness() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![6],
+                // Deliberately stale: the exact data vector and topology imply
+                // parity 2, so this legacy scalar must not make readiness fail.
+                standard_sc_parity: Some(4),
+                total_sets: vec![1],
+                drives_per_set: vec![8],
+                ..Default::default()
+            },
+            disks: online_readiness_disks(0, 8),
+            ..Default::default()
+        };
+
+        assert_eq!(pool_erasure_layout(&info, 0, 8), Some((6, 2)));
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn exact_data_vector_with_invalid_geometry_fails_closed() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![9],
+                standard_sc_parity: Some(1),
+                total_sets: vec![1],
+                drives_per_set: vec![8],
+                ..Default::default()
+            },
+            disks: online_readiness_disks(0, 8),
+            ..Default::default()
+        };
+
+        assert_eq!(pool_erasure_layout(&info, 0, 8), None);
+        assert!(!storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn pool_quorum_accepts_valid_legacy_scalar_layout() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_parity: Some(1),
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks: Vec::new(),
+            ..Default::default()
+        };
+
+        assert_eq!(pool_erasure_layout(&info, 0, 4), Some((3, 1)));
+        assert_eq!(pool_write_quorum(&info, 0, 4), Some(3));
+        assert_eq!(pool_read_quorum(&info, 0, 4), Some(3));
+    }
+
+    #[test]
+    fn legacy_payload_without_topology_uses_observed_sets_and_scalar_layout() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_parity: Some(1),
+                ..Default::default()
+            },
+            disks: online_readiness_disks(0, 3),
+            ..Default::default()
+        };
+
+        assert_eq!(pool_erasure_layout(&info, 0, 3), Some((2, 1)));
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn configured_topology_uses_configured_drive_count_when_rows_are_missing() {
+        let backend = BackendInfo {
+            standard_sc_data: vec![2],
+            standard_sc_parities: vec![2],
+            total_sets: vec![1],
+            drives_per_set: vec![4],
+            ..Default::default()
+        };
+        let three_online = StorageInfo {
+            backend: backend.clone(),
+            disks: online_readiness_disks(0, 3),
+            ..Default::default()
+        };
+        let two_online = StorageInfo {
+            backend,
+            disks: online_readiness_disks(0, 2),
+            ..Default::default()
+        };
+
+        assert!(storage_read_ready_from_runtime_state(&three_online));
+        assert!(storage_ready_from_runtime_state(&three_online));
+        assert!(storage_read_ready_from_runtime_state(&two_online));
+        assert!(!storage_ready_from_runtime_state(&two_online));
+    }
+
+    #[test]
+    fn configured_topology_requires_sets_with_no_disk_rows() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![2],
+                standard_sc_parities: vec![2],
+                total_sets: vec![2],
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks: online_readiness_disks(0, 3),
+            ..Default::default()
+        };
+
+        assert!(!storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn configured_topology_fails_closed_with_only_total_sets() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_parity: Some(1),
+                total_sets: vec![1],
+                ..Default::default()
+            },
+            disks: online_readiness_disks(0, 3),
+            ..Default::default()
+        };
+
+        assert!(!storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn configured_topology_fails_closed_with_only_drives_per_set() {
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_parity: Some(1),
+                drives_per_set: vec![3],
+                ..Default::default()
+            },
+            disks: online_readiness_disks(0, 3),
+            ..Default::default()
+        };
+
+        assert!(!storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn storage_readiness_fails_closed_when_backend_layout_is_empty() {
+        let disks = (0..4)
+            .map(|disk_index| Disk {
+                endpoint: format!("127.0.0.1:900{disk_index}"),
+                drive_path: format!("/data{disk_index}"),
+                pool_index: 0,
+                set_index: 0,
+                disk_index,
+                state: "ok".to_string(),
+                runtime_state: Some("online".to_string()),
+                ..Default::default()
+            })
+            .collect();
+        let info = StorageInfo {
+            backend: BackendInfo {
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks,
+            ..Default::default()
+        };
+
+        assert!(!storage_ready_from_runtime_state(&info));
+        assert!(!storage_read_ready_from_runtime_state(&info));
     }
 
     #[test]
@@ -733,6 +2758,7 @@ mod tests {
         let info = StorageInfo {
             backend: BackendInfo {
                 standard_sc_data: vec![1],
+                total_sets: vec![1],
                 drives_per_set: vec![1],
                 ..Default::default()
             },
@@ -743,6 +2769,7 @@ mod tests {
                 runtime_state: Some("offline".to_string()),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         assert!(!storage_ready_from_runtime_state(&info));
@@ -753,6 +2780,7 @@ mod tests {
         let info = StorageInfo {
             backend: BackendInfo {
                 standard_sc_data: vec![1],
+                total_sets: vec![1],
                 drives_per_set: vec![1],
                 ..Default::default()
             },
@@ -763,9 +2791,74 @@ mod tests {
                 runtime_state: Some("online".to_string()),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         assert!(storage_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state_with_pool_meta(&info, false));
+    }
+
+    #[test]
+    fn storage_read_ready_from_runtime_state_allows_read_quorum_below_write_quorum() {
+        let disks = (0..4)
+            .map(|disk_index| Disk {
+                endpoint: format!("127.0.0.1:900{disk_index}"),
+                drive_path: format!("/data{disk_index}"),
+                pool_index: 0,
+                set_index: 0,
+                disk_index,
+                state: if disk_index < 2 { "ok" } else { "offline" }.to_string(),
+                runtime_state: Some(if disk_index < 2 { "online" } else { "offline" }.to_string()),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![2],
+                total_sets: vec![1],
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks,
+            ..Default::default()
+        };
+
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn unknown_inventory_does_not_supply_quorum_evidence() {
+        let mut info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![2],
+                total_sets: vec![1],
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks: (0..4)
+                .map(|disk_index| Disk {
+                    endpoint: format!("node-{disk_index}"),
+                    pool_index: 0,
+                    set_index: 0,
+                    disk_index,
+                    state: "ok".to_string(),
+                    runtime_state: Some("online".to_string()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(storage_ready_from_runtime_state(&info));
+        for disk in &mut info.disks[2..] {
+            disk.state = rustfs_madmin::ITEM_UNKNOWN.to_string();
+            disk.runtime_state = Some(rustfs_madmin::ITEM_UNKNOWN.to_string());
+        }
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
+        assert_eq!(pool_read_quorum(&info, 0, 4), Some(2));
+        assert_eq!(pool_write_quorum(&info, 0, 4), Some(3));
+        assert!(info.disks.iter().all(|disk| disk.state != rustfs_madmin::ITEM_OFFLINE));
     }
 
     #[test]
@@ -782,11 +2875,13 @@ mod tests {
         };
         let info = StorageInfo {
             backend: BackendInfo {
-                standard_sc_data: vec![2],
-                drives_per_set: vec![4],
+                standard_sc_data: vec![1],
+                total_sets: vec![1],
+                drives_per_set: vec![2],
                 ..Default::default()
             },
             disks: vec![duplicate_disk.clone(), duplicate_disk],
+            ..Default::default()
         };
 
         assert!(!storage_ready_from_runtime_state(&info), "duplicate rows must not satisfy write quorum");
@@ -807,6 +2902,7 @@ mod tests {
         let info = StorageInfo {
             backend: BackendInfo {
                 standard_sc_data: vec![1],
+                total_sets: vec![2],
                 drives_per_set: vec![2],
                 ..Default::default()
             },
@@ -822,7 +2918,17 @@ mod tests {
                     ..Default::default()
                 },
                 Disk {
-                    endpoint: "127.0.0.1:9000".to_string(),
+                    endpoint: "127.0.0.1:9001".to_string(),
+                    drive_path: "/set0d1".to_string(),
+                    pool_index: 0,
+                    set_index: 0,
+                    disk_index: 1,
+                    state: "ok".to_string(),
+                    runtime_state: Some("online".to_string()),
+                    ..Default::default()
+                },
+                Disk {
+                    endpoint: "127.0.0.1:9002".to_string(),
                     drive_path: "/set1d0".to_string(),
                     pool_index: 0,
                     set_index: 1,
@@ -832,6 +2938,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
 
         assert!(
@@ -842,9 +2949,6 @@ mod tests {
 
     #[test]
     fn aggregate_lock_quorum_status_requires_each_set_to_meet_quorum() {
-        use rustfs_ecstore::disk::endpoint::Endpoint;
-        use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
-
         let endpoints = vec![
             Endpoint {
                 url: url::Url::parse("http://node1:9000/data1").unwrap(),
@@ -893,16 +2997,15 @@ mod tests {
         );
 
         assert!(status.ready);
+        assert!(status.read_ready);
         assert_eq!(status.connected_clients, 4);
         assert_eq!(status.total_clients, 4);
         assert_eq!(status.required_quorum, 4);
+        assert_eq!(status.required_read_quorum, 2);
     }
 
     #[test]
     fn aggregate_lock_quorum_status_fails_when_any_set_loses_quorum() {
-        use rustfs_ecstore::disk::endpoint::Endpoint;
-        use rustfs_ecstore::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
-
         let endpoints = vec![
             Endpoint {
                 url: url::Url::parse("http://node1:9000/data1").unwrap(),
@@ -946,47 +3049,274 @@ mod tests {
             aggregate_lock_quorum_status(&pools, &["node1:9000"].into_iter().map(str::to_string).collect::<HashSet<_>>());
 
         assert!(!status.ready);
+        assert!(!status.read_ready);
+    }
+
+    #[test]
+    fn node_service_readiness_follows_read_quorum_not_write_or_pool_metadata() {
+        let blocked = StorageWriteReadinessStatus {
+            ready: false,
+            pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetaWriteBlocked),
+        };
+        let (readiness, storage, details) = apply_node_service_readiness(
+            blocked,
+            StorageReadinessDetails {
+                read_quorum_ready: true,
+                write_quorum_ready: false,
+                pool_metadata_write_ready: true,
+                unavailable_drives: Vec::new(),
+                missing_drives: Vec::new(),
+            },
+            true,
+            true,
+            true,
+        );
+        assert!(readiness.storage_ready);
+        assert!(readiness.lock_quorum_ready);
+        assert!(!details.write_quorum_ready);
+        assert!(!details.pool_metadata_write_ready);
+        assert!(storage.pool_metadata_reason.is_none());
+        let report = dependency_readiness_report_from_write_status(readiness, storage);
+        assert!(
+            report.degraded_reasons.is_empty(),
+            "a readable node must stay ready when write quorum and the metadata writer are lost, got {:?}",
+            report.degraded_reasons
+        );
+
+        let (readiness, storage, _) = apply_node_service_readiness(
+            StorageWriteReadinessStatus {
+                ready: true,
+                pool_metadata_reason: None,
+            },
+            StorageReadinessDetails {
+                read_quorum_ready: false,
+                write_quorum_ready: false,
+                pool_metadata_write_ready: false,
+                unavailable_drives: Vec::new(),
+                missing_drives: Vec::new(),
+            },
+            false,
+            true,
+            true,
+        );
+        assert_eq!(
+            dependency_readiness_report_from_write_status(readiness, storage).degraded_reasons,
+            vec![ReadinessDegradedReason::StorageAndLockUnavailable]
+        );
+    }
+
+    #[test]
+    fn shared_lock_quorum_stays_ready_when_two_of_four_clients_remain() {
+        let endpoints = (0..4)
+            .map(|disk_idx| Endpoint {
+                url: url::Url::parse(&format!("http://node{disk_idx}:9000/data")).expect("valid test endpoint"),
+                is_local: disk_idx == 0,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx,
+            })
+            .collect::<Vec<_>>();
+        let online = ["node0:9000", "node1:9000"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        let status = set_lock_quorum_status(&online, &endpoints);
+
+        assert_eq!(status.total_clients, 4);
+        assert_eq!(status.connected_clients, 2);
+        assert_eq!(status.required_quorum, 3);
+        assert_eq!(status.required_read_quorum, 2);
+        assert!(!status.ready, "exclusive locks need three of four clients");
+        assert!(status.read_ready, "shared locks remain available at two of four clients");
+
+        let one = ["node0:9000"].into_iter().map(str::to_string).collect::<HashSet<_>>();
+        let below_read = set_lock_quorum_status(&one, &endpoints);
+        assert!(!below_read.ready);
+        assert!(!below_read.read_ready);
     }
 
     #[test]
     fn degraded_reasons_include_lock_quorum_failures() {
-        assert_eq!(degraded_reasons(true, true, false), vec![ReadinessDegradedReason::LockQuorumUnavailable]);
         assert_eq!(
-            degraded_reasons(false, true, false),
+            base_degraded_reasons(true, true, false),
+            vec![ReadinessDegradedReason::LockQuorumUnavailable]
+        );
+        assert_eq!(
+            base_degraded_reasons(false, true, false),
             vec![ReadinessDegradedReason::StorageAndLockUnavailable]
         );
-        assert_eq!(degraded_reasons(true, false, false), vec![ReadinessDegradedReason::IamAndLockUnavailable]);
         assert_eq!(
-            degraded_reasons(false, false, false),
+            base_degraded_reasons(true, false, false),
+            vec![ReadinessDegradedReason::IamAndLockUnavailable]
+        );
+        assert_eq!(
+            base_degraded_reasons(false, false, false),
             vec![ReadinessDegradedReason::StorageIamAndLockUnavailable]
         );
     }
 
-    #[tokio::test]
-    async fn lock_quorum_status_cache_roundtrip() {
-        let cache = lock_quorum_status_cache();
-        {
-            let mut guard = cache.lock().await;
-            *guard = None;
-        }
+    fn blocked_pool_metadata_status() -> StorageWriteReadinessStatus {
+        use crate::storage_api::error::{PoolMetadataError, PoolMetadataFailure};
+        pool_metadata_write_readiness(Err(StorageError::other(PoolMetadataError {
+            kind: PoolMetadataFailure::TransactionUnknown,
+            operation: "private operation".to_owned(),
+            phase: "prepare_cas",
+            since: time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed block time"),
+            source: Some(Arc::new(StorageError::other("private replica failure"))),
+        })))
+    }
 
-        update_lock_quorum_status_cache(LockQuorumStatus {
-            ready: true,
-            connected_clients: 2,
-            total_clients: 3,
-            required_quorum: 2,
+    #[test]
+    fn pool_metadata_observation_distinguishes_block_and_unavailable() {
+        let blocked = blocked_pool_metadata_status();
+        assert!(!blocked.ready);
+        assert_eq!(blocked.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetaWriteBlocked));
+        assert!(!format!("{blocked:?}").contains("private"));
+        let writable = pool_metadata_write_readiness(Ok(()));
+        assert!(writable.ready);
+        assert_eq!(writable.pool_metadata_reason, None);
+        let unavailable = pool_metadata_write_readiness(Err(StorageError::other("pool metadata writes remain blocked")));
+        assert!(!unavailable.ready);
+        assert_eq!(
+            unavailable.pool_metadata_reason, None,
+            "error text alone must not be interpreted as a typed write block"
+        );
+    }
+
+    #[test]
+    fn readiness_report_records_ready_gauge_and_degraded_reasons() {
+        let record = |report: DependencyReadinessReport| {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || record_readiness_report(&report));
+            snapshotter.snapshot().into_vec()
+        };
+        let ready = DependencyReadiness {
+            storage_ready: true,
+            iam_ready: true,
+            lock_quorum_ready: true,
+            peer_health_ready: true,
+        };
+
+        let entries = record(DependencyReadinessReport {
+            readiness: ready,
+            degraded_reasons: Vec::new(),
+            storage_details: None,
+        });
+        let gauge = entries.iter().find_map(|(composite, _, _, value)| {
+            (composite.kind() == MetricKind::Gauge && composite.key().name() == METRIC_RUNTIME_READINESS_READY).then_some(value)
+        });
+        assert!(
+            matches!(gauge, Some(DebugValue::Gauge(value)) if value.into_inner() == 1.0),
+            "a ready report must set the readiness gauge: {gauge:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|(composite, _, _, _)| composite.key().name() != METRIC_RUNTIME_READINESS_DEGRADED_TOTAL),
+            "a ready report without reasons must not count degradation"
+        );
+
+        let entries = record(DependencyReadinessReport {
+            readiness: DependencyReadiness {
+                storage_ready: false,
+                ..ready
+            },
+            degraded_reasons: vec![ReadinessDegradedReason::PoolMetaWriteBlocked],
+            storage_details: None,
+        });
+        let gauge = entries.iter().find_map(|(composite, _, _, value)| {
+            (composite.kind() == MetricKind::Gauge && composite.key().name() == METRIC_RUNTIME_READINESS_READY).then_some(value)
+        });
+        assert!(
+            matches!(gauge, Some(DebugValue::Gauge(value)) if value.into_inner() == 0.0),
+            "a degraded report must clear the readiness gauge: {gauge:?}"
+        );
+        let degraded = entries.iter().find_map(|(composite, _, _, value)| {
+            (composite.kind() == MetricKind::Counter
+                && composite.key().name() == METRIC_RUNTIME_READINESS_DEGRADED_TOTAL
+                && composite
+                    .key()
+                    .labels()
+                    .any(|label| label.key() == "reason" && label.value() == "pool_meta_write_blocked"))
+            .then_some(value)
+        });
+        assert!(
+            matches!(degraded, Some(DebugValue::Counter(1))),
+            "each degraded reason must be counted once: {degraded:?}"
+        );
+    }
+
+    #[test]
+    fn degraded_reasons_report_pool_meta_write_blocked() {
+        let readiness = DependencyReadiness {
+            storage_ready: false,
+            iam_ready: true,
+            lock_quorum_ready: true,
+            peer_health_ready: true,
+        };
+
+        assert_eq!(
+            degraded_reasons_with_pool_meta_status(readiness, blocked_pool_metadata_status().pool_metadata_reason),
+            vec![ReadinessDegradedReason::PoolMetaWriteBlocked]
+        );
+    }
+
+    #[test]
+    fn degraded_reasons_keep_pool_meta_source_with_other_failures() {
+        let readiness = DependencyReadiness {
+            storage_ready: false,
+            iam_ready: true,
+            lock_quorum_ready: false,
+            peer_health_ready: false,
+        };
+
+        assert_eq!(
+            degraded_reasons_with_pool_meta_status(readiness, blocked_pool_metadata_status().pool_metadata_reason),
+            vec![
+                ReadinessDegradedReason::PoolMetaWriteBlocked,
+                ReadinessDegradedReason::StorageAndLockUnavailable,
+                ReadinessDegradedReason::PeerHealthUnavailable,
+            ]
+        );
+    }
+
+    #[test]
+    fn degraded_reasons_append_peer_health_gate_failures() {
+        let readiness = DependencyReadiness {
+            storage_ready: true,
+            iam_ready: true,
+            lock_quorum_ready: true,
+            peer_health_ready: false,
+        };
+
+        assert_eq!(degraded_reasons(readiness), vec![ReadinessDegradedReason::PeerHealthUnavailable]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lock_quorum_status_cache_roundtrip() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"))], async {
+            let cache = lock_quorum_status_cache();
+            {
+                let mut guard = cache.lock().await;
+                *guard = None;
+            }
+
+            let observation = LockQuorumObservation {
+                status: LockQuorumStatus {
+                    ready: true,
+                    read_ready: true,
+                    connected_clients: 2,
+                    total_clients: 3,
+                    required_quorum: 2,
+                    required_read_quorum: 2,
+                },
+                online_hosts: HashSet::from(["node-a:9000".to_owned(), "node-b:9000".to_owned()]),
+            };
+            update_lock_quorum_status_cache(observation.clone()).await;
+            assert_eq!(load_cached_lock_quorum_status().await, Some(observation));
         })
         .await;
-
-        let cached = load_cached_lock_quorum_status().await;
-        assert_eq!(
-            cached,
-            Some(LockQuorumStatus {
-                ready: true,
-                connected_clients: 2,
-                total_clients: 3,
-                required_quorum: 2,
-            })
-        );
     }
 }

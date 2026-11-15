@@ -27,24 +27,33 @@ categories = ["network-programming", "web-programming", "development-tools"]
 [lints]
 workspace = true
 
+[features]
+default = []
+fips = ["rustls/fips"]
+hotpath = ["hotpath/hotpath", "hotpath/tokio", "rustfs-common/hotpath", "rustfs-config/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-common/hotpath-alloc", "rustfs-config/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-common/hotpath-cpu", "rustfs-config/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 rustfs-common.workspace = true
 rustfs-config.workspace = true
 arc-swap.workspace = true
 metrics.workspace = true
-rustls.workspace = true
+rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "rt", "sync", "time"] }
 tracing.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "fs"] }
 
 [lib]
 doctest = false

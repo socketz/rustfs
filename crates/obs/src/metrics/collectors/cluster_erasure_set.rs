@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! Cluster erasure set metrics collector.
 //!
 //! Collects erasure coding set metrics including parity, quorum,
@@ -122,8 +120,8 @@ pub fn collect_erasure_set_metrics(stats: &[ErasureSetStats]) -> Vec<PrometheusM
         );
         metrics.push(
             PrometheusMetric::from_descriptor(&ERASURE_SET_WRITE_HEALTH_MD, stat.write_health as f64)
-                .with_label_owned(POOL_ID_L, pool_id_label.clone())
-                .with_label_owned(SET_ID_L, set_id_label.clone()),
+                .with_label_owned(POOL_ID_L, pool_id_label)
+                .with_label_owned(SET_ID_L, set_id_label),
         );
     }
 

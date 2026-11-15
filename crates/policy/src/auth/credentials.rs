@@ -26,12 +26,11 @@ use tracing::debug;
 const ACCESS_KEY_MIN_LEN: usize = 3;
 const ACCESS_KEY_MAX_LEN: usize = 128;
 const SECRET_KEY_MIN_LEN: usize = 8;
-const SECRET_KEY_MAX_LEN: usize = 40;
 
 pub const ACCOUNT_ON: &str = "on";
 pub const ACCOUNT_OFF: &str = "off";
 
-const RESERVED_CHARS: &str = "=,";
+const RESERVED_CHARS: &[char] = &['=', ','];
 
 /// ContainsReservedChars - returns whether the input string contains reserved characters.
 ///
@@ -42,6 +41,9 @@ const RESERVED_CHARS: &str = "=,";
 /// * `bool` - true if contains reserved characters, false otherwise.
 ///
 pub fn contains_reserved_chars(s: &str) -> bool {
+    // Match ANY reserved character, mirroring MinIO's `strings.ContainsAny(s, "=,")`.
+    // The previous `s.contains("=,")` only matched the literal substring "=,", so an
+    // access key or group name containing a lone `=` or `,` slipped through (backlog#806).
     s.contains(RESERVED_CHARS)
 }
 
@@ -119,8 +121,8 @@ pub fn create_new_credentials_with_metadata(
         return Err(Error::InvalidAccessKeyLength);
     }
 
-    if sk.len() < SECRET_KEY_MIN_LEN || sk.len() > SECRET_KEY_MAX_LEN {
-        return Err(Error::InvalidAccessKeyLength);
+    if !is_secret_key_valid(sk) {
+        return Err(Error::InvalidSecretKeyLength);
     }
 
     if token_secret.is_empty() {
@@ -414,3 +416,86 @@ impl TryFrom<CredentialsBuilder> for Credentials {
 //         }
 //     }
 // }
+
+#[cfg(test)]
+mod reserved_chars_tests {
+    use super::{contains_reserved_chars, create_new_credentials_with_metadata};
+    use std::collections::HashMap;
+
+    #[test]
+    fn detects_any_reserved_char_not_just_the_substring() {
+        // Regression (backlog#806): a lone `=` or `,` must be rejected, not only
+        // the exact "=," substring.
+        assert!(contains_reserved_chars("a=b"));
+        assert!(contains_reserved_chars("a,b"));
+        assert!(contains_reserved_chars("="));
+        assert!(contains_reserved_chars(","));
+        assert!(contains_reserved_chars("=,"));
+        assert!(contains_reserved_chars("key,with=both"));
+    }
+
+    #[test]
+    fn allows_clean_strings() {
+        assert!(!contains_reserved_chars(""));
+        assert!(!contains_reserved_chars("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!contains_reserved_chars("group-name_1"));
+    }
+
+    #[test]
+    fn credential_creation_reports_secret_key_length_errors() {
+        let err =
+            create_new_credentials_with_metadata("AKIAIOSFODNN7EXAMPLE", "short", &HashMap::new(), "token-secret-for-tests")
+                .expect_err("short secret key should fail");
+
+        assert!(matches!(err, crate::error::Error::InvalidSecretKeyLength));
+    }
+
+    #[test]
+    fn credential_creation_preserves_custom_secret_keys() {
+        for length in [8, 40, 41, 90, 128, 256, 257, 4096] {
+            let secret_key = "s".repeat(length);
+            let cred = create_new_credentials_with_metadata("custom-access-key", &secret_key, &HashMap::new(), "")
+                .expect("custom secret key should be accepted");
+            assert_eq!(cred.secret_key, secret_key, "the full {length}-byte secret must be preserved");
+        }
+    }
+
+    #[test]
+    fn credential_creation_measures_the_minimum_in_utf8_bytes() {
+        let cred = create_new_credentials_with_metadata("custom-access-key", "éééé", &HashMap::new(), "")
+            .expect("eight UTF-8 bytes should be accepted");
+        assert_eq!(cred.secret_key, "éééé");
+
+        for secret_key in ["1234567", "ééé"] {
+            let err = create_new_credentials_with_metadata("custom-access-key", secret_key, &HashMap::new(), "")
+                .expect_err("fewer than eight UTF-8 bytes must be rejected");
+            assert!(matches!(err, crate::error::Error::InvalidSecretKeyLength));
+        }
+    }
+
+    #[test]
+    fn credential_creation_signs_with_the_entire_custom_secret() {
+        let mut claims = HashMap::new();
+        claims.insert(
+            "exp".to_owned(),
+            serde_json::json!((time::OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp()),
+        );
+        for length in [90, 256, 4096] {
+            let secret_key = format!("{}a", "s".repeat(length - 1));
+            let cred = create_new_credentials_with_metadata("custom-access-key", &secret_key, &claims, &secret_key)
+                .expect("long secret key should sign a session token");
+            crate::utils::extract_claims::<serde_json::Value>(&cred.session_token, &secret_key)
+                .expect("the original secret should verify the session token");
+            let changed_tail = format!("{}b", "s".repeat(length - 1));
+            assert!(crate::utils::extract_claims::<serde_json::Value>(&cred.session_token, &changed_tail).is_err());
+            assert!(crate::utils::extract_claims::<serde_json::Value>(&cred.session_token, &secret_key[..40]).is_err());
+        }
+    }
+
+    #[test]
+    fn credential_generation_keeps_the_default_lengths() {
+        let (access_key, secret_key) = super::generate_credentials().expect("generate default credentials");
+        assert_eq!(access_key.len(), 20);
+        assert_eq!(secret_key.len(), 40);
+    }
+}

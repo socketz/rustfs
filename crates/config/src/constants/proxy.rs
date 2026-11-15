@@ -30,10 +30,10 @@ pub const ENV_TRUSTED_PROXY_VALIDATION_MODE: &str = "RUSTFS_TRUSTED_PROXY_VALIDA
 /// Default validation mode is "hop_by_hop".
 pub const DEFAULT_TRUSTED_PROXY_VALIDATION_MODE: &str = "hop_by_hop";
 
-/// Environment variable to enable RFC 7239 "Forwarded" header support.
+/// Select RFC 7239 "Forwarded" instead of "X-Forwarded-For" in legacy mode.
 pub const ENV_TRUSTED_PROXY_ENABLE_RFC7239: &str = "RUSTFS_TRUSTED_PROXY_ENABLE_RFC7239";
-/// RFC 7239 support is enabled by default.
-pub const DEFAULT_TRUSTED_PROXY_ENABLE_RFC7239: bool = true;
+/// Legacy mode uses X-Forwarded-For unless RFC 7239 is explicitly selected.
+pub const DEFAULT_TRUSTED_PROXY_ENABLE_RFC7239: bool = false;
 
 /// Environment variable for the maximum allowed proxy hops.
 pub const ENV_TRUSTED_PROXY_MAX_HOPS: &str = "RUSTFS_TRUSTED_PROXY_MAX_HOPS";
@@ -53,8 +53,10 @@ pub const DEFAULT_TRUSTED_PROXY_LOG_FAILED_VALIDATIONS: bool = true;
 // ==================== Trusted Proxy Networks ====================
 /// Environment variable for the list of trusted proxy networks (comma-separated IP/CIDR).
 pub const ENV_TRUSTED_PROXY_PROXIES: &str = "RUSTFS_TRUSTED_PROXY_NETWORKS";
-/// Default trusted networks include localhost and common private ranges.
-pub const DEFAULT_TRUSTED_PROXY_PROXIES: &str = "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fd00::/8";
+/// Default trusted networks are loopback-only. Private/RFC1918 ranges are not
+/// trusted by default: an operator must explicitly add the specific proxy
+/// addresses in front of this server to have forwarding headers honored.
+pub const DEFAULT_TRUSTED_PROXY_PROXIES: &str = "127.0.0.1,::1";
 
 /// Environment variable for additional trusted proxy networks (production specific).
 pub const ENV_TRUSTED_PROXY_EXTRA_PROXIES: &str = "RUSTFS_TRUSTED_PROXY_EXTRA_NETWORKS";

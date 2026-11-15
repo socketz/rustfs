@@ -50,13 +50,13 @@
 //! let diskable_md5 = false;
 //!
 //! // Method 1: Simple creation (recommended for most cases)
-//! let hash_reader = HashReader::from_stream(reader, size, actual_size, etag.clone(), None, diskable_md5).unwrap();
+//! let hash_reader = HashReader::from_stream(reader, size, actual_size, etag.clone(), None, diskable_md5).expect("operation should succeed");
 //!
 //! // Method 2: With a capability-aware typed wrapper
 //! let reader2 = BufReader::new(Cursor::new(&data[..]));
-//! let reader2 = HashReader::from_stream(reader2, size, actual_size, etag.clone(), None, diskable_md5).unwrap();
+//! let reader2 = HashReader::from_stream(reader2, size, actual_size, etag.clone(), None, diskable_md5).expect("operation should succeed");
 //! let wrapped_reader = EtagReader::new(HardLimitReader::new(reader2, size), etag.clone());
-//! let hash_reader2 = HashReader::from_reader(wrapped_reader, size, actual_size, etag.clone(), None, diskable_md5).unwrap();
+//! let hash_reader2 = HashReader::from_reader(wrapped_reader, size, actual_size, etag.clone(), None, diskable_md5).expect("operation should succeed");
 //! # });
 //! ```
 //!
@@ -72,7 +72,7 @@
 //! # tokio_test::block_on(async {
 //! let data = b"test";
 //! let reader = BufReader::new(Cursor::new(&data[..]));
-//! let hash_reader = HashReader::from_stream(reader, 4, 4, None, None,false).unwrap();
+//! let hash_reader = HashReader::from_stream(reader, 4, 4, None, None,false).expect("operation should succeed");
 //!
 //! // Check if a type is a HashReader
 //! assert!(hash_reader.is_hash_reader());
@@ -90,20 +90,57 @@ use crate::ChecksumType;
 use crate::Sha256Hasher;
 use crate::compress_index::{Index, TryGetIndex};
 use crate::get_content_checksum;
+use crate::trailer::SharedTrailerSource;
 use crate::{DynReader, EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector, WarpReader, boxed_reader, wrap_reader};
-use base64::Engine;
-use base64::engine::general_purpose;
+
 use http::HeaderMap;
 use pin_project_lite::pin_project;
-use s3s::TrailingHeaders;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::io::Write;
 use std::mem;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use tracing::error;
+
+/// Whether a body of `size` bytes hashes its ETag MD5 off the request's task
+/// (`RUSTFS_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES`, read once).
+fn md5_offload_for(size: i64) -> bool {
+    static MIN_BYTES: OnceLock<u64> = OnceLock::new();
+    let min_bytes = *MIN_BYTES.get_or_init(|| {
+        rustfs_utils::get_env_u64(
+            rustfs_config::ENV_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES,
+            rustfs_config::DEFAULT_OBJECT_ETAG_MD5_OFFLOAD_MIN_BYTES,
+        )
+    });
+    min_bytes > 0 && u64::try_from(size).is_ok_and(|size| size >= min_bytes)
+}
+
+/// Hash behind an object's ETag when the client sent no Content-MD5. A body
+/// with Content-MD5 always hashes with MD5 so the check stays exact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EtagAlgorithm {
+    /// The S3 convention.
+    #[default]
+    Md5,
+    /// XXH3-128 in the same 32-hex-digit form, for buckets whose clients never
+    /// treat the ETag as an MD5 (per-bucket `etag.json`).
+    Xxh3,
+}
+
+/// The ETag reader for a body of `size` bytes: XXH3 when requested and the
+/// client sent no Content-MD5, otherwise MD5, hashed off the request's task
+/// when the body is large.
+fn etag_reader<R>(inner: R, md5hex: &Option<String>, size: i64, algorithm: EtagAlgorithm) -> EtagReader<R> {
+    let reader = EtagReader::new(inner, md5hex.clone());
+    if md5hex.is_none() && algorithm == EtagAlgorithm::Xxh3 {
+        reader.with_xxh3_etag(true)
+    } else {
+        reader.with_md5_offload(md5_offload_for(size))
+    }
+}
 
 /// Trait for mutable operations on HashReader
 pub trait HashReaderMut {
@@ -118,8 +155,8 @@ pub trait HashReaderMut {
     fn set_actual_size(&mut self, actual_size: i64);
     fn content_hash(&self) -> &Option<Checksum>;
     fn content_sha256(&self) -> &Option<String>;
-    fn get_trailer(&self) -> Option<&TrailingHeaders>;
-    fn set_trailer(&mut self, trailer: Option<TrailingHeaders>);
+    fn get_trailer(&self) -> Option<&SharedTrailerSource>;
+    fn set_trailer(&mut self, trailer: Option<SharedTrailerSource>);
 }
 
 pin_project! {
@@ -137,8 +174,10 @@ pin_project! {
         content_sha256: Option<String>,
         content_sha256_hasher: Option<Sha256Hasher>,
         checksum_on_finish: bool,
+        pub encrypted_etag: bool,
 
-        trailer_s3s: Option<TrailingHeaders>,
+        // Read only at EOF; see the timing contract in `crate::trailer`.
+        trailer: Option<SharedTrailerSource>,
 
     }
 
@@ -162,12 +201,12 @@ impl HashReader {
         let inner = if size > 0 {
             let hard_limit_reader = HardLimitReader::new(inner, size);
             if !diskable_md5 {
-                boxed_reader(EtagReader::new(hard_limit_reader, md5hex.clone()))
+                boxed_reader(etag_reader(hard_limit_reader, &md5hex, size, EtagAlgorithm::Md5))
             } else {
                 boxed_reader(hard_limit_reader)
             }
         } else if size != Self::SIZE_PRESERVE_LAYER && !diskable_md5 {
-            boxed_reader(EtagReader::new(inner, md5hex.clone()))
+            boxed_reader(etag_reader(inner, &md5hex, size, EtagAlgorithm::Md5))
         } else {
             boxed_reader(inner)
         };
@@ -184,7 +223,8 @@ impl HashReader {
             content_sha256: sha256hex.clone(),
             content_sha256_hasher: sha256hex.map(|_| Sha256Hasher::new()),
             checksum_on_finish: false,
-            trailer_s3s: None,
+            encrypted_etag: false,
+            trailer: None,
         })
     }
 
@@ -199,15 +239,32 @@ impl HashReader {
     where
         R: crate::ReadStream + 'static,
     {
+        Self::from_stream_with_etag(inner, size, actual_size, md5hex, sha256hex, diskable_md5, EtagAlgorithm::Md5)
+    }
+
+    /// [`HashReader::from_stream`] with the hash behind the ETag of a body
+    /// that carries no Content-MD5.
+    pub fn from_stream_with_etag<R>(
+        inner: R,
+        size: i64,
+        actual_size: i64,
+        md5hex: Option<String>,
+        sha256hex: Option<String>,
+        diskable_md5: bool,
+        etag: EtagAlgorithm,
+    ) -> std::io::Result<Self>
+    where
+        R: crate::ReadStream + 'static,
+    {
         let inner = WarpReader::new(inner);
         let inner = if size > 0 {
             if !diskable_md5 {
-                boxed_reader(EtagReader::new(HardLimitReader::new(inner, size), md5hex.clone()))
+                boxed_reader(etag_reader(HardLimitReader::new(inner, size), &md5hex, size, etag))
             } else {
                 boxed_reader(HardLimitReader::new(inner, size))
             }
         } else if size != Self::SIZE_PRESERVE_LAYER && !diskable_md5 {
-            boxed_reader(EtagReader::new(inner, md5hex.clone()))
+            boxed_reader(etag_reader(inner, &md5hex, size, etag))
         } else {
             boxed_reader(inner)
         };
@@ -224,7 +281,8 @@ impl HashReader {
             content_sha256: sha256hex.clone(),
             content_sha256_hasher: sha256hex.map(|_| Sha256Hasher::new()),
             checksum_on_finish: false,
-            trailer_s3s: None,
+            encrypted_etag: false,
+            trailer: None,
         })
     }
 
@@ -277,7 +335,7 @@ impl HashReader {
             let content_hasher = existing_hash_reader
                 .content_hash()
                 .clone()
-                .map(|hash| hash.checksum_type.hasher().unwrap());
+                .map(|hash| hash.checksum_type.hasher().expect("operation should succeed"));
             let content_sha256 = existing_hash_reader.content_sha256().clone();
             let content_sha256_hasher = existing_hash_reader.content_sha256().clone().map(|_| Sha256Hasher::new());
             let inner = existing_hash_reader.take_inner();
@@ -294,7 +352,8 @@ impl HashReader {
                 content_hash,
                 content_hasher,
                 checksum_on_finish: false,
-                trailer_s3s: existing_hash_reader.get_trailer().cloned(),
+                encrypted_etag: false,
+                trailer: existing_hash_reader.get_trailer().cloned(),
             })
         } else {
             if size > 0 {
@@ -302,11 +361,11 @@ impl HashReader {
                 inner = Box::new(hr);
 
                 if !diskable_md5 && !inner.is_hash_reader() {
-                    let er = EtagReader::new(inner, md5hex.clone());
+                    let er = etag_reader(inner, &md5hex, size, EtagAlgorithm::Md5);
                     inner = Box::new(er);
                 }
             } else if size != Self::SIZE_PRESERVE_LAYER && !diskable_md5 {
-                let er = EtagReader::new(inner, md5hex.clone());
+                let er = etag_reader(inner, &md5hex, size, EtagAlgorithm::Md5);
                 inner = Box::new(er);
             }
 
@@ -322,7 +381,8 @@ impl HashReader {
                 content_sha256: sha256hex.clone(),
                 content_sha256_hasher: sha256hex.map(|_| Sha256Hasher::new()),
                 checksum_on_finish: false,
-                trailer_s3s: None,
+                encrypted_etag: false,
+                trailer: None,
             })
         }
     }
@@ -353,10 +413,12 @@ impl HashReader {
         self.actual_size
     }
 
-    pub fn add_checksum_from_s3s(
+    /// Records the request checksum declared in `headers`. For a trailing
+    /// checksum, `trailer` supplies its value once the body has been read.
+    pub fn add_checksum(
         &mut self,
         headers: &HeaderMap,
-        trailing_headers: Option<TrailingHeaders>,
+        trailer: Option<SharedTrailerSource>,
         ignore_value: bool,
     ) -> Result<(), std::io::Error> {
         let cs = get_content_checksum(headers)?;
@@ -367,7 +429,7 @@ impl HashReader {
 
         if let Some(checksum) = cs {
             if checksum.checksum_type.trailing() {
-                self.trailer_s3s = trailing_headers;
+                self.trailer = trailer;
             }
 
             self.content_hash = Some(checksum.clone());
@@ -448,14 +510,7 @@ impl HashReader {
             }
 
             if checksum.checksum_type.trailing() {
-                if let Some(trailer) = self.trailer_s3s.as_ref()
-                    && let Some(Some(checksum_str)) = trailer.read(|headers| {
-                        checksum
-                            .checksum_type
-                            .key()
-                            .and_then(|key| headers.get(key).and_then(|value| value.to_str().ok().map(|s| s.to_string())))
-                    })
-                {
+                if let Some(checksum_str) = trailing_checksum_value(self.trailer.as_ref(), checksum.checksum_type) {
                     map.insert(checksum.checksum_type.to_string(), checksum_str);
                 }
                 return map;
@@ -467,6 +522,14 @@ impl HashReader {
         }
         map
     }
+}
+
+/// Returns the received trailer value for `checksum_type`. `Pending` and
+/// `Missing` both yield `None`, which leaves a trailing checksum unverified
+/// and therefore rejected at EOF.
+fn trailing_checksum_value(trailer: Option<&SharedTrailerSource>, checksum_type: ChecksumType) -> Option<String> {
+    let key = checksum_type.key()?;
+    trailer?.lookup(key).into_present()
 }
 
 impl HashReaderMut for HashReader {
@@ -515,12 +578,12 @@ impl HashReaderMut for HashReader {
         &self.content_sha256
     }
 
-    fn get_trailer(&self) -> Option<&TrailingHeaders> {
-        self.trailer_s3s.as_ref()
+    fn get_trailer(&self) -> Option<&SharedTrailerSource> {
+        self.trailer.as_ref()
     }
 
-    fn set_trailer(&mut self, trailer: Option<TrailingHeaders>) {
-        self.trailer_s3s = trailer;
+    fn set_trailer(&mut self, trailer: Option<SharedTrailerSource>) {
+        self.trailer = trailer;
     }
 }
 
@@ -531,7 +594,9 @@ impl AsyncRead for HashReader {
         let before = buf.filled().len();
         match this.inner.poll_read(cx, buf) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => {
+            // SAFETY: This fixed label is unique within rustfs-rio, satisfying hotpath's export_name symbol contract.
+            #[allow(unsafe_code)]
+            Poll::Ready(Ok(())) => crate::hp_measure_block!("HashReader::on_chunk", {
                 let data = &buf.filled()[before..];
                 let filled = data.len();
 
@@ -560,24 +625,25 @@ impl AsyncRead for HashReader {
                         let sha256 = hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower);
                         if sha256 != *expected_sha256 {
                             error!("SHA256 mismatch, expected={:?}, actual={:?}", expected_sha256, sha256);
-                            return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "SHA256 mismatch")));
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                crate::errors::Sha256Mismatch {
+                                    expected_sha256: expected_sha256.clone(),
+                                    calculated_sha256: sha256,
+                                },
+                            )));
                         }
                     }
 
                     // check content hasher
                     if let (Some(hasher), Some(expected_content_hash)) = (this.content_hasher, this.content_hash) {
                         if expected_content_hash.checksum_type.trailing()
-                            && let Some(trailer) = this.trailer_s3s.as_ref()
-                            && let Some(Some(checksum_str)) = trailer.read(|headers| {
-                                expected_content_hash
-                                    .checksum_type
-                                    .key()
-                                    .and_then(|key| headers.get(key).and_then(|value| value.to_str().ok().map(|s| s.to_string())))
-                            })
+                            && let Some(checksum_str) =
+                                trailing_checksum_value(this.trailer.as_ref(), expected_content_hash.checksum_type)
                         {
                             expected_content_hash.encoded = checksum_str;
-                            expected_content_hash.raw = general_purpose::STANDARD
-                                .decode(&expected_content_hash.encoded)
+                            expected_content_hash.raw = base64_simd::STANDARD
+                                .decode_to_vec(&expected_content_hash.encoded)
                                 .map_err(|_| std::io::Error::other("Invalid base64 checksum"))?;
 
                             if expected_content_hash.raw.is_empty() {
@@ -592,7 +658,7 @@ impl AsyncRead for HashReader {
                             && !expected_content_hash.checksum_type.trailing()
                         {
                             expected_content_hash.raw = content_hash;
-                            expected_content_hash.encoded = general_purpose::STANDARD.encode(&expected_content_hash.raw);
+                            expected_content_hash.encoded = base64_simd::STANDARD.encode_to_string(&expected_content_hash.raw);
                         } else if content_hash != expected_content_hash.raw {
                             let expected_hex = hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower);
                             let actual_hex = hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower);
@@ -612,13 +678,17 @@ impl AsyncRead for HashReader {
                     *this.checksum_on_finish = true;
                 }
                 Poll::Ready(Ok(()))
-            }
+            }),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
         }
     }
 }
 
 impl EtagResolvable for HashReader {
+    fn is_etag_reader(&self) -> bool {
+        !self.diskable_md5 && self.inner.is_etag_reader()
+    }
+
     fn try_resolve_etag(&mut self) -> Option<String> {
         if self.diskable_md5 {
             return None;
@@ -656,6 +726,40 @@ mod tests {
     use tokio::io::{AsyncReadExt, BufReader};
 
     #[tokio::test]
+    async fn from_stream_with_etag_selects_the_etag_hash() {
+        use md5::{Digest, Md5};
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i * 7) as u8).collect();
+        let size = data.len() as i64;
+        let md5 = hex_simd::encode_to_string(Md5::digest(&data), hex_simd::AsciiCase::Lower);
+        let xxh3 = hex_simd::encode_to_string(xxhash_rust::xxh3::xxh3_128(&data).to_be_bytes(), hex_simd::AsciiCase::Lower);
+
+        let etag_of = |etag: EtagAlgorithm, content_md5: Option<String>| {
+            let data = data.clone();
+            async move {
+                let mut reader = HashReader::from_stream_with_etag(
+                    BufReader::new(Cursor::new(data)),
+                    size,
+                    size,
+                    content_md5,
+                    None,
+                    false,
+                    etag,
+                )
+                .expect("reader");
+                let mut out = Vec::new();
+                reader.read_to_end(&mut out).await.map(|_| reader.try_resolve_etag())
+            }
+        };
+
+        assert_eq!(etag_of(EtagAlgorithm::Xxh3, None).await.expect("read"), Some(xxh3));
+        assert_eq!(etag_of(EtagAlgorithm::Md5, None).await.expect("read"), Some(md5.clone()));
+        // Content-MD5 always gets MD5, and a wrong one still fails.
+        assert_eq!(etag_of(EtagAlgorithm::Xxh3, Some(md5.clone())).await.expect("read"), Some(md5));
+        let wrong = hex_simd::encode_to_string(Md5::digest(b"other"), hex_simd::AsciiCase::Lower);
+        assert!(etag_of(EtagAlgorithm::Xxh3, Some(wrong)).await.is_err());
+    }
+
+    #[tokio::test]
     async fn test_hashreader_wrapping_logic() {
         let data = b"hello world";
         let size = data.len() as i64;
@@ -664,25 +768,28 @@ mod tests {
 
         // Test 1: Simple creation
         let reader1 = BufReader::new(Cursor::new(&data[..]));
-        let hash_reader1 = HashReader::from_stream(reader1, size, actual_size, etag.clone(), None, false).unwrap();
+        let hash_reader1 =
+            HashReader::from_stream(reader1, size, actual_size, etag.clone(), None, false).expect("operation should succeed");
         assert_eq!(hash_reader1.size(), size);
         assert_eq!(hash_reader1.actual_size(), actual_size);
 
         // Test 2: With HardLimitReader wrapping
         let reader2 =
             HashReader::from_stream(BufReader::new(Cursor::new(&data[..])), size, actual_size, etag.clone(), None, false)
-                .unwrap();
+                .expect("operation should succeed");
         let hard_limit = HardLimitReader::new(reader2, size);
-        let hash_reader2 = HashReader::from_reader(hard_limit, size, actual_size, etag.clone(), None, false).unwrap();
+        let hash_reader2 =
+            HashReader::from_reader(hard_limit, size, actual_size, etag.clone(), None, false).expect("operation should succeed");
         assert_eq!(hash_reader2.size(), size);
         assert_eq!(hash_reader2.actual_size(), actual_size);
 
         // Test 3: With EtagReader wrapping
         let reader3 =
             HashReader::from_stream(BufReader::new(Cursor::new(&data[..])), size, actual_size, etag.clone(), None, false)
-                .unwrap();
+                .expect("operation should succeed");
         let etag_reader = EtagReader::new(reader3, etag.clone());
-        let hash_reader3 = HashReader::from_reader(etag_reader, size, actual_size, etag, None, false).unwrap();
+        let hash_reader3 =
+            HashReader::from_reader(etag_reader, size, actual_size, etag, None, false).expect("operation should succeed");
         assert_eq!(hash_reader3.size(), size);
         assert_eq!(hash_reader3.actual_size(), actual_size);
     }
@@ -703,7 +810,7 @@ mod tests {
                 None,
                 false,
             )
-            .unwrap(),
+            .expect("operation should succeed"),
         );
         assert!(boxed_hash_reader.is_hash_reader());
     }
@@ -719,7 +826,7 @@ mod tests {
             None,
             false,
         )
-        .unwrap();
+        .expect("operation should succeed");
         let boxed_encrypt_reader = Box::new(EncryptReader::new(inner, [7u8; 32], [3u8; 12]));
 
         assert!(boxed_encrypt_reader.is_hash_reader());
@@ -732,9 +839,12 @@ mod tests {
             None,
             false,
         )
-        .unwrap();
+        .expect("operation should succeed");
         let mut encrypted = Vec::new();
-        hash_reader.read_to_end(&mut encrypted).await.unwrap();
+        hash_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         assert!(!encrypted.is_empty());
         assert_ne!(encrypted, data);
@@ -745,9 +855,10 @@ mod tests {
     async fn test_hashreader_etag_basic() {
         let data = b"hello hashreader";
         let reader = BufReader::new(Cursor::new(&data[..]));
-        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false).unwrap();
+        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false)
+            .expect("operation should succeed");
         let mut buf = Vec::new();
-        let _ = hash_reader.read_to_end(&mut buf).await.unwrap();
+        let _ = hash_reader.read_to_end(&mut buf).await.expect("operation should succeed");
         let etag = hash_reader.try_resolve_etag();
         assert!(etag.is_some());
         assert_eq!(buf, data);
@@ -757,9 +868,10 @@ mod tests {
     async fn test_hashreader_diskable_md5() {
         let data = b"no etag";
         let reader = BufReader::new(Cursor::new(&data[..]));
-        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, true).unwrap();
+        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, true)
+            .expect("operation should succeed");
         let mut buf = Vec::new();
-        let _ = hash_reader.read_to_end(&mut buf).await.unwrap();
+        let _ = hash_reader.read_to_end(&mut buf).await.expect("operation should succeed");
         // Etag should be None when diskable_md5 is true
         let etag = hash_reader.try_resolve_etag();
         assert!(etag.is_none());
@@ -767,17 +879,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sha256_mismatch_retains_typed_io_error_source() {
+        let data = b"tampered payload";
+        let expected_sha256 = "0".repeat(64);
+        let reader = BufReader::new(Cursor::new(&data[..]));
+        let mut hash_reader =
+            HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, Some(expected_sha256.clone()), false)
+                .expect("operation should succeed");
+
+        let error = hash_reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("SHA256 mismatch should fail");
+        let mismatch = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<crate::Sha256Mismatch>())
+            .expect("SHA256 mismatch should remain typed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(mismatch.expected_sha256, expected_sha256);
+        assert_eq!(mismatch.calculated_sha256.len(), 64);
+        assert_ne!(mismatch.calculated_sha256, mismatch.expected_sha256);
+    }
+
+    #[tokio::test]
     async fn test_add_calculated_checksum_records_checksum() {
         let data = b"server-side copy checksum";
         let reader = BufReader::new(Cursor::new(&data[..]));
-        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false).unwrap();
+        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false)
+            .expect("operation should succeed");
 
-        hash_reader.add_calculated_checksum(ChecksumType::CRC64_NVME).unwrap();
+        hash_reader
+            .add_calculated_checksum(ChecksumType::CRC64_NVME)
+            .expect("operation should succeed");
 
         let mut buf = Vec::new();
-        hash_reader.read_to_end(&mut buf).await.unwrap();
+        hash_reader.read_to_end(&mut buf).await.expect("operation should succeed");
 
-        let expected = Checksum::new_from_data(ChecksumType::CRC64_NVME, data).unwrap();
+        let expected = Checksum::new_from_data(ChecksumType::CRC64_NVME, data).expect("operation should succeed");
         let checksums = hash_reader.content_crc();
 
         assert_eq!(buf, data);
@@ -792,7 +931,7 @@ mod tests {
         // Create a HashReader first
         let hash_reader =
             HashReader::from_stream(reader, data.len() as i64, data.len() as i64, Some("test_etag".to_string()), None, false)
-                .unwrap();
+                .expect("operation should succeed");
         let hash_reader = wrap_reader(hash_reader);
         // Now try to create another HashReader from the existing one using new
         let result = HashReader::new(
@@ -805,7 +944,7 @@ mod tests {
         );
 
         assert!(result.is_ok());
-        let final_reader = result.unwrap();
+        let final_reader = result.expect("operation should succeed");
         assert_eq!(final_reader.checksum, Some("test_etag".to_string()));
         assert_eq!(final_reader.size(), data.len() as i64);
     }
@@ -838,14 +977,18 @@ mod tests {
         let size = data.len() as i64;
         let actual_size = data.len() as i64;
 
-        let mut hr = HashReader::from_stream(reader, size, actual_size, Some(expected.clone()), None, false).unwrap();
+        let mut hr = HashReader::from_stream(reader, size, actual_size, Some(expected.clone()), None, false)
+            .expect("operation should succeed");
 
         // If compression is enabled, compress data first
         let compressed_data = if is_compress {
             let mut compressed_buf = Vec::new();
             let compress_reader = CompressReader::new(hr, CompressionAlgorithm::Gzip);
             let mut compress_reader = compress_reader;
-            compress_reader.read_to_end(&mut compressed_buf).await.unwrap();
+            compress_reader
+                .read_to_end(&mut compressed_buf)
+                .await
+                .expect("operation should succeed");
 
             println!("Original size: {}, Compressed size: {}", data.len(), compressed_buf.len());
 
@@ -853,7 +996,7 @@ mod tests {
         } else {
             // If not compressing, read original data directly
             let mut buf = Vec::new();
-            hr.read_to_end(&mut buf).await.unwrap();
+            hr.read_to_end(&mut buf).await.expect("operation should succeed");
             buf
         };
 
@@ -869,7 +1012,10 @@ mod tests {
             let encrypt_reader = encrypt_reader::EncryptReader::new(Cursor::new(compressed_data), key, nonce);
             let mut encrypted_data = Vec::new();
             let mut encrypt_reader = encrypt_reader;
-            encrypt_reader.read_to_end(&mut encrypted_data).await.unwrap();
+            encrypt_reader
+                .read_to_end(&mut encrypted_data)
+                .await
+                .expect("operation should succeed");
 
             println!("Encrypted size: {}", encrypted_data.len());
 
@@ -877,14 +1023,20 @@ mod tests {
             let decrypt_reader = DecryptReader::new(Cursor::new(encrypted_data), key, nonce);
             let mut decrypt_reader = decrypt_reader;
             let mut decrypted_data = Vec::new();
-            decrypt_reader.read_to_end(&mut decrypted_data).await.unwrap();
+            decrypt_reader
+                .read_to_end(&mut decrypted_data)
+                .await
+                .expect("operation should succeed");
 
             if is_compress {
                 // If compression was used, decompress is needed
                 let decompress_reader = DecompressReader::new(Cursor::new(decrypted_data), CompressionAlgorithm::Gzip);
                 let mut decompress_reader = decompress_reader;
                 let mut final_data = Vec::new();
-                decompress_reader.read_to_end(&mut final_data).await.unwrap();
+                decompress_reader
+                    .read_to_end(&mut final_data)
+                    .await
+                    .expect("operation should succeed");
 
                 println!("Final decompressed size: {}", final_data.len());
                 assert_eq!(final_data.len() as i64, actual_size);
@@ -902,7 +1054,10 @@ mod tests {
             let decompress_reader = DecompressReader::new(Cursor::new(compressed_data), CompressionAlgorithm::Gzip);
             let mut decompress_reader = decompress_reader;
             let mut decompressed = Vec::new();
-            decompress_reader.read_to_end(&mut decompressed).await.unwrap();
+            decompress_reader
+                .read_to_end(&mut decompressed)
+                .await
+                .expect("operation should succeed");
 
             assert_eq!(decompressed.len() as i64, actual_size);
             assert_eq!(&decompressed, &data);
@@ -931,13 +1086,17 @@ mod tests {
         println!("Original data size: {} bytes", data.len());
 
         let reader = BufReader::new(Cursor::new(data.clone()));
-        let hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false).unwrap();
+        let hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false)
+            .expect("operation should succeed");
 
         // Test compression
         let compress_reader = CompressReader::new(hash_reader, CompressionAlgorithm::Gzip);
         let mut compressed_data = Vec::new();
         let mut compress_reader = compress_reader;
-        compress_reader.read_to_end(&mut compressed_data).await.unwrap();
+        compress_reader
+            .read_to_end(&mut compressed_data)
+            .await
+            .expect("operation should succeed");
 
         println!("Compressed data size: {} bytes", compressed_data.len());
         println!("Compression ratio: {:.2}%", (compressed_data.len() as f64 / data.len() as f64) * 100.0);
@@ -949,7 +1108,10 @@ mod tests {
         let decompress_reader = DecompressReader::new(Cursor::new(compressed_data), CompressionAlgorithm::Gzip);
         let mut decompressed_data = Vec::new();
         let mut decompress_reader = decompress_reader;
-        decompress_reader.read_to_end(&mut decompressed_data).await.unwrap();
+        decompress_reader
+            .read_to_end(&mut decompressed_data)
+            .await
+            .expect("operation should succeed");
 
         // Verify decompressed data matches original
         assert_eq!(decompressed_data.len(), data.len());
@@ -976,13 +1138,17 @@ mod tests {
             println!("\nTesting algorithm: {algorithm:?}");
 
             let reader = BufReader::new(Cursor::new(data.clone()));
-            let hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false).unwrap();
+            let hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false)
+                .expect("operation should succeed");
 
             // Compress
             let compress_reader = CompressReader::new(hash_reader, algorithm);
             let mut compressed_data = Vec::new();
             let mut compress_reader = compress_reader;
-            compress_reader.read_to_end(&mut compressed_data).await.unwrap();
+            compress_reader
+                .read_to_end(&mut compressed_data)
+                .await
+                .expect("operation should succeed");
 
             println!(
                 "  Compressed size: {} bytes (ratio: {:.2}%)",
@@ -994,12 +1160,302 @@ mod tests {
             let decompress_reader = DecompressReader::new(Cursor::new(compressed_data), algorithm);
             let mut decompressed_data = Vec::new();
             let mut decompress_reader = decompress_reader;
-            decompress_reader.read_to_end(&mut decompressed_data).await.unwrap();
+            decompress_reader
+                .read_to_end(&mut decompressed_data)
+                .await
+                .expect("operation should succeed");
 
             // Verify
             assert_eq!(decompressed_data.len(), data.len());
             assert_eq!(&decompressed_data, &data);
             println!("  ✓ Algorithm {algorithm:?} test passed");
         }
+    }
+}
+
+#[cfg(test)]
+mod trailer_tests {
+    use super::*;
+    use crate::{TrailerSource, TrailerValue, is_checksum_mismatch};
+    use http::HeaderValue;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::AsyncReadExt;
+
+    const TYPED: [ChecksumType; 5] = [
+        ChecksumType::CRC32,
+        ChecksumType::CRC32C,
+        ChecksumType::SHA1,
+        ChecksumType::SHA256,
+        ChecksumType::CRC64_NVME,
+    ];
+
+    /// Mirrors an aws-chunked decoder handle: `None` until the trailer section
+    /// has been published.
+    #[derive(Default)]
+    struct FakeTrailer(Mutex<Option<HashMap<String, String>>>);
+
+    impl TrailerSource for FakeTrailer {
+        fn lookup(&self, name: &str) -> TrailerValue {
+            match self.0.lock().expect("trailer lock").as_ref() {
+                None => TrailerValue::Pending,
+                Some(fields) => fields.get(name).cloned().map_or(TrailerValue::Missing, TrailerValue::Present),
+            }
+        }
+    }
+
+    /// Body that publishes `fields` (when set) only once it reaches EOF.
+    struct PublishOnEof {
+        body: Cursor<Vec<u8>>,
+        trailer: Arc<FakeTrailer>,
+        fields: Option<HashMap<String, String>>,
+    }
+
+    impl AsyncRead for PublishOnEof {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            let this = &mut *self;
+            let before = buf.filled().len();
+            let result = Pin::new(&mut this.body).poll_read(cx, buf);
+            if matches!(result, Poll::Ready(Ok(())))
+                && buf.filled().len() == before
+                && buf.remaining() > 0
+                && let Some(fields) = this.fields.clone()
+            {
+                *this.trailer.0.lock().expect("trailer lock") = Some(fields);
+            }
+            result
+        }
+    }
+
+    fn encoded(checksum_type: ChecksumType, data: &[u8]) -> String {
+        let mut hasher = checksum_type.hasher().expect("typed checksum hasher");
+        hasher.write_all(data).expect("hash data");
+        base64_simd::STANDARD.encode_to_string(hasher.finalize())
+    }
+
+    fn trailing_request(checksum_type: ChecksumType) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-trailer",
+            HeaderValue::from_static(checksum_type.key().expect("typed checksum key")),
+        );
+        headers
+    }
+
+    /// `published`: `None` never publishes (still `Pending` at EOF);
+    /// `Some(None)` publishes a trailer without the field; `Some(Some(v))`
+    /// publishes `v` under the checksum's key.
+    fn reader(checksum_type: ChecksumType, data: &[u8], published: Option<Option<String>>) -> (HashReader, Arc<FakeTrailer>) {
+        let trailer = Arc::new(FakeTrailer::default());
+        let key = checksum_type.key().expect("typed checksum key");
+        let fields = published.map(|value| value.into_iter().map(|v| (key.to_string(), v)).collect());
+        let body = PublishOnEof {
+            body: Cursor::new(data.to_vec()),
+            trailer: trailer.clone(),
+            fields,
+        };
+        let size = data.len() as i64;
+        let mut reader = HashReader::from_stream(body, size, size, None, None, false).expect("hash reader");
+        reader
+            .add_checksum(&trailing_request(checksum_type), Some(trailer.clone()), false)
+            .expect("declared trailing checksum");
+        (reader, trailer)
+    }
+
+    async fn read_all(reader: &mut HashReader) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.map(|_| out)
+    }
+
+    fn assert_checksum_mismatch(err: &std::io::Error) {
+        let inner = err.get_ref().expect("typed error source");
+        assert!(is_checksum_mismatch(inner), "expected ChecksumMismatch, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn trailing_checksum_published_at_eof_is_verified_and_reported() {
+        let data = b"trailing checksum payload";
+        for checksum_type in TYPED {
+            let value = encoded(checksum_type, data);
+            let (mut reader, trailer) = reader(checksum_type, data, Some(Some(value.clone())));
+            let key = checksum_type.key().expect("typed checksum key");
+            assert_eq!(
+                trailer.lookup(key),
+                TrailerValue::Pending,
+                "{checksum_type}: attached before the body ends"
+            );
+
+            assert_eq!(read_all(&mut reader).await.expect("verified body"), data);
+            assert_eq!(
+                reader.content_crc(),
+                HashMap::from([(checksum_type.to_string(), value)]),
+                "{checksum_type}: verified trailer value is reported for persistence"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trailing_checksum_mismatch_is_rejected() {
+        let data = b"trailing checksum payload";
+        for checksum_type in TYPED {
+            let wrong = encoded(checksum_type, b"different payload");
+            let (mut reader, _) = reader(checksum_type, data, Some(Some(wrong.clone())));
+            let err = read_all(&mut reader).await.expect_err("mismatched trailer must fail");
+            assert_checksum_mismatch(&err);
+            let mismatch = err
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::errors::ChecksumMismatch>())
+                .expect("mismatch details");
+            let wrong_raw = base64_simd::STANDARD.decode_to_vec(&wrong).expect("valid base64");
+            assert_eq!(mismatch.want, hex_simd::encode_to_string(wrong_raw, hex_simd::AsciiCase::Lower));
+        }
+    }
+
+    #[tokio::test]
+    async fn trailing_checksum_missing_or_still_pending_at_eof_is_rejected() {
+        let data = b"trailing checksum payload";
+        for published in [None, Some(None)] {
+            let (mut reader, _) = reader(ChecksumType::CRC32C, data, published.clone());
+            let err = read_all(&mut reader).await.expect_err("unverifiable trailer must fail");
+            assert_checksum_mismatch(&err);
+            assert!(reader.content_crc().is_empty(), "{published:?}: nothing to persist");
+        }
+
+        let size = data.len() as i64;
+        let mut reader = HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("hash reader");
+        reader
+            .add_checksum(&trailing_request(ChecksumType::CRC32C), None, false)
+            .expect("declared trailing checksum");
+        let err = read_all(&mut reader).await.expect_err("no trailer source must fail");
+        assert_checksum_mismatch(&err);
+        assert!(reader.content_crc().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_trailing_checksum_is_an_error_not_a_panic() {
+        let data = b"trailing checksum payload";
+        for value in ["not base64!", ""] {
+            let (mut reader, _) = reader(ChecksumType::SHA256, data, Some(Some(value.to_string())));
+            let err = read_all(&mut reader).await.expect_err("malformed trailer must fail");
+            assert_eq!(err.kind(), std::io::ErrorKind::Other, "{value:?}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapping_hash_reader_keeps_the_trailer_source() {
+        let data = b"trailing checksum payload";
+        let value = encoded(ChecksumType::CRC32, data);
+        let size = data.len() as i64;
+
+        let (inner, _) = reader(ChecksumType::CRC32, data, Some(Some(value.clone())));
+        let mut outer = HashReader::new(Box::new(inner), size, size, None, None, false).expect("outer hash reader");
+        assert!(outer.get_trailer().is_some(), "wrapping must carry the trailer source");
+        assert_eq!(read_all(&mut outer).await.expect("verified body"), data);
+        assert_eq!(outer.content_crc(), HashMap::from([("CRC32".to_string(), value)]));
+
+        let wrong = encoded(ChecksumType::CRC32, b"different payload");
+        let (inner, _) = reader(ChecksumType::CRC32, data, Some(Some(wrong)));
+        let mut outer = HashReader::new(Box::new(inner), size, size, None, None, false).expect("outer hash reader");
+        let err = read_all(&mut outer).await.expect_err("mismatch through a wrapper must fail");
+        assert_checksum_mismatch(&err);
+    }
+
+    #[tokio::test]
+    async fn wrapping_hash_reader_rejects_already_read_conflicting_checksum_and_size() {
+        let data = b"wrapping validation payload";
+        let size = data.len() as i64;
+
+        // 1. Wrapping a HashReader that has already been partially read must fail.
+        let mut inner = HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("inner");
+        let mut one = [0u8; 1];
+        inner.read_exact(&mut one).await.expect("read one byte");
+        assert_eq!(inner.bytes_read(), 1);
+        let err = HashReader::new(Box::new(inner), size, size, None, None, false)
+            .err()
+            .expect("wrapping after read must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("already read"));
+
+        // 2. Wrapping a HashReader with a conflicting MD5 checksum must fail.
+        let inner = HashReader::from_stream(
+            Cursor::new(data.to_vec()),
+            size,
+            size,
+            Some("11111111111111111111111111111111".to_string()),
+            None,
+            false,
+        )
+        .expect("inner with md5");
+        let err = HashReader::new(
+            Box::new(inner),
+            size,
+            size,
+            Some("22222222222222222222222222222222".to_string()),
+            None,
+            false,
+        )
+        .err()
+        .expect("conflicting md5 checksum must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("checksum mismatch"));
+
+        // 3. Wrapping a HashReader with a conflicting positive size must fail.
+        let inner = HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("inner");
+        let err = HashReader::new(Box::new(inner), size + 10, size, None, None, false)
+            .err()
+            .expect("conflicting positive size must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("size mismatch"));
+
+        // 4. Wrapping an unbounded (-1) HashReader propagates newly discovered positive size and actual_size.
+        let inner = HashReader::from_stream(Cursor::new(data.to_vec()), -1, -1, None, None, false).expect("unbounded inner");
+        let outer = HashReader::new(Box::new(inner), size, size, Some("abcd".to_string()), None, false).expect("outer");
+        assert_eq!(outer.size(), size);
+        assert_eq!(outer.actual_size(), size);
+    }
+
+    #[tokio::test]
+    async fn hash_reader_checksum_helpers_reject_invalid_inputs() {
+        let data = b"checksum helper validation";
+        let size = data.len() as i64;
+        let mut reader = HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("reader");
+
+        // add_calculated_checksum rejects both NONE and INVALID checksum types.
+        let err = reader
+            .add_calculated_checksum(ChecksumType::NONE)
+            .expect_err("NONE checksum type must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let err = reader
+            .add_calculated_checksum(ChecksumType::INVALID)
+            .expect_err("INVALID checksum type must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // add_non_trailing_checksum handles None as a no-op and rejects a Checksum with no hasher.
+        reader.add_non_trailing_checksum(None, false).expect("None is no-op");
+        let invalid_checksum = Checksum {
+            checksum_type: ChecksumType::INVALID,
+            encoded: "AAAA".to_string(),
+            raw: vec![1, 2, 3, 4],
+            want_parts: 0,
+        };
+        let err = reader
+            .add_non_trailing_checksum(Some(invalid_checksum), false)
+            .expect_err("invalid checksum_type must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // add_checksum_no_trailer attaches a direct header checksum without trailer reader.
+        let mut reader =
+            HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("fresh reader");
+        assert!(reader.checksum().is_none(), "HashReader::checksum() is None when no content_hash is set");
+        let crc32_val = encoded(ChecksumType::CRC32C, data);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-checksum-crc32c", HeaderValue::from_str(&crc32_val).expect("header"));
+        reader
+            .add_checksum_no_trailer(&headers, false)
+            .expect("direct header checksum");
+        assert!(
+            reader.checksum().is_some(),
+            "HashReader::checksum() returns Some after add_checksum_no_trailer"
+        );
+        assert_eq!(read_all(&mut reader).await.expect("verified"), data);
     }
 }

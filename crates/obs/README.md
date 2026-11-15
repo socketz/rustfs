@@ -36,7 +36,7 @@ use rustfs_obs::init_obs;
 #[tokio::main]
 async fn main() {
     // Build config from environment variables, then initialise all backends.
-    let _guard = init_obs(None).await.expect("failed to initialise observability");
+    let _guard = init_obs(None, None).await.expect("failed to initialise observability");
 
     tracing::info!("RustFS started");
 
@@ -56,7 +56,7 @@ async fn main() {
 ```rust
 use rustfs_obs::init_obs;
 
-let _guard = init_obs(Some("http://otel-collector:4318".to_string()))
+let _guard = init_obs(Some("http://otel-collector:4318".to_string()), None)
 .await
 .expect("observability init failed");
 ```
@@ -115,6 +115,7 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_TRACE_ENDPOINT`           | _(empty)_ | Dedicated trace endpoint (overrides root + `/v1/traces`)   |
 | `RUSTFS_OBS_METRIC_ENDPOINT`          | _(empty)_ | Dedicated metrics endpoint                                 |
 | `RUSTFS_OBS_LOG_ENDPOINT`             | _(empty)_ | Dedicated log endpoint                                     |
+| `RUSTFS_OBS_TLS_CA_FILE`              | _(empty)_ | Absolute PEM CA bundle added to system trust for OTLP/HTTP |
 | `RUSTFS_OBS_PROFILING_ENDPOINT`       | _(empty)_ | Dedicated profiling endpoint (e.g. Pyroscope)              |
 | `RUSTFS_OBS_TRACES_EXPORT_ENABLED`    | `true`    | Toggle trace export                                        |
 | `RUSTFS_OBS_METRICS_EXPORT_ENABLED`   | `true`    | Toggle metrics export                                      |
@@ -122,21 +123,29 @@ All configuration is read from environment variables at startup.
 | `RUSTFS_OBS_PROFILING_EXPORT_ENABLED` | `false`   | Toggle profiling export                                    |
 | `RUSTFS_OBS_USE_STDOUT`               | `false`   | Mirror all signals to stdout alongside OTLP                |
 | `RUSTFS_OBS_SAMPLE_RATIO`             | `0.1`     | Trace sampling ratio `0.0`–`1.0`                           |
-| `RUSTFS_OBS_METER_INTERVAL`           | `15`      | Metrics export interval (seconds)                          |
+| `RUSTFS_OBS_METER_INTERVAL`           | `30`      | Metrics export interval (seconds)                          |
+
+`RUSTFS_OBS_TLS_CA_FILE` is read only while OTLP exporters are initialized. Its PEM certificates are added to, not substituted for, the platform trust roots, and TLS chain, expiry, and hostname checks remain enabled. Restart RustFS after rotating the bundle. A missing, unreadable, non-absolute, empty, or invalid bundle fails OTLP initialization.
+
+The export interval is separate from application metric collection. Without interval overrides, node/disk metrics refresh every 60 seconds (`RUSTFS_METRICS_NODE_INTERVAL_SEC`), cluster metrics including scanner bucket usage every 60 seconds (`RUSTFS_METRICS_CLUSTER_INTERVAL_SEC`), and the separate bucket collector every 300 seconds (`RUSTFS_METRICS_BUCKET_INTERVAL_SEC`). See the [collection defaults](src/metrics/config.rs) and [interval configuration](src/metrics/scheduler.rs) for collector-specific and global overrides.
+
+For bucket size and object-count metric names, all-bucket PromQL queries, accounting semantics, and scanner freshness, see [Bucket usage metrics](../../docs/operations/bucket-usage-metrics.md).
+
+With OTLP → Collector → Prometheus, the time from a failure to an alert also includes underlying health detection, collection and export work, transport and Collector batching, Prometheus `scrape_interval` and `evaluation_interval`, and any alert rule `for` duration. A shorter scrape interval cannot refresh a value that RustFS has not yet collected and exported. These periodic intervals do not guarantee a fixed detection or alert latency; see the [Prometheus alert rule documentation](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/) for the role of `for`.
 
 ### Service identity
 
 | Variable                     | Default           | Description                                             |
 |------------------------------|-------------------|---------------------------------------------------------|
 | `RUSTFS_OBS_SERVICE_NAME`    | `rustfs`          | OTel `service.name`                                     |
-| `RUSTFS_OBS_SERVICE_VERSION` | _(crate version)_ | OTel `service.version`                                  |
+| `RUSTFS_OBS_SERVICE_VERSION` | RustFS build version | OTel `service.version`; the explicit environment value overrides the version passed by the RustFS binary |
 | `RUSTFS_OBS_ENVIRONMENT`     | `development`     | Deployment environment (`production`, `development`, …) |
 
 ### Local logging
 
 | Variable                        | Default      | Description                                                                                                                                                                                                                                                                                                                                                           |
 |---------------------------------|--------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `RUSTFS_OBS_LOGGER_LEVEL`       | `info`       | Log level; `RUST_LOG` syntax supported                                                                                                                                                                                                                                                                                                                                |
+| `RUSTFS_OBS_LOGGER_LEVEL`       | `error`      | Log level; `RUST_LOG` syntax supported                                                                                                                                                                                                                                                                                                                                |
 | `RUSTFS_OBS_LOG_STDOUT_ENABLED` | `false`      | When file logging is active, also mirror to stdout                                                                                                                                                                                                                                                                                                                    |
 | `RUSTFS_OBS_LOG_DIRECTORY`      | _(empty)_    | **Directory for rolling log files. When empty, logs go to stdout only**                                                                                                                                                                                                                                                                                               |
 | `RUSTFS_OBS_LOG_FILENAME`       | `rustfs.log` | Base filename for rolling logs. Rotated archives include a high-precision timestamp and counter. With the default `RUSTFS_OBS_LOG_MATCH_MODE=suffix`, names look like `<timestamp>-<counter>.rustfs.log` (e.g., `20231027103001.123456-0.rustfs.log`); with `prefix`, they look like `rustfs.log.<timestamp>-<counter>` (e.g., `rustfs.log.20231027103001.123456-0`). |
@@ -148,22 +157,30 @@ All configuration is read from environment variables at startup.
 
 | Variable                                        | Default      | Description                                                 |
 |-------------------------------------------------|--------------|-------------------------------------------------------------|
-| `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES`           | `2147483648` | Hard cap on total log directory size (2 GiB)                |
-| `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES`     | `0`          | Per-file size cap; `0` = unlimited                          |
+| `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES`           | `2147483648` | Byte budget (2 GiB), applied to rolled logs and to compressed archives separately; `0` = no budget. See [Disk usage bound](#disk-usage-bound) |
+| `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES`     | unset        | Unset or unparsable: the active file rolls at 256 MiB, or at a quarter of the byte budget when that is smaller (at least 1 MiB). A value: the active file rolls at that size and the cleaner also processes rolled files above it. `0` = no size roll |
 | `RUSTFS_OBS_LOG_COMPRESS_OLD_FILES`             | `true`       | Compress files before deleting                              |
 | `RUSTFS_OBS_LOG_GZIP_COMPRESSION_LEVEL`         | `6`          | Gzip level `1` (fastest) – `9` (best)                       |
 | `RUSTFS_OBS_LOG_COMPRESSION_ALGORITHM`          | `zstd`       | Compression codec: `zstd` or `gzip`                         |
 | `RUSTFS_OBS_LOG_PARALLEL_COMPRESS`              | `true`       | Enable work-stealing parallel compression                   |
 | `RUSTFS_OBS_LOG_PARALLEL_WORKERS`               | `6`          | Number of cleaner worker threads                            |
-| `RUSTFS_OBS_LOG_ZSTD_COMPRESSION_LEVEL`         | `8`          | Zstd level `1` (fastest) – `21` (best ratio)               |
+| `RUSTFS_OBS_LOG_ZSTD_COMPRESSION_LEVEL`         | `8`          | Zstd level `1` (fastest) – `22` (best ratio); `0` = codec default |
 | `RUSTFS_OBS_LOG_ZSTD_FALLBACK_TO_GZIP`          | `true`       | Fallback to gzip when zstd compression fails                |
 | `RUSTFS_OBS_LOG_ZSTD_WORKERS`                   | `1`          | zstdmt worker threads per compression task                  |
 | `RUSTFS_OBS_LOG_COMPRESSED_FILE_RETENTION_DAYS` | `30`         | Delete `.gz` / `.zst` archives older than N days; `0` = keep forever |
 | `RUSTFS_OBS_LOG_EXCLUDE_PATTERNS`               | _(empty)_    | Comma-separated glob patterns to never clean up             |
 | `RUSTFS_OBS_LOG_DELETE_EMPTY_FILES`             | `true`       | Remove zero-byte files                                      |
-| `RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS`           | `3600`       | Minimum file age (seconds) before cleanup                   |
-| `RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS`       | `1800`       | How often the cleanup task runs (0.5 hours)                 |
+| `RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS`           | `3600`       | Minimum file age (seconds) before cleanup; not applied while rolled logs exceed the byte budget |
+| `RUSTFS_OBS_LOG_CLEANUP_INTERVAL_SECONDS`       | `1800`       | How often the cleanup task runs (0.5 hours); a pass also runs after every roll |
 | `RUSTFS_OBS_LOG_DRY_RUN`                        | `false`      | Report deletions without actually removing files            |
+
+### Disk usage bound
+
+With the defaults the log directory holds at most the byte budget of rolled logs, the same budget of compressed archives, and one active file of up to 256 MiB. The active file is rolled by size as well as by time, and the cleaner runs a pass after every roll in addition to its interval, so the budget is enforced when a file is rolled. While the rolled logs exceed the budget the cleaner processes the oldest ones, as many as the budget requires, even if they are younger than `RUSTFS_OBS_LOG_MIN_FILE_AGE_SECONDS`; `RUSTFS_OBS_LOG_KEEP_FILES` still applies only to files past that age.
+
+The bound is not instantaneous: the directory can exceed it by what is written while one cleanup pass runs, archives created by a pass are trimmed by the next one, and a cleaner that compresses more slowly than logs are produced falls behind. Setting `RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES=0` removes the budget and `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES=0` turns size rolling off, which leaves the active file bounded only by the rotation period. Neither setting limits how fast logs are produced.
+
+The cleaner recognizes only its own process's active file. Do not let two processes write log files that match the same pattern in one directory: a file another process is still writing looks like a rolled log, and the minimum file age no longer shields it once the budget is exceeded.
 
 ---
 

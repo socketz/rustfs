@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{RustFSTestClusterEnvironment, init_logging, local_http_client};
+use crate::common::{RustFSTestClusterEnvironment, init_logging, local_http_client, signal_process};
 use aws_sdk_s3::primitives::ByteStream;
 use http::header::HOST;
 use reqwest::StatusCode;
@@ -20,13 +20,17 @@ use rustfs_madmin::{ITEM_OFFLINE, InfoMessage, StorageInfo};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
-use serial_test::serial;
+use serde::Deserialize;
 use std::error::Error;
-use std::process::Command;
 use tokio::time::{Duration, sleep, timeout};
 use uuid::Uuid;
 
 const BUCKET: &str = "issue-2525-admin-timeout";
+
+#[derive(Deserialize)]
+struct StorageInfoResponse {
+    info: StorageInfo,
+}
 
 async fn signed_admin_get(
     url: &str,
@@ -60,7 +64,8 @@ async fn fetch_info(cluster: &RustFSTestClusterEnvironment) -> Result<InfoMessag
 async fn fetch_storage_info(cluster: &RustFSTestClusterEnvironment) -> Result<StorageInfo, Box<dyn Error + Send + Sync>> {
     let url = format!("{}/rustfs/admin/v3/storageinfo", cluster.nodes[0].url);
     let response = signed_admin_get(&url, &cluster.access_key, &cluster.secret_key).await?;
-    parse_json_response(response, "storage info").await
+    let wrapper: StorageInfoResponse = parse_json_response(response, "storage info").await?;
+    Ok(wrapper.info)
 }
 
 async fn parse_json_response<T: serde::de::DeserializeOwned>(
@@ -76,15 +81,6 @@ async fn parse_json_response<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(&body)?)
 }
 
-fn signal_process(pid: u32, signal: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let output = Command::new("kill").arg(format!("-{signal}")).arg(pid.to_string()).output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    Err(format!("kill -{signal} {pid} failed: {}", String::from_utf8_lossy(&output.stderr)).into())
-}
-
 fn offline_server_count(info: &InfoMessage) -> usize {
     info.servers
         .as_ref()
@@ -93,7 +89,6 @@ fn offline_server_count(info: &InfoMessage) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[serial]
 async fn test_single_admin_timeout_does_not_immediately_mark_peer_offline() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 

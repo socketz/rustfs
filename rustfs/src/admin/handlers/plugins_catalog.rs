@@ -12,29 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::{
-    auth::validate_admin_request,
+    auth::authorize_admin_envelope,
     plugin_contract::{
-        PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain, PluginContractEntrypointKind,
-        PluginContractPackaging, PluginDistributionContract, PluginRuntimeContract,
+        PluginCatalogAdminDiscovery, PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain,
+        PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract, PluginRuntimeContract,
     },
-    router::{AdminOperation, Operation, S3Router},
+    router::{AdminOperation, S3Router},
+    runtime_sources::default_admin_usecase,
 };
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use rustfs_targets::catalog::{
     builtin::builtin_audit_target_admin_descriptors, builtin::builtin_notify_target_admin_descriptors,
 };
-use rustfs_targets::{
-    BuiltinTargetAdminDescriptor, builtin_target_marketplace_manifest, builtin_target_plugin_installation,
-    catalog::example_external_webhook_plugin,
-};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use rustfs_targets::{BuiltinTargetAdminDescriptor, builtin_target_marketplace_manifest, builtin_target_plugin_installation};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -57,6 +55,7 @@ fn target_domain_name_from_subsystem(subsystem: &str) -> PluginContractDomain {
 }
 
 fn build_catalog_response() -> PluginCatalogResponse {
+    let usecase = default_admin_usecase();
     let mut plugins: HashMap<&'static str, PluginCatalogEntry> = HashMap::new();
 
     for descriptor in builtin_notify_target_admin_descriptors()
@@ -67,39 +66,19 @@ fn build_catalog_response() -> PluginCatalogResponse {
     }
 
     let mut plugins = plugins.into_values().collect::<Vec<_>>();
-    plugins.push(example_external_webhook_plugin_entry());
     plugins.sort_by(|a, b| a.target_type.cmp(&b.target_type));
     for plugin in &mut plugins {
         plugin.supported_domains.sort();
         plugin.domain_configs.sort_by_key(|a| a.domain);
     }
 
-    PluginCatalogResponse { plugins }
-}
-
-fn example_external_webhook_plugin_entry() -> PluginCatalogEntry {
-    let example = example_external_webhook_plugin();
-    let manifest = example.manifest;
-
-    PluginCatalogEntry {
-        plugin_id: manifest.plugin_id.to_string(),
-        target_type: manifest.target_type.to_string(),
-        display_name: manifest.display_name.to_string(),
-        provider: manifest.provider.to_string(),
-        version: manifest.version.to_string(),
-        packaging: PluginContractPackaging::from(manifest.packaging),
-        entrypoint_kind: PluginContractEntrypointKind::from(manifest.entrypoint_kind),
-        api_compatibility_version: manifest.api_compatibility_version.to_string(),
-        runtime_contract: PluginRuntimeContract::from(manifest.runtime_contract),
-        distribution: manifest.distribution.map(PluginDistributionContract::from),
-        supported_domains: manifest.supported_domains.iter().copied().map(Into::into).collect(),
-        secret_fields: manifest.secret_fields.iter().map(|field| (*field).to_string()).collect(),
-        domain_configs: vec![PluginCatalogDomainEntry {
-            domain: PluginContractDomain::Notify,
-            subsystem: "notify_webhook".to_string(),
-            valid_fields: example.valid_fields,
-        }],
-        installation: Some(example.installation.into()),
+    PluginCatalogResponse {
+        plugins,
+        admin_discovery: PluginCatalogAdminDiscovery {
+            runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
+            cluster_snapshot: usecase.cluster_snapshot_route().to_string(),
+            extensions_catalog: usecase.extensions_catalog_route().to_string(),
+        },
     }
 }
 
@@ -135,46 +114,34 @@ fn merge_catalog_descriptor(plugins: &mut HashMap<&'static str, PluginCatalogEnt
     }
 }
 
-async fn authorize_plugin_catalog_request(req: &S3Request<Body>) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+/// The pre-check keeps this endpoint's historical missing-credentials message;
+/// the shared gate reports "get cred failed".
+async fn authorize_plugin_catalog_request(req: &AdminRequest) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)],
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-    )
-    .await
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ServerInfoAdminAction)]).await?;
+    Ok(())
 }
 
-fn build_json_response(
-    status: StatusCode,
-    body: &impl Serialize,
-    request_id: Option<&HeaderValue>,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn build_json_response(status: StatusCode, body: &impl Serialize, request_id: Option<&HeaderValue>) -> S3Result<AdminResponse> {
     let data = serde_json::to_vec(body).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
     let mut header = HeaderMap::new();
     header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Some(value) = request_id {
         header.insert("x-request-id", value.clone());
     }
-    Ok(S3Response::with_headers((status, Body::from(data)), header))
+    Ok(AdminResponse::with_headers(status, Body::from(data), header))
 }
 
 pub struct GetPluginCatalogHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetPluginCatalogHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_plugin_catalog_request(&req).await?;
-        build_json_response(StatusCode::OK, &build_catalog_response(), req.headers.get("x-request-id"))
+        build_json_response(StatusCode::OK, &build_catalog_response(), req.headers().get("x-request-id"))
     }
 }
 
@@ -184,6 +151,7 @@ mod tests {
     use crate::admin::plugin_contract::{
         PluginContractDomain, PluginContractEntrypointKind, PluginContractPackaging, PluginRuntimeTransport,
     };
+    use rustfs_s3_types::Body;
 
     #[test]
     fn plugin_catalog_handlers_require_admin_authorization_contract() {
@@ -196,9 +164,31 @@ mod tests {
         );
     }
 
+    /// This endpoint authorizes through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message it has always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn plugin_catalog_gate_keeps_its_missing_credentials_message() {
+        let req = crate::admin::operation::test_support::TestRequest::new(http::Method::GET, "/rustfs/admin/v4/plugins/catalog")
+            .headers(http::HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::from(String::new()))
+            .build();
+
+        let err = super::authorize_plugin_catalog_request(&req)
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
+
     #[test]
     fn plugin_catalog_contains_representative_builtin_targets() {
         let response = build_catalog_response();
+
+        assert_eq!(response.admin_discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(response.admin_discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(response.admin_discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
 
         let webhook = response
             .plugins
@@ -236,6 +226,26 @@ mod tests {
         assert_eq!(kafka.target_type, "kafka");
         assert!(kafka.domain_configs.iter().any(|domain| domain.subsystem == "audit_kafka"));
         assert!(kafka.domain_configs.iter().any(|domain| domain.subsystem == "notify_kafka"));
+    }
+
+    #[test]
+    fn plugin_catalog_never_exposes_example_or_external_fixtures() {
+        let response = build_catalog_response();
+
+        assert!(
+            response
+                .plugins
+                .iter()
+                .all(|plugin| plugin.packaging == PluginContractPackaging::Builtin),
+            "production plugin catalog must only expose builtin plugins until a real marketplace source exists"
+        );
+        assert!(
+            !response
+                .plugins
+                .iter()
+                .any(|plugin| plugin.plugin_id.starts_with("external:")),
+            "example external plugin fixtures must not leak into the production catalog"
+        );
     }
 
     #[test]

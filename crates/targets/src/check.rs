@@ -100,11 +100,27 @@ pub async fn check_nats_server_available(args: &crate::target::nats::NATSArgs) -
             .flush()
             .await
             .map_err(|e| crate::TargetError::Network(format!("NATS connection check failed: {e}")))?;
+        // Validate the configured stream on the live connection before the drain closes it, so a
+        // missing or non-writable stream is rejected here rather than at first publish. The lookup is
+        // read-only and never creates a stream. The drain runs regardless of the validation outcome so
+        // the check connection is closed gracefully, and the validation error then propagates.
+        let validation = if args.jetstream_enable.unwrap_or(false) {
+            let mut context = async_nats::jetstream::new(client.clone());
+            // Match every other context construction site: the ack timeout is the per-operation await
+            // bound, so the validation get_stream lookup uses it rather than the library default.
+            context.set_timeout(std::time::Duration::from_secs(
+                args.jetstream_ack_timeout_secs
+                    .unwrap_or(rustfs_config::NATS_JETSTREAM_ACK_TIMEOUT_DEFAULT_SECS),
+            ));
+            crate::target::nats::validate_jetstream_stream(&context, args, "nats-check", None).await
+        } else {
+            Ok(())
+        };
         client
             .drain()
             .await
             .map_err(|e| crate::TargetError::Network(format!("Failed to close NATS check connection: {e}")))?;
-        Ok(())
+        validation
     })
     .await
     .unwrap_or_else(|_| Err(crate::TargetError::Timeout("NATS connection timed out".to_string())))
@@ -146,7 +162,7 @@ pub async fn check_mysql_server_available(args: &crate::target::mysql::MySqlArgs
         .db_name(Some(dsn.database.clone()));
 
     if dsn.tls {
-        ensure_rustls_provider_installed();
+        ensure_rustls_provider_installed()?;
         let mut ssl_opts = SslOpts::default();
         if !args.tls_ca.is_empty() {
             ssl_opts = ssl_opts.with_root_certs(vec![PathBuf::from(args.tls_ca.clone()).into()]);
@@ -339,21 +355,24 @@ mod tests {
     }
 
     #[test]
-    fn check_kafka_broker_available_rejects_sasl_without_tls_before_connecting() {
+    fn check_kafka_broker_available_accepts_sasl_without_tls_configuration() {
         let mut args = kafka_args();
         args.sasl_enable = true;
         args.sasl_username = "user".to_string();
         args.sasl_password = "secret".to_string();
 
-        let err = tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(check_kafka_broker_available(&args))
-            .expect_err("SASL without TLS should fail before opening a network connection");
+        assert!(args.validate().is_ok());
+        let security = args
+            .security_config(false)
+            .expect("valid SASL configuration")
+            .expect("SASL should configure security");
+        assert!(!security.tls_enabled());
 
-        match err {
-            TargetError::Configuration(msg) => assert!(msg.contains("requires tls_enable")),
-            other => panic!("expected configuration error, got {other:?}"),
-        }
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(check_kafka_broker_available(&args));
+
+        assert!(!matches!(result, Err(TargetError::Configuration(_))));
     }
 
     #[test]

@@ -27,9 +27,11 @@ pub enum GlobalError {
     #[error("Failed to set a global recorder: {0}")]
     SetRecorder(#[from] metrics::SetRecorderError<crate::Recorder>),
     #[error("Failed to set global guard: {0}")]
-    SetError(#[from] SetError<Arc<Mutex<OtelGuard>>>),
+    SetError(#[from] SetError<Arc<Mutex<Option<OtelGuard>>>>),
     #[error("Global guard not initialized")]
     NotInitialized,
+    #[error("Global guard lock poisoned: {0}")]
+    GuardPoisoned(&'static str),
     #[error("Global system metrics err: {0}")]
     MetricsError(String),
     #[error("Failed to get current PID: {0}")]
@@ -58,6 +60,18 @@ pub enum TelemetryError {
     BuildMetricExporter(String),
     #[error("Log exporter build failed: {0}")]
     BuildLogExporter(String),
+    #[error("RUSTFS_OBS_TLS_CA_FILE must be an absolute path")]
+    OtlpTlsCaPathNotAbsolute,
+    #[error("Failed to read RUSTFS_OBS_TLS_CA_FILE")]
+    OtlpTlsCaRead(#[source] std::io::Error),
+    #[error("RUSTFS_OBS_TLS_CA_FILE does not contain a PEM certificate")]
+    OtlpTlsCaEmpty,
+    #[error("RUSTFS_OBS_TLS_CA_FILE does not contain a valid PEM certificate")]
+    OtlpTlsCaInvalid,
+    #[error("Failed to parse RUSTFS_OBS_TLS_CA_FILE as a PEM certificate bundle")]
+    OtlpTlsCaParse(#[source] reqwest::Error),
+    #[error("Failed to build OTLP HTTP client")]
+    BuildOtlpHttpClient(#[source] reqwest::Error),
     #[error("Install metrics recorder failed: {0}")]
     InstallMetricsRecorder(String),
     #[error("Tracing subscriber init failed: {0}")]
@@ -66,6 +80,8 @@ pub enum TelemetryError {
     Io(String),
     #[error("Set permissions failed: {0}")]
     SetPermissions(String),
+    #[error("Log sink conflict: {0}")]
+    LogSinkConflict(String),
 }
 
 impl From<std::io::Error> for TelemetryError {

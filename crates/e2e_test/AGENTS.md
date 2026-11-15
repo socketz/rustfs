@@ -2,6 +2,8 @@
 
 Applies to `crates/e2e_test/`.
 
+Contributor guide (how to run suites, add a test, the harness/fixture inventory, `#[ignore]` classes, and the CI map) lives in [`README.md`](README.md). This file holds the crate rules that agents must follow.
+
 ## Test Reliability
 
 - Keep end-to-end tests deterministic and environment-aware.
@@ -22,5 +24,4 @@ Applies to `crates/e2e_test/`.
 
 ## Suggested Validation
 
-- `cargo test --package e2e_test`
-- Full gate before commit: `make pre-commit`
+- Use the build/run provenance wrapper and select the affected tests or matching nextest profile from [`README.md`](README.md#how-to-run). Keep build/run features aligned and add `--no-tests fail` to focused nextest commands; running the tests directly fails with a missing E2E run receipt.

@@ -14,19 +14,23 @@
 
 use super::iam_error::iam_error_to_s3_error;
 use crate::admin::access_key_identity;
-use crate::admin::handlers::site_replication::site_replication_iam_change_hook;
+use crate::admin::handlers::site_replication::{encode_service_account_replication_policy, site_replication_iam_change_hook};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::runtime_sources::current_action_credentials;
 use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use crate::{
-    admin::router::{AdminOperation, Operation, S3Router},
+    admin::router::{AdminOperation, S3Router},
     auth::check_key_valid,
 };
 use http::HeaderMap;
+use http::header::CONTENT_LENGTH;
+use http::header::CONTENT_TYPE;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_credentials::{Credentials as StoredCredentials, get_global_action_cred};
+use rustfs_credentials::Credentials as StoredCredentials;
 use rustfs_iam::error::{is_err_no_such_service_account, is_err_no_such_temp_account};
 use rustfs_iam::store::Store as IamStore;
 use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
@@ -37,10 +41,9 @@ use rustfs_madmin::{
     ServiceAccountInfo, TemporaryAccountInfoResp, UpdateServiceAccountReq,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_policy::policy::{Args, Policy};
-use s3s::S3ErrorCode::InvalidRequest;
-use s3s::header::CONTENT_LENGTH;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use rustfs_policy::policy::{Args, DEFAULT_VERSION, Policy, SVC_TARGET_USER};
+use rustfs_s3_types::{Body, S3ErrorCode::InvalidRequest};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
@@ -51,14 +54,55 @@ use url::form_urlencoded;
 const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_SERVICE_ACCOUNT: &str = "service_account";
 const EVENT_ADMIN_SERVICE_ACCOUNT_STATE: &str = "admin_service_account_state";
+const EMPTY_EXPLICIT_SERVICE_ACCOUNT_POLICY: &str =
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":["s3:*"],"Resource":["arn:aws:s3:::*"]}]}"#;
 
-fn sr_session_policy_from_value(value: Option<&serde_json::Value>) -> S3Result<SRSessionPolicy> {
-    let Some(value) = value else {
+fn sr_session_policy_from_policy(policy: Option<&Policy>) -> S3Result<SRSessionPolicy> {
+    let Some(policy) = policy else {
         return Ok(SRSessionPolicy::default());
     };
 
-    let raw = serde_json::to_string(value).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
+    let raw = serde_json::to_string(policy).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
     SRSessionPolicy::from_json(&raw).map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))
+}
+
+fn normalize_service_account_policy(mut policy: Policy) -> S3Result<Policy> {
+    if policy.statements.is_empty() && (!policy.id.is_empty() || !policy.version.is_empty()) {
+        let id = policy.id;
+        policy = Policy::parse_config(EMPTY_EXPLICIT_SERVICE_ACCOUNT_POLICY.as_bytes())
+            .map_err(|e| s3_error!(InternalError, "parse empty service account policy failed: {:?}", e))?;
+        policy.id = id;
+    } else if policy.version.is_empty() && !policy.statements.is_empty() {
+        policy.version = DEFAULT_VERSION.to_string();
+    }
+    Ok(policy)
+}
+
+fn parse_new_service_account_policy(policy: Option<&serde_json::Value>) -> S3Result<Option<Policy>> {
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+    let policy = normalize_service_account_policy(parse_service_account_policy(policy)?)?;
+    Ok((!policy.id.is_empty() || !policy.version.is_empty() || !policy.statements.is_empty()).then_some(policy))
+}
+
+/// Service accounts cannot delegate beyond their own lifetime. STS sessions
+/// retain the existing ability to create independently expiring service accounts.
+fn bounded_service_account_expiration(caller: &StoredCredentials, requested: Option<OffsetDateTime>) -> Option<OffsetDateTime> {
+    match caller.expiration.filter(|_| caller.is_service_account()) {
+        Some(limit) => Some(requested.map_or(limit, |expiration| expiration.min(limit))),
+        None => requested,
+    }
+}
+
+fn set_service_account_duration_condition(
+    conditions: &mut HashMap<String, Vec<String>>,
+    expiration: Option<OffsetDateTime>,
+    now: OffsetDateTime,
+) {
+    // An unlimited credential must not bypass a finite NumericGreaterThan Deny.
+    let seconds = expiration.map_or(i64::MAX, |expiration| (expiration - now).whole_seconds().max(0));
+    conditions.insert("DurationSeconds".to_string(), vec![seconds.to_string()]);
 }
 
 fn compat_time_sentinel() -> OffsetDateTime {
@@ -85,18 +129,6 @@ fn delete_service_account_success_status(path: &str) -> StatusCode {
     }
 }
 
-fn merge_derived_service_account_claims(
-    target_claims: &mut HashMap<String, serde_json::Value>,
-    source_claims: &HashMap<String, serde_json::Value>,
-) {
-    for (key, value) in source_claims {
-        if key == "exp" {
-            continue;
-        }
-        target_claims.insert(key.clone(), value.clone());
-    }
-}
-
 fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &str) -> bool {
     let caller_parent = if caller.parent_user.is_empty() {
         caller.access_key.as_str()
@@ -105,6 +137,37 @@ fn is_service_account_owner_of(caller: &StoredCredentials, target_parent_user: &
     };
 
     caller_parent == target_parent_user
+}
+
+/// Scope available with the base create permission. Creating for another local
+/// user requires separate authorization in IAM, even when the caller is owner.
+fn add_service_account_parent_within_scope(
+    root_access_key: &str,
+    target_user: &str,
+    req_user: &str,
+    req_parent_user: &str,
+    owner: bool,
+) -> bool {
+    let effective_parent = if target_user == req_user {
+        req_parent_user
+    } else {
+        target_user
+    };
+    owner || (effective_parent != root_access_key && (target_user == req_user || target_user == req_parent_user))
+}
+
+/// Fail-closed ownership check used by DeleteServiceAccount for a caller that
+/// lacks the RemoveServiceAccount admin action.
+///
+/// Returns `true` only when the target service account was successfully loaded
+/// AND is owned by the caller. A `None` target — meaning `get_service_account`
+/// failed with a non-not-found error (e.g. a stored-credential decode error) so
+/// ownership could not be verified — denies, as does an owner mismatch. The
+/// previous `svc_account.is_some_and(|v| v.parent_user != user)` form returned
+/// `false` for a `None` target and thus fell through to the delete, an authz
+/// bypass (backlog#806).
+fn non_admin_may_delete_service_account(caller_user: &str, target_parent_user: Option<&str>) -> bool {
+    matches!(target_parent_user, Some(parent) if parent == caller_user)
 }
 
 fn map_service_account_lookup_error(err: rustfs_iam::error::Error, action: &str) -> S3Error {
@@ -178,6 +241,27 @@ fn parse_update_service_account_policy(new_policy: Option<serde_json::Value>) ->
     Ok(Some(parse_service_account_policy(&policy)?))
 }
 
+fn service_account_update_replication_change(
+    access_key: &str,
+    update: &UpdateServiceAccountReq,
+    session_policy: Option<&Policy>,
+) -> S3Result<SRSvcAccChange> {
+    Ok(SRSvcAccChange {
+        update: Some(SRSvcAccUpdate {
+            access_key: access_key.to_string(),
+            secret_key: update.new_secret_key.clone().unwrap_or_default(),
+            status: update.new_status.clone().unwrap_or_default(),
+            name: update.new_name.clone().unwrap_or_default(),
+            description: update.new_description.clone().unwrap_or_default(),
+            session_policy: sr_session_policy_from_policy(session_policy)?,
+            expiration: update.new_expiration,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        }),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    })
+}
+
 pub fn register_service_account_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
         Method::POST,
@@ -237,179 +321,52 @@ pub fn register_service_account_route(r: &mut S3Router<AdminOperation>) -> std::
     Ok(())
 }
 
-pub struct AddServiceAccount {}
-#[async_trait::async_trait]
-impl Operation for AddServiceAccount {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(req_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
+fn map_service_account_create_error(error: rustfs_iam::error::Error) -> S3Error {
+    match error {
+        rustfs_iam::error::Error::NoSuchUser(_) => s3_error!(InvalidRequest, "target user not exist"),
+        rustfs_iam::error::Error::InvalidArgument
+        | rustfs_iam::error::Error::InvalidAccessKeyLength
+        | rustfs_iam::error::Error::InvalidSecretKeyLength
+        | rustfs_iam::error::Error::AccessKeyAlreadyExists => iam_error_to_s3_error(error),
+        rustfs_iam::error::Error::IAMActionNotAllowed => s3_error!(AccessDenied, "access denied"),
+        _ => s3_error!(InternalError, "create service account failed"),
+    }
+}
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &req_cred.access_key).await?;
+// The Admin operation owns the local write and site notification together.
+// A disconnected requester can stop waiting without splitting those effects.
+async fn create_and_replicate_service_account<R: Future<Output = S3Result<()>> + Send>(
+    create: impl Future<Output = S3Result<(StoredCredentials, OffsetDateTime, HashMap<String, serde_json::Value>)>> + Send + 'static,
+    replication_policy: Option<String>,
+    replication_expiration: Option<OffsetDateTime>,
+    replicate: impl FnOnce(SRIAMItem) -> R + Send + 'static,
+) -> S3Result<StoredCredentials> {
+    super::supervise_admin_mutation("service account creation", async move {
+        let (new_cred, updated_at, replication_claims) = create.await?;
+        let (replication_session_policy, oidc_service_account_envelope) =
+            encode_service_account_replication_policy(&replication_claims, replication_policy.as_deref())?;
 
-        let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await?;
-
-        let create_req: AddServiceAccountReq =
-            serde_json::from_slice(&body[..]).map_err(|e| s3_error!(InvalidRequest, "unmarshal body failed, e: {:?}", e))?;
-
-        // create_req.expiration = create_req.expiration.and_then(|expire| expire.replace_millisecond(0).ok());
-
-        if has_space_be(&create_req.access_key) {
-            return Err(s3_error!(InvalidRequest, "access key has spaces"));
-        }
-
-        create_req.validate().map_err(|e| S3Error::with_message(InvalidRequest, e))?;
-
-        let session_policy = if let Some(policy) = &create_req.policy {
-            Some(parse_service_account_policy(policy)?)
-        } else {
-            None
-        };
-
-        let Some(sys_cred) = get_global_action_cred() else {
-            return Err(s3_error!(InvalidRequest, "get sys cred failed"));
-        };
-
-        if constant_time_eq(&sys_cred.access_key, &create_req.access_key) {
-            return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
-        }
-
-        let mut target_user = if let Some(u) = create_req.target_user {
-            u
-        } else {
-            cred.access_key.clone()
-        };
-
-        let req_user = cred.access_key.clone();
-        let mut req_parent_user = cred.access_key.clone();
-        let req_groups = cred.groups.clone();
-        let mut req_is_derived_cred = false;
-
-        if cred.is_service_account() || cred.is_temp() {
-            req_parent_user = cred.parent_user.clone();
-            req_is_derived_cred = true;
-        }
-
-        let Ok(iam_store) = rustfs_iam::get() else {
-            return Err(s3_error!(InvalidRequest, "iam not init"));
-        };
-
-        if !iam_store
-            .is_allowed(&Args {
-                account: &cred.access_key,
-                groups: &cred.groups,
-                action: Action::AdminAction(AdminAction::CreateServiceAccountAdminAction),
-                bucket: "",
-                conditions: &get_condition_values(
-                    &req.headers,
-                    &cred,
-                    None,
-                    None,
-                    req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-                ),
-                is_owner: owner,
-                object: "",
-                claims: cred.claims_or_empty(),
-                deny_only: false, // Always require explicit Allow permission
-            })
-            .await
-        {
-            return Err(s3_error!(AccessDenied, "access denied"));
-        }
-
-        if target_user != cred.access_key {
-            let has_user = iam_store.get_user(&target_user).await;
-            if has_user.is_none() && target_user != sys_cred.access_key {
-                return Err(s3_error!(InvalidRequest, "target user not exist"));
-            }
-        }
-
-        let is_svc_acc = target_user == req_user || target_user == req_parent_user;
-
-        let mut target_groups = None;
-        let mut opts = NewServiceAccountOpts {
-            access_key: create_req.access_key,
-            secret_key: create_req.secret_key,
-            name: create_req.name,
-            description: create_req.description.or(create_req.comment),
-            expiration: create_req.expiration,
-            session_policy,
-            ..Default::default()
-        };
-
-        if is_svc_acc {
-            if req_is_derived_cred {
-                if req_parent_user.is_empty() {
-                    return Err(s3_error!(AccessDenied, "only derived cred can create service account"));
-                }
-                target_user = req_parent_user;
-            }
-
-            target_groups = req_groups;
-
-            if let Some(claims) = cred.claims {
-                if opts.claims.is_none() {
-                    opts.claims = Some(HashMap::new());
-                }
-
-                merge_derived_service_account_claims(opts.claims.as_mut().unwrap(), &claims);
-            }
-        }
-
-        let replication_claims = opts.claims.clone().unwrap_or_default();
-        let replication_policy = create_req
-            .policy
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
-        let replication_groups = target_groups.clone().unwrap_or_default();
-        let replication_name = opts.name.clone().unwrap_or_default();
-        let replication_description = opts.description.clone().unwrap_or_default();
-        let replication_expiration = opts.expiration;
-
-        let (new_cred, _) = iam_store
-            .new_service_account(&target_user, target_groups, opts)
-            .await
-            .map_err(|e| {
-                debug!(
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
-                    event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
-                    target_user = %target_user,
-                    result = "create_failed",
-                    error = ?e,
-                    "admin service account state"
-                );
-                s3_error!(InternalError, "create service account failed, e: {:?}", e)
-            })?;
-
-        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+        if let Err(err) = replicate(SRIAMItem {
             r#type: "service-account".to_string(),
             svc_acc_change: Some(SRSvcAccChange {
                 create: Some(SRSvcAccCreate {
-                    parent: target_user.clone(),
+                    parent: new_cred.parent_user.clone(),
                     access_key: new_cred.access_key.clone(),
                     secret_key: new_cred.secret_key.clone(),
-                    groups: replication_groups,
+                    groups: new_cred.groups.clone().unwrap_or_default(),
                     claims: replication_claims,
-                    session_policy: replication_policy
-                        .as_deref()
-                        .map(SRSessionPolicy::from_json)
-                        .transpose()
-                        .map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?
-                        .unwrap_or_default(),
+                    session_policy: replication_session_policy,
                     status: String::new(),
-                    name: replication_name,
-                    description: replication_description,
+                    name: new_cred.name.clone().unwrap_or_default(),
+                    description: new_cred.description.clone().unwrap_or_default(),
                     expiration: replication_expiration,
                     api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 }),
+                oidc_service_account_envelope,
                 api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 ..Default::default()
             }),
-            updated_at: Some(OffsetDateTime::now_utc()),
+            updated_at: Some(updated_at),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
             ..Default::default()
         })
@@ -426,6 +383,154 @@ impl Operation for AddServiceAccount {
                 "admin service account state"
             );
         }
+        Ok(new_cred)
+    })
+    .await
+}
+
+pub struct AddServiceAccount {}
+#[async_trait::async_trait]
+impl Operation for AddServiceAccount {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(req_cred) = req.credentials() else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), req_cred.access_key()).await?;
+
+        if !req_cred.secret_key_matches(&cred.secret_key) {
+            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "access denied"));
+        }
+
+        let body =
+            read_compatible_admin_body(req.take_body(), MAX_ADMIN_REQUEST_BODY_SIZE, req.uri().path(), &cred.secret_key).await?;
+
+        let mut create_req: AddServiceAccountReq =
+            serde_json::from_slice(&body[..]).map_err(|e| s3_error!(InvalidRequest, "unmarshal body failed, e: {:?}", e))?;
+
+        // create_req.expiration = create_req.expiration.and_then(|expire| expire.replace_millisecond(0).ok());
+
+        if has_space_be(&create_req.access_key) {
+            return Err(s3_error!(InvalidRequest, "access key has spaces"));
+        }
+
+        create_req.validate().map_err(|e| S3Error::with_message(InvalidRequest, e))?;
+
+        let session_policy = parse_new_service_account_policy(create_req.policy.as_ref())?;
+        let replication_policy = session_policy
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| s3_error!(InvalidArgument, "marshal policy failed: {:?}", e))?;
+
+        let Some(sys_cred) = current_action_credentials() else {
+            return Err(s3_error!(InvalidRequest, "get sys cred failed"));
+        };
+
+        if constant_time_eq(&sys_cred.access_key, &create_req.access_key) {
+            return Err(s3_error!(InvalidArgument, "can't create user with system access key"));
+        }
+
+        let requested_user = create_req.target_user.as_deref().unwrap_or(&cred.access_key);
+        let derived = cred.is_service_account() || cred.is_temp();
+        let caller_parent = if derived { &cred.parent_user } else { &cred.access_key };
+        let self_scoped = requested_user == cred.access_key || requested_user == caller_parent;
+        let target_user = if self_scoped { caller_parent.as_str() } else { requested_user };
+        if target_user.is_empty() {
+            return Err(s3_error!(AccessDenied, "service account requires a parent"));
+        }
+
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
+            return Err(s3_error!(InvalidRequest, "iam not init"));
+        };
+
+        create_req.expiration = bounded_service_account_expiration(&cred, create_req.expiration);
+        let mut conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
+        set_service_account_duration_condition(&mut conditions, create_req.expiration, OffsetDateTime::now_utc());
+
+        // The policy and the write must see the same resolved parent, including
+        // when a derived credential names itself. OPA receives this map too.
+        conditions.retain(|key, _| !key.eq_ignore_ascii_case(SVC_TARGET_USER));
+        conditions.insert(SVC_TARGET_USER.to_owned(), vec![target_user.to_owned()]);
+        if self_scoped {
+            if !iam_store
+                .is_allowed(&Args {
+                    account: &cred.access_key,
+                    groups: &cred.groups,
+                    action: Action::AdminAction(AdminAction::CreateServiceAccountAdminAction),
+                    bucket: "",
+                    conditions: &conditions,
+                    is_owner: owner,
+                    object: "",
+                    claims: cred.claims_or_empty(),
+                    deny_only: false,
+                })
+                .await
+            {
+                return Err(s3_error!(AccessDenied, "access denied"));
+            }
+            if !add_service_account_parent_within_scope(
+                &sys_cred.access_key,
+                requested_user,
+                &cred.access_key,
+                caller_parent,
+                owner,
+            ) {
+                return Err(s3_error!(AccessDenied, "service account parent is outside requester scope"));
+            }
+            if requested_user != cred.access_key
+                && requested_user != sys_cred.access_key
+                && iam_store.get_user(requested_user).await.is_none()
+            {
+                return Err(s3_error!(InvalidRequest, "target user not exist"));
+            }
+        }
+
+        let target_groups = if self_scoped { cred.groups.clone() } else { None };
+        let opts = NewServiceAccountOpts {
+            access_key: create_req.access_key,
+            secret_key: create_req.secret_key,
+            name: create_req.name,
+            description: create_req.description.or(create_req.comment),
+            expiration: create_req.expiration,
+            session_policy,
+            ..Default::default()
+        };
+
+        let target_user = target_user.to_owned();
+        let response_secret = cred.secret_key.clone();
+        let replication_expiration = opts.expiration;
+        let create = async move {
+            let create_result = if self_scoped {
+                iam_store
+                    .new_service_account_from_caller(&target_user, target_groups, opts, &cred)
+                    .await
+            } else {
+                iam_store
+                    .new_service_account_for_user(&target_user, opts, &cred, &conditions, owner)
+                    .await
+            };
+            create_result.map_err(|e| {
+                debug!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                    event = EVENT_ADMIN_SERVICE_ACCOUNT_STATE,
+                    target_user = %target_user,
+                    result = "create_failed",
+                    error = ?e,
+                    "admin service account state"
+                );
+                map_service_account_create_error(e)
+            })
+        };
+        let new_cred = create_and_replicate_service_account(
+            create,
+            replication_policy,
+            replication_expiration,
+            site_replication_iam_change_hook,
+        )
+        .await?;
 
         let resp = AddServiceAccountResp {
             credentials: Credentials {
@@ -437,12 +542,12 @@ impl Operation for AddServiceAccount {
         };
 
         let body = serde_json::to_vec(&resp).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
-        let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
+        let (body, content_type) = encode_compatible_admin_payload(req.uri().path(), &response_secret, body)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), header))
     }
 }
 
@@ -491,9 +596,9 @@ async fn build_info_service_account_resp<T: IamStore>(
 pub struct UpdateServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for UpdateServiceAccount {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AccessKeyQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
                 input
@@ -508,11 +613,15 @@ impl Operation for UpdateServiceAccount {
 
         let access_key = query.access_key;
 
-        let Some(input_cred) = req.credentials else {
+        let input = req.take_body();
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let (cred, owner) =
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
+
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -521,17 +630,28 @@ impl Operation for UpdateServiceAccount {
         //     s3_error!(InternalError, "get service account failed")
         // })?;
 
-        let body =
-            read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), input_cred.secret_key.expose())
-                .await?;
+        let body = read_compatible_admin_body(input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri().path(), &cred.secret_key).await?;
 
-        let update_req: UpdateServiceAccountReq =
+        let mut update_req: UpdateServiceAccountReq =
             serde_json::from_slice(&body[..]).map_err(|e| s3_error!(InvalidRequest, "unmarshal body failed, e: {:?}", e))?;
 
         update_req.validate().map_err(|e| S3Error::with_message(InvalidRequest, e))?;
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        // Keep lookup errors behind authorization even though lifetime conditions
+        // need the existing expiration when the request omits it.
+        let existing_account = iam_store.get_service_account(&access_key).await;
+
+        if update_req.new_expiration.is_some() {
+            update_req.new_expiration = bounded_service_account_expiration(&cred, update_req.new_expiration);
+        }
+        let mut conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
+        set_service_account_duration_condition(
+            &mut conditions,
+            update_req
+                .new_expiration
+                .or_else(|| existing_account.as_ref().ok().and_then(|(account, _)| account.expiration)),
+            OffsetDateTime::now_utc(),
+        );
 
         if !iam_store
             .is_allowed(&Args {
@@ -539,13 +659,7 @@ impl Operation for UpdateServiceAccount {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::UpdateServiceAccountAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(
-                    &req.headers,
-                    &cred,
-                    None,
-                    None,
-                    req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-                ),
+                conditions: &conditions,
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
@@ -556,12 +670,11 @@ impl Operation for UpdateServiceAccount {
             return Err(s3_error!(AccessDenied, "access denied"));
         }
 
-        let (svc_account, _) = iam_store
-            .get_service_account(&access_key)
-            .await
-            .map_err(|e| map_service_account_lookup_error(e, "get service account failed"))?;
+        let (svc_account, _) = existing_account.map_err(|e| map_service_account_lookup_error(e, "get service account failed"))?;
 
-        if !is_service_account_owner_of(&cred, &svc_account.parent_user) {
+        // The admin action permits updates within a caller's scope; only an
+        // owner may cross service-account parent boundaries.
+        if !owner && !is_service_account_owner_of(&cred, &svc_account.parent_user) {
             return Err(s3_error!(AccessDenied, "access denied"));
         }
 
@@ -573,6 +686,7 @@ impl Operation for UpdateServiceAccount {
         let new_policy = update_req.new_policy.clone();
 
         let sp = parse_update_service_account_policy(new_policy.clone())?;
+        let svc_acc_change = service_account_update_replication_change(&access_key, &update_req, sp.as_ref())?;
 
         let opts = UpdateServiceAccountOpts {
             secret_key: new_secret_key.clone(),
@@ -581,6 +695,8 @@ impl Operation for UpdateServiceAccount {
             description: new_description.clone(),
             expiration: new_expiration,
             session_policy: sp,
+            parent_user: None,
+            allow_site_replicator_account: false,
         };
 
         let updated_at = iam_store
@@ -590,20 +706,7 @@ impl Operation for UpdateServiceAccount {
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
             r#type: "service-account".to_string(),
-            svc_acc_change: Some(SRSvcAccChange {
-                update: Some(SRSvcAccUpdate {
-                    access_key: access_key.clone(),
-                    secret_key: new_secret_key.unwrap_or_default(),
-                    status: new_status.unwrap_or_default(),
-                    name: new_name.unwrap_or_default(),
-                    description: new_description.unwrap_or_default(),
-                    session_policy: sr_session_policy_from_value(new_policy.as_ref())?,
-                    expiration: new_expiration,
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                }),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                ..Default::default()
-            }),
+            svc_acc_change: Some(svc_acc_change),
             updated_at: Some(updated_at),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
             ..Default::default()
@@ -614,18 +717,18 @@ impl Operation for UpdateServiceAccount {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
-        Ok(S3Response::with_headers((StatusCode::NO_CONTENT, Body::empty()), header))
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
+        Ok(AdminResponse::with_headers(StatusCode::NO_CONTENT, Body::empty(), header))
     }
 }
 
 pub struct InfoServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for InfoServiceAccount {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AccessKeyQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
                 input
@@ -640,21 +743,21 @@ impl Operation for InfoServiceAccount {
 
         let access_key = query.access_key;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
+
+        let Some(input_cred) = req.credentials() else {
+            return Err(s3_error!(InvalidRequest, "get cred failed"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
         let (svc_account, session_policy) = iam_store
             .get_service_account(&access_key)
             .await
             .map_err(|e| map_service_account_lookup_error(e, "get service account failed"))?;
-
-        let Some(input_cred) = req.credentials else {
-            return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
         if !iam_store
             .is_allowed(&Args {
@@ -662,13 +765,7 @@ impl Operation for InfoServiceAccount {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(
-                    &req.headers,
-                    &cred,
-                    None,
-                    None,
-                    req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-                ),
+                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
@@ -683,21 +780,21 @@ impl Operation for InfoServiceAccount {
         let resp = build_info_service_account_resp(&iam_store, &svc_account, session_policy).await?;
 
         let body = serde_json::to_vec(&resp).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
-        let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
+        let (body, content_type) = encode_compatible_admin_payload(req.uri().path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), header))
     }
 }
 
 pub struct TemporaryAccountInfo {}
 #[async_trait::async_trait]
 impl Operation for TemporaryAccountInfo {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AccessKeyQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
                 input
@@ -710,14 +807,14 @@ impl Operation for TemporaryAccountInfo {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -727,13 +824,7 @@ impl Operation for TemporaryAccountInfo {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::ListTemporaryAccountsAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(
-                    &req.headers,
-                    &cred,
-                    None,
-                    None,
-                    req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-                ),
+                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
@@ -751,21 +842,21 @@ impl Operation for TemporaryAccountInfo {
 
         let resp: TemporaryAccountInfoResp = build_info_service_account_resp(&iam_store, &temp_account, session_policy).await?;
         let body = serde_json::to_vec(&resp).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
-        let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
+        let (body, content_type) = encode_compatible_admin_payload(req.uri().path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), header))
     }
 }
 
 pub struct InfoAccessKey {}
 #[async_trait::async_trait]
 impl Operation for InfoAccessKey {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AccessKeyQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "get body failed1"))?;
                 input
@@ -774,12 +865,12 @@ impl Operation for InfoAccessKey {
             }
         };
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
         let access_key = if query.access_key.is_empty() {
             cred.access_key.clone()
@@ -787,19 +878,13 @@ impl Operation for InfoAccessKey {
             query.access_key
         };
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
         let target_cred = iam_store.get_user(&access_key).await.map(|identity| identity.credentials);
 
-        let conditions = get_condition_values(
-            &req.headers,
-            &cred,
-            None,
-            None,
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        );
+        let conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
         let claims = cred.claims_or_empty();
 
         if !iam_store
@@ -849,12 +934,12 @@ impl Operation for InfoAccessKey {
         let resp = access_key_identity::resolve_info_access_key_resp(&iam_store, access_key, target_cred).await?;
 
         let body = serde_json::to_vec(&resp).map_err(|e| s3_error!(InternalError, "marshal body failed, e: {:?}", e))?;
-        let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
+        let (body, content_type) = encode_compatible_admin_payload(req.uri().path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), header))
     }
 }
 
@@ -866,9 +951,9 @@ pub struct ListServiceAccountQuery {
 pub struct ListServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for ListServiceAccount {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: ListServiceAccountQuery = from_bytes(query.as_bytes())
                     .map_err(|_e| s3_error!(InvalidArgument, "invalid service account query parameters"))?;
                 input
@@ -877,12 +962,12 @@ impl Operation for ListServiceAccount {
             }
         };
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key)
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key())
                 .await
                 .map_err(|e| {
                     debug!(
@@ -910,7 +995,7 @@ impl Operation for ListServiceAccount {
         //     cred.parent_user
         // };
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -923,13 +1008,7 @@ impl Operation for ListServiceAccount {
                     groups: &cred.groups,
                     action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
                     bucket: "",
-                    conditions: &get_condition_values(
-                        &req.headers,
-                        &cred,
-                        None,
-                        None,
-                        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-                    ),
+                    conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
                     is_owner: owner,
                     object: "",
                     claims: cred.claims_or_empty(),
@@ -969,18 +1048,18 @@ impl Operation for ListServiceAccount {
                 access_key: sa.access_key,
                 name: sa.name,
                 description: sa.description,
-                expiration: expiration_for_admin_path(req.uri.path(), sa.expiration),
+                expiration: expiration_for_admin_path(req.uri().path(), sa.expiration),
             })
             .collect();
 
         let data = serde_json::to_vec(&ListServiceAccountsResp { accounts })
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal users err {e}")))?;
-        let (data, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, data)?;
+        let (data, content_type) = encode_compatible_admin_payload(req.uri().path(), &cred.secret_key, data)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
@@ -1033,21 +1112,21 @@ fn parse_list_access_keys_query(query: Option<&str>) -> ListAccessKeysQuery {
 pub struct ListAccessKeysBulk {}
 #[async_trait::async_trait]
 impl Operation for ListAccessKeysBulk {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let query = { parse_list_access_keys_query(req.uri.query()) };
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let query = { parse_list_access_keys_query(req.uri().query()) };
 
         if query.all && !query.users.is_empty() {
             return Err(s3_error!(InvalidRequest, "either specify users or all, not both"));
         }
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -1067,13 +1146,7 @@ impl Operation for ListAccessKeysBulk {
                     groups: &cred.groups,
                     action: Action::AdminAction(AdminAction::ListUsersAdminAction),
                     bucket: "",
-                    conditions: &get_condition_values(
-                        &req.headers,
-                        &cred,
-                        None,
-                        None,
-                        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-                    ),
+                    conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
                     is_owner: owner,
                     object: "",
                     claims: cred.claims_or_empty(),
@@ -1090,13 +1163,7 @@ impl Operation for ListAccessKeysBulk {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::ListServiceAccountsAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(
-                    &req.headers,
-                    &cred,
-                    None,
-                    None,
-                    req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-                ),
+                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
@@ -1119,7 +1186,7 @@ impl Operation for ListAccessKeysBulk {
                 .into_keys()
                 .collect::<Vec<_>>();
 
-            if let Some(sys_cred) = get_global_action_cred() {
+            if let Some(sys_cred) = current_action_credentials() {
                 users.push(sys_cred.access_key);
             }
             users
@@ -1160,7 +1227,7 @@ impl Operation for ListAccessKeysBulk {
                     .map(|sts| {
                         access_key_identity::list_entry_from_credentials(
                             &sts,
-                            expiration_for_admin_path(req.uri.path(), sts.expiration),
+                            expiration_for_admin_path(req.uri().path(), sts.expiration),
                         )
                     })
                     .collect();
@@ -1189,7 +1256,7 @@ impl Operation for ListAccessKeysBulk {
                     .map(|svc| {
                         access_key_identity::list_entry_from_credentials(
                             &svc,
-                            expiration_for_admin_path(req.uri.path(), svc.expiration),
+                            expiration_for_admin_path(req.uri().path(), svc.expiration),
                         )
                     })
                     .collect();
@@ -1204,25 +1271,25 @@ impl Operation for ListAccessKeysBulk {
 
         let data = serde_json::to_vec(&access_key_map)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal access keys err {e}")))?;
-        let (data, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, data)?;
+        let (data, content_type) = encode_compatible_admin_payload(req.uri().path(), &cred.secret_key, data)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(data), header))
     }
 }
 
 pub struct DeleteServiceAccount {}
 #[async_trait::async_trait]
 impl Operation for DeleteServiceAccount {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
+        let Some(input_cred) = req.credentials() else {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
         let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key)
+            check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key())
                 .await
                 .map_err(|e| {
                     debug!(
@@ -1237,7 +1304,7 @@ impl Operation for DeleteServiceAccount {
                 })?;
 
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: AccessKeyQuery = from_bytes(query.as_bytes())
                     .map_err(|_e| s3_error!(InvalidArgument, "invalid access key query parameters"))?;
                 input
@@ -1250,7 +1317,7 @@ impl Operation for DeleteServiceAccount {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -1271,13 +1338,7 @@ impl Operation for DeleteServiceAccount {
                 groups: &cred.groups,
                 action: Action::AdminAction(AdminAction::RemoveServiceAccountAdminAction),
                 bucket: "",
-                conditions: &get_condition_values(
-                    &req.headers,
-                    &cred,
-                    None,
-                    None,
-                    req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-                ),
+                conditions: &get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr()),
                 is_owner: owner,
                 object: "",
                 claims: cred.claims_or_empty(),
@@ -1286,43 +1347,55 @@ impl Operation for DeleteServiceAccount {
             .await
         {
             let user = if cred.parent_user.is_empty() {
-                &cred.access_key
+                cred.access_key.as_str()
             } else {
-                &cred.parent_user
+                cred.parent_user.as_str()
             };
 
-            if svc_account.is_some_and(|v| &v.parent_user != user) {
+            // Fail closed: a caller without the RemoveServiceAccount admin action
+            // may only delete a service account it OWNS. If the target could not be
+            // loaded (svc_account is None because get_service_account failed with a
+            // non-not-found error — e.g. a credential decode error), ownership cannot
+            // be verified, so deny rather than fall through to the delete. The
+            // previous `is_some_and(parent != user)` form skipped the guard on a
+            // None target, an authz bypass (backlog#806).
+            let target_parent = svc_account.as_ref().map(|v| v.parent_user.as_str());
+            if !non_admin_may_delete_service_account(user, target_parent) {
                 return Err(s3_error!(InvalidRequest, "service account not exist"));
             }
         }
 
-        iam_store.delete_service_account(&query.access_key, true).await.map_err(|e| {
-            debug!(
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
-                event = "service_account_delete_failed",
-                access_key = %query.access_key,
-                error = ?e,
-                "Failed to delete service account"
-            );
-            s3_error!(InternalError, "delete service account failed")
-        })?;
+        let deleted_at = iam_store
+            .delete_service_account_with_revision(&query.access_key, true)
+            .await
+            .map_err(|e| {
+                debug!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SERVICE_ACCOUNT,
+                    event = "service_account_delete_failed",
+                    access_key = %query.access_key,
+                    error = ?e,
+                    "Failed to delete service account"
+                );
+                s3_error!(InternalError, "delete service account failed")
+            })?;
 
-        if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
-            r#type: "service-account".to_string(),
-            svc_acc_change: Some(SRSvcAccChange {
-                delete: Some(SRSvcAccDelete {
-                    access_key: query.access_key.clone(),
+        if let Some(deleted_at) = deleted_at
+            && let Err(err) = site_replication_iam_change_hook(SRIAMItem {
+                r#type: "service-account".to_string(),
+                svc_acc_change: Some(SRSvcAccChange {
+                    delete: Some(SRSvcAccDelete {
+                        access_key: query.access_key.clone(),
+                        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    }),
                     api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    ..Default::default()
                 }),
+                updated_at: Some(deleted_at),
                 api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 ..Default::default()
-            }),
-            updated_at: Some(OffsetDateTime::now_utc()),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        })
-        .await
+            })
+            .await
         {
             warn!(
                 component = LOG_COMPONENT_ADMIN,
@@ -1337,10 +1410,11 @@ impl Operation for DeleteServiceAccount {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
-        Ok(S3Response::with_headers(
-            (delete_service_account_success_status(req.uri.path()), Body::empty()),
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
+        Ok(AdminResponse::with_headers(
+            delete_service_account_success_status(req.uri().path()),
+            Body::empty(),
             header,
         ))
     }
@@ -1354,9 +1428,269 @@ mod tests {
     use serde_urlencoded::from_bytes;
 
     #[test]
+    #[serial_test::serial]
+    fn service_account_handlers_authenticate_before_decryption_or_lookup() {
+        crate::app::gating_test_env::run_large_stack_test("service-account-auth-first", || async {
+            use crate::admin::runtime_sources::IamInterface;
+            use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
+            use rustfs_iam::store::object::ObjectStore;
+            use std::sync::Arc;
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<ObjectStore>> {
+                    self.0.clone()
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+            let (_directory, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            ObjectStore::new(store.clone())
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("initialize IAM storage");
+            let iam = rustfs_iam::build_iam_sys(store.clone()).await.expect("initialized IAM");
+            let disabled_key = format!("disabled-{}", uuid::Uuid::new_v4());
+            iam.create_user(
+                &disabled_key,
+                &rustfs_madmin::AddOrUpdateUserReq {
+                    secret_key: "disabled-user-secret".to_owned(),
+                    policy: None,
+                    status: rustfs_madmin::AccountStatus::Disabled,
+                },
+            )
+            .await
+            .expect("create disabled IAM caller");
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), ambient.kms()));
+            assert!(context.publish_action_credentials(StoredCredentials {
+                access_key: "auth-first-root".to_owned(),
+                secret_key: "auth-first-root-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+            for caller in ["keystone:forged", disabled_key.as_str()] {
+                for operation in ["update-service-account", "info-service-account"] {
+                    let method = if operation == "update-service-account" {
+                        http::Method::POST
+                    } else {
+                        http::Method::GET
+                    };
+                    let req = crate::admin::operation::test_support::TestRequest::new(
+                        method,
+                        format!("/minio/admin/v3/{operation}?accessKey=missing-target").as_str(),
+                    )
+                    .credentials(caller, "disabled-user-secret", None)
+                    .body(vec![0u8; 64])
+                    .build();
+                    let result = if operation == "update-service-account" {
+                        UpdateServiceAccount {}.call(req, Params::new()).await
+                    } else {
+                        InfoServiceAccount {}.call(req, Params::new()).await
+                    };
+                    assert_eq!(
+                        result
+                            .expect_err("invalid identity precedes KDF and missing target lookup")
+                            .code(),
+                        &S3ErrorCode::InvalidAccessKeyId,
+                        "{caller}: {operation}"
+                    );
+                }
+            }
+            publish_test_app_context(ambient);
+        });
+    }
+
+    #[test]
     fn access_key_query_supports_external_alias() {
         let query: AccessKeyQuery = from_bytes(b"access-key=test-access-key").expect("parse query");
         assert_eq!(query.access_key, "test-access-key");
+    }
+
+    #[test]
+    fn service_account_cannot_delegate_a_longer_lifetime() {
+        let deadline = OffsetDateTime::UNIX_EPOCH + time::Duration::days(10);
+        let earlier = deadline - time::Duration::hours(1);
+        let later = deadline + time::Duration::days(365);
+        let mut caller = StoredCredentials {
+            access_key: "expiring-service".to_string(),
+            parent_user: "parent".to_string(),
+            expiration: Some(deadline),
+            claims: Some(HashMap::from([("sa-policy".to_string(), json!("inherited-policy"))])),
+            ..Default::default()
+        };
+        assert_eq!(bounded_service_account_expiration(&caller, None), Some(deadline));
+        assert_eq!(bounded_service_account_expiration(&caller, Some(later)), Some(deadline));
+        assert_eq!(bounded_service_account_expiration(&caller, Some(earlier)), Some(earlier));
+        caller.expiration = None;
+        assert_eq!(bounded_service_account_expiration(&caller, None), None);
+        caller.expiration = Some(deadline);
+        caller.claims = None;
+        caller.session_token = "signed-sts".to_string();
+        assert_eq!(
+            bounded_service_account_expiration(&caller, None),
+            None,
+            "STS retains independent service lifetime"
+        );
+        assert_eq!(bounded_service_account_expiration(&caller, Some(later)), Some(later));
+    }
+
+    #[tokio::test]
+    async fn service_account_duration_condition_enforces_finite_and_unlimited_lifetimes() {
+        let policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["admin:CreateServiceAccount","admin:UpdateServiceAccount"],"Resource":"*"},
+            {"Effect":"Deny","Action":["admin:CreateServiceAccount","admin:UpdateServiceAccount"],"Resource":"*",
+             "Condition":{"NumericGreaterThan":{"svc:DurationSeconds":"3600"}}}
+        ]}"#,
+        )
+        .expect("service lifetime policy");
+        let now = OffsetDateTime::UNIX_EPOCH;
+        for (expiration, allowed) in [
+            (Some(now + time::Duration::seconds(3600)), true),
+            (Some(now + time::Duration::seconds(3601)), false),
+            (None, false),
+        ] {
+            let mut conditions = HashMap::from([("DurationSeconds".to_string(), vec!["1".to_string()])]);
+            set_service_account_duration_condition(&mut conditions, expiration, now);
+            for action in [
+                AdminAction::CreateServiceAccountAdminAction,
+                AdminAction::UpdateServiceAccountAdminAction,
+            ] {
+                assert_eq!(
+                    policy
+                        .is_allowed(&Args {
+                            account: "user",
+                            groups: &None,
+                            action: Action::AdminAction(action),
+                            conditions: &conditions,
+                            is_owner: false,
+                            claims: &HashMap::new(),
+                            deny_only: false,
+                            bucket: "",
+                            object: "",
+                        })
+                        .await,
+                    allowed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_admin_delete_is_fail_closed_on_unloadable_target() {
+        // Regression (backlog#806): a non-admin caller may delete ONLY a service
+        // account it owns; a None target (get_service_account failed to load /
+        // decode) must DENY, not fall through to the delete.
+        assert!(
+            non_admin_may_delete_service_account("alice", Some("alice")),
+            "owner may delete own service account"
+        );
+        assert!(!non_admin_may_delete_service_account("alice", Some("bob")), "non-owner must be denied");
+        assert!(
+            !non_admin_may_delete_service_account("alice", None),
+            "unloadable target (None) must be denied (fail-closed), not bypass the owner check"
+        );
+        assert!(
+            !non_admin_may_delete_service_account("", None),
+            "empty caller + unloadable target must still deny"
+        );
+    }
+
+    #[test]
+    fn ghsa_5354_non_owner_service_account_parent_confined_to_scope() {
+        // Regression (GHSA-5354): a caller holding CreateServiceAccountAdminAction
+        // but resolving to owner=false must not be able to parent a new service
+        // account to the root credential (or any other user). A root-parented SA
+        // authenticates as owner, so allowing this is a full-takeover escalation.
+        let root = rustfs_credentials::DEFAULT_ACCESS_KEY; // "rustfsadmin"
+
+        // Attack: non-owner "alice" targets root as the parent -> DENY.
+        assert!(
+            !add_service_account_parent_within_scope(root, root, "alice", "alice", false),
+            "non-owner must not parent a service account to root"
+        );
+        // Non-owner targeting an unrelated user -> DENY.
+        assert!(
+            !add_service_account_parent_within_scope(root, "bob", "alice", "alice", false),
+            "non-owner must not parent a service account to another user"
+        );
+        // Self-scoped creation (default target == own key) -> ALLOW.
+        assert!(
+            add_service_account_parent_within_scope(root, "alice", "alice", "alice", false),
+            "non-owner may create a service account for itself"
+        );
+        // Derived credential targeting its own parent -> ALLOW.
+        assert!(
+            add_service_account_parent_within_scope(root, "parent-user", "svc-key", "parent-user", false),
+            "derived credential may create a service account under its own parent"
+        );
+        // Owner may target any parent, including root (cross-user creation intact).
+        assert!(
+            add_service_account_parent_within_scope(root, root, root, root, true),
+            "owner retains cross-user / root-parent creation"
+        );
+        assert!(
+            add_service_account_parent_within_scope(root, "bob", root, root, true),
+            "owner may create a service account for another user"
+        );
+    }
+
+    #[test]
+    fn ghsa_5354_scope_guard_preserves_non_root_self_scope() {
+        let root = rustfs_credentials::DEFAULT_ACCESS_KEY;
+        let cases: &[(&str, &str, &str, bool, bool)] = &[
+            // Derived non-owner (own key != parent) aiming at root -> deny.
+            (root, "attacker-sa", "alice", false, false),
+            // Derived non-owner aiming at an unrelated user -> deny.
+            ("bob", "attacker-sa", "alice", false, false),
+            // Derived non-owner aiming at its own parent -> allow.
+            ("alice", "attacker-sa", "alice", false, true),
+            // Derived non-owner aiming at its own key -> allow.
+            ("attacker-sa", "attacker-sa", "alice", false, true),
+            // Top-level non-owner aiming at itself -> allow.
+            ("alice", "alice", "alice", false, true),
+            // Owner is unrestricted, including root and a derived shape.
+            (root, "attacker-sa", "alice", true, true),
+            ("bob", root, root, true, true),
+        ];
+        for &(target_user, req_user, req_parent_user, owner, expected) in cases {
+            assert_eq!(
+                add_service_account_parent_within_scope(root, target_user, req_user, req_parent_user, owner),
+                expected,
+                "scope guard mismatch for (target={target_user}, req_user={req_user}, req_parent={req_parent_user}, owner={owner})"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_boundary_root_derived_non_owner_cannot_create_owner_service_account() {
+        let root = "deployment-root";
+        for target in [root, "restricted-service-account", "other-user"] {
+            assert!(
+                !add_service_account_parent_within_scope(root, target, "restricted-service-account", root, false),
+                "a root-derived non-owner must be denied even when targeting its own key: {target}"
+            );
+        }
+        assert!(add_service_account_parent_within_scope(root, root, root, root, true));
+        assert!(add_service_account_parent_within_scope(
+            root,
+            "alice",
+            "alice-service-account",
+            "alice",
+            false
+        ));
+        assert!(add_service_account_parent_within_scope(
+            root,
+            "alice-service-account",
+            "alice-service-account",
+            "alice",
+            false
+        ));
     }
 
     #[test]
@@ -1518,6 +1852,60 @@ mod tests {
         assert_eq!(err.message(), Some("service account 'missing' does not exist"));
     }
 
+    #[tokio::test]
+    async fn delegated_service_account_replication_survives_request_cancellation() {
+        use tokio::sync::oneshot;
+        use tokio::time::{Duration, timeout};
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (event_tx, event_rx) = oneshot::channel();
+        let updated_at = OffsetDateTime::now_utc();
+        let create = async move {
+            started_tx.send(()).expect("signal creation");
+            release_rx.await.expect("release write");
+            let credentials = StoredCredentials {
+                access_key: "backup-key".to_owned(),
+                parent_user: "backup-user".to_owned(),
+                ..Default::default()
+            };
+            Ok((credentials, updated_at, HashMap::new()))
+        };
+        let waiter = tokio::spawn(create_and_replicate_service_account(create, None, None, |item| async move {
+            event_tx.send(item).expect("capture site replication event");
+            Ok(())
+        }));
+        let deadline = Duration::from_secs(5);
+        timeout(deadline, started_rx)
+            .await
+            .expect("creation started")
+            .expect("start signal");
+        waiter.abort();
+        assert!(waiter.await.expect_err("request cancelled").is_cancelled());
+        release_tx.send(()).expect("write still admitted");
+        let item = timeout(deadline, event_rx)
+            .await
+            .expect("replication completed")
+            .expect("replication event");
+        assert_eq!(item.updated_at, Some(updated_at));
+        let created = item.svc_acc_change.and_then(|change| change.create).expect("create event");
+        assert_eq!(created.access_key, "backup-key");
+        assert_eq!(created.parent, "backup-user");
+    }
+
+    #[test]
+    fn add_service_account_maps_iam_create_errors_to_s3_errors() {
+        use rustfs_iam::error::Error;
+
+        for (error, expected) in [
+            (Error::AccessKeyAlreadyExists, S3ErrorCode::InvalidArgument),
+            (Error::NoSuchUser("missing".into()), S3ErrorCode::InvalidRequest),
+            (Error::Io(std::io::Error::other("storage unavailable")), S3ErrorCode::InternalError),
+        ] {
+            assert_eq!(map_service_account_create_error(error).code(), &expected);
+        }
+    }
+
     #[test]
     fn map_temp_account_lookup_error_reports_missing_access_keys_explicitly() {
         let err = map_temp_account_lookup_error(
@@ -1537,6 +1925,81 @@ mod tests {
         let policy = policy.unwrap();
         assert!(policy.version.is_empty());
         assert!(policy.statements.is_empty());
+    }
+
+    #[test]
+    fn sparse_explicit_create_policy_is_normalized_before_persistence_and_replication() {
+        let id_only = parse_new_service_account_policy(Some(&json!({"ID": "deny-boundary", "Version": "", "Statement": []})))
+            .expect("ID-only policy should normalize")
+            .expect("normalized explicit policy");
+        assert_eq!(id_only.id.as_str(), "deny-boundary");
+        assert_eq!(id_only.version, DEFAULT_VERSION);
+        assert!(!id_only.statements.is_empty());
+
+        let missing_version = parse_new_service_account_policy(Some(&json!({
+            "Statement": [{
+                "Effect": "Deny",
+                "Action": ["s3:GetObject"],
+                "Resource": ["arn:aws:s3:::bucket/*"]
+            }]
+        })))
+        .expect("policy version should normalize")
+        .expect("normalized explicit policy");
+        assert_eq!(missing_version.version, DEFAULT_VERSION);
+    }
+
+    #[test]
+    fn explicit_empty_create_policy_is_canonicalized_as_inherited() {
+        let policy = parse_new_service_account_policy(Some(&json!({}))).expect("parse empty create policy");
+
+        assert!(policy.is_none());
+    }
+
+    #[test]
+    fn sparse_explicit_update_policy_preserves_existing_semantics() {
+        let id_only = parse_update_service_account_policy(Some(json!({"ID": "clear-boundary", "Version": "", "Statement": []})))
+            .expect("parse ID-only update")
+            .expect("explicit update policy");
+        assert_eq!(id_only.id.as_str(), "clear-boundary");
+        assert!(id_only.version.is_empty());
+        assert!(id_only.statements.is_empty());
+
+        let missing_version = parse_update_service_account_policy(Some(json!({
+            "Statement": [{
+                "Effect": "Deny",
+                "Action": ["s3:GetObject"],
+                "Resource": ["arn:aws:s3:::bucket/*"]
+            }]
+        })))
+        .expect("parse versionless update")
+        .expect("explicit update policy");
+        assert!(missing_version.version.is_empty());
+        assert!(!missing_version.statements.is_empty());
+    }
+
+    #[test]
+    fn replication_update_stays_partial() {
+        let update = UpdateServiceAccountReq {
+            new_policy: Some(json!({})),
+            new_secret_key: None,
+            new_status: None,
+            new_name: None,
+            new_description: None,
+            new_expiration: None,
+        };
+
+        let session_policy = parse_update_service_account_policy(update.new_policy.clone()).expect("parse update policy");
+        let change = service_account_update_replication_change("OIDCSERVICEACCOUNT01", &update, session_policy.as_ref())
+            .expect("build replication update");
+
+        assert!(change.create.is_none());
+        assert!(change.delete.is_none());
+        let update = change.update.expect("partial update");
+        let cleared: Policy =
+            serde_json::from_str(update.session_policy.as_str().expect("explicit policy clear")).expect("parse policy clear");
+        assert!(cleared.id.is_empty());
+        assert!(cleared.version.is_empty());
+        assert!(cleared.statements.is_empty());
     }
 
     #[test]
@@ -1598,22 +2061,6 @@ mod tests {
         assert!(is_service_account_owner_of(&parent_owner, "owner-user"));
         assert!(is_service_account_owner_of(&derived_owner, "owner-user"));
         assert!(!is_service_account_owner_of(&foreign_user, "owner-user"));
-    }
-
-    #[test]
-    fn merge_derived_service_account_claims_skips_only_expiration() {
-        let mut merged = HashMap::new();
-        let source = HashMap::from([
-            ("exp".to_string(), json!(123456)),
-            ("parent".to_string(), json!("owner-user")),
-            ("custom".to_string(), json!("value")),
-        ]);
-
-        merge_derived_service_account_claims(&mut merged, &source);
-
-        assert!(!merged.contains_key("exp"));
-        assert_eq!(merged.get("parent"), Some(&json!("owner-user")));
-        assert_eq!(merged.get("custom"), Some(&json!("value")));
     }
 
     #[test]

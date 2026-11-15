@@ -31,8 +31,13 @@ pub struct KeystoneClient {
     admin_password: Option<String>,
     admin_project: Option<String>,
     admin_domain: String,
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "TLS verification flag parsed from config; the reqwest client is built before it is consulted, so nothing reads it back (backlog#1823)"
+    )]
     verify_ssl: bool,
+    /// Request timeout applied to the underlying HTTP client.
+    timeout: std::time::Duration,
 }
 
 #[derive(Clone)]
@@ -49,6 +54,7 @@ impl AdminToken {
 
 impl KeystoneClient {
     /// Create new Keystone client
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         auth_url: String,
         version: KeystoneVersion,
@@ -57,6 +63,7 @@ impl KeystoneClient {
         admin_project: Option<String>,
         admin_domain: String,
         verify_ssl: bool,
+        timeout: std::time::Duration,
     ) -> Self {
         if !verify_ssl {
             warn!(
@@ -67,7 +74,7 @@ impl KeystoneClient {
 
         let client = Client::builder()
             .danger_accept_invalid_certs(!verify_ssl)
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(timeout)
             .build()
             .unwrap();
 
@@ -81,10 +88,17 @@ impl KeystoneClient {
             admin_project,
             admin_domain,
             verify_ssl,
+            timeout,
         }
     }
 
+    /// Request timeout applied to the underlying HTTP client.
+    pub fn timeout(&self) -> std::time::Duration {
+        self.timeout
+    }
+
     /// Validate a Keystone token
+    #[hotpath::measure]
     pub async fn validate_token(&self, token: &str) -> Result<KeystoneToken> {
         match self.version {
             KeystoneVersion::V3 => self.validate_token_v3(token).await,
@@ -107,7 +121,7 @@ impl KeystoneClient {
             .await
             .map_err(|e| {
                 error!("Failed to send token validation request: {}", e);
-                KeystoneError::HttpError(e.to_string())
+                KeystoneError::HttpError(e.without_url().to_string())
             })?;
 
         let status = response.status();
@@ -124,7 +138,10 @@ impl KeystoneClient {
             )));
         }
 
-        let body: serde_json::Value = response.json().await.map_err(|e| KeystoneError::ParseError(e.to_string()))?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| KeystoneError::ParseError(e.without_url().to_string()))?;
 
         self.parse_token_v3(&body)
     }
@@ -209,56 +226,26 @@ impl KeystoneClient {
     }
 
     /// Validate EC2 credentials
+    ///
+    /// This path is intentionally not implemented and fails closed. A correct
+    /// implementation must derive the identity (user, project, roles, expiry)
+    /// from the Keystone `/v3/ec2tokens` response, not from client-supplied
+    /// input. The previous implementation discarded the response body and
+    /// fabricated an identity by splitting the client access key on `:`, which
+    /// let a caller shape their own user_id/project_id. Until the response
+    /// schema is modeled against a live server, refuse to produce credentials.
     pub async fn validate_ec2_credentials(
         &self,
-        access_key: &str,
-        signature: &str,
-        string_to_sign: &str,
+        _access_key: &str,
+        _signature: &str,
+        _string_to_sign: &str,
     ) -> Result<EC2Credential> {
-        let url = format!("{}/v3/ec2tokens", self.auth_url);
-
-        debug!("Validating EC2 credentials: access_key={}", access_key);
-
-        let payload = json!({
-            "auth": {
-                "identity": {
-                    "methods": ["ec2"],
-                    "ec2": {
-                        "access": access_key,
-                        "signature": signature,
-                        "data": string_to_sign
-                    }
-                }
-            }
-        });
-
-        let response = self
-            .client
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| KeystoneError::HttpError(e.to_string()))?;
-
-        if !response.status().is_success() {
-            return Err(KeystoneError::InvalidCredentials);
-        }
-
-        let _body: serde_json::Value = response.json().await.map_err(|e| KeystoneError::ParseError(e.to_string()))?;
-
-        // Parse access key to extract user_id and project_id
-        let (user_id, project_id) = EC2Credential::parse_access_key(access_key).unwrap_or_else(|| (access_key.to_string(), None));
-
-        Ok(EC2Credential {
-            access: access_key.to_string(),
-            secret: String::new(), // Secret not returned in validation
-            user_id,
-            project_id,
-            trust_id: None,
-        })
+        warn!("EC2/SigV4 credential authentication is not supported; refusing to fabricate identity from client input");
+        Err(KeystoneError::Ec2AuthUnsupported)
     }
 
     /// Get EC2 credentials for a user
+    #[hotpath::measure]
     pub async fn get_ec2_credentials(&self, user_id: &str, project_id: Option<&str>) -> Result<Vec<EC2Credential>> {
         let admin_token = self.get_admin_token().await?;
 
@@ -276,13 +263,16 @@ impl KeystoneClient {
             .header("X-Auth-Token", admin_token)
             .send()
             .await
-            .map_err(|e| KeystoneError::HttpError(e.to_string()))?;
+            .map_err(|e| KeystoneError::HttpError(e.without_url().to_string()))?;
 
         if !response.status().is_success() {
             return Ok(vec![]);
         }
 
-        let body: serde_json::Value = response.json().await.map_err(|e| KeystoneError::ParseError(e.to_string()))?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| KeystoneError::ParseError(e.without_url().to_string()))?;
 
         let credentials = body
             .get("credentials")
@@ -381,7 +371,7 @@ impl KeystoneClient {
             .json(&auth_payload)
             .send()
             .await
-            .map_err(|e| KeystoneError::HttpError(e.to_string()))?;
+            .map_err(|e| KeystoneError::HttpError(e.without_url().to_string()))?;
 
         if !response.status().is_success() {
             return Err(KeystoneError::AuthenticationFailed("Admin authentication failed".to_string()));
@@ -395,7 +385,10 @@ impl KeystoneClient {
             .to_string();
 
         // Parse expiration from response body
-        let body: serde_json::Value = response.json().await.map_err(|e| KeystoneError::ParseError(e.to_string()))?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| KeystoneError::ParseError(e.without_url().to_string()))?;
 
         let expires_at = body
             .get("token")
@@ -426,6 +419,133 @@ impl KeystoneClient {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn subscription_token_refresh_bypasses_a_still_valid_login_cache() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fake Keystone");
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let expires = (OffsetDateTime::now_utc() + time::Duration::hours(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let body = json!({"token":{"user":{"id":"listener","name":"listener"},
+            "roles":[{"name":"Member"}],"expires_at":expires}})
+        .to_string();
+        let server = std::thread::spawn(move || {
+            for response in [
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+            ] {
+                let (mut socket, _) = listener.accept().expect("token validation request");
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = [0; 4096];
+                let length = socket.read(&mut request).expect("request headers");
+                assert!(String::from_utf8_lossy(&request[..length]).contains("subscription-token"));
+                socket.write_all(response.as_bytes()).expect("validation response");
+            }
+        });
+        let mut client = KeystoneClient::new(
+            endpoint,
+            KeystoneVersion::V3,
+            None,
+            None,
+            None,
+            "Default".into(),
+            true,
+            std::time::Duration::from_secs(5),
+        );
+        client.client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let provider = crate::KeystoneAuthProvider::new(client, 10, std::time::Duration::from_secs(60), true);
+        assert!(provider.authenticate_with_token("subscription-token").await.is_ok());
+        assert!(
+            provider.authenticate_with_token("subscription-token").await.is_ok(),
+            "ordinary login still uses the valid cached token"
+        );
+        assert!(matches!(
+            provider.revalidate_subscription_token("subscription-token").await,
+            Err(KeystoneError::InvalidToken)
+        ));
+        server.join().expect("fake Keystone finished");
+    }
+
+    #[tokio::test]
+    async fn middleware_keystone_failures_do_not_disclose_upstream_locations() {
+        use http_body_util::{BodyExt, Full};
+        use std::io::{Read, Write};
+        use tower::{Layer, ServiceExt};
+
+        for (response, details) in [
+            (None, "Keystone token validation failed"),
+            (
+                Some("HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json"),
+                "Keystone token validation failed",
+            ),
+            (
+                Some("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+                "Invalid token",
+            ),
+        ] {
+            for header in ["X-Auth-Token", "X-Storage-Token"] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake Keystone");
+                let endpoint = format!("http://{}/private-deployment", listener.local_addr().unwrap());
+                let server = response.map(|response| {
+                    std::thread::spawn(move || {
+                        let (mut stream, _) = listener.accept().expect("Keystone request");
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                        let mut request = [0; 4096];
+                        assert!(stream.read(&mut request).expect("read token validation request") > 0);
+                        stream.write_all(response.as_bytes()).expect("send fake response");
+                    })
+                });
+                let mut client = KeystoneClient::new(
+                    endpoint.clone(),
+                    KeystoneVersion::V3,
+                    None,
+                    None,
+                    None,
+                    "Default".to_owned(),
+                    true,
+                    std::time::Duration::from_secs(5),
+                );
+                client.client = reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap();
+                let provider = crate::KeystoneAuthProvider::new(client, 1, std::time::Duration::from_secs(1), false);
+                let inner = tower::service_fn(|_| async {
+                    Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(bytes::Bytes::new())))
+                });
+                let response = crate::middleware::KeystoneAuthLayer::new(Some(Arc::new(provider)))
+                    .layer(inner)
+                    .oneshot(
+                        http::Request::builder()
+                            .header(header, "private-token")
+                            .body(Full::new(bytes::Bytes::new()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let body = std::str::from_utf8(&body).unwrap();
+                assert!(body.contains(&format!("<Details>{details}</Details>")));
+                for secret in [&endpoint, "private-deployment", "private-token", "/v3/auth/tokens"] {
+                    assert!(!body.contains(secret), "upstream diagnostics must not appear in the response");
+                }
+                if let Some(server) = server {
+                    server.join().unwrap();
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_client_creation() {
         let client = KeystoneClient::new(
@@ -436,6 +556,7 @@ mod tests {
             Some("admin".to_string()),
             "Default".to_string(),
             true,
+            std::time::Duration::from_secs(30),
         );
 
         assert_eq!(client.auth_url, "http://keystone:5000");

@@ -30,6 +30,9 @@ pub const ENV_OBS_ENDPOINT_TIMEOUT_MILLIS: &str = "RUSTFS_OBS_ENDPOINT_TIMEOUT_M
 pub const ENV_OBS_ENDPOINT_TRACES_TIMEOUT_MILLIS: &str = "RUSTFS_OBS_ENDPOINT_TRACES_TIMEOUT_MILLIS";
 pub const ENV_OBS_ENDPOINT_METRICS_TIMEOUT_MILLIS: &str = "RUSTFS_OBS_ENDPOINT_METRICS_TIMEOUT_MILLIS";
 pub const ENV_OBS_ENDPOINT_LOGS_TIMEOUT_MILLIS: &str = "RUSTFS_OBS_ENDPOINT_LOGS_TIMEOUT_MILLIS";
+/// Absolute path to a PEM bundle whose certificates are added to the system
+/// trust roots used by OTLP/HTTP exporters.
+pub const ENV_OBS_TLS_CA_FILE: &str = "RUSTFS_OBS_TLS_CA_FILE";
 pub const ENV_OBS_PROFILING_ENDPOINT: &str = "RUSTFS_OBS_PROFILING_ENDPOINT";
 pub const ENV_OBS_USE_STDOUT: &str = "RUSTFS_OBS_USE_STDOUT";
 pub const ENV_OBS_SAMPLE_RATIO: &str = "RUSTFS_OBS_SAMPLE_RATIO";
@@ -44,12 +47,31 @@ pub const ENV_OBS_METRICS_EXPORT_ENABLED: &str = "RUSTFS_OBS_METRICS_EXPORT_ENAB
 pub const ENV_OBS_LOGS_EXPORT_ENABLED: &str = "RUSTFS_OBS_LOGS_EXPORT_ENABLED";
 pub const ENV_OBS_PROFILING_EXPORT_ENABLED: &str = "RUSTFS_OBS_PROFILING_EXPORT_ENABLED";
 
+/// Enables detailed per-stage PUT metrics. Disabled by default because each
+/// PUT records multiple timers and histograms when attribution is active.
+pub const ENV_OBS_PUT_STAGE_METRICS_ENABLED: &str = "RUSTFS_OBS_PUT_STAGE_METRICS_ENABLED";
+
+/// Enables sampled in-process GetObject stage summaries without OTLP histograms.
+pub const ENV_OBS_GET_STAGE_LOCAL_SUMMARY_ENABLED: &str = "RUSTFS_OBS_GET_STAGE_LOCAL_SUMMARY_ENABLED";
+pub const ENV_OBS_GET_STAGE_LOCAL_SUMMARY_SAMPLE_RATE: &str = "RUSTFS_OBS_GET_STAGE_LOCAL_SUMMARY_SAMPLE_RATE";
+pub const ENV_OBS_GET_STAGE_LOCAL_SUMMARY_INTERVAL_SECS: &str = "RUSTFS_OBS_GET_STAGE_LOCAL_SUMMARY_INTERVAL_SECS";
+/// Path of the sampled GetObject stage summary file (defaults to `/var/log/rustfs/get-stage-summary.log`).
+pub const ENV_OBS_GET_STAGE_LOCAL_SUMMARY_FILE: &str = "RUSTFS_OBS_GET_STAGE_LOCAL_SUMMARY_FILE";
+pub const DEFAULT_OBS_GET_STAGE_LOCAL_SUMMARY_FILE: &str = "/var/log/rustfs/get-stage-summary.log";
+
 pub const ENV_OBS_LOGGER_LEVEL: &str = "RUSTFS_OBS_LOGGER_LEVEL";
 pub const ENV_OBS_LOG_STDOUT_ENABLED: &str = "RUSTFS_OBS_LOG_STDOUT_ENABLED";
 pub const ENV_OBS_LOG_DIRECTORY: &str = "RUSTFS_OBS_LOG_DIRECTORY";
 pub const ENV_OBS_LOG_FILENAME: &str = "RUSTFS_OBS_LOG_FILENAME";
 pub const ENV_OBS_LOG_ROTATION_TIME: &str = "RUSTFS_OBS_LOG_ROTATION_TIME";
 pub const ENV_OBS_LOG_KEEP_FILES: &str = "RUSTFS_OBS_LOG_KEEP_FILES";
+
+/// Span lifecycle events emitted by the JSON log layers (`none`|`close`|`full`).
+///
+/// Defaults to `none`: a record per span lifecycle multiplies log volume on
+/// object hot paths, and emitting the ancestor span list on every record
+/// produced multi-megabyte lines that journald truncated (backlog#2642).
+pub const ENV_OBS_LOG_SPAN_EVENTS: &str = "RUSTFS_OBS_LOG_SPAN_EVENTS";
 
 /// Log cleanup related configurations
 pub const ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES: &str = "RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES";
@@ -72,7 +94,12 @@ pub const ENV_OBS_LOG_MATCH_MODE: &str = "RUSTFS_OBS_LOG_MATCH_MODE";
 
 /// Default values for log cleanup
 pub const DEFAULT_OBS_LOG_MAX_TOTAL_SIZE_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
-pub const DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES: u64 = 0; // No single file limit
+pub const DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES: u64 = 0; // No per-file trim by the cleaner
+/// Size at which the active log file is rolled when
+/// `RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES` is unset. Without a size roll
+/// the active file is bounded only by the rotation period, and the cleaner
+/// never touches the active file. An explicit `0` keeps size rolling off.
+pub const DEFAULT_OBS_LOG_ACTIVE_FILE_ROLL_SIZE_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 pub const DEFAULT_OBS_LOG_COMPRESS_OLD_FILES: bool = true;
 pub const DEFAULT_OBS_LOG_GZIP_COMPRESSION_LEVEL: u32 = 6;
 pub const DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM_GZIP: &str = "gzip";
@@ -94,6 +121,8 @@ pub const DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS: u64 = 1800; // 0.5 hours
 pub const DEFAULT_OBS_LOG_DRY_RUN: bool = false;
 pub const DEFAULT_OBS_LOG_MATCH_MODE_PREFIX: &str = "prefix";
 pub const DEFAULT_OBS_LOG_MATCH_MODE: &str = "suffix";
+
+pub const DEFAULT_OBS_LOG_SPAN_EVENTS: &str = "none";
 
 /// Default values for observability configuration
 // ### Supported Environment Values
@@ -137,10 +166,22 @@ mod tests {
         assert_eq!(ENV_OBS_LOG_FILENAME, "RUSTFS_OBS_LOG_FILENAME");
         assert_eq!(ENV_OBS_LOG_ROTATION_TIME, "RUSTFS_OBS_LOG_ROTATION_TIME");
         assert_eq!(ENV_OBS_LOG_KEEP_FILES, "RUSTFS_OBS_LOG_KEEP_FILES");
+        assert_eq!(ENV_OBS_LOG_SPAN_EVENTS, "RUSTFS_OBS_LOG_SPAN_EVENTS");
         assert_eq!(ENV_OBS_TRACES_EXPORT_ENABLED, "RUSTFS_OBS_TRACES_EXPORT_ENABLED");
         assert_eq!(ENV_OBS_METRICS_EXPORT_ENABLED, "RUSTFS_OBS_METRICS_EXPORT_ENABLED");
         assert_eq!(ENV_OBS_LOGS_EXPORT_ENABLED, "RUSTFS_OBS_LOGS_EXPORT_ENABLED");
         assert_eq!(ENV_OBS_PROFILING_EXPORT_ENABLED, "RUSTFS_OBS_PROFILING_EXPORT_ENABLED");
+        assert_eq!(ENV_OBS_PUT_STAGE_METRICS_ENABLED, "RUSTFS_OBS_PUT_STAGE_METRICS_ENABLED");
+        assert_eq!(ENV_OBS_GET_STAGE_LOCAL_SUMMARY_ENABLED, "RUSTFS_OBS_GET_STAGE_LOCAL_SUMMARY_ENABLED");
+        assert_eq!(
+            ENV_OBS_GET_STAGE_LOCAL_SUMMARY_SAMPLE_RATE,
+            "RUSTFS_OBS_GET_STAGE_LOCAL_SUMMARY_SAMPLE_RATE"
+        );
+        assert_eq!(
+            ENV_OBS_GET_STAGE_LOCAL_SUMMARY_INTERVAL_SECS,
+            "RUSTFS_OBS_GET_STAGE_LOCAL_SUMMARY_INTERVAL_SECS"
+        );
+        assert_eq!(ENV_OBS_GET_STAGE_LOCAL_SUMMARY_FILE, "RUSTFS_OBS_GET_STAGE_LOCAL_SUMMARY_FILE");
         // Test log cleanup related env keys
         assert_eq!(ENV_OBS_LOG_MAX_TOTAL_SIZE_BYTES, "RUSTFS_OBS_LOG_MAX_TOTAL_SIZE_BYTES");
         assert_eq!(ENV_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES, "RUSTFS_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES");
@@ -173,6 +214,7 @@ mod tests {
         assert_eq!(DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM_GZIP, "gzip");
         assert_eq!(DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM_ZSTD, "zstd");
         assert_eq!(DEFAULT_OBS_LOG_MATCH_MODE_PREFIX, "prefix");
+        assert_eq!(DEFAULT_OBS_LOG_SPAN_EVENTS, "none");
         assert_eq!(DEFAULT_OBS_LOG_MATCH_MODE, "suffix");
         assert_eq!(DEFAULT_OBS_LOG_COMPRESSION_ALGORITHM, "zstd");
     }

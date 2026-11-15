@@ -16,15 +16,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::Result as DFResult;
+use datafusion::common::{Result as DFResult, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::var_provider::is_system_variables;
-use datafusion::logical_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF};
+use datafusion::logical_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF, planner::ExprPlanner};
 use datafusion::variable::VarType;
-use datafusion::{
-    config::ConfigOptions,
-    sql::{TableReference, planner::ContextProvider},
-};
+use datafusion::{config::ConfigOptions, sql::planner::ContextProvider};
 use rustfs_s3select_api::query::{function::FuncMetaManagerRef, session::SessionCtx};
 
 use crate::data_source::table_source::{TableHandle, TableSourceAdapter};
@@ -67,6 +64,10 @@ impl MetadataProvider {
         }
     }
 
+    pub(crate) fn source_column_count(&self) -> usize {
+        self.provider.schema().fields().len()
+    }
+
     fn build_table_handle(&self) -> datafusion::common::Result<TableHandle> {
         self.current_session_table_provider.build_table_handle(self.provider.clone())
     }
@@ -79,11 +80,15 @@ impl ContextProviderExtension for MetadataProvider {
 
         let table_handle = self.build_table_handle()?;
 
-        Ok(Arc::new(TableSourceAdapter::try_new(table_ref.clone(), table_name, table_handle)?))
+        Ok(Arc::new(TableSourceAdapter::try_new(table_ref, table_name, table_handle)?))
     }
 }
 
 impl ContextProvider for MetadataProvider {
+    fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
+        self.session.inner().expr_planners()
+    }
+
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
         self.func_manager
             .udf(name)
@@ -118,7 +123,6 @@ impl ContextProvider for MetadataProvider {
     }
 
     fn options(&self) -> &ConfigOptions {
-        // TODO refactor
         &self.config_options
     }
 

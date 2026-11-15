@@ -1,0 +1,1665 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! `NamespaceLocking` contract impl for `SetDisks` plus the set-disk locking
+//! helpers (P7 of the God-Object split, tracking backlog#815, issue
+//! backlog#822). The `NamespaceLocking` impl is relocated from set_disk/mod.rs
+//! and the lock formatting/mapping helpers from set_disk/lock.rs are collected
+//! here; the contract stays implemented `for SetDisks`, so its associated-type
+//! bounds are unchanged and helper access is via inherent calls.
+
+use super::super::{
+    Arc, DiskError, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, Endpoint, Error, FormatV3, HealChannelPriority, LockResult,
+    NamespaceLock, NamespaceLockWrapper, ObjectKey, Result, SetDisks, StorageError, debug, disk, load_format_erasure, warn,
+};
+use crate::disk::health_state::DriveMembershipSnapshot;
+use crate::disk::{DiskAPI, new_disk};
+use crate::layout::disks_layout::MAX_ERASURE_SET_DRIVE_COUNT;
+use crate::runtime::sources as runtime_sources;
+use futures::{StreamExt, stream, stream::FuturesUnordered};
+use rand::prelude::SliceRandom;
+use rustfs_heal_contracts::heal_channel::{create_auto_replacement_disks_request, send_heal_request};
+use rustfs_utils::path::object_name_disk_identity;
+#[cfg(test)]
+use uuid::Uuid;
+
+// Bound batching when another reconnect is still pending.
+const REPLACEMENT_BATCH_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[async_trait::async_trait]
+impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
+    type Error = Error;
+    type NamespaceLock = NamespaceLockWrapper;
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
+        // Lock the file the disk resolves, not the spelling: on Windows `a\b`
+        // and `a/b` share one xl.meta, so they must share one lock. The key is
+        // folded by the requesting node only; lock servers compare it verbatim.
+        let resource = ObjectKey {
+            bucket: Arc::from(bucket),
+            object: Arc::from(object_name_disk_identity(object).as_ref()),
+            version: None,
+        };
+
+        Ok(self.namespace_lock_for_key(resource).await)
+    }
+}
+
+impl SetDisks {
+    async fn namespace_lock_for_key(&self, resource: ObjectKey) -> NamespaceLockWrapper {
+        // Resolved from this set's own instance context (backlog#1052), not the
+        // ambient facade: the facade tracks whichever context is currently
+        // published process-wide, so a second instance (or, in tests, another
+        // test's transient DistErasure window) would push this set's namespace
+        // locking onto its own — possibly empty — dist locker list.
+        let set_lock = if self.ctx.is_dist_erasure().await {
+            let lockers = if self.lockers.len() == self.shared_lockers.len()
+                && self
+                    .lockers
+                    .iter()
+                    .zip(self.shared_lockers.iter())
+                    .all(|(current, shared)| Arc::ptr_eq(current, shared))
+            {
+                self.shared_lockers.clone()
+            } else {
+                Arc::from(self.lockers.clone())
+            };
+            // Calculate quorum from the exact client domain used by this lock.
+            let lockers_count = lockers.len();
+            let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
+            NamespaceLock::with_clients_and_quorum_shared(self.set_lock_namespace.clone(), lockers, write_quorum)
+        } else {
+            NamespaceLock::with_local_manager_shared(self.set_lock_namespace.clone(), self.local_lock_manager.clone())
+        };
+
+        NamespaceLockWrapper::new(set_lock, resource, self.locker_owner.clone())
+    }
+
+    /// Raw object locks precede this set-local transaction lock. Its versioned
+    /// resource cannot collide with normal namespace keys, which use None.
+    /// Keeping the target set's clients avoids nesting overlapping raw quorums.
+    pub(in crate::set_disk) async fn acquire_delete_transaction_lock(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> Result<Arc<rustfs_lock::NamespaceLockGuard>> {
+        let guard = self
+            .namespace_lock_for_key(self.delete_transaction_resource(bucket, object))
+            .await
+            .get_write_lock(super::super::get_lock_acquire_timeout())
+            .await
+            .map_err(|error| self.map_namespace_lock_error(bucket, object, "delete_transaction", error))?;
+        #[cfg(test)]
+        super::delete_recovery::test_hooks::run_after_transaction_lock_acquired(bucket, object, &guard);
+        Ok(Arc::new(guard))
+    }
+
+    fn delete_transaction_resource(&self, bucket: &str, object: &str) -> ObjectKey {
+        ObjectKey::with_version(
+            bucket,
+            object_name_disk_identity(object).as_ref(),
+            format!("rustfs:delete-transaction:{}:{}", self.pool_index, self.set_index),
+        )
+    }
+
+    /// Batched write-lock acquisition for the whole key set of one bulk
+    /// mutation: one lock round instead of one quorum round-trip per key.
+    ///
+    /// Bulk delete is the only multi-key write-lock holder. The batched round
+    /// is deadlock-free by construction (a single `lock_batch` RPC per lock
+    /// client, and every lock server orders concurrent batches by the same
+    /// global (shard, key) order), so unlike an optimistic probe wave it
+    /// needs no canonical serial fallback. Outcomes are per key and use the
+    /// same error shape as the single-key paths.
+    async fn namespace_write_locks_batch(
+        &self,
+        bucket: &str,
+        resources: &[ObjectKey],
+        timeout: std::time::Duration,
+        mode: &'static str,
+    ) -> Vec<Result<rustfs_lock::NamespaceLockGuard>> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+        let lock = self.namespace_lock_for_key(resources[0].clone()).await;
+        lock.get_write_locks_batch(resources, timeout)
+            .await
+            .into_iter()
+            .zip(resources)
+            .map(|(result, resource)| {
+                result.map_err(|error| self.map_namespace_lock_error(bucket, resource.object.as_ref(), mode, error))
+            })
+            .collect()
+    }
+
+    /// Batched raw namespace write locks for a bulk delete's key set. The
+    /// resource keys use the same disk-identity folding as `new_ns_lock`, so
+    /// aliases (`a\b` vs `a/b`) still share one lock.
+    pub(crate) async fn acquire_object_write_locks_batch(
+        &self,
+        bucket: &str,
+        objects: &[&str],
+        timeout: std::time::Duration,
+    ) -> Vec<Result<rustfs_lock::NamespaceLockGuard>> {
+        let resources: Vec<ObjectKey> = objects
+            .iter()
+            .map(|object| ObjectKey {
+                bucket: Arc::from(bucket),
+                object: Arc::from(object_name_disk_identity(object).as_ref()),
+                version: None,
+            })
+            .collect();
+        self.namespace_write_locks_batch(bucket, &resources, timeout, "write").await
+    }
+
+    /// Batched delete-transaction locks for a bulk delete's key set; see
+    /// [`Self::acquire_delete_transaction_lock`] for the resource shape.
+    pub(in crate::set_disk) async fn acquire_delete_transaction_locks_batch(
+        &self,
+        bucket: &str,
+        objects: &[&str],
+        timeout: std::time::Duration,
+    ) -> Vec<Result<Arc<rustfs_lock::NamespaceLockGuard>>> {
+        let resources: Vec<ObjectKey> = objects
+            .iter()
+            .map(|object| self.delete_transaction_resource(bucket, object))
+            .collect();
+        let mut guards = Vec::with_capacity(resources.len());
+        for (object, result) in objects.iter().zip(
+            self.namespace_write_locks_batch(bucket, &resources, timeout, "delete_transaction")
+                .await,
+        ) {
+            match result {
+                Ok(guard) => {
+                    #[cfg(test)]
+                    super::delete_recovery::test_hooks::run_after_transaction_lock_acquired(bucket, object, &guard);
+                    let _ = object;
+                    guards.push(Ok(Arc::new(guard)));
+                }
+                Err(error) => guards.push(Err(error)),
+            }
+        }
+        guards
+    }
+
+    #[allow(dead_code, reason = "lock diagnostics formatter with no caller in this port (backlog#1823)")]
+    pub(in crate::set_disk) fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
+        match err {
+            LockResult::Timeout => {
+                format!("{mode} lock acquisition timed out on {bucket}/{object} (owner={})", self.locker_owner)
+            }
+            LockResult::Conflict {
+                current_owner,
+                current_mode,
+            } => format!("{mode} lock conflicted on {bucket}/{object}: held by {current_owner} as {current_mode:?}"),
+            LockResult::Acquired => format!("unexpected lock state while acquiring {mode} lock on {bucket}/{object}"),
+        }
+    }
+
+    #[allow(dead_code, reason = "lock diagnostics formatter with no caller in this port (backlog#1823)")]
+    pub(in crate::set_disk) fn format_lock_error_from_error(
+        &self,
+        bucket: &str,
+        object: &str,
+        mode: &str,
+        err: &rustfs_lock::error::LockError,
+    ) -> String {
+        match err {
+            rustfs_lock::error::LockError::Timeout { .. } => {
+                format!(
+                    "ns_loc: {mode} lock acquisition timed out on {bucket}/{object} (owner={})",
+                    self.locker_owner
+                )
+            }
+            rustfs_lock::error::LockError::AlreadyLocked { owner, .. } => {
+                format!("ns_loc: {mode} lock conflicted on {bucket}/{object}: held by {owner}")
+            }
+            _ => format!("ns_loc: {mode} lock acquisition failed on {bucket}/{object}: {}", err),
+        }
+    }
+
+    pub(in crate::set_disk) fn map_namespace_lock_error(
+        &self,
+        bucket: &str,
+        object: &str,
+        mode: &'static str,
+        err: rustfs_lock::error::LockError,
+    ) -> StorageError {
+        match err {
+            rustfs_lock::error::LockError::QuorumNotReached { required, achieved } => {
+                StorageError::NamespaceLockQuorumUnavailable {
+                    mode,
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    required,
+                    achieved,
+                }
+            }
+            other => StorageError::Lock(other),
+        }
+    }
+
+    pub(in crate::set_disk) async fn get_disks_internal(&self) -> Vec<Option<DiskStore>> {
+        let rl = self.disks.read().await;
+
+        rl.clone()
+    }
+
+    pub async fn get_local_disks(&self) -> Vec<Option<DiskStore>> {
+        let rl = self.disks.read().await;
+
+        let mut disks: Vec<Option<DiskStore>> = rl
+            .clone()
+            .into_iter()
+            .filter(|v| v.as_ref().is_some_and(|d| d.is_local()))
+            .collect();
+
+        let mut rng = rand::rng();
+
+        disks.shuffle(&mut rng);
+
+        disks
+    }
+
+    #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
+    pub(in crate::set_disk) async fn get_online_disks(&self) -> Vec<Option<DiskStore>> {
+        let snapshot = self.drive_membership_snapshot().await;
+        let mut disks = snapshot.strict_online_candidates().into_iter().map(Some).collect::<Vec<_>>();
+
+        let mut rng = rand::rng();
+        disks.shuffle(&mut rng);
+
+        disks
+    }
+
+    #[allow(
+        dead_code,
+        reason = "local-only sibling of the test-covered get_online_disks; no caller in this port (backlog#1823)"
+    )]
+    pub(in crate::set_disk) async fn get_online_local_disks(&self) -> Vec<Option<DiskStore>> {
+        let snapshot = self.drive_membership_snapshot().await;
+        let mut disks = snapshot
+            .strict_online_local_candidates()
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+
+        let mut rng = rand::rng();
+
+        disks.shuffle(&mut rng);
+
+        disks
+    }
+
+    pub async fn get_online_disks_with_healing(&self, incl_healing: bool) -> (Vec<DiskStore>, bool) {
+        let (disks, _, healing) = self.get_online_disks_with_healing_and_info(incl_healing).await;
+        (disks, healing > 0)
+    }
+
+    pub async fn drive_membership_snapshot(&self) -> DriveMembershipSnapshot {
+        let disks = self.get_disks_internal().await;
+        DriveMembershipSnapshot::from_optional_disks(&disks)
+    }
+
+    fn reprobe_runtime_candidates_once(&self, disks: &[DiskStore]) {
+        for disk in disks {
+            if disk.runtime_state() != disk::health_state::RuntimeDriveHealthState::Online {
+                disk.reset_health_for_store_init_retry();
+            }
+        }
+    }
+
+    pub async fn get_online_disks_with_healing_and_info(&self, incl_healing: bool) -> (Vec<DiskStore>, Vec<DiskInfo>, usize) {
+        let snapshot = self.drive_membership_snapshot().await;
+        let mut membership_candidates = snapshot.scanner_heal_candidates();
+        let mut reprobed = false;
+
+        loop {
+            let mut disks = membership_candidates.clone();
+            let mut infos: Vec<Option<DiskInfo>> = vec![None; disks.len()];
+
+            let mut futures = Vec::with_capacity(disks.len());
+            {
+                let mut rng = rand::rng();
+                disks.shuffle(&mut rng);
+            }
+
+            for (i, disk) in disks.iter().cloned().enumerate() {
+                futures.push(async move {
+                    let info = match disk.disk_info(&DiskInfoOptions::default()).await {
+                        Ok(info) => info,
+                        Err(err) => DiskInfo {
+                            error: err.to_string(),
+                            ..Default::default()
+                        },
+                    };
+
+                    Ok((i, info))
+                });
+            }
+
+            let processor = runtime_sources::batch_processors().metadata_processor();
+            let results = processor.execute_batch(futures).await;
+
+            for (submitted_idx, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok((disk_idx, info)) => {
+                        infos[disk_idx] = Some(info);
+                    }
+                    Err(err) => {
+                        infos[submitted_idx] = Some(DiskInfo {
+                            error: err.to_string(),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+
+            let mut healing: usize = 0;
+
+            let mut scanning_disks = Vec::new();
+            let mut healing_disks = Vec::new();
+            let mut scanning_infos = Vec::new();
+            let mut healing_infos = Vec::new();
+
+            let mut new_disks = Vec::new();
+            let mut new_infos = Vec::new();
+
+            for (disk, info) in disks.into_iter().zip(infos) {
+                let Some(info) = info else {
+                    continue;
+                };
+
+                if !info.error.is_empty() {
+                    continue;
+                }
+
+                if info.healing {
+                    healing += 1;
+                    if incl_healing {
+                        healing_disks.push(disk);
+                        healing_infos.push(info);
+                    }
+
+                    continue;
+                }
+
+                if !info.scanning {
+                    new_disks.push(disk);
+                    new_infos.push(info);
+                } else {
+                    scanning_disks.push(disk);
+                    scanning_infos.push(info);
+                }
+            }
+
+            new_disks.extend(scanning_disks);
+            new_infos.extend(scanning_infos);
+            new_disks.extend(healing_disks);
+            new_infos.extend(healing_infos);
+
+            if !new_disks.is_empty() || membership_candidates.is_empty() || reprobed {
+                return (new_disks, new_infos, healing);
+            }
+
+            reprobed = true;
+            self.reprobe_runtime_candidates_once(&membership_candidates);
+            membership_candidates = self.drive_membership_snapshot().await.scanner_heal_candidates();
+        }
+    }
+
+    pub(in crate::set_disk) async fn _get_local_disks(&self) -> Vec<Option<DiskStore>> {
+        let mut disks = self.get_disks_internal().await;
+
+        let mut rng = rand::rng();
+
+        disks.shuffle(&mut rng);
+
+        disks
+            .into_iter()
+            .filter(|v| v.as_ref().is_some_and(|d| d.is_local()))
+            .collect()
+    }
+
+    pub async fn connect_disks(&self) {
+        let active_monitoring = rustfs_utils::get_env_bool(
+            disk::disk_store::ENV_RUSTFS_DRIVE_ACTIVE_MONITORING,
+            disk::disk_store::DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING,
+        );
+        self.connect_disks_with_active_monitoring(active_monitoring).await;
+    }
+
+    async fn connect_disks_with_active_monitoring(&self, active_monitoring: bool) {
+        let disks = self.get_disks_internal().await;
+        // Reconnect drives concurrently without holding the inventory lock.
+        let mut reconnects = stream::iter(disks.into_iter().enumerate())
+            .map(|(i, opdisk)| async move {
+                if let Some(disk) = opdisk {
+                    if !active_monitoring
+                        && disk.get_disk_location().set_idx.is_some()
+                        && let disk::Disk::Local(local) = disk.as_ref()
+                        && local.can_skip_background_probe().await
+                    {
+                        return None;
+                    }
+                    if disk.is_online().await && disk.get_disk_location().set_idx.is_some() {
+                        return None;
+                    }
+
+                    // A failed remote reconnect must retain its existing recovery monitor.
+                    if disk.is_local() {
+                        let _ = disk.close().await;
+                    }
+                }
+
+                let endpoint = self.set_endpoints.get(i)?;
+                self.reconnect_disk(endpoint).await.then(|| endpoint.to_string())
+            })
+            .buffer_unordered(MAX_ERASURE_SET_DRIVE_COUNT);
+        let mut submissions = FuturesUnordered::new();
+        let mut batch = Vec::new();
+        let mut deadline = None;
+        let mut reconnects_done = false;
+        loop {
+            if reconnects_done && submissions.is_empty() {
+                break;
+            }
+            tokio::select! {
+                result = reconnects.next(), if !reconnects_done => match result {
+                    Some(Some(endpoint)) => {
+                        batch.push(endpoint);
+                        deadline.get_or_insert_with(|| tokio::time::Instant::now() + REPLACEMENT_BATCH_WAIT);
+                    }
+                    Some(None) => {}
+                    None => {
+                        reconnects_done = true;
+                        if !batch.is_empty() {
+                            submissions.push(self.submit_replacement_heal(std::mem::take(&mut batch)));
+                        }
+                        deadline = None;
+                    }
+                },
+                _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {
+                    submissions.push(self.submit_replacement_heal(std::mem::take(&mut batch)));
+                    deadline = None;
+                }
+                _ = submissions.next(), if !submissions.is_empty() => {}
+            }
+        }
+    }
+
+    async fn submit_replacement_heal(&self, replacements: Vec<String>) {
+        if replacements.is_empty() {
+            return;
+        }
+        // Queue admission deduplicates by set, so publish ready targets together.
+        let request = create_auto_replacement_disks_request(
+            self.pool_index,
+            self.set_index,
+            replacements,
+            Some(HealChannelPriority::Normal),
+        );
+        let _ = send_heal_request(request).await;
+    }
+
+    pub async fn renew_disk(&self, ep: &Endpoint) {
+        if self.reconnect_disk(ep).await {
+            self.submit_replacement_heal(vec![ep.to_string()]).await;
+        }
+    }
+
+    /// Return whether this reconnect attached a verified unformatted target.
+    async fn reconnect_disk(&self, ep: &Endpoint) -> bool {
+        debug!("renew_disk: start {:?}", ep);
+
+        let previous_disk = {
+            let disks = self.disks.read().await;
+            disks
+                .iter()
+                .filter_map(|disk| disk.as_ref())
+                .find(|disk| disk.endpoint() == *ep)
+                .cloned()
+        };
+        let previous_health = previous_disk
+            .as_ref()
+            .and_then(|disk| disk.local_health_tracker_epoch_for_reconnect());
+
+        let (new_disk, fm) = match self.connect_endpoint(ep, previous_health).await {
+            Ok(res) => res,
+            Err(e) => {
+                warn!("renew_disk: connect_endpoint err {:?}", &e);
+                if !matches!(e, DiskError::UnformattedDisk | DiskError::Io(_)) {
+                    return false;
+                }
+
+                let attached = match self.attach_unformatted_replacement_disk(ep).await {
+                    Ok(attached) => attached,
+                    Err(err) => {
+                        warn!(endpoint = %ep, error = ?err, "renew_disk: unformatted replacement probe failed");
+                        return false;
+                    }
+                };
+                return attached;
+            }
+        };
+
+        let (set_idx, disk_idx) = match self.find_disk_index(&fm) {
+            Ok(res) => res,
+            Err(e) => {
+                warn!("renew_disk: find_disk_index err {:?}", e);
+                return false;
+            }
+        };
+
+        // Claiming a misplaced drive into `self.disks` would let two slots or
+        // sets manage the same drive and degrade together (backlog#799 B19).
+        if set_idx != self.set_index || self.set_endpoints.get(disk_idx) != Some(ep) {
+            warn!(
+                endpoint = %ep,
+                format_set_index = set_idx,
+                format_disk_index = disk_idx,
+                endpoint_pool_index = ep.pool_idx,
+                endpoint_set_index = ep.set_idx,
+                endpoint_disk_index = ep.disk_idx,
+                expected_pool_index = self.pool_index,
+                expected_set_index = self.set_index,
+                "renew_disk rejected a drive whose endpoint and format do not identify the same topology slot"
+            );
+            return false;
+        }
+
+        let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
+
+        if !new_disk.is_local() {
+            let displaced = {
+                let mut disks = self.disks.write().await;
+                let slot = &mut disks[disk_idx];
+                let unchanged = match (slot.as_ref(), previous_disk.as_ref()) {
+                    (None, None) => true,
+                    (Some(current), Some(previous)) => Arc::ptr_eq(current, previous),
+                    _ => false,
+                };
+                // A GET probe or another reconnect may have filled this slot while
+                // format I/O was pending. Only the successful publisher owns the
+                // displaced monitor; a failed or superseded probe must retain it.
+                if unchanged {
+                    new_disk.enable_health_check();
+                    slot.replace(new_disk)
+                } else {
+                    None
+                }
+            };
+            if let Some(disk) = displaced {
+                let _ = disk.close().await;
+            }
+            return false;
+        }
+
+        new_disk.enable_health_check();
+
+        if new_disk.is_local() {
+            if let crate::disk::Disk::Local(wrapper) = new_disk.as_ref() {
+                wrapper.get_disk().usage_watch_binding.bind(&self.ctx.usage_watches);
+            }
+            let local_disk_map = runtime_sources::local_disk_map_handle();
+            let mut global_local_disk_map = local_disk_map.write().await;
+            let path = new_disk.endpoint().to_string();
+            global_local_disk_map.insert(path, Some(new_disk.clone()));
+
+            if runtime_sources::setup_is_dist_erasure().await {
+                let local_disk_set_drives = runtime_sources::local_disk_set_drives_handle();
+                let mut local_set_drives = local_disk_set_drives.write().await;
+                local_set_drives[self.pool_index][set_idx][disk_idx] = Some(new_disk.clone());
+            }
+        }
+
+        debug!("renew_disk: update {:?}", fm.erasure.this);
+
+        let mut disk_lock = self.disks.write().await;
+        disk_lock[disk_idx] = Some(new_disk);
+        false
+    }
+
+    /// Attach a replacement target only after proving that the exact local slot
+    /// is present and unformatted. A health-checked reconnect may reject a
+    /// blank target before it reaches the format-heal path; that target still
+    /// has to be visible in this set for the formatter to claim it safely.
+    async fn attach_unformatted_replacement_disk(&self, ep: &Endpoint) -> disk::error::Result<bool> {
+        if !ep.is_local
+            || usize::try_from(ep.pool_idx).ok() != Some(self.pool_index)
+            || usize::try_from(ep.set_idx).ok() != Some(self.set_index)
+        {
+            return Ok(false);
+        }
+
+        let Some(disk_idx) = self.set_endpoints.iter().position(|candidate| candidate == ep) else {
+            return Ok(false);
+        };
+
+        let replacement = new_disk(
+            ep,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await?;
+        match load_format_erasure(&replacement, false).await {
+            Err(DiskError::UnformattedDisk) => {}
+            Ok(_) => return Ok(false),
+            Err(err) => return Err(err),
+        }
+
+        {
+            let mut disks = self.disks.write().await;
+            if disks[disk_idx].as_ref().is_some_and(|existing| existing.endpoint() != *ep) {
+                warn!(endpoint = %ep, disk_idx, "renew_disk rejected unformatted replacement for an occupied foreign slot");
+                return Ok(false);
+            }
+            disks[disk_idx] = Some(replacement.clone());
+        }
+
+        let local_disk_map = runtime_sources::local_disk_map_handle();
+        local_disk_map
+            .write()
+            .await
+            .insert(replacement.endpoint().to_string(), Some(replacement.clone()));
+
+        if runtime_sources::setup_is_dist_erasure().await {
+            let local_disk_set_drives = runtime_sources::local_disk_set_drives_handle();
+            let mut local_set_drives = local_disk_set_drives.write().await;
+            local_set_drives[self.pool_index][self.set_index][disk_idx] = Some(replacement);
+        }
+
+        Ok(true)
+    }
+
+    pub(in crate::set_disk) fn find_disk_index(&self, fm: &FormatV3) -> Result<(usize, usize)> {
+        self.format.check_other(fm)?;
+
+        if fm.erasure.this.is_nil() {
+            return Err(Error::other("DriveID: offline"));
+        }
+
+        let set_drive_count = self.format.erasure.sets[0].len();
+        for (i, set) in self.format.erasure.sets.iter().enumerate() {
+            for (j, drive) in set.iter().enumerate().take(set_drive_count) {
+                if fm.erasure.this == *drive {
+                    return Ok((i, j));
+                }
+            }
+        }
+
+        Err(Error::other("DriveID: not found"))
+    }
+
+    pub(in crate::set_disk) async fn connect_endpoint(
+        &self,
+        ep: &Endpoint,
+        reconnect: Option<disk::disk_store::ReconnectDiskHealthState>,
+    ) -> disk::error::Result<(DiskStore, FormatV3)> {
+        let disk = crate::disk::new_disk_with_health_tracker(
+            ep,
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+            reconnect,
+            #[cfg(feature = "internode-transport")]
+            Some(&self.ctx),
+        )
+        .await?;
+
+        let fm = load_format_erasure(&disk, false).await?;
+
+        Ok((disk, fm))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "MinIO-parity healing-disk accessor with no caller in this port (backlog#1823)"
+    )]
+    pub(in crate::set_disk) async fn get_online_disk_with_healing(
+        &self,
+        incl_healing: bool,
+    ) -> Result<(Vec<Option<DiskStore>>, bool)> {
+        let (new_disks, _, healing) = self.get_online_disk_with_healing_and_info(incl_healing).await?;
+        Ok((new_disks, healing > 0))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "reached only from get_online_disk_with_healing, itself uncalled in this port (backlog#1823)"
+    )]
+    pub(in crate::set_disk) async fn get_online_disk_with_healing_and_info(
+        &self,
+        incl_healing: bool,
+    ) -> Result<(Vec<Option<DiskStore>>, Vec<DiskInfo>, usize)> {
+        let mut infos = vec![DiskInfo::default(); self.disks.read().await.len()];
+        for (idx, disk) in self.disks.write().await.iter().enumerate() {
+            if let Some(disk) = disk {
+                match disk.disk_info(&DiskInfoOptions::default()).await {
+                    Ok(disk_info) => infos[idx] = disk_info,
+                    Err(err) => infos[idx].error = err.to_string(),
+                }
+            } else {
+                infos[idx].error = "disk not found".to_string();
+            }
+        }
+
+        let mut new_disks = Vec::new();
+        let mut healing_disks = Vec::new();
+        let mut scanning_disks = Vec::new();
+        let mut new_infos = Vec::new();
+        let mut healing_infos = Vec::new();
+        let mut scanning_infos = Vec::new();
+        let mut healing = 0;
+
+        infos.iter().zip(self.disks.write().await.iter()).for_each(|(info, disk)| {
+            if info.error.is_empty() {
+                if info.healing {
+                    healing += 1;
+                    if incl_healing {
+                        healing_disks.push(disk.clone());
+                        healing_infos.push(info.clone());
+                    }
+                } else if !info.scanning {
+                    new_disks.push(disk.clone());
+                    new_infos.push(info.clone());
+                } else {
+                    scanning_disks.push(disk.clone());
+                    scanning_infos.push(info.clone());
+                }
+            }
+        });
+
+        // Prefer non-scanning disks over disks which are currently being scanned.
+        new_disks.extend(scanning_disks);
+        new_infos.extend(scanning_infos);
+
+        // Then add healing disks.
+        new_disks.extend(healing_disks);
+        new_infos.extend(healing_infos);
+
+        Ok((new_disks, new_infos, healing))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::init_format::save_format_file;
+    use tempfile::TempDir;
+    use tokio::sync::RwLock;
+
+    async fn make_formatted_local_disk(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let mut endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(disk_idx);
+
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("local disk should be created");
+
+        let mut disk_format = format.clone();
+        disk_format.erasure.this = format.erasure.sets[0][disk_idx];
+        save_format_file(&Some(disk.clone()), &Some(disk_format))
+            .await
+            .expect("format should be saved");
+
+        (dir, endpoint, disk)
+    }
+
+    #[tokio::test]
+    async fn quiet_monitor_skips_idle_format_stat_but_request_detects_removal() {
+        let format = FormatV3::new(1, 1);
+        let (dir, endpoint, disk) = make_formatted_local_disk(0, &format).await;
+        assert!(disk.is_online().await, "initialize the expected disk identity");
+        let disk::Disk::Local(wrapper) = disk.as_ref() else {
+            panic!("fixture must use a local disk");
+        };
+        let local = wrapper.get_disk();
+        let set = SetDisks::new(
+            "quiet-monitor".to_owned(),
+            Arc::new(RwLock::new(vec![Some(disk.clone())])),
+            1,
+            0,
+            0,
+            0,
+            vec![endpoint],
+            format,
+            Vec::new(),
+        )
+        .await;
+        let format_path = dir.path().join(disk::RUSTFS_META_BUCKET).join(disk::FORMAT_CONFIG_FILE);
+        let saved_path = dir.path().join("saved-format.json");
+        tokio::fs::rename(&format_path, &saved_path)
+            .await
+            .expect("hide format for the idle probe");
+        local.format_info.write().await.last_check = None;
+
+        set.connect_disks_with_active_monitoring(false).await;
+        assert!(
+            local.format_info.read().await.last_check.is_none(),
+            "idle monitoring must not stat format.json"
+        );
+        assert!(
+            local.format_info.read().await.id.is_some(),
+            "idle monitoring must leave the cache untouched"
+        );
+        assert!(
+            matches!(disk.disk_info(&DiskInfoOptions::default()).await, Err(DiskError::UnformattedDisk)),
+            "a foreground request must still reject the missing format"
+        );
+        assert!(
+            local.format_info.read().await.id.is_none(),
+            "the request must invalidate the stale identity"
+        );
+
+        tokio::fs::rename(&saved_path, &format_path)
+            .await
+            .expect("restore the same disk format");
+        set.connect_disks_with_active_monitoring(false).await;
+        assert!(
+            local.format_info.read().await.last_check.is_some(),
+            "invalidated disks must still be reprobed"
+        );
+        assert!(disk.is_online().await, "the restored disk must recover without a restart");
+    }
+
+    #[tokio::test]
+    async fn quiet_monitor_still_probes_unhealthy_disks_and_active_monitoring() {
+        use disk::health_state::RuntimeDriveHealthState;
+
+        let format = FormatV3::new(1, 1);
+        let (_dir, endpoint, disk) = make_formatted_local_disk(0, &format).await;
+        assert!(disk.is_online().await, "initialize the expected disk identity");
+        let set = SetDisks::new(
+            "quiet-monitor".to_owned(),
+            Arc::new(RwLock::new(vec![Some(disk.clone())])),
+            1,
+            0,
+            0,
+            0,
+            vec![endpoint],
+            format,
+            Vec::new(),
+        )
+        .await;
+        for (active, state) in [
+            (true, RuntimeDriveHealthState::Online),
+            (false, RuntimeDriveHealthState::Suspect),
+            (false, RuntimeDriveHealthState::Offline),
+            (false, RuntimeDriveHealthState::Returning),
+        ] {
+            let disk = set.get_disks_internal().await[0].clone().expect("current drive");
+            let disk::Disk::Local(wrapper) = disk.as_ref() else {
+                panic!("fixture must use a local disk");
+            };
+            let local = wrapper.get_disk();
+            disk.force_runtime_state_for_test(state);
+            local.format_info.write().await.last_check = None;
+            set.connect_disks_with_active_monitoring(active).await;
+            let current = set.get_disks_internal().await[0].clone().expect("probed or renewed drive");
+            let disk::Disk::Local(wrapper) = current.as_ref() else {
+                panic!("fixture must use a local disk");
+            };
+            assert!(
+                wrapper.get_disk().format_info.read().await.last_check.is_some(),
+                "probe required for active={active}, state={state:?}"
+            );
+            current
+                .disk_info(&DiskInfoOptions::default())
+                .await
+                .expect("the probed or renewed drive must admit real I/O");
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_reconnect_restores_ec4_io_without_all_disks_returning() {
+        use crate::object_api::{ObjectOptions, PutObjReader};
+        use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+        use crate::storage_api_contracts::object::ObjectIO;
+        use disk::health_state::RuntimeDriveHealthState;
+        use http::HeaderMap;
+        use tokio::io::AsyncReadExt;
+
+        for active_monitoring in [true, false] {
+            let format = FormatV3::new(1, 16);
+            let mut dirs = Vec::new();
+            let mut endpoints = Vec::new();
+            let mut disks = Vec::new();
+            for index in 0..16 {
+                let (dir, endpoint, disk) = make_formatted_local_disk(index, &format).await;
+                assert!(disk.is_online().await, "initialize the original drive identity");
+                dirs.push(dir);
+                endpoints.push(endpoint);
+                disks.push(Some(disk));
+            }
+            let set = SetDisks::new(
+                "partial-reconnect".to_owned(),
+                Arc::new(RwLock::new(disks.clone())),
+                16,
+                4,
+                0,
+                0,
+                endpoints,
+                format,
+                Vec::new(),
+            )
+            .await;
+            let bucket = "partial-reconnect";
+            let opts = ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            };
+            set.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket before the outage");
+            let payload = vec![b'r'; 1_300_000];
+            set.put_object(bucket, "before", &mut PutObjReader::from_vec(payload.clone()), &opts)
+                .await
+                .expect("write the original object");
+
+            let mut saved_formats = Vec::new();
+            for (dir, disk) in dirs.iter().zip(&disks).take(8) {
+                let disk = disk.as_ref().expect("original disk");
+                disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+                let path = dir.path().join(disk::RUSTFS_META_BUCKET).join(disk::FORMAT_CONFIG_FILE);
+                saved_formats.push(tokio::fs::read(&path).await.expect("save original format"));
+                // A corrupt format makes reconnect fail without admitting a blank replacement.
+                tokio::fs::write(&path, b"invalid-format")
+                    .await
+                    .expect("make the original drive unavailable");
+                let disk::Disk::Local(local) = disk.as_ref() else {
+                    panic!("fixture must use local drives");
+                };
+                local.get_disk().format_info.write().await.last_check = None;
+            }
+            set.connect_disks_with_active_monitoring(active_monitoring).await;
+            let unavailable = set.get_disks_internal().await;
+            for (original, retained) in disks.iter().zip(&unavailable).take(8) {
+                assert!(
+                    Arc::ptr_eq(original.as_ref().expect("original"), retained.as_ref().expect("retained")),
+                    "failed reconnect must leave the old handle to exercise subsequent recovery"
+                );
+            }
+            assert!(
+                set.put_object(bucket, "during", &mut PutObjReader::from_vec(payload.clone()), &opts)
+                    .await
+                    .is_err(),
+                "eight available drives must not satisfy a 16-drive EC:4 write"
+            );
+
+            for (dir, saved) in dirs.iter().zip(&saved_formats).take(4) {
+                let path = dir.path().join(disk::RUSTFS_META_BUCKET).join(disk::FORMAT_CONFIG_FILE);
+                tokio::fs::write(path, saved)
+                    .await
+                    .expect("restore four original drive identities");
+            }
+            set.connect_disks_with_active_monitoring(active_monitoring).await;
+            assert_eq!(
+                set.drive_membership_snapshot().await.online.len(),
+                12,
+                "the four restored drives must be usable while four others remain unavailable"
+            );
+            set.put_object(bucket, "after", &mut PutObjReader::from_vec(payload.clone()), &opts)
+                .await
+                .expect("write at the restored EC:4 quorum");
+            for object in ["before", "after"] {
+                let mut reader = set
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("read at the restored EC:4 quorum");
+                let mut actual = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut actual)
+                    .await
+                    .expect("read every reconstructed byte");
+                assert_eq!(actual, payload, "the complete object must survive partial recovery");
+            }
+            for disk in set.get_disks_internal().await.into_iter().flatten() {
+                disk.close().await.expect("stop the recovered drive monitors");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_online_disks_with_healing_and_info_keeps_disk_and_info_aligned() {
+        let disk_count = 8;
+        let format = FormatV3::new(1, disk_count);
+
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        for _ in 0..32 {
+            let (online_disks, infos, healing) = set_disks.get_online_disks_with_healing_and_info(false).await;
+            assert_eq!(healing, 0);
+            assert_eq!(online_disks.len(), disk_count);
+            assert_eq!(infos.len(), disk_count);
+
+            for (disk, info) in online_disks.iter().zip(infos.iter()) {
+                assert!(
+                    info.error.is_empty(),
+                    "unexpected disk_info error for {}: {}",
+                    disk.endpoint(),
+                    info.error
+                );
+                assert_eq!(info.endpoint, disk.endpoint().to_string());
+                assert_eq!(
+                    info.id,
+                    disk.get_disk_id().await.expect("disk id lookup should succeed"),
+                    "disk info should stay aligned with disk {}",
+                    disk.endpoint()
+                );
+            }
+        }
+
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn drive_membership_snapshot_filters_offline_disks_from_candidates() {
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        let all_disks = set_disks.get_disks_internal().await;
+        all_disks[1]
+            .as_ref()
+            .expect("disk 1 should exist")
+            .force_runtime_state_for_test(disk::health_state::RuntimeDriveHealthState::Suspect);
+        all_disks[2]
+            .as_ref()
+            .expect("disk 2 should exist")
+            .force_runtime_state_for_test(disk::health_state::RuntimeDriveHealthState::Returning);
+        all_disks[3]
+            .as_ref()
+            .expect("disk 3 should exist")
+            .force_runtime_state_for_test(disk::health_state::RuntimeDriveHealthState::Offline);
+
+        let snapshot = set_disks.drive_membership_snapshot().await;
+        assert_eq!(snapshot.online.len(), 1);
+        assert_eq!(snapshot.suspect.len(), 1);
+        assert_eq!(snapshot.returning.len(), 1);
+        assert_eq!(snapshot.offline.len(), 1);
+        assert_eq!(snapshot.scanner_heal_candidates().len(), 3);
+
+        let strict_online = set_disks.get_online_disks().await;
+        assert_eq!(strict_online.len(), 1, "strict online selection should exclude suspect/returning/offline");
+
+        let (online_disks, infos, healing) = set_disks.get_online_disks_with_healing_and_info(false).await;
+        assert_eq!(healing, 0);
+        assert_eq!(online_disks.len(), 3);
+        assert_eq!(infos.len(), 3);
+        assert!(
+            online_disks
+                .iter()
+                .all(|disk| { disk.runtime_state() != disk::health_state::RuntimeDriveHealthState::Offline }),
+            "offline disks should be filtered by membership snapshot"
+        );
+
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn get_online_disks_with_healing_and_info_reprobes_runtime_candidates_once() {
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        let all_disks = set_disks.get_disks_internal().await;
+        for disk in all_disks.iter().flatten() {
+            disk.force_runtime_state_for_test(disk::health_state::RuntimeDriveHealthState::Returning);
+        }
+
+        let (online_disks, infos, healing) = set_disks.get_online_disks_with_healing_and_info(false).await;
+        assert_eq!(healing, 0);
+        assert_eq!(online_disks.len(), disk_count);
+        assert_eq!(infos.len(), disk_count);
+        assert!(
+            infos.iter().all(|info| info.error.is_empty()),
+            "runtime reprobe should recover a usable candidate set without probe errors"
+        );
+
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn renew_disk_enables_health_monitoring_for_recovered_disk() {
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, _) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![None; disk_count])),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints.clone(),
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        set_disks.renew_disk(&endpoints[0]).await;
+
+        let disks = set_disks.get_disks_internal().await;
+        let renewed_disk = disks[0].as_ref().expect("renew_disk should attach the recovered disk");
+        assert!(
+            renewed_disk.health_check_enabled_for_test(),
+            "renewed disks must keep health monitoring enabled so later faulty marks can recover"
+        );
+        renewed_disk
+            .disk_info(&DiskInfoOptions::default())
+            .await
+            .expect("renewed disk_info should record a drive API metric");
+        renewed_disk.force_runtime_state_for_test(disk::health_state::RuntimeDriveHealthState::Offline);
+
+        set_disks.renew_disk(&endpoints[0]).await;
+
+        let disks = set_disks.get_disks_internal().await;
+        let renewed_again = disks[0]
+            .as_ref()
+            .expect("second renew_disk should keep the recovered disk attached");
+        assert_eq!(
+            renewed_again
+                .metrics_snapshot()
+                .and_then(|metrics| metrics.api_calls.get("disk_info").copied()),
+            Some(1),
+            "disk reconnect must preserve the local drive metrics tracker epoch"
+        );
+
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn reconnect_sweep_collects_all_blank_targets_and_excludes_original_disks() {
+        use rustfs_heal_contracts::heal_channel::{HealAdmissionResult, HealChannelCommand, init_heal_channel};
+
+        const CHILD: &str = "RUSTFS_TEST_GROUPED_RECONNECT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // The heal sender is process-global; keep this receiver isolated.
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "set_disk::ops::locking::tests::reconnect_sweep_collects_all_blank_targets_and_excludes_original_disks",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("isolated reconnect test should run");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "isolated reconnect test failed: {stdout} {stderr}");
+            assert!(stdout.contains("1 passed"), "child must execute the reconnect test: {stdout}");
+            return;
+        }
+        let mut heal_rx = init_heal_channel().expect("isolated heal receiver");
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+        let mut directories = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+        for disk_idx in 0..2 {
+            let (directory, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            directories.push(directory);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+        for disk_idx in 2..disk_count {
+            let directory = tempfile::tempdir().expect("replacement directory");
+            let mut endpoint =
+                Endpoint::try_from(directory.path().to_str().expect("UTF-8 replacement path")).expect("replacement endpoint");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_idx);
+            directories.push(directory);
+            endpoints.push(endpoint);
+            disks.push(None);
+        }
+        let mut ready_targets = endpoints[2..].iter().map(ToString::to_string).collect::<Vec<_>>();
+        ready_targets.sort_unstable();
+        // Disk 1 returns with its format and data; disks 2 and 3 are blank.
+        disks[1]
+            .take()
+            .expect("original disk handle")
+            .close()
+            .await
+            .expect("close original disk");
+        let retained_data = directories[1].path().join("retained-data");
+        tokio::fs::write(&retained_data, b"original data")
+            .await
+            .expect("write original data");
+        let set = Arc::new(
+            SetDisks::new(
+                "reconnect-sweep".to_string(),
+                Arc::new(RwLock::new(disks)),
+                disk_count,
+                2,
+                0,
+                0,
+                endpoints.clone(),
+                format,
+                Vec::new(),
+            )
+            .await,
+        );
+
+        // Block disk 0's format check, then make it a late blank replacement.
+        let slow = set.get_disks_internal().await[0].clone().expect("original disk");
+        assert!(slow.is_online().await, "initialize original disk identity");
+        let disk::Disk::Local(wrapper) = slow.as_ref() else {
+            panic!("fixture must use a local disk");
+        };
+        let slow_local = wrapper.get_disk();
+        let mut slow_format_guard = slow_local.format_info.write().await;
+        slow_format_guard.last_check = None;
+        std::fs::remove_file(
+            directories[0]
+                .path()
+                .join(disk::RUSTFS_META_BUCKET)
+                .join(disk::FORMAT_CONFIG_FILE),
+        )
+        .expect("make the blocked disk a blank replacement");
+        let sweep = tokio::spawn({
+            let set = set.clone();
+            async move { set.connect_disks_with_active_monitoring(true).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let attached = set.get_disks_internal().await;
+                if attached[1..].iter().all(Option::is_some) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("other drives must reconnect while the first drive is blocked");
+        let command = tokio::time::timeout(std::time::Duration::from_secs(10), heal_rx.recv())
+            .await
+            .expect("ready targets must be submitted while a drive is blocked")
+            .expect("heal receiver should remain open");
+        let HealChannelCommand::Start { request, response_tx } = command else {
+            panic!("expected a replacement heal request");
+        };
+        assert_eq!(request.heal_endpoints, ready_targets, "ready blank disks must share one request");
+        assert!(!sweep.is_finished(), "the blocked drive must still be pending");
+        drop(slow_format_guard);
+        // Do not acknowledge the first request yet: a delayed admission
+        // response must not stop the late drive reconnecting and submitting.
+        let late_command = tokio::time::timeout(std::time::Duration::from_secs(10), heal_rx.recv())
+            .await
+            .expect("late target must be submitted while the first response is pending")
+            .expect("heal receiver should remain open");
+        let HealChannelCommand::Start {
+            request: late_request,
+            response_tx: late_response,
+        } = late_command
+        else {
+            panic!("expected a late replacement heal request");
+        };
+        assert_eq!(late_request.heal_endpoints, [endpoints[0].to_string()]);
+        response_tx
+            .send(Ok(HealAdmissionResult::Accepted))
+            .expect("acknowledge ready targets");
+        late_response
+            .send(Ok(HealAdmissionResult::Accepted))
+            .expect("acknowledge late target");
+        sweep.await.expect("reconnect sweep should finish");
+        assert!(heal_rx.try_recv().is_err(), "no duplicate request should be sent");
+        let attached = set.get_disks_internal().await;
+        for (index, disk) in attached.iter().enumerate() {
+            let disk = disk.as_ref().expect("each verified endpoint should be attached");
+            let format = load_format_erasure(disk, false).await;
+            if index == 1 {
+                assert!(format.is_ok(), "original disk must retain its format");
+            } else {
+                assert_eq!(format.expect_err("replacement must remain unformatted"), DiskError::UnformattedDisk);
+                assert!(!disk.health_check_enabled_for_test(), "format must precede replacement health checks");
+            }
+            disk.close().await.expect("close test disk");
+        }
+        assert_eq!(tokio::fs::read(&retained_data).await.expect("read original data"), b"original data");
+        let local_map = runtime_sources::local_disk_map_handle();
+        let mut local_map = local_map.write().await;
+        for endpoint in endpoints {
+            local_map.remove(&endpoint.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn renew_disk_attaches_only_a_verified_local_unformatted_replacement() {
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count - 1 {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let replacement_dir = tempfile::tempdir().expect("replacement tempdir should be created");
+        let mut replacement_endpoint =
+            Endpoint::try_from(replacement_dir.path().to_str().expect("replacement path should be utf8"))
+                .expect("replacement endpoint should parse");
+        replacement_endpoint.set_pool_index(0);
+        replacement_endpoint.set_set_index(0);
+        replacement_endpoint.set_disk_index(disk_count - 1);
+        temp_dirs.push(replacement_dir);
+        endpoints.push(replacement_endpoint.clone());
+        disks.push(None);
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        assert!(
+            set_disks
+                .attach_unformatted_replacement_disk(&replacement_endpoint)
+                .await
+                .expect("a blank local replacement should be admitted")
+        );
+
+        let attached = set_disks.get_disks_internal().await;
+        let replacement = attached[disk_count - 1]
+            .as_ref()
+            .expect("the verified replacement must occupy its exact set slot");
+        assert_eq!(replacement.endpoint(), replacement_endpoint);
+        assert!(
+            !replacement.health_check_enabled_for_test(),
+            "the blank replacement must not start health checks before it receives a format"
+        );
+        assert_eq!(
+            load_format_erasure(replacement, false).await.unwrap_err(),
+            DiskError::UnformattedDisk,
+            "only a still-unformatted replacement may be attached by the fallback"
+        );
+
+        runtime_sources::local_disk_map_handle()
+            .write()
+            .await
+            .remove(&replacement_endpoint.to_string());
+        drop(set_disks);
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn renew_disk_rejects_a_format_from_another_slot_or_cluster() {
+        let disk_count = 3;
+        let format = FormatV3::new(1, disk_count);
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut fixture_disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            fixture_disks.push(disk);
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![Some(fixture_disks[0].clone()), None, None])),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints.clone(),
+            format.clone(),
+            Vec::new(),
+        )
+        .await;
+
+        let mut other_cluster_format = format.clone();
+        other_cluster_format.id = Uuid::new_v4();
+        other_cluster_format.erasure.this = format.erasure.sets[0][2];
+        save_format_file(&Some(fixture_disks[2].clone()), &Some(other_cluster_format))
+            .await
+            .expect("other-cluster format should be written for the rejection test");
+
+        set_disks.renew_disk(&endpoints[2]).await;
+
+        let disks = set_disks.get_disks_internal().await;
+        assert_eq!(
+            disks[0]
+                .as_ref()
+                .expect("the canonical first slot must remain attached")
+                .endpoint(),
+            endpoints[0]
+        );
+        assert!(
+            disks[2].is_none(),
+            "a disk from another deployment must remain detached even when its slot UUID matches"
+        );
+
+        let mut correct_format = format.clone();
+        correct_format.erasure.this = format.erasure.sets[0][2];
+        let replacement_disk = new_disk(
+            &endpoints[2],
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("third endpoint should reopen after other-cluster rejection");
+        save_format_file(&Some(replacement_disk), &Some(correct_format))
+            .await
+            .expect("correct slot format should be restored");
+
+        set_disks.renew_disk(&endpoints[2]).await;
+
+        let disks = set_disks.get_disks_internal().await;
+        assert_eq!(
+            disks[0]
+                .as_ref()
+                .expect("the canonical first slot must remain attached")
+                .endpoint(),
+            endpoints[0]
+        );
+        assert_eq!(disks[2].as_ref().expect("the restored third slot should attach").endpoint(), endpoints[2]);
+
+        let third_disk = disks[2].clone();
+        let mut wrong_slot_format = format.clone();
+        wrong_slot_format.erasure.this = format.erasure.sets[0][0];
+        save_format_file(&third_disk, &Some(wrong_slot_format))
+            .await
+            .expect("wrong-slot format should be written for the rejection test");
+        set_disks.disks.write().await[2] = None;
+
+        let mut misplaced_endpoint = endpoints[2].clone();
+        misplaced_endpoint.set_disk_index(0);
+        set_disks.renew_disk(&misplaced_endpoint).await;
+
+        let disks = set_disks.get_disks_internal().await;
+        assert_eq!(
+            disks[0]
+                .as_ref()
+                .expect("the canonical first slot must remain attached")
+                .endpoint(),
+            endpoints[0]
+        );
+        assert!(disks[2].is_none(), "a disk claiming another endpoint's slot must remain detached");
+
+        drop(temp_dirs);
+    }
+
+    // SetDisks split P0 (#816): the borrow handle must mirror the core state and
+    // the List operation family must run identically through it.
+    #[tokio::test]
+    async fn set_disks_ctx_mirrors_core_and_drives_list_operations() {
+        use crate::set_disk::ops::list::ListOperations;
+
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints.clone(),
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        // The handle reads through to the same core state, not a copy.
+        let ctx = set_disks.ctx();
+        assert_eq!(ctx.locker_owner(), "test-owner");
+        assert_eq!(ctx.set_drive_count(), disk_count);
+        assert_eq!(ctx.default_parity_count(), disk_count / 2);
+        assert_eq!(ctx.set_index(), 0);
+        assert_eq!(ctx.pool_index(), 0);
+        assert_eq!(ctx.set_endpoints().len(), endpoints.len());
+        assert!(ctx.lockers().is_empty());
+        assert!(
+            Arc::ptr_eq(ctx.disks(), &set_disks.disks),
+            "ctx must borrow the core disks, not clone them"
+        );
+        assert!(std::ptr::eq(ctx.core(), &*set_disks), "ctx must borrow the core, not clone it");
+        assert!(std::ptr::eq(ctx.format(), &set_disks.format), "ctx must borrow the core format");
+
+        // The List family runs through the borrow handle with unchanged
+        // behavior: delete_all reports success even when the prefix is absent.
+        let (result, observed_disks) = ListOperations::new(set_disks.ctx())
+            .delete_all_observed("nonexistent-bucket", "nonexistent-prefix", None)
+            .await;
+        result.expect("delete_all via borrow handle should succeed");
+        assert_eq!(observed_disks.len(), disk_count);
+        set_disks
+            .delete_all("nonexistent-bucket", "nonexistent-prefix")
+            .await
+            .expect("delete_all public entry should stay in sync");
+
+        drop(temp_dirs);
+    }
+}

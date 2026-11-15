@@ -78,7 +78,7 @@ use super::{SwiftError, SwiftResult, container, object};
 use axum::http::{Response, StatusCode};
 use futures::StreamExt;
 use rustfs_credentials::Credentials;
-use s3s::Body;
+use rustfs_s3_types::Body;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 
@@ -627,15 +627,13 @@ mod tests {
     #[test]
     fn test_parse_paths_with_empty_lines() {
         let body = "/container1/file1.txt\n\n/container2/file2.txt\n   \n/container1/file3.txt";
-        let paths: Vec<&str> = body.lines().filter(|line| !line.trim().is_empty()).collect();
-
-        assert_eq!(paths.len(), 3);
+        assert_eq!(body.lines().filter(|line| !line.trim().is_empty()).count(), 3);
     }
 
     /// Tests for the `extract_tar_entries` async function.
     ///
     /// Conditionally compiled with the `swift` feature, which gates the
-    /// `tokio_tar` (astral-tokio-tar) and `async_compression` dependencies.
+    /// `tokio_tar` (rustfs-tokio-tar) and `async_compression` dependencies.
     #[cfg(feature = "swift")]
     mod tar_extraction {
         use super::*;

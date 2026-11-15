@@ -12,39 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_object_store_handle;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, S3Router};
+use crate::admin::runtime_sources::{ServerContextSlot, current_action_credentials, current_object_store_handle, current_region};
+use crate::admin::storage_api::access::{ReqInfo, authorize_owned_request};
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
+use crate::admin::storage_api::contract::list::ListOperations as _;
+use crate::admin::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
+use crate::admin::storage_api::object::StorageObjectOptions as ObjectOptions;
+use crate::app::{RequestEnvelope, RequestHead};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use crate::storage::access::{ReqInfo, authorize_request};
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
 };
 use async_zip::{Compression, ZipEntryBuilder, base::write::ZipFileWriter};
 use futures_lite::io::AsyncWriteExt;
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use hyper::{Method, Uri};
 use matchit::Params;
 use rand::RngExt;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_credentials::get_global_action_cred;
-use rustfs_ecstore::{
-    global::get_global_region,
-    store_api::{BucketOperations, ListOperations, ObjectIO, ObjectOperations, ObjectOptions},
-};
+use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_storage_api::bucket::BucketOptions;
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
 use rustfs_utils::{base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad};
-use s3s::{Body, S3Request, S3Response, S3Result, dto::StreamingBlob, header::CONTENT_TYPE, s3_error};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -207,8 +210,11 @@ impl From<ObjectZipDownloadReqInfoSnapshot> for ReqInfo {
             bucket: snapshot.bucket,
             object: snapshot.object,
             version_id: snapshot.version_id,
-            region: get_global_region(),
+            replication_request_authorized: false,
+            region: current_region(),
             request_context: None,
+            suppress_denial_log: false,
+            suppress_denial_audit: false,
         }
     }
 }
@@ -233,7 +239,7 @@ impl From<&ObjectZipDownloadAuthContext> for ObjectZipDownloadAuthContextSnapsho
 }
 
 impl TryFrom<ObjectZipDownloadAuthContextSnapshot> for ObjectZipDownloadAuthContext {
-    type Error = s3s::S3Error;
+    type Error = rustfs_s3_types::S3Error;
 
     fn try_from(snapshot: ObjectZipDownloadAuthContextSnapshot) -> S3Result<Self> {
         let mut headers = HeaderMap::new();
@@ -283,9 +289,11 @@ impl From<ClientInfoSnapshot> for ClientInfo {
     }
 }
 
-fn download_token_encryption_key() -> S3Result<[u8; 32]> {
-    let credentials =
-        get_global_action_cred().ok_or_else(|| s3_error!(InternalError, "global action credentials are not initialized"))?;
+fn current_download_token_credentials() -> S3Result<Credentials> {
+    current_action_credentials().ok_or_else(|| s3_error!(InternalError, "global action credentials are not initialized"))
+}
+
+fn download_token_encryption_key(credentials: &Credentials) -> S3Result<[u8; 32]> {
     if credentials.secret_key.is_empty() {
         return Err(s3_error!(InternalError, "global action credentials are not initialized"));
     }
@@ -295,10 +303,10 @@ fn download_token_encryption_key() -> S3Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-fn encode_download_token(payload: &ObjectZipDownloadTokenPayload) -> S3Result<String> {
+fn encode_download_token(payload: &ObjectZipDownloadTokenPayload, credentials: &Credentials) -> S3Result<String> {
     let payload_json =
         serde_json::to_vec(payload).map_err(|e| s3_error!(InternalError, "failed to serialize download token: {}", e))?;
-    let key = download_token_encryption_key()?;
+    let key = download_token_encryption_key(credentials)?;
     let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(key));
     let mut nonce_bytes = [0_u8; 12];
     rand::rng().fill(&mut nonce_bytes);
@@ -313,7 +321,7 @@ fn encode_download_token(payload: &ObjectZipDownloadTokenPayload) -> S3Result<St
     ))
 }
 
-fn decode_download_token(token: &str) -> S3Result<ObjectZipDownloadTokenPayload> {
+fn decode_download_token(token: &str, credentials: &Credentials) -> S3Result<ObjectZipDownloadTokenPayload> {
     let Some((nonce_part, ciphertext_part)) = token.split_once('.') else {
         return Err(s3_error!(AccessDenied, "invalid or expired download token"));
     };
@@ -329,7 +337,7 @@ fn decode_download_token(token: &str) -> S3Result<ObjectZipDownloadTokenPayload>
         .as_slice()
         .try_into()
         .map_err(|_| s3_error!(AccessDenied, "invalid or expired download token"))?;
-    let key = download_token_encryption_key()?;
+    let key = download_token_encryption_key(credentials)?;
     let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(key));
     let payload = cipher
         .decrypt(&Nonce::from(nonce), ciphertext.as_slice())
@@ -344,6 +352,7 @@ fn create_download_token(
     auth_context: ObjectZipDownloadAuthContext,
     request: CreateObjectZipDownloadRequest,
     now: OffsetDateTime,
+    credentials: &Credentials,
 ) -> S3Result<CreatedObjectZipDownloadToken> {
     let id = Uuid::new_v4().to_string();
     let expires_at = now + OBJECT_ZIP_DOWNLOAD_TOKEN_TTL;
@@ -355,13 +364,18 @@ fn create_download_token(
         request,
         expires_at_unix: expires_at.unix_timestamp(),
     };
-    let token = encode_download_token(&payload)?;
+    let token = encode_download_token(&payload, credentials)?;
 
     Ok(CreatedObjectZipDownloadToken { id, token, expires_at })
 }
 
-fn validate_download_token(id: &str, token: &str, now: OffsetDateTime) -> S3Result<ObjectZipDownloadToken> {
-    let payload = decode_download_token(token)?;
+fn validate_download_token(
+    id: &str,
+    token: &str,
+    now: OffsetDateTime,
+    credentials: &Credentials,
+) -> S3Result<ObjectZipDownloadToken> {
+    let payload = decode_download_token(token, credentials)?;
     if payload.id != id {
         return Err(s3_error!(AccessDenied, "invalid or expired download token"));
     }
@@ -390,23 +404,22 @@ fn build_download_url(id: &str, token: &str) -> String {
     format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/{id}.zip?token={token}")
 }
 
-async fn authenticate_object_zip_download_request(req: &mut S3Request<Body>) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+async fn authenticate_object_zip_download_request(req: &mut AdminRequest) -> S3Result<()> {
+    let Some(input_cred) = req.credentials() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
 
     let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), input_cred.access_key()).await?;
 
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().cloned().unwrap_or_default();
-    req.extensions.insert(ReqInfo {
+    let request_context = req.request_context().cloned();
+    req.install_req_info(ReqInfo {
         cred: Some(cred),
         is_owner: owner,
-        region: get_global_region(),
-        request_context: req.extensions.get().cloned(),
+        region: current_region(),
+        request_context,
         ..Default::default()
     });
-    req.extensions.insert(remote_addr);
 
     license_check().map_err(|er| match er.kind() {
         std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
@@ -419,10 +432,9 @@ async fn authenticate_object_zip_download_request(req: &mut S3Request<Body>) -> 
     Ok(())
 }
 
-fn authenticated_zip_download_principal(req: &S3Request<Body>) -> S3Result<String> {
+fn authenticated_zip_download_principal(req: &AdminRequest) -> S3Result<String> {
     let req_info = req
-        .extensions
-        .get::<ReqInfo>()
+        .req_info()
         .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
     let credentials = req_info
         .cred
@@ -432,10 +444,9 @@ fn authenticated_zip_download_principal(req: &S3Request<Body>) -> S3Result<Strin
     Ok(credentials.access_key)
 }
 
-fn authenticated_zip_download_req_info(req: &S3Request<Body>) -> S3Result<ReqInfo> {
+fn authenticated_zip_download_req_info(req: &AdminRequest) -> S3Result<ReqInfo> {
     let mut req_info = req
-        .extensions
-        .get::<ReqInfo>()
+        .req_info()
         .cloned()
         .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
     if let Some(cred) = req_info.cred.as_mut() {
@@ -445,18 +456,15 @@ fn authenticated_zip_download_req_info(req: &S3Request<Body>) -> S3Result<ReqInf
     Ok(req_info)
 }
 
-fn authenticated_zip_download_auth_context(req: &S3Request<Body>) -> ObjectZipDownloadAuthContext {
+fn authenticated_zip_download_auth_context(req: &AdminRequest) -> ObjectZipDownloadAuthContext {
     ObjectZipDownloadAuthContext {
-        headers: req.headers.clone(),
-        remote_addr: req.extensions.get::<Option<RemoteAddr>>().copied().flatten(),
-        client_info: req.extensions.get::<ClientInfo>().cloned(),
+        headers: req.headers().clone(),
+        remote_addr: req.remote_addr().map(RemoteAddr),
+        client_info: req.client_info().cloned(),
     }
 }
 
-async fn authorize_object_zip_download_scope(
-    req: &mut S3Request<Body>,
-    request: &CreateObjectZipDownloadRequest,
-) -> S3Result<()> {
+async fn authorize_object_zip_download_scope(req: &mut AdminRequest, request: &CreateObjectZipDownloadRequest) -> S3Result<()> {
     for prefix in listing_prefixes(request) {
         authorize_object_zip_download_list_prefix(req, &request.bucket, prefix).await?;
     }
@@ -468,27 +476,81 @@ async fn authorize_object_zip_download_scope(
     Ok(())
 }
 
-async fn authorize_object_zip_download_list_prefix(req: &mut S3Request<Body>, bucket: &str, prefix: &str) -> S3Result<()> {
-    let original_uri = req.uri.clone();
-    req.uri = uri_with_prefix_query(&original_uri, prefix)?;
+async fn authorize_object_zip_download_list_prefix(req: &mut AdminRequest, bucket: &str, prefix: &str) -> S3Result<()> {
+    let original_uri = req.uri().clone();
+    *req.envelope_mut().uri_mut() = uri_with_prefix_query(&original_uri, prefix)?;
     let result = authorize_object_zip_download_s3_action(req, bucket, None, S3Action::ListBucketAction).await;
-    req.uri = original_uri;
+    *req.envelope_mut().uri_mut() = original_uri;
     result
 }
 
 async fn authorize_object_zip_download_s3_action(
-    req: &mut S3Request<Body>,
+    req: &mut AdminRequest,
     bucket: &str,
     object: Option<&str>,
     action: S3Action,
 ) -> S3Result<()> {
-    if let Some(req_info) = req.extensions.get_mut::<ReqInfo>() {
+    if let Some(req_info) = req.req_info_mut() {
         req_info.bucket = Some(bucket.to_string());
         req_info.object = object.map(str::to_string);
         req_info.version_id = None;
     }
 
-    authorize_request(req, Action::S3Action(action)).await
+    let mut extensions = http::Extensions::new();
+    extensions.insert(req.remote_addr().map(RemoteAddr));
+    if let Some(client_info) = req.client_info() {
+        extensions.insert(client_info.clone());
+    }
+    if let Some(server_context) = req.envelope().server_context() {
+        extensions.insert(server_context.clone());
+    }
+    if let Some(req_info) = req.req_info() {
+        extensions.insert(req_info.clone());
+    }
+    let mut authorization = RequestEnvelope::from_parts(
+        RequestHead {
+            method: req.method().clone(),
+            uri: req.uri().clone(),
+            headers: req.headers().clone(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        extensions,
+    );
+    authorize_owned_request(&mut authorization, Action::S3Action(action), None).await
+}
+
+/// Builds the owned authorization request used when a download token is redeemed.
+fn token_authorization_request(
+    method: Method,
+    uri: Uri,
+    auth_context: &ObjectZipDownloadAuthContext,
+    server_context: Option<Arc<ServerContextSlot>>,
+    req_info: Option<ReqInfo>,
+) -> RequestEnvelope {
+    let mut extensions = http::Extensions::new();
+    extensions.insert(auth_context.remote_addr);
+    if let Some(client_info) = auth_context.client_info.clone() {
+        extensions.insert(client_info);
+    }
+    if let Some(server_context) = server_context {
+        extensions.insert(server_context);
+    }
+    if let Some(req_info) = req_info {
+        extensions.insert(req_info);
+    }
+    RequestEnvelope::from_parts(
+        RequestHead {
+            method,
+            uri,
+            headers: auth_context.headers.clone(),
+            credentials: None,
+            region: None,
+            service: None,
+        },
+        extensions,
+    )
 }
 
 fn uri_with_prefix_query(uri: &Uri, prefix: &str) -> S3Result<Uri> {
@@ -517,18 +579,14 @@ fn uri_with_prefix_query(uri: &Uri, prefix: &str) -> S3Result<Uri> {
     Uri::from_parts(parts).map_err(|e| s3_error!(InvalidRequest, "invalid prefix authorization URI: {}", e))
 }
 
-fn build_json_response(
-    status: StatusCode,
-    body: &impl Serialize,
-    request_id: Option<&HeaderValue>,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn build_json_response(status: StatusCode, body: &impl Serialize, request_id: Option<&HeaderValue>) -> S3Result<AdminResponse> {
     let data = serde_json::to_vec(body).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
     let mut header = HeaderMap::new();
     header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Some(value) = request_id {
         header.insert("x-request-id", value.clone());
     }
-    Ok(S3Response::with_headers((status, Body::from(data)), header))
+    Ok(AdminResponse::with_headers(status, Body::from(data), header))
 }
 
 fn query_value_exact(uri: &Uri, key: &str) -> Option<String> {
@@ -542,11 +600,11 @@ pub struct CreateObjectZipDownloadHandler {}
 
 #[async_trait::async_trait]
 impl Operation for CreateObjectZipDownloadHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authenticate_object_zip_download_request(&mut req).await?;
 
         let body = req
-            .input
+            .take_body()
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
@@ -557,7 +615,8 @@ impl Operation for CreateObjectZipDownloadHandler {
         let principal = authenticated_zip_download_principal(&req)?;
         let req_info = authenticated_zip_download_req_info(&req)?;
         let auth_context = authenticated_zip_download_auth_context(&req);
-        let created = create_download_token(principal, req_info, auth_context, request, OffsetDateTime::now_utc())?;
+        let credentials = current_download_token_credentials()?;
+        let created = create_download_token(principal, req_info, auth_context, request, OffsetDateTime::now_utc(), &credentials)?;
 
         build_json_response(
             StatusCode::OK,
@@ -565,7 +624,7 @@ impl Operation for CreateObjectZipDownloadHandler {
                 download_url: build_download_url(&created.id, &created.token),
                 expires_at: Some(format_expires_at(created.expires_at)?),
             },
-            req.headers.get("x-request-id"),
+            req.headers().get("x-request-id"),
         )
     }
 }
@@ -574,14 +633,15 @@ pub struct DownloadObjectZipHandler {}
 
 #[async_trait::async_trait]
 impl Operation for DownloadObjectZipHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let id = params.get("id").unwrap_or("");
-        let token = query_value_exact(&req.uri, "token").unwrap_or_default();
+        let token = query_value_exact(req.uri(), "token").unwrap_or_default();
         if id.is_empty() || token.is_empty() {
             return Err(s3_error!(AccessDenied, "invalid or expired download token"));
         }
 
-        let record = validate_download_token(id, &token, OffsetDateTime::now_utc())?;
+        let credentials = current_download_token_credentials()?;
+        let record = validate_download_token(id, &token, OffsetDateTime::now_utc(), &credentials)?;
         let _token_id = &record.id;
         let _principal = &record.principal;
         let prepared = prepare_zip_download_archive(&record).await?;
@@ -599,7 +659,7 @@ impl Operation for DownloadObjectZipHandler {
             .map_err(|e| s3_error!(InternalError, "invalid download filename: {}", e))?,
         );
 
-        Ok(S3Response::with_headers((StatusCode::OK, body), headers))
+        Ok(AdminResponse::with_headers(StatusCode::OK, body, headers))
     }
 }
 
@@ -640,7 +700,7 @@ fn validate_zip_entry_name(entry_name: &str) -> S3Result<()> {
 }
 
 async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[ZipDownloadItem]) -> S3Result<()> {
-    let store = resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let store = current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     for item in items {
         store
             .get_object_info(&request.bucket, &item.key, &ObjectOptions::default())
@@ -650,12 +710,12 @@ async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[
     Ok(())
 }
 
-fn storage_error_to_s3(err: rustfs_ecstore::error::Error) -> s3s::S3Error {
+fn storage_error_to_s3(err: crate::admin::storage_api::error::Error) -> rustfs_s3_types::S3Error {
     ApiError::from(err).into()
 }
 
 async fn validate_zip_download_request(record: &ObjectZipDownloadToken) -> S3Result<()> {
-    let store = resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let store = current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     store
         .get_bucket_info(&record.request.bucket, &BucketOptions::default())
         .await
@@ -683,32 +743,20 @@ fn listing_prefixes(request: &CreateObjectZipDownloadRequest) -> Vec<&str> {
 
 async fn authorize_zip_items_for_download(record: &ObjectZipDownloadToken, items: &[ZipDownloadItem]) -> S3Result<()> {
     for item in items {
-        let mut req = S3Request {
-            input: Body::empty(),
-            method: Method::GET,
-            uri: format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/{}.zip", record.id)
-                .parse()
-                .map_err(|e| s3_error!(InternalError, "failed to build download authorization URI: {}", e))?,
-            headers: record.auth_context.headers.clone(),
-            extensions: {
-                let mut extensions = http::Extensions::new();
-                extensions.insert(record.auth_context.remote_addr);
-                if let Some(client_info) = record.auth_context.client_info.clone() {
-                    extensions.insert(client_info);
-                }
-                extensions
-            },
-            credentials: None,
-            region: get_global_region(),
-            service: None,
-            trailing_headers: None,
-        };
         let mut req_info = record.req_info.clone();
         req_info.bucket = Some(record.request.bucket.clone());
         req_info.object = Some(item.key.clone());
         req_info.version_id = None;
-        req.extensions.insert(req_info);
-        authorize_request(&mut req, Action::S3Action(S3Action::GetObjectAction)).await?;
+        let mut req = token_authorization_request(
+            Method::GET,
+            format!("{ADMIN_PREFIX}{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH}/{}.zip", record.id)
+                .parse()
+                .map_err(|e| s3_error!(InternalError, "failed to build download authorization URI: {}", e))?,
+            &record.auth_context,
+            None,
+            Some(req_info),
+        );
+        authorize_owned_request(&mut req, Action::S3Action(S3Action::GetObjectAction), None).await?;
     }
     Ok(())
 }
@@ -758,7 +806,7 @@ fn normalized_listing_prefixes(request: &CreateObjectZipDownloadRequest) -> Vec<
 
 fn build_zip_stream_body(prepared: PreparedZipArchive) -> Body {
     let stream = ReaderStream::with_capacity(prepared.file, ZIP_STREAM_BUFFER_SIZE);
-    Body::from(StreamingBlob::wrap(stream))
+    Body::from_stream(stream)
 }
 
 async fn prepare_zip_download_archive(record: &ObjectZipDownloadToken) -> S3Result<PreparedZipArchive> {
@@ -780,7 +828,7 @@ async fn prepare_zip_download_archive(record: &ObjectZipDownloadToken) -> S3Resu
 
 async fn generate_zip_archive(record: &ObjectZipDownloadToken, file: &mut File) -> io::Result<()> {
     let mut zip = ZipFileWriter::with_tokio(file).force_zip64();
-    let store = resolve_object_store_handle().ok_or_else(|| io::Error::other("object store not initialized"))?;
+    let store = current_object_store_handle().ok_or_else(|| io::Error::other("object store not initialized"))?;
 
     let explicit_items = collect_explicit_zip_items(&record.request)
         .map_err(|err| io::Error::other(format!("failed to prepare explicit ZIP items: {err}")))?;
@@ -867,7 +915,7 @@ async fn write_zip_item<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let store = resolve_object_store_handle().ok_or_else(|| io::Error::other("object store not initialized"))?;
+    let store = current_object_store_handle().ok_or_else(|| io::Error::other("object store not initialized"))?;
     let mut reader = store
         .get_object_reader(bucket, &item.key, None, HeaderMap::new(), &ObjectOptions::default())
         .await
@@ -901,8 +949,237 @@ struct ZipDownloadItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_credentials::init_global_action_credentials;
-    use s3s::S3ErrorCode;
+    use rustfs_s3_types::S3ErrorCode;
+
+    #[tokio::test]
+    async fn zip_scope_authorizes_real_iam_and_restores_prefix_query() {
+        use crate::admin::operation::test_support::TestRequest;
+        use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface};
+        use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use rustfs_iam::store::{Store as _, UserType};
+        use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+        use rustfs_policy::policy::Policy;
+
+        struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+        impl IamInterface for ReadyIam {
+            fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                Arc::clone(&self.0)
+            }
+            fn is_ready(&self) -> bool {
+                true
+            }
+        }
+        struct TestKms;
+        impl KmsInterface for TestKms {
+            fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                Arc::new(rustfs_kms::KmsServiceManager::new())
+            }
+        }
+
+        let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        store
+            .make_bucket("photos", &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+            .save_iam_config(
+                serde_json::json!({"version": 1}),
+                format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+            )
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("initialize IAM");
+        let access_key = "zip-scope-user";
+        iam.create_user(
+            access_key,
+            &AddOrUpdateUserReq {
+                secret_key: "zip-scope-secret-key".to_owned(),
+                policy: None,
+                status: AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create user");
+        iam.set_policy(
+            "zip-scope-policy",
+            Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::photos","Condition":{"StringEquals":{"s3:prefix":"allowed/"}}},{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/allowed/*"}]}"#)
+                .expect("parse policy"),
+        )
+        .await
+        .expect("store policy");
+        iam.policy_db_set(access_key, UserType::Reg, false, "zip-scope-policy")
+            .await
+            .expect("attach policy");
+        let credentials = iam.get_user(access_key).await.expect("load user").credentials;
+        let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(context));
+        let original_uri = "/rustfs/admin/v3/object-zip-downloads?prefix=old&marker=1";
+        let mut request = TestRequest::new(Method::POST, original_uri)
+            .extension(slot)
+            .extension(ReqInfo {
+                cred: Some(credentials),
+                ..Default::default()
+            })
+            .build();
+
+        let mut selection = valid_request();
+        selection.prefix = None;
+        selection.prefixes = vec!["allowed/".to_owned()];
+        selection.objects = vec!["allowed/file".to_owned()];
+        authorize_object_zip_download_scope(&mut request, &selection)
+            .await
+            .expect("allowed prefix and object");
+        assert_eq!(request.uri().to_string(), original_uri);
+
+        selection.prefixes = vec!["denied/".to_owned()];
+        let err = authorize_object_zip_download_scope(&mut request, &selection)
+            .await
+            .expect_err("another prefix is denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(request.uri().to_string(), original_uri);
+
+        selection.prefixes = vec!["allowed/".to_owned()];
+        selection.objects = vec!["denied/file".to_owned()];
+        let err = authorize_object_zip_download_scope(&mut request, &selection)
+            .await
+            .expect_err("another object is denied");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(request.uri().to_string(), original_uri);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn token_redemption_authorizes_each_item_through_real_iam() {
+        crate::app::gating_test_env::run_large_stack_test("zip-token-redemption", || async {
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use rustfs_iam::store::{Store as _, UserType};
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+
+            let previous = crate::runtime_sources::current_app_context();
+            let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            store
+                .make_bucket("photos", &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            rustfs_iam::store::object::ObjectStore::new(Arc::clone(&store))
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("seed IAM format");
+            let iam = rustfs_iam::build_iam_sys(Arc::clone(&store)).await.expect("initialize IAM");
+            let access_key = "zip-redeem-user";
+            iam.create_user(
+                access_key,
+                &AddOrUpdateUserReq {
+                    secret_key: "zip-redeem-secret-key".to_owned(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create user");
+            iam.set_policy(
+                "zip-redeem-policy",
+                Policy::parse_config(
+                    br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::photos/allowed/*"}]}"#,
+                )
+                .expect("parse policy"),
+            )
+            .await
+            .expect("store policy");
+            iam.policy_db_set(access_key, UserType::Reg, false, "zip-redeem-policy")
+                .await
+                .expect("attach policy");
+            let credentials = iam.get_user(access_key).await.expect("load user").credentials;
+            // Redemption carries no server context slot, so it resolves the ambient context.
+            publish_test_app_context(Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms))));
+
+            let record = zip_redemption_record(access_key, credentials, test_auth_context());
+
+            authorize_zip_items_for_download(&record, &[zip_item("allowed/one"), zip_item("allowed/two")])
+                .await
+                .expect("every saved item is readable by the token principal");
+            let err = authorize_zip_items_for_download(&record, &[zip_item("allowed/one"), zip_item("denied/one")])
+                .await
+                .expect_err("one unreadable item denies the download");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+            let err = authorize_zip_items_for_download(&record, &[zip_item("denied/one")])
+                .await
+                .expect_err("an unreadable item is denied");
+            assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
+    }
+
+    /// A saved copy-source header is a body-derived policy input the token cannot supply,
+    /// so redemption fails closed before any policy is evaluated.
+    #[tokio::test]
+    async fn token_redemption_denies_saved_copy_source_header() {
+        let mut auth_context = test_auth_context();
+        auth_context
+            .headers
+            .insert("x-amz-copy-source", HeaderValue::from_static("/photos/allowed/one"));
+        let record = zip_redemption_record("zip-redeem-user", rustfs_credentials::Credentials::default(), auth_context);
+        let err = authorize_zip_items_for_download(&record, &[zip_item("allowed/one")])
+            .await
+            .expect_err("an unresolved copy-source input fails closed");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert_eq!(err.message(), Some("request body policy input is missing for this action"));
+    }
+
+    fn zip_redemption_record(
+        access_key: &str,
+        credentials: rustfs_credentials::Credentials,
+        auth_context: ObjectZipDownloadAuthContext,
+    ) -> ObjectZipDownloadToken {
+        ObjectZipDownloadToken {
+            id: "zip-redeem-token".to_owned(),
+            principal: access_key.to_owned(),
+            req_info: ReqInfo {
+                cred: Some(credentials),
+                ..Default::default()
+            },
+            auth_context,
+            request: CreateObjectZipDownloadRequest {
+                bucket: "photos".to_owned(),
+                prefix: None,
+                objects: Vec::new(),
+                prefixes: Vec::new(),
+                filename: None,
+            },
+        }
+    }
+
+    fn zip_item(key: &str) -> ZipDownloadItem {
+        ZipDownloadItem {
+            key: key.to_owned(),
+            entry_name: key.to_owned(),
+        }
+    }
 
     fn valid_request() -> CreateObjectZipDownloadRequest {
         CreateObjectZipDownloadRequest {
@@ -1010,7 +1287,8 @@ mod tests {
 
     #[test]
     fn validate_download_token_rejects_unknown_token() {
-        let err = validate_download_token("missing", "missing", OffsetDateTime::UNIX_EPOCH)
+        let credentials = test_signing_credentials();
+        let err = validate_download_token("missing", "missing", OffsetDateTime::UNIX_EPOCH, &credentials)
             .expect_err("unknown token should be rejected");
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
@@ -1020,8 +1298,10 @@ mod tests {
     fn validate_download_token_rejects_mismatched_token_value() {
         let now = OffsetDateTime::UNIX_EPOCH;
         let created = create_test_download_token(now);
+        let credentials = test_signing_credentials();
 
-        let err = validate_download_token("different-id", &created.token, now).expect_err("wrong token id should be rejected");
+        let err = validate_download_token("different-id", &created.token, now, &credentials)
+            .expect_err("wrong token id should be rejected");
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
@@ -1030,8 +1310,9 @@ mod tests {
     fn validate_download_token_rejects_expired_token() {
         let now = OffsetDateTime::UNIX_EPOCH;
         let created = create_test_download_token(now);
+        let credentials = test_signing_credentials();
 
-        let err = validate_download_token(&created.id, &created.token, now + OBJECT_ZIP_DOWNLOAD_TOKEN_TTL)
+        let err = validate_download_token(&created.id, &created.token, now + OBJECT_ZIP_DOWNLOAD_TOKEN_TTL, &credentials)
             .expect_err("expired token should be rejected");
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
@@ -1041,8 +1322,10 @@ mod tests {
     fn validate_download_token_accepts_unexpired_matching_token() {
         let now = OffsetDateTime::UNIX_EPOCH;
         let created = create_test_download_token(now);
+        let credentials = test_signing_credentials();
 
-        let record = validate_download_token(&created.id, &created.token, now).expect("matching token should be accepted");
+        let record =
+            validate_download_token(&created.id, &created.token, now, &credentials).expect("matching token should be accepted");
 
         assert_eq!(record.id, created.id);
         assert_eq!(record.principal, "alice");
@@ -1079,8 +1362,10 @@ mod tests {
         let first = ciphertext.first_mut().expect("ciphertext should not be empty");
         *first ^= 0x01;
         let tampered = format!("{}.{}", nonce, base64_encode_url_safe_no_pad(&ciphertext));
+        let credentials = test_signing_credentials();
 
-        let err = validate_download_token(&created.id, &tampered, now).expect_err("tampered token should be rejected");
+        let err =
+            validate_download_token(&created.id, &tampered, now, &credentials).expect_err("tampered token should be rejected");
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
@@ -1094,7 +1379,7 @@ mod tests {
             "object ZIP download token should carry an authenticated payload"
         );
         assert!(
-            src.contains("get_global_action_cred"),
+            src.contains("current_action_credentials"),
             "object ZIP download token should be verifiable by any node sharing global credentials"
         );
         assert!(
@@ -1373,17 +1658,23 @@ mod tests {
     }
 
     fn create_test_download_token(now: OffsetDateTime) -> CreatedObjectZipDownloadToken {
-        ensure_test_signing_credentials();
-        create_download_token("alice".to_string(), test_req_info(), test_auth_context(), valid_request(), now)
-            .expect("token should be created")
+        let credentials = test_signing_credentials();
+        create_download_token(
+            "alice".to_string(),
+            test_req_info(),
+            test_auth_context(),
+            valid_request(),
+            now,
+            &credentials,
+        )
+        .expect("token should be created")
     }
 
-    fn ensure_test_signing_credentials() {
-        if get_global_action_cred().is_none() {
-            let _ = init_global_action_credentials(
-                Some("TESTROOTACCESSKEY".to_string()),
-                Some("TESTROOTSECRET1234567890".to_string()),
-            );
+    fn test_signing_credentials() -> Credentials {
+        Credentials {
+            access_key: "TESTROOTACCESSKEY".to_string(),
+            secret_key: "TESTROOTSECRET1234567890".to_string(),
+            ..Default::default()
         }
     }
 
@@ -1402,8 +1693,11 @@ mod tests {
             bucket: Some("photos".to_string()),
             object: None,
             version_id: None,
-            region: get_global_region(),
+            replication_request_authorized: false,
+            region: current_region(),
             request_context: None,
+            suppress_denial_log: false,
+            suppress_denial_audit: false,
         }
     }
 

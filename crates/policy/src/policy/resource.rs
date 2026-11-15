@@ -17,7 +17,11 @@ use serde::{
     Deserialize, Deserializer, Serialize,
     de::{self, Error as DeError, Visitor},
 };
-use std::{collections::HashMap, fmt, ops::Deref};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    ops::Deref,
+};
 
 use super::{
     Error as IamError, Validator,
@@ -38,11 +42,7 @@ impl Serialize for ResourceSet {
 
         let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
         for resource in &self.0 {
-            let resource_str = match resource {
-                Resource::S3(value) => format!("{}{}", Resource::S3_PREFIX, value),
-                Resource::Kms(value) => value.clone(),
-            };
-            seq.serialize_element(&resource_str)?;
+            seq.serialize_element(resource)?;
         }
         seq.end()
     }
@@ -52,12 +52,6 @@ impl ResourceSet {
     /// Returns true if the resource set is empty.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-
-    fn push_unique(&mut self, resource: Resource) {
-        if !self.0.contains(&resource) {
-            self.0.push(resource);
-        }
     }
 
     pub async fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
@@ -134,9 +128,7 @@ impl<'de> Deserialize<'de> for ResourceSet {
                 E: de::Error,
             {
                 let resource = Resource::try_from(value).map_err(|e| E::custom(format!("invalid resource: {}", e)))?;
-                let mut resources = ResourceSet::default();
-                resources.push_unique(resource);
-                Ok(resources)
+                Ok(ResourceSet(vec![resource]))
             }
 
             fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
@@ -144,11 +136,14 @@ impl<'de> Deserialize<'de> for ResourceSet {
                 A: de::SeqAccess<'de>,
                 A::Error: DeError,
             {
-                let mut resources = ResourceSet(Vec::with_capacity(seq.size_hint().unwrap_or(0)));
+                let mut resources = ResourceSet::default();
+                let mut seen = HashSet::new();
                 while let Some(value) = seq.next_element::<String>()? {
                     match Resource::try_from(value.as_str()) {
                         Ok(resource) => {
-                            resources.push_unique(resource);
+                            if seen.insert(resource.clone()) {
+                                resources.0.push(resource);
+                            }
                         }
                         Err(e) => {
                             return Err(A::Error::custom(format!("invalid resource: {}", e)));
@@ -165,12 +160,27 @@ impl<'de> Deserialize<'de> for ResourceSet {
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub enum Resource {
+    All,
     S3(String),
     Kms(String),
 }
 
 impl Resource {
     pub const S3_PREFIX: &'static str = "arn:aws:s3:::";
+    /// KMS ARNs use the same empty-account form as [`Self::S3_PREFIX`]; the suffix is
+    /// `key/<key_id>` (wildcards allowed in the id), `alias/<name>`, or a bare `*`.
+    pub const KMS_PREFIX: &'static str = "arn:aws:kms:::";
+    /// Resource-type segment for key ids; request-side KMS resource strings are
+    /// `key/<key_id>` so they line up with these patterns.
+    pub const KMS_KEY_SEGMENT: &'static str = "key/";
+    /// Resource-type segment reserved for key aliases. Alias patterns parse and
+    /// validate, but requests are always evaluated against `key/<key_id>` strings,
+    /// so an alias pattern matches nothing until alias resolution lands.
+    pub const KMS_ALIAS_SEGMENT: &'static str = "alias/";
+
+    pub fn is_kms(&self) -> bool {
+        matches!(self, Resource::Kms(_))
+    }
 
     pub async fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
         self.is_match_with_resolver(resource, conditions, None).await
@@ -183,6 +193,7 @@ impl Resource {
         resolver: Option<&dyn PolicyVariableResolver>,
     ) -> bool {
         let pattern = match self {
+            Resource::All => return true,
             Resource::S3(s) => s.to_owned(),
             Resource::Kms(s) => s.to_owned(),
         };
@@ -212,7 +223,14 @@ impl Resource {
                 return true;
             }
 
-            if cp != "." && wildcard::is_match(resolved_pattern, &cp) {
+            // Keep directory objects distinct from their bare key for prefix
+            // matching, while retaining path cleaning and exact-match compatibility.
+            let wildcard_resource = if matches!(self, Resource::S3(_)) && resource.ends_with('/') && cp.contains('/') {
+                format!("{cp}/")
+            } else {
+                cp.clone()
+            };
+            if cp != "." && wildcard::is_match(resolved_pattern, &wildcard_resource) {
                 return true;
             }
         }
@@ -228,10 +246,15 @@ impl Resource {
 impl TryFrom<&str> for Resource {
     type Error = Error;
     fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
-        let Some(value) = value.strip_prefix(Self::S3_PREFIX) else {
+        let resource = if value == "*" {
+            Resource::All
+        } else if let Some(suffix) = value.strip_prefix(Self::S3_PREFIX) {
+            Resource::S3(suffix.into())
+        } else if let Some(suffix) = value.strip_prefix(Self::KMS_PREFIX) {
+            Resource::Kms(suffix.into())
+        } else {
             return Err(IamError::InvalidResource("unknown".into(), value.into()).into());
         };
-        let resource = Resource::S3(value.into());
 
         resource.is_valid()?;
         Ok(resource)
@@ -242,19 +265,24 @@ impl Validator for Resource {
     type Error = Error;
     fn is_valid(&self) -> std::result::Result<(), Error> {
         match self {
+            Self::All => {}
             Self::S3(pattern) => {
                 if pattern.is_empty() || pattern.starts_with('/') {
                     return Err(IamError::InvalidResource("s3".into(), pattern.into()).into());
                 }
             }
             Self::Kms(pattern) => {
-                if pattern.is_empty()
+                // A bare `*` matches every key resource; anything else must carry a
+                // resource-type segment. Key ids never contain separators (the KMS
+                // backends reject them), while alias names may nest ("alias/aws/s3").
+                let well_formed = pattern == "*"
                     || pattern
-                        .char_indices()
-                        .find(|&(_, c)| c == '/' || c == '\\' || c == '.')
-                        .map(|(i, _)| i)
-                        .is_some()
-                {
+                        .strip_prefix(Self::KMS_KEY_SEGMENT)
+                        .is_some_and(|id| !id.is_empty() && !id.contains('/') && !id.contains('\\'))
+                    || pattern
+                        .strip_prefix(Self::KMS_ALIAS_SEGMENT)
+                        .is_some_and(|name| !name.is_empty() && !name.contains('\\'));
+                if !well_formed {
                     return Err(IamError::InvalidResource("kms".into(), pattern.into()).into());
                 }
             }
@@ -269,8 +297,9 @@ impl Serialize for Resource {
         S: serde::Serializer,
     {
         match self {
+            Resource::All => serializer.serialize_str("*"),
             Resource::S3(s) => serializer.serialize_str(&format!("{}{}", Self::S3_PREFIX, s)),
-            Resource::Kms(s) => serializer.serialize_str(s),
+            Resource::Kms(s) => serializer.serialize_str(&format!("{}{}", Self::KMS_PREFIX, s)),
         }
     }
 }
@@ -291,6 +320,24 @@ mod tests {
     use std::collections::HashMap;
     use test_case::test_case;
 
+    #[test]
+    fn large_resource_sets_deduplicate_without_changing_first_seen_order() {
+        let unique = (0..40_000)
+            .map(|index| format!("arn:aws:s3:::bucket/key-{index}"))
+            .collect::<Vec<_>>();
+        let mut repeated = unique.clone();
+        repeated.extend(unique.iter().rev().cloned());
+        let resources: super::ResourceSet = serde_json::from_slice(&serde_json::to_vec(&repeated).expect("encode resources"))
+            .expect("large valid resource list parses");
+        assert_eq!(resources.len(), unique.len());
+        assert_eq!(serde_json::to_value(resources).expect("serialize resources"), serde_json::json!(unique));
+        assert!(serde_json::from_str::<super::ResourceSet>(r#"["arn:aws:s3:::bucket/key","invalid"]"#).is_err());
+    }
+
+    #[test_case("*", "mybucket" => true; "all buckets")]
+    #[test_case("*", "mybucket/myobject" => true; "all objects")]
+    #[test_case("*", "key/mykey" => true; "all keys")]
+    #[test_case("*", "" => true; "unscoped action")]
     #[test_case("arn:aws:s3:::*","mybucket" => true; "1")]
     #[test_case("arn:aws:s3:::*","mybucket/myobject" => true; "2")]
     #[test_case("arn:aws:s3:::mybucket*","mybucket" => true; "3")]
@@ -308,9 +355,114 @@ mod tests {
     #[test_case("arn:aws:s3:::mybucket","mybucket/myobject" => false; "15")]
     #[test_case("arn:aws:s3:::attacker-bucket/*","attacker-bucket/../victim-bucket/evil.txt" => false; "16")]
     #[test_case("arn:aws:s3:::attacker-bucket/*","attacker-bucket/safe/../../victim-bucket/evil.txt" => false; "17")]
+    #[test_case("arn:aws:s3:::bucket/secret/*","bucket/secret/" => true; "directory prefix")]
+    #[test_case("arn:aws:s3:::bucket/secret","bucket/secret/" => true; "directory exact compatibility")]
+    #[test_case("arn:aws:s3:::bucket/*","bucket/" => false; "bucket is not a directory object")]
+    #[test_case("arn:aws:s3:::attacker-bucket/*","attacker-bucket/../victim-bucket/" => false; "directory traversal")]
+    #[test_case("arn:aws:kms:::key/mykey","key/mykey" => true; "kms exact key")]
+    #[test_case("arn:aws:kms:::key/mykey","key/otherkey" => false; "kms wrong key")]
+    #[test_case("arn:aws:kms:::key/*","key/mykey" => true; "kms key wildcard")]
+    #[test_case("arn:aws:kms:::key/app-*","key/app-primary" => true; "kms key prefix wildcard")]
+    #[test_case("arn:aws:kms:::key/app-*","key/backup-primary" => false; "kms key prefix mismatch")]
+    #[test_case("arn:aws:kms:::key/mykey?","key/mykey1" => true; "kms key question mark")]
+    #[test_case("arn:aws:kms:::*","key/mykey" => true; "kms bare star")]
+    #[test_case("arn:aws:kms:::key/mykey","key/mykey/../otherkey" => false; "kms traversal cleaned")]
+    #[test_case("arn:aws:kms:::alias/myalias","key/myalias" => false; "kms alias never matches key")]
+    #[test_case("arn:aws:kms:::alias/*","key/mykey" => false; "kms alias wildcard never matches key")]
+    #[test_case("arn:aws:kms:::key/mykey","mykey" => false; "kms bare id lacks key segment")]
     fn test_resource_is_match(resource: &str, object: &str) -> bool {
         let resource: Resource = resource.try_into().unwrap();
 
         pollster::block_on(resource.is_match(object, &HashMap::new()))
+    }
+
+    #[test_case("arn:aws:s3:::mybucket/${jwt:preferred_username}/*", "mybucket/alice/photo.jpg" => true; "jwt variable")]
+    #[test_case("arn:aws:s3:::mybucket/${jwt:preferred_username}/*", "mybucket/bob/photo.jpg" => false; "jwt variable other user")]
+    #[test_case("arn:aws:s3:::mybucket/${ldap:username}/*", "mybucket/alice-ldap/photo.jpg" => true; "ldap variable")]
+    fn test_resource_is_match_substitutes_condition_variables(resource: &str, object: &str) -> bool {
+        let resource: Resource = resource.try_into().unwrap();
+        let conditions = HashMap::from([
+            ("preferred_username".to_string(), vec!["alice".to_string()]),
+            ("username".to_string(), vec!["alice-ldap".to_string()]),
+        ]);
+
+        pollster::block_on(resource.is_match(object, &conditions))
+    }
+
+    #[test]
+    fn test_wildcard_resource_serialization_round_trip() {
+        use crate::policy::resource::ResourceSet;
+
+        let resource: Resource = serde_json::from_str(r#""*""#).expect("wildcard resource should parse");
+        assert_eq!(serde_json::to_string(&resource).expect("resource should serialize"), r#""*""#);
+
+        for json in [r#""*""#, r#"["*"]"#, r#"["*","*"]"#] {
+            let set: ResourceSet = serde_json::from_str(json).expect("wildcard resource set should parse");
+            assert_eq!(set.len(), 1, "duplicate wildcard resources should be removed");
+            let serialized = serde_json::to_string(&set).expect("resource set should serialize");
+            assert_eq!(serialized, r#"["*"]"#);
+            let round_trip: ResourceSet = serde_json::from_str(&serialized).expect("resource set should parse again");
+            assert_eq!(round_trip, set);
+        }
+    }
+
+    #[test_case(""; "empty resource")]
+    #[test_case("**"; "multiple wildcards")]
+    #[test_case("*/*"; "unqualified path")]
+    #[test_case(" *"; "leading whitespace")]
+    #[test_case("arn:aws:unknown:::*"; "unknown service")]
+    fn test_invalid_resource_is_rejected(resource: &str) {
+        assert!(Resource::try_from(resource).is_err(), "invalid resource must not become a wildcard");
+    }
+
+    #[test_case("arn:aws:kms:::key/mykey" => true; "key id parses")]
+    #[test_case("arn:aws:kms:::key/*" => true; "key wildcard parses")]
+    #[test_case("arn:aws:kms:::key/app-key.v2" => true; "key id with dot parses")]
+    #[test_case("arn:aws:kms:::alias/myalias" => true; "alias parses")]
+    #[test_case("arn:aws:kms:::alias/aws/s3" => true; "nested alias parses")]
+    #[test_case("arn:aws:kms:::*" => true; "bare star parses")]
+    #[test_case("arn:aws:kms:::" => false; "empty suffix rejected")]
+    #[test_case("arn:aws:kms:::key/" => false; "empty key id rejected")]
+    #[test_case("arn:aws:kms:::alias/" => false; "empty alias name rejected")]
+    #[test_case("arn:aws:kms:::mykey" => false; "missing resource type segment rejected")]
+    #[test_case("arn:aws:kms:::key/a/b" => false; "separator in key id rejected")]
+    #[test_case("arn:aws:kms:::key/a\\b" => false; "backslash in key id rejected")]
+    #[test_case("arn:aws:kms:us-east-1:123456789012:key/mykey" => false; "region and account form rejected")]
+    fn test_kms_resource_parse(resource: &str) -> bool {
+        Resource::try_from(resource).is_ok()
+    }
+
+    #[test]
+    fn test_kms_resource_serialization_round_trip() {
+        for raw in [
+            "arn:aws:kms:::key/mykey",
+            "arn:aws:kms:::key/*",
+            "arn:aws:kms:::alias/myalias",
+            "arn:aws:kms:::*",
+        ] {
+            let resource = Resource::try_from(raw).expect("KMS resource should parse");
+            assert!(resource.is_kms());
+
+            let json = serde_json::to_string(&resource).expect("KMS resource should serialize");
+            assert_eq!(json, format!("\"{raw}\""), "serialization must write back the full ARN");
+
+            let round_trip: Resource = serde_json::from_str(&json).expect("serialized KMS resource should deserialize");
+            assert_eq!(round_trip, resource);
+        }
+    }
+
+    #[test]
+    fn test_kms_resource_set_serialization_round_trip() {
+        use crate::policy::resource::ResourceSet;
+
+        let set: ResourceSet =
+            serde_json::from_str(r#"["arn:aws:kms:::key/app-*","arn:aws:kms:::alias/myalias"]"#).expect("set should parse");
+        assert_eq!(set.len(), 2);
+
+        let json = serde_json::to_string(&set).expect("set should serialize");
+        assert_eq!(json, r#"["arn:aws:kms:::key/app-*","arn:aws:kms:::alias/myalias"]"#);
+
+        let round_trip: ResourceSet = serde_json::from_str(&json).expect("serialized set should deserialize");
+        assert_eq!(round_trip, set);
     }
 }

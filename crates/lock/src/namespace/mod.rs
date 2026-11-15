@@ -57,6 +57,16 @@ impl NamespaceLockWrapper {
         &self.owner
     }
 
+    /// The exact namespace key used by this acquisition wrapper.
+    pub fn resource(&self) -> &ObjectKey {
+        &self.resource
+    }
+
+    /// Logical namespace label for diagnostics; local namespaces may share a manager.
+    pub fn namespace(&self) -> &str {
+        self.lock.namespace()
+    }
+
     /// Acquire write lock (exclusive lock) with timeout
     /// Returns the guard if acquisition succeeds, or an error if it fails
     pub async fn get_write_lock(&self, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
@@ -77,6 +87,17 @@ impl NamespaceLockWrapper {
     /// Returns the guard if acquisition succeeds, or an error if it fails
     pub async fn get_read_lock(&self, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
         self.lock.get_read_lock(self.resource.clone(), &self.owner, timeout).await
+    }
+
+    /// Acquire write locks for `resources` in one batched round using this
+    /// wrapper's owner; see [`NamespaceLock::acquire_write_locks_batch`].
+    /// One guard or error per resource, in `resources` order.
+    pub async fn get_write_locks_batch(
+        &self,
+        resources: &[ObjectKey],
+        timeout: Duration,
+    ) -> Vec<std::result::Result<NamespaceLockGuard, crate::error::LockError>> {
+        self.lock.acquire_write_locks_batch(resources, &self.owner, timeout).await
     }
 }
 
@@ -118,6 +139,38 @@ impl NamespaceLockGuard {
             Self::Fast(guard) => guard.is_released(),
         }
     }
+
+    /// Whether the distributed guard's refresh heartbeat has observed a
+    /// refresh-quorum loss (backlog#899 Phase 2). Local (fast) locks are
+    /// single-node and never lose quorum, so they always report `false`.
+    pub fn is_lock_lost(&self) -> bool {
+        match self {
+            Self::Standard(guard) => guard.is_lock_lost(),
+            Self::Fast(_) => false,
+        }
+    }
+
+    /// Share the loss signal when a caller deliberately forwards a mutation
+    /// under an already-held distributed lock.
+    pub fn lock_lost_signal(&self) -> Option<Arc<crate::distributed_lock::LockLostSignal>> {
+        match self {
+            Self::Standard(guard) => Some(guard.lock_lost()),
+            Self::Fast(_) => None,
+        }
+    }
+
+    /// Resolves when a distributed guard loses refresh quorum.
+    ///
+    /// Local fast locks cannot lose distributed quorum, so their future remains pending.
+    pub async fn lock_lost_notified(&self) {
+        match self {
+            Self::Standard(guard) => {
+                let signal = guard.lock_lost();
+                signal.notified().await;
+            }
+            Self::Fast(_) => std::future::pending().await,
+        }
+    }
 }
 
 /// Namespace lock for managing locks by resource namespaces
@@ -148,6 +201,11 @@ impl NamespaceLock {
         Self::Local(LocalLock::new(namespace, manager))
     }
 
+    /// Create a local namespace lock that shares an existing namespace allocation.
+    pub fn with_local_manager_shared(namespace: Arc<str>, manager: Arc<crate::GlobalLockManager>) -> Self {
+        Self::Local(LocalLock::new_shared(namespace, manager))
+    }
+
     /// Create namespace lock with clients
     /// Uses DistributedLock with appropriate quorum
     pub fn with_clients(namespace: String, clients: Vec<Arc<dyn LockClient>>) -> Self {
@@ -161,6 +219,15 @@ impl NamespaceLock {
     /// The write quorum will be clamped into [1, clients.len()].
     pub fn with_clients_and_quorum(namespace: String, clients: Vec<Arc<dyn LockClient>>, quorum: usize) -> Self {
         Self::Distributed(DistributedLock::new(namespace, clients, quorum))
+    }
+
+    /// Create a namespace lock that shares existing namespace and client allocations.
+    pub fn with_clients_and_quorum_shared(
+        namespace: Arc<str>,
+        clients: impl Into<Arc<[Arc<dyn LockClient>]>>,
+        quorum: usize,
+    ) -> Self {
+        Self::Distributed(DistributedLock::new_shared(namespace, clients.into(), quorum))
     }
 
     /// Get namespace identifier
@@ -290,6 +357,38 @@ impl NamespaceLock {
             Ok(Some(guard)) => Ok(guard),
             Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Acquire exclusive locks for many independent resources in one batched
+    /// round; see [`crate::distributed_lock::DistributedLock::acquire_guard_batch`].
+    /// Returns one guard or error per resource, in `resources` order.
+    ///
+    /// This is the lock primitive bulk mutations (S3 `DeleteObjects`) should
+    /// use: per-key quorum round-trips serialize a 1000-key batch, while the
+    /// batched form is one wire round per lock client and stays deadlock-free
+    /// without any canonical serial fallback (every lock server orders
+    /// concurrent batches by the same global key order).
+    pub async fn acquire_write_locks_batch(
+        &self,
+        resources: &[ObjectKey],
+        owner: &str,
+        timeout: Duration,
+    ) -> Vec<std::result::Result<NamespaceLockGuard, crate::error::LockError>> {
+        let ttl = crate::fast_lock::DEFAULT_LOCK_TIMEOUT;
+        match self {
+            Self::Distributed(lock) => lock
+                .acquire_guard_batch(resources, owner, timeout, ttl)
+                .await
+                .into_iter()
+                .map(|result| result.map(NamespaceLockGuard::Standard))
+                .collect(),
+            Self::Local(lock) => lock
+                .acquire_guard_batch(resources, owner, timeout, ttl)
+                .await
+                .into_iter()
+                .map(|result| result.map(NamespaceLockGuard::Fast))
+                .collect(),
         }
     }
 

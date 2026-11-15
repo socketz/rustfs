@@ -20,7 +20,7 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 homepage.workspace = true
-description = "ZIP file handling for RustFS, providing support for reading and writing ZIP archives."
+description = "Archive format detection and async stream decoders for RustFS."
 keywords = ["zip", "compression", "rustfs", "Minio"]
 categories = ["web-programming", "development-tools", "compression"]
 documentation = "https://docs.rs/rustfs-zip/latest/rustfs_zip/"
@@ -28,33 +28,39 @@ documentation = "https://docs.rs/rustfs-zip/latest/rustfs_zip/"
 [lib]
 doctest = false
 
-[[bench]]
-name = "zip_benchmark"
-harness = false
+[features]
+default = []
+hotpath = ["hotpath/hotpath", "hotpath/tokio", "rustfs-rio/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-rio/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-rio/hotpath-cpu"]
 
 [dependencies]
+hotpath.workspace = true
 async-compression = { workspace = true, features = [
     "tokio",
     "bzip2",
     "gzip",
+    "lz4",
     "zlib",
     "zstd",
     "xz",
 ] }
-tokio = { workspace = true, features = ["fs","io-util","macros"] }
-tokio-stream = { workspace = true }
-astral-tokio-tar = { workspace = true }
+rustfs-rio.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
 thiserror = { workspace = true }
-zip = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Keep XZ decoding self-contained in macOS binaries instead of linking Homebrew liblzma.
+liblzma = { version = "0.4.9", features = ["static"] }
 
 [dev-dependencies]
-criterion = { workspace = true, features = ["html_reports"] }
-tempfile = { workspace = true }
-
+rustfs-tokio-tar = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tar-codec = { workspace = true }
+tar-framing = { workspace = true }
 
 [lints]
 workspace = true
-
-# io-uring is Linux-only. Scope the feature to Linux targets.
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio = { workspace = true, features = ["io-uring"] }

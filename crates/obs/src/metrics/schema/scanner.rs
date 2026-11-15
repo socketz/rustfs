@@ -12,10 +12,187 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 use crate::{MetricDescriptor, MetricName, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
+
+pub const SERVER_LABEL: &str = "server";
+pub const SOURCE_LABEL: &str = "source";
+pub const STATE_LABEL: &str = "state";
+pub const CYCLE_SCOPE_LABEL: &str = "cycle_scope";
+pub const BUCKET_LABEL: &str = "bucket";
+pub const DRIVE_LABEL: &str = "drive";
+pub const RESULT_LABEL: &str = "result";
+
+pub static SCANNER_SOURCE_WORK_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("source_work_total".to_string()),
+        "Total scanner work by source and state since server start",
+        &[SERVER_LABEL, SOURCE_LABEL, STATE_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_CYCLE_SOURCE_WORK_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("cycle_source_work".to_string()),
+        "Scanner work by cycle scope, source, and state",
+        &[SERVER_LABEL, CYCLE_SCOPE_LABEL, SOURCE_LABEL, STATE_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_BUCKET_DRIVE_RESULT_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("bucket_drive_result_total".to_string()),
+        "Total scanner bucket-drive scan results by server, bucket, drive, and result",
+        &[SERVER_LABEL, BUCKET_LABEL, DRIVE_LABEL, RESULT_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("cycle_bucket_drive_result".to_string()),
+        "Scanner bucket-drive scan results by cycle scope, server, bucket, drive, and result",
+        &[SERVER_LABEL, CYCLE_SCOPE_LABEL, BUCKET_LABEL, DRIVE_LABEL, RESULT_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_ACTIVE_BUCKET_DRIVE_SCANS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("active_bucket_drive_scans".to_string()),
+        "Current active scanner bucket-drive scans by server, source, bucket, and drive",
+        &[SERVER_LABEL, SOURCE_LABEL, BUCKET_LABEL, DRIVE_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_ACTIVE_BUCKET_DRIVE_SCAN_AGE_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("active_bucket_drive_scan_age_seconds".to_string()),
+        "Age of the oldest active scanner bucket-drive scan by server, source, bucket, and drive",
+        &[SERVER_LABEL, SOURCE_LABEL, BUCKET_LABEL, DRIVE_LABEL],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_DIRTY_USAGE_PENDING_BUCKETS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("dirty_usage_pending_buckets".to_string()),
+        "Current number of buckets with pending scanner dirty-usage acknowledgements.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_DIRTY_USAGE_LAST_MARK_UNIX_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("dirty_usage_last_mark_unix_seconds".to_string()),
+        "Unix timestamp of the last scanner dirty-usage mark, or zero when none has been recorded.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_DIRTY_USAGE_LAST_CLEAR_UNIX_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("dirty_usage_last_clear_unix_seconds".to_string()),
+        "Unix timestamp of the last scanner dirty-usage clear, or zero when none has been recorded.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_DIRTY_USAGE_LAST_CYCLE_BUCKETS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("dirty_usage_last_cycle_buckets".to_string()),
+        "Number of dirty-usage buckets observed by the last scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_DIRTY_USAGE_LAST_CYCLE_CLEARED_BUCKETS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("dirty_usage_last_cycle_cleared_buckets".to_string()),
+        "Number of dirty-usage buckets cleared by the last scanner cycle.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_USAGE_LAST_SAVE_UNIX_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("usage_last_save_unix_seconds".to_string()),
+        "Unix timestamp of the last scanner usage-cache save attempt, or zero when none has been recorded.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_USAGE_LAST_SAVE_RESULT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("usage_last_save_result".to_string()),
+        "Last scanner usage-cache save result code: 0 unknown, 1 success, 2 failed, 3 skipped_stale, 4 encode_failed.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_USAGE_LAST_DURABLE_SUCCESS_UNIX_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("usage_last_durable_success_unix_seconds".to_string()),
+        "Unix timestamp of the last durable scanner usage-cache publication success, or zero when none has been recorded.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_USAGE_LAST_PUBLICATION_UNIX_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("usage_last_publication_unix_seconds".to_string()),
+        "Unix timestamp of the last scanner usage-cache publication state update, or zero when none has been recorded.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_USAGE_LAST_PUBLICATION_RESULT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("usage_last_publication_result".to_string()),
+        "Last scanner usage-cache publication result code: 0 unknown, 1 success, 2 deferred, 3 failed, 4 no_update.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_USAGE_DEFERRED_PENDING_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("usage_deferred_pending".to_string()),
+        "Whether scanner usage-cache publication is currently deferred: 1 deferred, 0 not deferred.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_USAGE_DEFERRED_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::Custom("usage_deferred_total".to_string()),
+        "Total scanner usage-cache publication deferrals since server start.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_USAGE_LAST_DEFERRED_UNIX_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("usage_last_deferred_unix_seconds".to_string()),
+        "Unix timestamp of the last scanner usage-cache publication deferral, or zero when none has been recorded.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
 
 pub static SCANNER_BUCKET_SCANS_FINISHED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
@@ -416,7 +593,7 @@ pub static SCANNER_CURRENT_SCAN_MODE_MD: LazyLock<MetricDescriptor> = LazyLock::
 pub static SCANNER_LAST_CYCLE_RESULT_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::ScannerLastCycleResult,
-        "Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial.",
+        "Last scanner cycle result: 0 unknown, 1 success, 2 error, 3 partial, 4 superseded, 5 deferred.",
         &[],
         subsystems::SCANNER,
     )
@@ -584,6 +761,15 @@ pub static SCANNER_FAILED_CYCLES_MD: LazyLock<MetricDescriptor> = LazyLock::new(
     )
 });
 
+pub static SCANNER_SUPERSEDED_CYCLES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::ScannerSupersededCycles,
+        "Total number of clean scanner cycles superseded by concurrent cluster, configuration, topology, or namespace activity since server start.",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
 pub static SCANNER_PARTIAL_CYCLES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_counter_md(
         MetricName::ScannerPartialCycles,
@@ -598,6 +784,78 @@ pub static SCANNER_PARTIAL_CYCLES_BY_REASON_MD: LazyLock<MetricDescriptor> = Laz
         MetricName::ScannerPartialCyclesByReason,
         "Total number of scanner cycles stopped before completion by cycle budget reason.",
         &["reason"],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_RUNTIME_ACTIVE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("runtime_active".to_string()),
+        "Whether the latest local scanner runtime owns its lifecycle guard, not a health proof",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_PHASE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_phase".to_string()),
+        "Local scanner startup phase: 0 unknown, 1 initializing, 2 usage inspection, 3 waiting, 4 attempted, 5 stopped",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_STARTED_UNIX_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_started_unix_seconds".to_string()),
+        "Unix timestamp when the latest local scanner runtime was initialized, or zero if unknown",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_PHASE_AGE_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_phase_age_seconds".to_string()),
+        "Seconds since the latest local scanner startup transition",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_PLANNED_ATTEMPT_UNIX_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_planned_attempt_unix_seconds".to_string()),
+        "Estimated Unix timestamp of the sampled startup attempt deadline, not scan completion; zero if unavailable",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_WAIT_REMAINING_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_wait_remaining_seconds".to_string()),
+        "Monotonic seconds remaining before the sampled startup attempt deadline",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_WAIT_OVERDUE_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_wait_overdue_seconds".to_string()),
+        "Monotonic seconds past the sampled startup deadline while the runtime remains in startup waiting",
+        &[],
+        subsystems::SCANNER,
+    )
+});
+
+pub static SCANNER_STARTUP_FIRST_ATTEMPT_UNIX_SECONDS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::Custom("startup_first_attempt_unix_seconds".to_string()),
+        "Unix timestamp of first normal scanner leadership/recovery attempt after startup recovery, not scan success; zero if unobserved",
+        &[],
         subsystems::SCANNER,
     )
 });

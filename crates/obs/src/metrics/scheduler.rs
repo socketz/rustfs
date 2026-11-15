@@ -23,45 +23,61 @@
 //! - Process disk I/O metrics
 //! - Host network I/O metrics
 
+use crate::metrics::collectors::cluster_drive::collect_cluster_drive_metrics;
 use crate::metrics::collectors::{
+    AuditTargetRuntimeStats,
     AuditTargetStats,
+    BucketReplicationBacklogStats,
     BucketReplicationBandwidthStats,
+    BucketReplicationRuntimeStats,
     NotificationStats,
+    NotificationTargetRuntimeStats,
     NotificationTargetStats,
+    OdmBackfillRuntimeStats,
+    OnDemandMigrationBucketStats,
     // System monitoring collectors (migrated from rustfs-obs::system)
     ProcessAttributeError,
     ProcessCpuStats,
     ProcessDiskStats,
     ProcessMemoryStats,
-    collect_audit_metrics,
+    ReplicationRuntimeStats,
+    ScannerRuntimeStats,
+    collect_audit_runtime_metrics,
     collect_bucket_metrics,
+    collect_bucket_replication_backlog_metrics,
     collect_bucket_replication_bandwidth_metrics,
-    collect_bucket_replication_metrics,
+    collect_bucket_replication_runtime_metrics,
     collect_bucket_usage_metrics,
     collect_cluster_config_metrics,
     collect_cluster_health_metrics,
     collect_cluster_metrics,
     collect_cluster_usage_metrics,
+    collect_compression_cluster_metrics,
     collect_cpu_metrics,
+    collect_current_dial9_metrics,
     collect_drive_count_metrics,
-    collect_drive_detailed_metrics,
+    collect_drive_runtime_detailed_metrics,
     collect_erasure_set_metrics,
     collect_host_network_metrics,
     collect_iam_metrics,
-    collect_ilm_metrics,
+    collect_ilm_runtime_metrics,
     collect_memory_metrics,
     collect_network_metrics,
     collect_node_metrics,
-    collect_notification_metrics,
-    collect_notification_target_metrics,
+    collect_notification_runtime_metrics,
+    collect_notification_target_runtime_metrics,
+    collect_on_demand_migration_backfill_metrics,
+    collect_on_demand_migration_metrics,
     collect_process_attributes,
     collect_process_cpu_metrics,
     collect_process_disk_metrics,
     collect_process_memory_metrics,
     collect_process_metrics,
-    collect_replication_metrics,
+    collect_replication_runtime_metrics,
+    collect_request_metrics,
     collect_resource_metrics,
-    collect_scanner_metrics,
+    collect_scanner_runtime_metrics,
+    collect_tier_request_metrics,
 };
 use crate::metrics::config::{
     DEFAULT_AUDIT_METRICS_INTERVAL, DEFAULT_BUCKET_METRICS_INTERVAL, DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
@@ -70,29 +86,87 @@ use crate::metrics::config::{
     ENV_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL, ENV_CLUSTER_METRICS_INTERVAL, ENV_DEFAULT_METRICS_INTERVAL,
     ENV_NODE_METRICS_INTERVAL, ENV_NOTIFICATION_METRICS_INTERVAL, ENV_RESOURCE_METRICS_INTERVAL,
 };
+use crate::metrics::obs_is_disk_compression_enabled;
 use crate::metrics::report::{PrometheusMetric, report_metrics};
+use crate::metrics::runtime_sources::bucket_monitor_available;
+use crate::metrics::schema::audit::{
+    AUDIT_FAILED_MESSAGES_BY_SERVER_MD, AUDIT_FAILED_MESSAGES_MD, AUDIT_FAILED_STORE_LENGTH_BY_SERVER_MD,
+    AUDIT_FAILED_STORE_LENGTH_MD, AUDIT_TARGET_QUEUE_LENGTH_BY_SERVER_MD, AUDIT_TARGET_QUEUE_LENGTH_MD,
+    AUDIT_TOTAL_MESSAGES_BY_SERVER_MD, AUDIT_TOTAL_MESSAGES_MD, SERVER as AUDIT_SERVER_LABEL,
+};
 use crate::metrics::schema::bucket_replication::{
-    BUCKET_L, BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, TARGET_ARN_L,
+    BUCKET_L, BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD,
+    BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD, BUCKET_REPL_CURRENT_TARGET_BACKLOG_BYTES_MD,
+    BUCKET_REPL_CURRENT_TARGET_BACKLOG_COUNT_MD, BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD, BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD,
+    BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD, BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD,
+    BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD, BUCKET_REPL_LATENCY_MS_MD, BUCKET_REPL_MRF_DROPPED_COUNT_MD,
+    BUCKET_REPL_MRF_FLUSH_FAILURES_MD, BUCKET_REPL_MRF_LAST_FLUSH_DURATION_MILLIS_MD, BUCKET_REPL_MRF_MISSED_COUNT_MD,
+    BUCKET_REPL_MRF_PENDING_BYTES_MD, BUCKET_REPL_MRF_PENDING_COUNT_MD, BUCKET_REPL_PROXY_REQUESTS_TOTAL_MD,
+    BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD, BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD,
+    BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD, BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD, BUCKET_REPL_TARGET_SENT_BYTES_MD,
+    BUCKET_REPL_TARGET_SENT_COUNT_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD, BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD,
+    OPERATION_L, RANGE_L, RESULT_L, TARGET_ARN_L,
 };
+use crate::metrics::schema::cluster_usage::{
+    BUCKET_LABEL as USAGE_BUCKET_LABEL, RANGE_LABEL as USAGE_RANGE_LABEL, USAGE_BUCKET_DELETE_MARKERS_COUNT_MD,
+    USAGE_BUCKET_OBJECT_SIZE_DISTRIBUTION_MD, USAGE_BUCKET_OBJECT_VERSION_COUNT_DISTRIBUTION_MD, USAGE_BUCKET_OBJECTS_TOTAL_MD,
+    USAGE_BUCKET_QUOTA_TOTAL_BYTES_MD, USAGE_BUCKET_TOTAL_BYTES_MD, USAGE_BUCKET_VERSIONS_COUNT_MD,
+};
+use crate::metrics::schema::node_bucket::{BUCKET_OBJECTS_TOTAL_MD, BUCKET_QUOTA_BYTES_MD, BUCKET_USAGE_BYTES_MD};
+use crate::metrics::schema::notification_target::{
+    NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD, NOTIFICATION_TARGET_FAILED_MESSAGES_MD,
+    NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD, NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD,
+    NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD, NOTIFICATION_TARGET_QUEUE_LENGTH_MD,
+    NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD, NOTIFICATION_TARGET_TOTAL_MESSAGES_MD, SERVER as NOTIFICATION_SERVER_LABEL,
+    TARGET_ID as NOTIFICATION_TARGET_ID_LABEL, TARGET_TYPE as NOTIFICATION_TARGET_TYPE_LABEL,
+};
+use crate::metrics::schema::on_demand_migration::{
+    BACKFILL_STATES as ODM_BACKFILL_STATES, BUCKET_L as ODM_BUCKET_L, LE_L as ODM_LE_L, ODM_BACKFILL_BYTES_MD,
+    ODM_BACKFILL_ENQUEUED_MD, ODM_BACKFILL_FAILED_MD, ODM_BACKFILL_JOBS_MD, ODM_BACKFILL_LISTED_MD, ODM_BACKFILL_PULLED_MD,
+    ODM_BACKFILL_SKIPPED_EXISTING_MD, ODM_BREAKER_STATE_MD, ODM_INFLIGHT_PULLS_MD, ODM_PULL_FAILURES_TOTAL_MD,
+    ODM_PULLED_BYTES_TOTAL_MD, ODM_PULLED_OBJECTS_TOTAL_MD, ODM_QUEUE_DEPTH_MD, ODM_REQUESTS_TOTAL_MD,
+    ODM_SOURCE_LATENCY_SECONDS_COUNT_MD, ODM_SOURCE_LATENCY_SECONDS_DISTRIBUTION_MD, ODM_SOURCE_LATENCY_SECONDS_SUM_MD,
+    OP_L as ODM_OP_L, OUTCOME_L as ODM_OUTCOME_L, PATH_L as ODM_PATH_L, PULL_FAILURE_REASONS as ODM_PULL_FAILURE_REASONS,
+    PULL_PATHS as ODM_PULL_PATHS, REASON_L as ODM_REASON_L, REQUEST_OPS as ODM_REQUEST_OPS,
+    REQUEST_OUTCOMES as ODM_REQUEST_OUTCOMES, SERVER_L as ODM_SERVER_L, SOURCE_LATENCY_LE as ODM_SOURCE_LATENCY_LE,
+    STATE_L as ODM_STATE_L,
+};
+use crate::metrics::schema::scanner::{
+    BUCKET_LABEL as SCANNER_BUCKET_LABEL, CYCLE_SCOPE_LABEL as SCANNER_CYCLE_SCOPE_LABEL, DRIVE_LABEL as SCANNER_DRIVE_LABEL,
+    RESULT_LABEL as SCANNER_RESULT_LABEL, SCANNER_ACTIVE_BUCKET_DRIVE_SCAN_AGE_SECONDS_MD, SCANNER_ACTIVE_BUCKET_DRIVE_SCANS_MD,
+    SCANNER_BUCKET_DRIVE_RESULT_TOTAL_MD, SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD, SOURCE_LABEL as SCANNER_SOURCE_LABEL,
+};
+use crate::metrics::schema::system_process::{PROCESS_EXECUTABLE_NAME_LABEL, PROCESS_PID_LABEL};
 use crate::metrics::stats_collector::{
-    ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_replication_detail_stats,
-    collect_bucket_stats, collect_cluster_and_health_stats, collect_cluster_config_stats, collect_cluster_usage_metric_stats,
-    collect_disk_and_system_drive_stats, collect_erasure_set_stats, collect_host_network_stats, collect_iam_stats,
-    collect_ilm_metric_stats, collect_internode_network_stats, collect_process_metric_bundle, collect_replication_stats,
-    collect_scanner_metric_stats, collect_system_cpu_and_memory_stats_with,
+    ProcessMetricBundle, collect_api_request_stats, collect_bucket_replication_bandwidth_stats,
+    collect_bucket_replication_stats_bundle, collect_bucket_stats, collect_cluster_config_stats,
+    collect_cluster_storage_snapshot, collect_cluster_usage_metric_stats, collect_compression_cluster_stats,
+    collect_disk_and_system_drive_runtime_stats, collect_host_network_stats, collect_iam_stats, collect_ilm_runtime_metric_stats,
+    collect_internode_network_stats, collect_on_demand_migration_backfill_stats, collect_on_demand_migration_stats,
+    collect_process_metric_bundle_with, collect_replication_stats, collect_scanner_runtime_metric_stats,
+    collect_system_cpu_and_memory_stats_with, collect_tier_request_metric_stats,
 };
+use crate::metrics::storage_snapshot::StorageSnapshotMetrics;
+use crate::node_identity::{SERVER_LABEL, current_local_node_identity};
+use crate::telemetry::{process_global_meter, retire_metric_series};
+use futures_util::FutureExt;
 use rustfs_audit::audit_target_metrics;
-use rustfs_ecstore::global::get_global_bucket_monitor;
+use rustfs_config::METER_INTERVAL;
+use rustfs_config::observability::ENV_OBS_METER_INTERVAL;
+use rustfs_io_metrics::ProcessSampler;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
 use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use sysinfo::System;
-use tokio::time::Instant;
+use sysinfo::{Networks, System};
+use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{error, warn};
 
 const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_METRICS_RUNTIME: &str = "metrics_runtime";
@@ -112,15 +186,222 @@ const LEGACY_RESOURCE_INTERVAL: &str = "RUSTFS_METRICS_RESOURCE_INTERVAL";
 const LEGACY_AUDIT_INTERVAL: &str = "RUSTFS_METRICS_AUDIT_INTERVAL";
 const LEGACY_NOTIFICATION_INTERVAL: &str = "RUSTFS_METRICS_NOTIFICATION_INTERVAL";
 const LEGACY_DEFAULT_INTERVAL: &str = "RUSTFS_METRICS_DEFAULT_INTERVAL";
+const AUDIT_TARGET_ID_LABEL: &str = "target_id";
 
 /// Default cycles to emit zero for removed replication bandwidth series before letting them expire.
 const DEFAULT_REPL_BW_ZERO_TOMBSTONE_CYCLES: u8 = 3;
 /// Env var that overrides the zero-emission tombstone cycles for removed replication bandwidth series.
 const ENV_REPL_BW_ZERO_TOMBSTONE_CYCLES: &str = "RUSTFS_METRICS_REPL_BW_ZERO_TOMBSTONE_CYCLES";
 const METRICS_RUNTIME_SERVICE_NAME: &str = "metrics_runtime";
-const METRICS_RUNTIME_COLLECTOR_TASKS: u8 = 10;
+const METRICS_RUNTIME_BASE_COLLECTOR_TASKS: u8 = 11;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum MetricsCollectorTaskId {
+    ClusterStats = 0,
+    SupplementaryClusterStats = 1,
+    BucketStats = 2,
+    NodeDiskStats = 3,
+    BucketReplicationBandwidth = 4,
+    AuditTargetStats = 5,
+    NotificationStats = 6,
+    BackgroundWorkflowStats = 7,
+    ProcessMetrics = 8,
+    InternodeNetworkStats = 9,
+    RequestStats = 10,
+    CompressionClusterStats = 11,
+}
+
+const BASE_COLLECTOR_TASK_IDS: [MetricsCollectorTaskId; METRICS_RUNTIME_BASE_COLLECTOR_TASKS as usize] = [
+    MetricsCollectorTaskId::ClusterStats,
+    MetricsCollectorTaskId::SupplementaryClusterStats,
+    MetricsCollectorTaskId::BucketStats,
+    MetricsCollectorTaskId::NodeDiskStats,
+    MetricsCollectorTaskId::BucketReplicationBandwidth,
+    MetricsCollectorTaskId::AuditTargetStats,
+    MetricsCollectorTaskId::NotificationStats,
+    MetricsCollectorTaskId::BackgroundWorkflowStats,
+    MetricsCollectorTaskId::ProcessMetrics,
+    MetricsCollectorTaskId::InternodeNetworkStats,
+    MetricsCollectorTaskId::RequestStats,
+];
+
+const ALL_COLLECTOR_TASK_IDS: [MetricsCollectorTaskId; METRICS_RUNTIME_BASE_COLLECTOR_TASKS as usize + 1] = [
+    MetricsCollectorTaskId::ClusterStats,
+    MetricsCollectorTaskId::SupplementaryClusterStats,
+    MetricsCollectorTaskId::BucketStats,
+    MetricsCollectorTaskId::NodeDiskStats,
+    MetricsCollectorTaskId::BucketReplicationBandwidth,
+    MetricsCollectorTaskId::AuditTargetStats,
+    MetricsCollectorTaskId::NotificationStats,
+    MetricsCollectorTaskId::BackgroundWorkflowStats,
+    MetricsCollectorTaskId::ProcessMetrics,
+    MetricsCollectorTaskId::InternodeNetworkStats,
+    MetricsCollectorTaskId::RequestStats,
+    MetricsCollectorTaskId::CompressionClusterStats,
+];
+
+#[derive(Debug)]
+struct MetricsRuntimeCollectorHealth {
+    last_success_unix_secs: [AtomicU64; ALL_COLLECTOR_TASK_IDS.len()],
+    collector_panics_total: [AtomicU64; ALL_COLLECTOR_TASK_IDS.len()],
+    failure_state: [AtomicBool; ALL_COLLECTOR_TASK_IDS.len()],
+}
+
+impl MetricsRuntimeCollectorHealth {
+    fn new() -> Self {
+        Self {
+            last_success_unix_secs: std::array::from_fn(|_| AtomicU64::new(0)),
+            collector_panics_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            failure_state: std::array::from_fn(|_| AtomicBool::new(false)),
+        }
+    }
+
+    fn record_success(&self, collector_id: MetricsCollectorTaskId) {
+        let idx = collector_id as usize;
+        self.last_success_unix_secs[idx].store(unix_timestamp_secs_now(), Ordering::Relaxed);
+        self.failure_state[idx].store(false, Ordering::Relaxed);
+    }
+
+    fn record_panic(&self, collector_id: MetricsCollectorTaskId) {
+        let idx = collector_id as usize;
+        self.collector_panics_total[idx].fetch_add(1, Ordering::Relaxed);
+        self.failure_state[idx].store(true, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, active_collectors: &[MetricsCollectorTaskId]) -> MetricsRuntimeCollectorHealthSnapshot {
+        let now = unix_timestamp_secs_now();
+        let mut healthy_collectors = 0_u8;
+        let mut never_succeeded_collectors = 0_u8;
+        let mut collector_panics_total = 0_u64;
+        let mut oldest_success_age_secs = 0_u64;
+
+        for collector_id in active_collectors {
+            let idx = *collector_id as usize;
+            let last_success = self.last_success_unix_secs[idx].load(Ordering::Relaxed);
+            let has_failed = self.failure_state[idx].load(Ordering::Relaxed);
+            collector_panics_total =
+                collector_panics_total.saturating_add(self.collector_panics_total[idx].load(Ordering::Relaxed));
+
+            if last_success == 0 {
+                never_succeeded_collectors = never_succeeded_collectors.saturating_add(1);
+            } else {
+                oldest_success_age_secs = oldest_success_age_secs.max(now.saturating_sub(last_success));
+            }
+
+            if last_success > 0 && !has_failed {
+                healthy_collectors = healthy_collectors.saturating_add(1);
+            }
+        }
+
+        MetricsRuntimeCollectorHealthSnapshot {
+            healthy_collectors,
+            unhealthy_collectors: u8::try_from(active_collectors.len())
+                .unwrap_or(u8::MAX)
+                .saturating_sub(healthy_collectors),
+            never_succeeded_collectors,
+            collector_panics_total,
+            oldest_success_age_secs,
+        }
+    }
+}
+
+static METRICS_RUNTIME_COLLECTOR_HEALTH: OnceLock<MetricsRuntimeCollectorHealth> = OnceLock::new();
 
 type ReplBwKey = (String, String); // (bucket, target_arn)
+type BucketKey = String;
+/// `(full metric name, labels)` of one series.
+type MetricSeriesKey = (String, Vec<(&'static str, Cow<'static, str>)>);
+type BucketRangeKey = (String, String); // (bucket, range)
+type AuditLegacyTargetKey = String;
+type AuditTargetKey = (String, String); // (server, target_id)
+type NotificationLegacyTargetKey = (String, String); // (target_id, target_type)
+type NotificationTargetKey = (String, String, String); // (server, target_id, target_type)
+type ScannerCycleBucketDriveResultKey = (String, String, String, String, String); // (server, cycle_scope, bucket, drive, result)
+type ScannerBucketDriveResultKey = (String, String, String, String); // (server, bucket, drive, result)
+type ScannerActiveBucketDriveKey = (String, String, String, String); // (server, source, bucket, drive)
+
+fn scanner_cycle_bucket_drive_result_live_keys(stats: &ScannerRuntimeStats) -> HashSet<ScannerCycleBucketDriveResultKey> {
+    stats
+        .current_cycle_bucket_drive_results
+        .iter()
+        .map(|result| {
+            (
+                stats.server.clone(),
+                "current".to_string(),
+                result.bucket.clone(),
+                result.drive.clone(),
+                result.result.clone(),
+            )
+        })
+        .chain(stats.last_cycle_bucket_drive_results.iter().map(|result| {
+            (
+                stats.server.clone(),
+                "last".to_string(),
+                result.bucket.clone(),
+                result.drive.clone(),
+                result.result.clone(),
+            )
+        }))
+        .collect()
+}
+
+fn scanner_bucket_drive_result_live_keys(stats: &ScannerRuntimeStats) -> HashSet<ScannerBucketDriveResultKey> {
+    stats
+        .bucket_drive_results
+        .iter()
+        .map(|result| (stats.server.clone(), result.bucket.clone(), result.drive.clone(), result.result.clone()))
+        .collect()
+}
+
+fn retire_scanner_cycle_bucket_drive_result_metric_series(key: &ScannerCycleBucketDriveResultKey) -> usize {
+    let labels = [
+        (SERVER_LABEL, Cow::Owned(key.0.clone())),
+        (SCANNER_CYCLE_SCOPE_LABEL, Cow::Owned(key.1.clone())),
+        (SCANNER_BUCKET_LABEL, Cow::Owned(key.2.clone())),
+        (SCANNER_DRIVE_LABEL, Cow::Owned(key.3.clone())),
+        (SCANNER_RESULT_LABEL, Cow::Owned(key.4.clone())),
+    ];
+    retire_metric_series(&SCANNER_CYCLE_BUCKET_DRIVE_RESULT_MD.get_full_metric_name(), &labels)
+}
+
+fn retire_scanner_bucket_drive_result_metric_series(key: &ScannerBucketDriveResultKey) -> usize {
+    let labels = [
+        (SERVER_LABEL, Cow::Owned(key.0.clone())),
+        (SCANNER_BUCKET_LABEL, Cow::Owned(key.1.clone())),
+        (SCANNER_DRIVE_LABEL, Cow::Owned(key.2.clone())),
+        (SCANNER_RESULT_LABEL, Cow::Owned(key.3.clone())),
+    ];
+    retire_metric_series(&SCANNER_BUCKET_DRIVE_RESULT_TOTAL_MD.get_full_metric_name(), &labels)
+}
+
+fn scanner_active_bucket_drive_live_keys(stats: &ScannerRuntimeStats) -> HashSet<ScannerActiveBucketDriveKey> {
+    stats
+        .active_bucket_drive_scans
+        .iter()
+        .map(|active| (stats.server.clone(), active.source.clone(), active.bucket.clone(), active.drive.clone()))
+        .collect()
+}
+
+fn retire_scanner_active_bucket_drive_metric_series(key: &ScannerActiveBucketDriveKey) -> usize {
+    let labels = [
+        (SERVER_LABEL, Cow::Owned(key.0.clone())),
+        (SCANNER_SOURCE_LABEL, Cow::Owned(key.1.clone())),
+        (SCANNER_BUCKET_LABEL, Cow::Owned(key.2.clone())),
+        (SCANNER_DRIVE_LABEL, Cow::Owned(key.3.clone())),
+    ];
+    retire_metric_series(&SCANNER_ACTIVE_BUCKET_DRIVE_SCANS_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&SCANNER_ACTIVE_BUCKET_DRIVE_SCAN_AGE_SECONDS_MD.get_full_metric_name(), &labels)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub struct MetricsRuntimeCollectorHealthSnapshot {
+    pub healthy_collectors: u8,
+    pub unhealthy_collectors: u8,
+    pub never_succeeded_collectors: u8,
+    pub collector_panics_total: u64,
+    pub oldest_success_age_secs: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -162,6 +443,7 @@ pub struct MetricsRuntimeStatusSnapshot {
     pub state: MetricsRuntimeServiceState,
     pub metrics_enabled: bool,
     pub collector_tasks: u8,
+    pub collector_health: MetricsRuntimeCollectorHealthSnapshot,
     pub intervals: MetricsRuntimeIntervalsSnapshot,
     pub cancellation_source: MetricsRuntimeCancellationSource,
     pub shutdown_handle: MetricsRuntimeShutdownHandle,
@@ -260,7 +542,7 @@ fn parse_metrics_interval(primary_env: &str, legacy_env: &str, default_interval:
 
 fn parse_system_metrics_interval() -> Duration {
     get_env_opt_u64(ENV_SYSTEM_METRICS_INTERVAL)
-        .or_else(|| get_env_opt_u64(LEGACY_SYSTEM_METRICS_INTERVAL).map(|ms| ms / 1000))
+        .or_else(|| get_env_opt_u64(LEGACY_SYSTEM_METRICS_INTERVAL).map(|ms| if ms == 0 { 0 } else { ms.div_ceil(1000) }))
         .or_else(|| get_env_opt_u64(ENV_DEFAULT_METRICS_INTERVAL))
         .filter(|&v| v > 0)
         .map(Duration::from_secs)
@@ -319,10 +601,27 @@ fn metrics_runtime_intervals_snapshot(config: MetricsRuntimeConfig) -> MetricsRu
     }
 }
 
+fn metrics_runtime_collector_health() -> &'static MetricsRuntimeCollectorHealth {
+    METRICS_RUNTIME_COLLECTOR_HEALTH.get_or_init(MetricsRuntimeCollectorHealth::new)
+}
+
+fn active_metrics_collector_task_ids(compression_enabled: bool) -> &'static [MetricsCollectorTaskId] {
+    if compression_enabled {
+        &ALL_COLLECTOR_TASK_IDS
+    } else {
+        &BASE_COLLECTOR_TASK_IDS
+    }
+}
+
+fn metrics_runtime_collector_tasks(compression_enabled: bool) -> u8 {
+    u8::try_from(active_metrics_collector_task_ids(compression_enabled).len()).unwrap_or(u8::MAX)
+}
+
 fn build_metrics_runtime_status_snapshot(
     metrics_enabled: bool,
     cancellation_requested: bool,
     config: MetricsRuntimeConfig,
+    compression_enabled: bool,
 ) -> MetricsRuntimeStatusSnapshot {
     let state = if !metrics_enabled {
         MetricsRuntimeServiceState::Disabled
@@ -332,18 +631,29 @@ fn build_metrics_runtime_status_snapshot(
         MetricsRuntimeServiceState::Running
     };
 
+    let collector_health = if metrics_enabled {
+        metrics_runtime_collector_health().snapshot(active_metrics_collector_task_ids(compression_enabled))
+    } else {
+        MetricsRuntimeCollectorHealthSnapshot::default()
+    };
+
     MetricsRuntimeStatusSnapshot {
         service: METRICS_RUNTIME_SERVICE_NAME,
         state,
         metrics_enabled,
-        collector_tasks: METRICS_RUNTIME_COLLECTOR_TASKS,
+        collector_tasks: metrics_runtime_collector_tasks(compression_enabled),
+        collector_health,
         intervals: metrics_runtime_intervals_snapshot(config),
         cancellation_source: MetricsRuntimeCancellationSource::RuntimeToken,
         shutdown_handle: MetricsRuntimeShutdownHandle::RuntimeTokenOnly,
     }
 }
 
-fn build_metrics_runtime_desired_snapshot(metrics_enabled: bool, config: MetricsRuntimeConfig) -> MetricsRuntimeDesiredSnapshot {
+fn build_metrics_runtime_desired_snapshot(
+    metrics_enabled: bool,
+    config: MetricsRuntimeConfig,
+    compression_enabled: bool,
+) -> MetricsRuntimeDesiredSnapshot {
     let state = if metrics_enabled {
         MetricsRuntimeDesiredState::Enabled
     } else {
@@ -352,7 +662,7 @@ fn build_metrics_runtime_desired_snapshot(metrics_enabled: bool, config: Metrics
 
     MetricsRuntimeDesiredSnapshot {
         state,
-        collector_tasks: METRICS_RUNTIME_COLLECTOR_TASKS,
+        collector_tasks: metrics_runtime_collector_tasks(compression_enabled),
         intervals: metrics_runtime_intervals_snapshot(config),
     }
 }
@@ -361,10 +671,11 @@ fn build_metrics_runtime_controller_snapshot(
     metrics_enabled: bool,
     cancellation_requested: bool,
     config: MetricsRuntimeConfig,
+    compression_enabled: bool,
 ) -> MetricsRuntimeControllerSnapshot {
     MetricsRuntimeControllerSnapshot {
-        desired: build_metrics_runtime_desired_snapshot(metrics_enabled, config),
-        status: build_metrics_runtime_status_snapshot(metrics_enabled, cancellation_requested, config),
+        desired: build_metrics_runtime_desired_snapshot(metrics_enabled, config, compression_enabled),
+        status: build_metrics_runtime_status_snapshot(metrics_enabled, cancellation_requested, config, compression_enabled),
     }
 }
 
@@ -373,6 +684,7 @@ pub fn metrics_runtime_status_snapshot(token: &CancellationToken) -> MetricsRunt
         crate::observability_metric_enabled(),
         token.is_cancelled(),
         configured_metrics_runtime_config(),
+        obs_is_disk_compression_enabled(),
     )
 }
 
@@ -381,11 +693,507 @@ pub fn metrics_runtime_controller_snapshot(token: &CancellationToken) -> Metrics
         crate::observability_metric_enabled(),
         token.is_cancelled(),
         configured_metrics_runtime_config(),
+        obs_is_disk_compression_enabled(),
     )
+}
+
+fn unix_timestamp_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn stagger_duration(period: Duration, numerator: u32, denominator: u32) -> Duration {
+    let staggered_nanos = period
+        .as_nanos()
+        .saturating_mul(u128::from(numerator))
+        .checked_div(u128::from(denominator))
+        .unwrap_or(0)
+        .min(u128::from(u64::MAX));
+    Duration::from_nanos(u64::try_from(staggered_nanos).unwrap_or(u64::MAX))
+}
+
+fn storage_snapshot_metrics(scope: &'static str, collection_interval: Duration) -> StorageSnapshotMetrics {
+    let export_interval = Duration::from_secs(
+        get_env_opt_u64(ENV_OBS_METER_INTERVAL)
+            .filter(|value| *value > 0)
+            .unwrap_or(METER_INTERVAL),
+    );
+    let max_age = collection_interval.max(export_interval).saturating_mul(3);
+    StorageSnapshotMetrics::new(
+        opentelemetry::global::meter("rustfs.storage"),
+        scope,
+        current_local_node_identity(),
+        max_age,
+    )
+}
+
+fn bucket_metrics_snapshot(collection_interval: Duration) -> StorageSnapshotMetrics {
+    let export_interval = Duration::from_secs(
+        get_env_opt_u64(ENV_OBS_METER_INTERVAL)
+            .filter(|value| *value > 0)
+            .unwrap_or(METER_INTERVAL),
+    );
+    let max_age = collection_interval.max(export_interval).saturating_mul(3);
+    let meter = process_global_meter().unwrap_or_else(|| opentelemetry::global::meter("rustfs.storage"));
+    StorageSnapshotMetrics::new_unscoped(meter, max_age)
+}
+
+fn metrics_interval(period: Duration, initial_delay: Duration) -> Interval {
+    let mut interval = tokio::time::interval_at(Instant::now() + initial_delay, period);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    interval
+}
+
+async fn run_metrics_collector_tick<F>(
+    health: &MetricsRuntimeCollectorHealth,
+    collector_id: MetricsCollectorTaskId,
+    collector: &'static str,
+    future: F,
+) where
+    F: std::future::Future<Output = ()>,
+{
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(()) => health.record_success(collector_id),
+        Err(payload) => {
+            health.record_panic(collector_id);
+            let panic_message = payload
+                .downcast_ref::<&'static str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic payload");
+            warn!(
+                event = EVENT_METRICS_RUNTIME_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME,
+                collector,
+                result = "panic_caught",
+                panic_message,
+                "metrics runtime state changed"
+            );
+        }
+    }
 }
 
 fn repl_bw_live_keys(stats: &[BucketReplicationBandwidthStats]) -> HashSet<ReplBwKey> {
     stats.iter().map(|s| (s.bucket.clone(), s.target_arn.clone())).collect()
+}
+
+fn repl_backlog_live_keys(stats: &[BucketReplicationBacklogStats]) -> HashSet<BucketKey> {
+    stats.iter().map(|s| s.bucket.clone()).collect()
+}
+
+fn repl_backlog_target_live_keys(stats: &[BucketReplicationBacklogStats]) -> HashSet<ReplBwKey> {
+    stats
+        .iter()
+        .flat_map(|stat| {
+            stat.target_backlogs
+                .iter()
+                .map(|target| (stat.bucket.clone(), target.target_arn.clone()))
+        })
+        .collect()
+}
+
+fn repl_flow_live_keys(stats: &[BucketReplicationRuntimeStats]) -> HashSet<ReplBwKey> {
+    stats
+        .iter()
+        .flat_map(|stat| {
+            stat.target_flows
+                .iter()
+                .map(|target| (stat.stats.bucket.clone(), target.target_arn.clone()))
+        })
+        .collect()
+}
+
+fn repl_proxy_bucket_live_keys(stats: &[BucketReplicationRuntimeStats]) -> HashSet<BucketKey> {
+    stats.iter().map(|stat| stat.stats.bucket.clone()).collect()
+}
+
+fn on_demand_migration_bucket_live_keys(stats: &[OnDemandMigrationBucketStats]) -> HashSet<BucketKey> {
+    stats.iter().map(|stat| stat.bucket.clone()).collect()
+}
+
+fn on_demand_migration_backfill_bucket_live_keys(stats: &OdmBackfillRuntimeStats) -> HashSet<BucketKey> {
+    stats.buckets.iter().map(|stat| stat.bucket.clone()).collect()
+}
+
+fn update_series_zero_tombstones<T: Clone + Eq + std::hash::Hash>(
+    has_seen_valid_snapshot: &mut bool,
+    prev_live_keys: &mut HashSet<T>,
+    zero_tombstones: &mut HashMap<T, u8>,
+    current_live_keys: HashSet<T>,
+    tombstone_cycles: u8,
+) {
+    if *has_seen_valid_snapshot {
+        for removed in prev_live_keys.difference(&current_live_keys) {
+            zero_tombstones.insert(removed.clone(), tombstone_cycles);
+        }
+    }
+
+    for key in &current_live_keys {
+        zero_tombstones.remove(key);
+    }
+
+    *prev_live_keys = current_live_keys;
+    *has_seen_valid_snapshot = true;
+}
+
+fn expire_series_zero_tombstones<T: Clone + Eq + std::hash::Hash>(zero_tombstones: &mut HashMap<T, u8>) -> Vec<T> {
+    let mut expired = Vec::new();
+    if !zero_tombstones.is_empty() {
+        zero_tombstones.retain(|key, remaining| {
+            if *remaining <= 1 {
+                expired.push(key.clone());
+                false
+            } else {
+                *remaining -= 1;
+                true
+            }
+        });
+    }
+    expired
+}
+
+fn bucket_live_keys(stats: &[crate::metrics::collectors::BucketStats]) -> HashSet<BucketKey> {
+    stats.iter().map(|stat| stat.name.clone()).collect()
+}
+
+fn collect_bucket_zero_tombstone_metrics(zero_tombstones: &HashMap<BucketKey, u8>) -> Vec<PrometheusMetric> {
+    if zero_tombstones.is_empty() {
+        return Vec::new();
+    }
+
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 3);
+    for bucket in zero_tombstones.keys() {
+        let bucket_label: Cow<'static, str> = Cow::Owned(bucket.clone());
+        zero_metrics
+            .push(PrometheusMetric::from_descriptor(&BUCKET_USAGE_BYTES_MD, 0.0).with_label("bucket", bucket_label.clone()));
+        zero_metrics
+            .push(PrometheusMetric::from_descriptor(&BUCKET_OBJECTS_TOTAL_MD, 0.0).with_label("bucket", bucket_label.clone()));
+        zero_metrics.push(PrometheusMetric::from_descriptor(&BUCKET_QUOTA_BYTES_MD, 0.0).with_label("bucket", bucket_label));
+    }
+
+    zero_metrics
+}
+
+#[derive(Default)]
+struct BucketSeriesState {
+    has_seen_snapshot: bool,
+    live_keys: HashSet<BucketKey>,
+    zero_tombstones: HashMap<BucketKey, u8>,
+}
+
+struct BucketSeriesUpdate {
+    metrics: Vec<PrometheusMetric>,
+}
+
+impl BucketSeriesState {
+    fn observe(
+        &mut self,
+        stats: Option<&[crate::metrics::collectors::BucketStats]>,
+        tombstone_cycles: u8,
+    ) -> Option<BucketSeriesUpdate> {
+        let stats = stats?;
+        let current_bucket_keys = bucket_live_keys(stats);
+        update_series_zero_tombstones(
+            &mut self.has_seen_snapshot,
+            &mut self.live_keys,
+            &mut self.zero_tombstones,
+            current_bucket_keys,
+            tombstone_cycles,
+        );
+        let mut metrics = collect_bucket_metrics(stats);
+        metrics.extend(collect_bucket_zero_tombstone_metrics(&self.zero_tombstones));
+        let _ = expire_series_zero_tombstones(&mut self.zero_tombstones);
+        Some(BucketSeriesUpdate { metrics })
+    }
+}
+
+fn bucket_usage_live_keys(stats: &[crate::metrics::collectors::BucketUsageStats]) -> HashSet<BucketKey> {
+    stats.iter().map(|stat| stat.bucket.clone()).collect()
+}
+
+fn bucket_usage_object_size_live_keys(stats: &[crate::metrics::collectors::BucketUsageStats]) -> HashSet<BucketRangeKey> {
+    stats
+        .iter()
+        .flat_map(|stat| {
+            stat.object_size_distribution
+                .iter()
+                .map(move |(range, _)| (stat.bucket.clone(), range.clone()))
+        })
+        .collect()
+}
+
+fn bucket_usage_version_live_keys(stats: &[crate::metrics::collectors::BucketUsageStats]) -> HashSet<BucketRangeKey> {
+    stats
+        .iter()
+        .flat_map(|stat| {
+            stat.version_count_distribution
+                .iter()
+                .map(move |(range, _)| (stat.bucket.clone(), range.clone()))
+        })
+        .collect()
+}
+
+fn collect_bucket_usage_zero_tombstone_metrics(
+    zero_bucket_tombstones: &HashMap<BucketKey, u8>,
+    zero_object_size_tombstones: &HashMap<BucketRangeKey, u8>,
+    zero_version_tombstones: &HashMap<BucketRangeKey, u8>,
+) -> Vec<PrometheusMetric> {
+    let mut zero_metrics =
+        Vec::with_capacity(zero_bucket_tombstones.len() * 5 + zero_object_size_tombstones.len() + zero_version_tombstones.len());
+
+    for bucket in zero_bucket_tombstones.keys() {
+        let bucket_label: Cow<'static, str> = Cow::Owned(bucket.clone());
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&USAGE_BUCKET_TOTAL_BYTES_MD, 0.0)
+                .with_label(USAGE_BUCKET_LABEL, bucket_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&USAGE_BUCKET_OBJECTS_TOTAL_MD, 0.0)
+                .with_label(USAGE_BUCKET_LABEL, bucket_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&USAGE_BUCKET_VERSIONS_COUNT_MD, 0.0)
+                .with_label(USAGE_BUCKET_LABEL, bucket_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&USAGE_BUCKET_DELETE_MARKERS_COUNT_MD, 0.0)
+                .with_label(USAGE_BUCKET_LABEL, bucket_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&USAGE_BUCKET_QUOTA_TOTAL_BYTES_MD, 0.0)
+                .with_label(USAGE_BUCKET_LABEL, bucket_label),
+        );
+    }
+
+    for (bucket, range) in zero_object_size_tombstones.keys() {
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&USAGE_BUCKET_OBJECT_SIZE_DISTRIBUTION_MD, 0.0)
+                .with_label(USAGE_RANGE_LABEL, Cow::Owned(range.clone()))
+                .with_label(USAGE_BUCKET_LABEL, Cow::Owned(bucket.clone())),
+        );
+    }
+
+    for (bucket, range) in zero_version_tombstones.keys() {
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&USAGE_BUCKET_OBJECT_VERSION_COUNT_DISTRIBUTION_MD, 0.0)
+                .with_label(USAGE_RANGE_LABEL, Cow::Owned(range.clone()))
+                .with_label(USAGE_BUCKET_LABEL, Cow::Owned(bucket.clone())),
+        );
+    }
+
+    zero_metrics
+}
+
+fn audit_target_live_keys(stats: &[AuditTargetRuntimeStats]) -> HashSet<AuditTargetKey> {
+    stats
+        .iter()
+        .map(|stat| (stat.server.clone(), stat.target.target_id.clone()))
+        .collect()
+}
+
+fn audit_legacy_target_live_keys(stats: &[AuditTargetRuntimeStats]) -> HashSet<AuditLegacyTargetKey> {
+    stats.iter().map(|stat| stat.target.target_id.clone()).collect()
+}
+
+fn collect_audit_legacy_zero_tombstone_metrics(zero_tombstones: &HashMap<AuditLegacyTargetKey, u8>) -> Vec<PrometheusMetric> {
+    if zero_tombstones.is_empty() {
+        return Vec::new();
+    }
+
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 4);
+    for target_id in zero_tombstones.keys() {
+        let target_id_label: Cow<'static, str> = Cow::Owned(target_id.clone());
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_FAILED_MESSAGES_MD, 0.0)
+                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_FAILED_STORE_LENGTH_MD, 0.0)
+                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_TARGET_QUEUE_LENGTH_MD, 0.0)
+                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_TOTAL_MESSAGES_MD, 0.0).with_label(AUDIT_TARGET_ID_LABEL, target_id_label),
+        );
+    }
+
+    zero_metrics
+}
+
+fn collect_audit_zero_tombstone_metrics(zero_tombstones: &HashMap<AuditTargetKey, u8>) -> Vec<PrometheusMetric> {
+    if zero_tombstones.is_empty() {
+        return Vec::new();
+    }
+
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 4);
+    for (server, target_id) in zero_tombstones.keys() {
+        let server_label: Cow<'static, str> = Cow::Owned(server.clone());
+        let target_id_label: Cow<'static, str> = Cow::Owned(target_id.clone());
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_FAILED_MESSAGES_BY_SERVER_MD, 0.0)
+                .with_label(AUDIT_SERVER_LABEL, server_label.clone())
+                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_FAILED_STORE_LENGTH_BY_SERVER_MD, 0.0)
+                .with_label(AUDIT_SERVER_LABEL, server_label.clone())
+                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_TARGET_QUEUE_LENGTH_BY_SERVER_MD, 0.0)
+                .with_label(AUDIT_SERVER_LABEL, server_label.clone())
+                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&AUDIT_TOTAL_MESSAGES_BY_SERVER_MD, 0.0)
+                .with_label(AUDIT_SERVER_LABEL, server_label)
+                .with_label(AUDIT_TARGET_ID_LABEL, target_id_label),
+        );
+    }
+
+    zero_metrics
+}
+
+fn retire_audit_legacy_target_metric_series(target_id: &str) -> usize {
+    let labels = [(AUDIT_TARGET_ID_LABEL, Cow::Owned(target_id.to_string()))];
+    retire_metric_series(&AUDIT_FAILED_MESSAGES_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&AUDIT_FAILED_STORE_LENGTH_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&AUDIT_TARGET_QUEUE_LENGTH_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&AUDIT_TOTAL_MESSAGES_MD.get_full_metric_name(), &labels)
+}
+
+fn retire_audit_target_metric_series(server: &str, target_id: &str) -> usize {
+    let server_labels = [
+        (AUDIT_SERVER_LABEL, Cow::Owned(server.to_string())),
+        (AUDIT_TARGET_ID_LABEL, Cow::Owned(target_id.to_string())),
+    ];
+    retire_metric_series(&AUDIT_FAILED_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+        + retire_metric_series(&AUDIT_FAILED_STORE_LENGTH_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+        + retire_metric_series(&AUDIT_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+        + retire_metric_series(&AUDIT_TOTAL_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+}
+
+fn notification_target_live_keys(stats: &[NotificationTargetRuntimeStats]) -> HashSet<NotificationTargetKey> {
+    stats
+        .iter()
+        .map(|stat| (stat.server.clone(), stat.target.target_id.clone(), stat.target.target_type.clone()))
+        .collect()
+}
+
+fn notification_legacy_target_live_keys(stats: &[NotificationTargetRuntimeStats]) -> HashSet<NotificationLegacyTargetKey> {
+    stats
+        .iter()
+        .map(|stat| (stat.target.target_id.clone(), stat.target.target_type.clone()))
+        .collect()
+}
+
+fn collect_notification_legacy_target_zero_tombstone_metrics(
+    zero_tombstones: &HashMap<NotificationLegacyTargetKey, u8>,
+) -> Vec<PrometheusMetric> {
+    if zero_tombstones.is_empty() {
+        return Vec::new();
+    }
+
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 4);
+    for (target_id, target_type) in zero_tombstones.keys() {
+        let target_id_label: Cow<'static, str> = Cow::Owned(target_id.clone());
+        let target_type_label: Cow<'static, str> = Cow::Owned(target_type.clone());
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_FAILED_MESSAGES_MD, 0.0)
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label.clone())
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD, 0.0)
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label.clone())
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_QUEUE_LENGTH_MD, 0.0)
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label.clone())
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_TOTAL_MESSAGES_MD, 0.0)
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label)
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label),
+        );
+    }
+
+    zero_metrics
+}
+
+fn collect_notification_target_zero_tombstone_metrics(
+    zero_tombstones: &HashMap<NotificationTargetKey, u8>,
+) -> Vec<PrometheusMetric> {
+    if zero_tombstones.is_empty() {
+        return Vec::new();
+    }
+
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 4);
+    for (server, target_id, target_type) in zero_tombstones.keys() {
+        let server_label: Cow<'static, str> = Cow::Owned(server.clone());
+        let target_id_label: Cow<'static, str> = Cow::Owned(target_id.clone());
+        let target_type_label: Cow<'static, str> = Cow::Owned(target_type.clone());
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD, 0.0)
+                .with_label(NOTIFICATION_SERVER_LABEL, server_label.clone())
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label.clone())
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD, 0.0)
+                .with_label(NOTIFICATION_SERVER_LABEL, server_label.clone())
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label.clone())
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD, 0.0)
+                .with_label(NOTIFICATION_SERVER_LABEL, server_label.clone())
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label.clone())
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD, 0.0)
+                .with_label(NOTIFICATION_SERVER_LABEL, server_label)
+                .with_label(NOTIFICATION_TARGET_ID_LABEL, target_id_label)
+                .with_label(NOTIFICATION_TARGET_TYPE_LABEL, target_type_label),
+        );
+    }
+
+    zero_metrics
+}
+
+fn retire_notification_legacy_target_metric_series(target_id: &str, target_type: &str) -> usize {
+    let labels = [
+        (NOTIFICATION_TARGET_ID_LABEL, Cow::Owned(target_id.to_string())),
+        (NOTIFICATION_TARGET_TYPE_LABEL, Cow::Owned(target_type.to_string())),
+    ];
+    retire_metric_series(&NOTIFICATION_TARGET_FAILED_MESSAGES_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&NOTIFICATION_TARGET_QUEUE_LENGTH_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&NOTIFICATION_TARGET_TOTAL_MESSAGES_MD.get_full_metric_name(), &labels)
+}
+
+fn retire_notification_target_metric_series(server: &str, target_id: &str, target_type: &str) -> usize {
+    let server_labels = [
+        (NOTIFICATION_SERVER_LABEL, Cow::Owned(server.to_string())),
+        (NOTIFICATION_TARGET_ID_LABEL, Cow::Owned(target_id.to_string())),
+        (NOTIFICATION_TARGET_TYPE_LABEL, Cow::Owned(target_type.to_string())),
+    ];
+    retire_metric_series(&NOTIFICATION_TARGET_FAILED_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+        + retire_metric_series(
+            &NOTIFICATION_TARGET_FAILED_STORE_LENGTH_BY_SERVER_MD.get_full_metric_name(),
+            &server_labels,
+        )
+        + retire_metric_series(&NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name(), &server_labels)
+        + retire_metric_series(&NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD.get_full_metric_name(), &server_labels)
 }
 
 fn update_repl_bw_zero_tombstones(
@@ -415,6 +1223,30 @@ fn update_repl_bw_zero_tombstones(
     *has_seen_valid_snapshot = true;
 }
 
+fn update_repl_backlog_zero_tombstones(
+    monitor_available: bool,
+    has_seen_valid_snapshot: &mut bool,
+    prev_live_keys: &mut HashSet<BucketKey>,
+    zero_tombstones: &mut HashMap<BucketKey, u8>,
+    current_live_keys: HashSet<BucketKey>,
+    tombstone_cycles: u8,
+) {
+    if !monitor_available {
+        for key in &current_live_keys {
+            zero_tombstones.remove(key);
+        }
+        return;
+    }
+
+    update_series_zero_tombstones(
+        has_seen_valid_snapshot,
+        prev_live_keys,
+        zero_tombstones,
+        current_live_keys,
+        tombstone_cycles,
+    );
+}
+
 fn collect_repl_bw_zero_tombstone_metrics(zero_tombstones: &HashMap<ReplBwKey, u8>) -> Vec<PrometheusMetric> {
     if zero_tombstones.is_empty() {
         return Vec::new();
@@ -441,17 +1273,272 @@ fn collect_repl_bw_zero_tombstone_metrics(zero_tombstones: &HashMap<ReplBwKey, u
     zero_metrics
 }
 
-fn expire_repl_bw_zero_tombstones(monitor_available: bool, zero_tombstones: &mut HashMap<ReplBwKey, u8>) {
-    if monitor_available && !zero_tombstones.is_empty() {
-        zero_tombstones.retain(|_, remaining| {
-            if *remaining <= 1 {
-                false
-            } else {
-                *remaining -= 1;
-                true
-            }
-        });
+fn collect_repl_backlog_zero_tombstone_metrics(zero_tombstones: &HashMap<BucketKey, u8>) -> Vec<PrometheusMetric> {
+    if zero_tombstones.is_empty() {
+        return Vec::new();
     }
+
+    let stats = zero_tombstones
+        .keys()
+        .map(|bucket| BucketReplicationBacklogStats {
+            bucket: bucket.clone(),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    collect_bucket_replication_backlog_metrics(&stats)
+}
+
+fn collect_repl_backlog_target_zero_tombstone_metrics(zero_tombstones: &HashMap<ReplBwKey, u8>) -> Vec<PrometheusMetric> {
+    if zero_tombstones.is_empty() {
+        return Vec::new();
+    }
+
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 4);
+    for (bucket, target_arn) in zero_tombstones.keys() {
+        let bucket_label: Cow<'static, str> = Cow::Owned(bucket.clone());
+        let target_arn_label: Cow<'static, str> = Cow::Owned(target_arn.clone());
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_CURRENT_TARGET_BACKLOG_COUNT_MD, 0.0)
+                .with_label(BUCKET_L, bucket_label.clone())
+                .with_label(TARGET_ARN_L, target_arn_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_CURRENT_TARGET_BACKLOG_BYTES_MD, 0.0)
+                .with_label(BUCKET_L, bucket_label.clone())
+                .with_label(TARGET_ARN_L, target_arn_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD, 0.0)
+                .with_label(BUCKET_L, bucket_label.clone())
+                .with_label(TARGET_ARN_L, target_arn_label.clone()),
+        );
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD, 0.0)
+                .with_label(BUCKET_L, bucket_label)
+                .with_label(TARGET_ARN_L, target_arn_label),
+        );
+    }
+
+    zero_metrics
+}
+
+fn collect_repl_flow_zero_tombstone_metrics(zero_tombstones: &HashMap<ReplBwKey, u8>) -> Vec<PrometheusMetric> {
+    if zero_tombstones.is_empty() {
+        return Vec::new();
+    }
+
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len());
+    for (bucket, target_arn) in zero_tombstones.keys() {
+        let bucket_label: Cow<'static, str> = Cow::Owned(bucket.clone());
+        let target_arn_label: Cow<'static, str> = Cow::Owned(target_arn.clone());
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_LATENCY_MS_MD, 0.0)
+                .with_label(BUCKET_L, bucket_label)
+                .with_label(OPERATION_L, Cow::Borrowed("object_replication"))
+                .with_label(RANGE_L, Cow::Borrowed("all"))
+                .with_label(TARGET_ARN_L, target_arn_label),
+        );
+    }
+
+    zero_metrics
+}
+
+fn retire_repl_bw_metric_series(bucket: &str, target_arn: &str) -> usize {
+    let labels = [
+        (BUCKET_L, Cow::Owned(bucket.to_string())),
+        (TARGET_ARN_L, Cow::Owned(target_arn.to_string())),
+    ];
+    retire_metric_series(&BUCKET_REPL_BANDWIDTH_LIMIT_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&BUCKET_REPL_BANDWIDTH_CURRENT_MD.get_full_metric_name(), &labels)
+}
+
+fn retire_repl_flow_metric_series(bucket: &str, target_arn: &str) -> usize {
+    let labels = [
+        (BUCKET_L, Cow::Owned(bucket.to_string())),
+        (TARGET_ARN_L, Cow::Owned(target_arn.to_string())),
+    ];
+    let latency_labels = [
+        (BUCKET_L, Cow::Owned(bucket.to_string())),
+        (OPERATION_L, Cow::Borrowed("object_replication")),
+        (RANGE_L, Cow::Borrowed("all")),
+        (TARGET_ARN_L, Cow::Owned(target_arn.to_string())),
+    ];
+    [
+        BUCKET_REPL_TARGET_SENT_BYTES_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_SENT_COUNT_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_TOTAL_FAILED_BYTES_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_TOTAL_FAILED_COUNT_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_LAST_MIN_FAILED_BYTES_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_LAST_MIN_FAILED_COUNT_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_LAST_HOUR_FAILED_BYTES_MD.get_full_metric_name(),
+        BUCKET_REPL_TARGET_LAST_HOUR_FAILED_COUNT_MD.get_full_metric_name(),
+    ]
+    .iter()
+    .map(|name| retire_metric_series(name, &labels))
+    .sum::<usize>()
+        + retire_metric_series(&BUCKET_REPL_LATENCY_MS_MD.get_full_metric_name(), &latency_labels)
+}
+
+fn retire_repl_backlog_metric_series(bucket: &str) -> usize {
+    let labels = [(BUCKET_L, Cow::Owned(bucket.to_string()))];
+    [
+        BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD.get_full_metric_name(),
+        BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD.get_full_metric_name(),
+        BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD.get_full_metric_name(),
+        BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD.get_full_metric_name(),
+        BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD.get_full_metric_name(),
+        BUCKET_REPL_MRF_PENDING_COUNT_MD.get_full_metric_name(),
+        BUCKET_REPL_MRF_PENDING_BYTES_MD.get_full_metric_name(),
+        BUCKET_REPL_MRF_DROPPED_COUNT_MD.get_full_metric_name(),
+        BUCKET_REPL_MRF_MISSED_COUNT_MD.get_full_metric_name(),
+        BUCKET_REPL_MRF_FLUSH_FAILURES_MD.get_full_metric_name(),
+        BUCKET_REPL_MRF_LAST_FLUSH_DURATION_MILLIS_MD.get_full_metric_name(),
+    ]
+    .iter()
+    .map(|name| retire_metric_series(name, &labels))
+    .sum()
+}
+
+fn retire_bucket_replication_proxy_request_metric_series(bucket: &str) -> usize {
+    const PROXY_OPERATIONS: [&str; 6] = ["get", "head", "put", "put_tagging", "get_tagging", "delete_tagging"];
+    let mut retired = 0;
+    for operation in PROXY_OPERATIONS {
+        for result in ["success", "failure"] {
+            let labels = [
+                (BUCKET_L, Cow::Owned(bucket.to_string())),
+                (OPERATION_L, Cow::Borrowed(operation)),
+                (RESULT_L, Cow::Borrowed(result)),
+            ];
+            retired += retire_metric_series(&BUCKET_REPL_PROXY_REQUESTS_TOTAL_MD.get_full_metric_name(), &labels);
+        }
+    }
+    retired
+}
+
+/// Every on-demand migration series a bucket can own, as `(name, labels)`:
+/// the fixed label sets of the runtime snapshot, in the collector's label
+/// order. Retirement walks this list once the bucket's config is gone.
+fn on_demand_migration_metric_series(bucket: &str) -> Vec<MetricSeriesKey> {
+    let bucket_label = || (ODM_BUCKET_L, Cow::Owned(bucket.to_string()));
+    let mut series = Vec::new();
+    for op in ODM_REQUEST_OPS {
+        for outcome in ODM_REQUEST_OUTCOMES {
+            series.push((
+                ODM_REQUESTS_TOTAL_MD.get_full_metric_name(),
+                vec![
+                    bucket_label(),
+                    (ODM_OP_L, Cow::Borrowed(op)),
+                    (ODM_OUTCOME_L, Cow::Borrowed(outcome)),
+                ],
+            ));
+        }
+    }
+    series.push((ODM_PULLED_BYTES_TOTAL_MD.get_full_metric_name(), vec![bucket_label()]));
+    for path in ODM_PULL_PATHS {
+        series.push((
+            ODM_PULLED_OBJECTS_TOTAL_MD.get_full_metric_name(),
+            vec![bucket_label(), (ODM_PATH_L, Cow::Borrowed(path))],
+        ));
+    }
+    for reason in ODM_PULL_FAILURE_REASONS {
+        series.push((
+            ODM_PULL_FAILURES_TOTAL_MD.get_full_metric_name(),
+            vec![bucket_label(), (ODM_REASON_L, Cow::Borrowed(reason))],
+        ));
+    }
+    series.push((ODM_INFLIGHT_PULLS_MD.get_full_metric_name(), vec![bucket_label()]));
+    series.push((ODM_QUEUE_DEPTH_MD.get_full_metric_name(), vec![bucket_label()]));
+    for le in ODM_SOURCE_LATENCY_LE {
+        series.push((
+            ODM_SOURCE_LATENCY_SECONDS_DISTRIBUTION_MD.get_full_metric_name(),
+            vec![bucket_label(), (ODM_LE_L, Cow::Borrowed(le))],
+        ));
+    }
+    series.push((ODM_SOURCE_LATENCY_SECONDS_SUM_MD.get_full_metric_name(), vec![bucket_label()]));
+    series.push((ODM_SOURCE_LATENCY_SECONDS_COUNT_MD.get_full_metric_name(), vec![bucket_label()]));
+    series.push((ODM_BREAKER_STATE_MD.get_full_metric_name(), vec![bucket_label()]));
+    series
+}
+
+fn retire_on_demand_migration_metric_series(bucket: &str) -> usize {
+    on_demand_migration_metric_series(bucket)
+        .iter()
+        .map(|(name, labels)| retire_metric_series(name, labels))
+        .sum()
+}
+
+/// Every on-demand migration backfill series one node's job can own. The
+/// `state` gauge is enumerated over the checkpoint's fixed lifecycle values
+/// because only one of them is emitted per cycle.
+fn on_demand_migration_backfill_metric_series(server: &str, bucket: &str) -> Vec<MetricSeriesKey> {
+    let job_labels = || {
+        vec![
+            (ODM_SERVER_L, Cow::Owned(server.to_string())),
+            (ODM_BUCKET_L, Cow::Owned(bucket.to_string())),
+        ]
+    };
+    let mut series = Vec::new();
+    for state in ODM_BACKFILL_STATES {
+        let mut labels = job_labels();
+        labels.push((ODM_STATE_L, Cow::Borrowed(state)));
+        series.push((ODM_BACKFILL_JOBS_MD.get_full_metric_name(), labels));
+    }
+    for descriptor in [
+        &*ODM_BACKFILL_LISTED_MD,
+        &*ODM_BACKFILL_ENQUEUED_MD,
+        &*ODM_BACKFILL_PULLED_MD,
+        &*ODM_BACKFILL_SKIPPED_EXISTING_MD,
+        &*ODM_BACKFILL_FAILED_MD,
+        &*ODM_BACKFILL_BYTES_MD,
+    ] {
+        series.push((descriptor.get_full_metric_name(), job_labels()));
+    }
+    series
+}
+
+fn retire_on_demand_migration_backfill_metric_series(server: &str, bucket: &str) -> usize {
+    on_demand_migration_backfill_metric_series(server, bucket)
+        .iter()
+        .map(|(name, labels)| retire_metric_series(name, labels))
+        .sum()
+}
+
+fn retire_repl_backlog_target_metric_series(bucket: &str, target_arn: &str) -> usize {
+    let labels = [
+        (BUCKET_L, Cow::Owned(bucket.to_string())),
+        (TARGET_ARN_L, Cow::Owned(target_arn.to_string())),
+    ];
+    retire_metric_series(&BUCKET_REPL_CURRENT_TARGET_BACKLOG_COUNT_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&BUCKET_REPL_CURRENT_TARGET_BACKLOG_BYTES_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD.get_full_metric_name(), &labels)
+        + retire_metric_series(&BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD.get_full_metric_name(), &labels)
+}
+
+fn expire_repl_bw_zero_tombstones(monitor_available: bool, zero_tombstones: &mut HashMap<ReplBwKey, u8>) -> Vec<ReplBwKey> {
+    if !monitor_available {
+        return Vec::new();
+    }
+
+    expire_series_zero_tombstones(zero_tombstones)
+}
+
+fn expire_repl_backlog_zero_tombstones(monitor_available: bool, zero_tombstones: &mut HashMap<BucketKey, u8>) -> Vec<BucketKey> {
+    if !monitor_available {
+        return Vec::new();
+    }
+
+    expire_series_zero_tombstones(zero_tombstones)
+}
+
+fn expire_repl_backlog_target_zero_tombstones(
+    target_metrics_available: bool,
+    zero_tombstones: &mut HashMap<ReplBwKey, u8>,
+) -> Vec<ReplBwKey> {
+    if !target_metrics_available {
+        return Vec::new();
+    }
+
+    expire_series_zero_tombstones(zero_tombstones)
 }
 
 /// Initialize all metrics collectors.
@@ -480,6 +1567,7 @@ fn expire_repl_bw_zero_tombstones(monitor_available: bool, zero_tombstones: &mut
 /// - `RUSTFS_METRICS_RESOURCE_INTERVAL`
 pub fn init_metrics_runtime(token: CancellationToken) {
     let config = configured_metrics_runtime_config();
+    let health = metrics_runtime_collector_health();
     let cluster_interval = config.cluster_interval;
     let bucket_interval = config.bucket_interval;
     let bucket_replication_bandwidth_interval = config.bucket_replication_bandwidth_interval;
@@ -487,18 +1575,28 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     let resource_interval = config.resource_interval;
     let audit_interval = config.audit_interval;
     let notification_interval = config.notification_interval;
+    let compression_enabled = obs_is_disk_compression_enabled();
 
     // Spawn task for cluster metrics
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(cluster_interval);
+        let mut interval = metrics_interval(cluster_interval, Duration::ZERO);
+        let mut snapshot = storage_snapshot_metrics("cluster", cluster_interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let (stats, cluster_health) = collect_cluster_and_health_stats().await;
-                    let mut metrics = collect_cluster_metrics(&stats);
-                    metrics.extend(collect_cluster_health_metrics(&cluster_health));
-                    report_metrics(&metrics);
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::ClusterStats, "cluster_stats", async {
+                        let collection_started = std::time::Instant::now();
+                        if let Some(stats) = collect_cluster_storage_snapshot().await {
+                            let mut metrics = collect_cluster_metrics(&stats.cluster);
+                            metrics.extend(collect_cluster_health_metrics(&stats.health));
+                            metrics.extend(collect_cluster_drive_metrics(&stats.drives));
+                            metrics.extend(collect_erasure_set_metrics(&stats.erasure_sets));
+                            if let Err(error) = snapshot.replace_collected(metrics, collection_started) {
+                                error!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "cluster_stats", result = "invalid_snapshot", error = %error, "storage metrics snapshot rejected");
+                            }
+                        }
+                    }).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "cluster_stats", state = "cancelled", "metrics runtime state changed");
@@ -512,33 +1610,82 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // but filled by later task-specific runtime sources.
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(cluster_interval);
+        let mut interval = metrics_interval(cluster_interval, stagger_duration(cluster_interval, 1, 3));
+        let tombstone_cycles = config.replication_bandwidth_zero_tombstone_cycles;
+        let mut has_seen_bucket_usage_snapshot = false;
+        let mut bucket_usage_snapshot = bucket_metrics_snapshot(cluster_interval);
+        let mut prev_bucket_usage_keys: HashSet<BucketKey> = HashSet::new();
+        let mut bucket_usage_zero_tombstones: HashMap<BucketKey, u8> = HashMap::new();
+        let mut prev_bucket_usage_object_size_keys: HashSet<BucketRangeKey> = HashSet::new();
+        let mut bucket_usage_object_size_zero_tombstones: HashMap<BucketRangeKey, u8> = HashMap::new();
+        let mut prev_bucket_usage_version_keys: HashSet<BucketRangeKey> = HashSet::new();
+        let mut bucket_usage_version_zero_tombstones: HashMap<BucketRangeKey, u8> = HashMap::new();
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let mut metrics = Vec::new();
+                    run_metrics_collector_tick(
+                        health,
+                        MetricsCollectorTaskId::SupplementaryClusterStats,
+                        "supplementary_cluster_stats",
+                        async {
+                            let mut metrics = Vec::new();
+                            let mut usage_metrics_update = None;
 
-                    if let Some(stats) = collect_cluster_config_stats().await {
-                        metrics.extend(collect_cluster_config_metrics(&stats));
-                    }
+                            if let Some(stats) = collect_cluster_config_stats().await {
+                                metrics.extend(collect_cluster_config_metrics(&stats));
+                            }
 
-                    let erasure_sets = collect_erasure_set_stats().await;
-                    if !erasure_sets.is_empty() {
-                        metrics.extend(collect_erasure_set_metrics(&erasure_sets));
-                    }
+                            if let Some(stats) = collect_iam_stats().await {
+                                metrics.extend(collect_iam_metrics(&stats));
+                            }
 
-                    if let Some(stats) = collect_iam_stats().await {
-                        metrics.extend(collect_iam_metrics(&stats));
-                    }
+                            let usage_collection_started = std::time::Instant::now();
+                            if let Some((cluster_usage, bucket_usage)) = collect_cluster_usage_metric_stats().await {
+                                let mut usage_metrics = collect_cluster_usage_metrics(&cluster_usage);
+                                usage_metrics.extend(collect_bucket_usage_metrics(&bucket_usage));
+                                update_series_zero_tombstones(
+                                    &mut has_seen_bucket_usage_snapshot,
+                                    &mut prev_bucket_usage_keys,
+                                    &mut bucket_usage_zero_tombstones,
+                                    bucket_usage_live_keys(&bucket_usage),
+                                    tombstone_cycles,
+                                );
+                                update_series_zero_tombstones(
+                                    &mut has_seen_bucket_usage_snapshot,
+                                    &mut prev_bucket_usage_object_size_keys,
+                                    &mut bucket_usage_object_size_zero_tombstones,
+                                    bucket_usage_object_size_live_keys(&bucket_usage),
+                                    tombstone_cycles,
+                                );
+                                update_series_zero_tombstones(
+                                    &mut has_seen_bucket_usage_snapshot,
+                                    &mut prev_bucket_usage_version_keys,
+                                    &mut bucket_usage_version_zero_tombstones,
+                                    bucket_usage_version_live_keys(&bucket_usage),
+                                    tombstone_cycles,
+                                );
+                                usage_metrics.extend(collect_bucket_usage_zero_tombstone_metrics(
+                                    &bucket_usage_zero_tombstones,
+                                    &bucket_usage_object_size_zero_tombstones,
+                                    &bucket_usage_version_zero_tombstones,
+                                ));
+                                let _ = expire_series_zero_tombstones(&mut bucket_usage_zero_tombstones);
+                                let _ = expire_series_zero_tombstones(&mut bucket_usage_object_size_zero_tombstones);
+                                let _ = expire_series_zero_tombstones(&mut bucket_usage_version_zero_tombstones);
+                                usage_metrics_update = Some(usage_metrics);
+                            }
 
-                    if let Some((cluster_usage, bucket_usage)) = collect_cluster_usage_metric_stats().await {
-                        metrics.extend(collect_cluster_usage_metrics(&cluster_usage));
-                        metrics.extend(collect_bucket_usage_metrics(&bucket_usage));
-                    }
+                            if let Some(usage_metrics) = usage_metrics_update
+                                && let Err(error) = bucket_usage_snapshot.replace_collected(usage_metrics, usage_collection_started)
+                            {
+                                error!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "supplementary_cluster_stats", result = "invalid_bucket_snapshot", error = %error, "bucket usage metrics snapshot rejected");
+                            }
 
-                    if !metrics.is_empty() {
-                        report_metrics(&metrics);
-                    }
+                            if !metrics.is_empty() {
+                                report_metrics(&metrics);
+                            }
+                        },
+                    ).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "supplementary_cluster_stats", state = "cancelled", "metrics runtime state changed");
@@ -551,13 +1698,23 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // Spawn task for bucket metrics
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(bucket_interval);
+        let mut interval = metrics_interval(bucket_interval, Duration::ZERO);
+        let tombstone_cycles = config.replication_bandwidth_zero_tombstone_cycles;
+        let mut series_state = BucketSeriesState::default();
+        let mut snapshot = bucket_metrics_snapshot(bucket_interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let stats = collect_bucket_stats().await;
-                    let metrics = collect_bucket_metrics(&stats);
-                    report_metrics(&metrics);
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::BucketStats, "bucket_stats", async {
+                        let collection_started = std::time::Instant::now();
+                        let stats = collect_bucket_stats().await;
+                        let Some(update) = series_state.observe(stats.as_deref(), tombstone_cycles) else {
+                            return;
+                        };
+                        if let Err(error) = snapshot.replace_collected(update.metrics, collection_started) {
+                            error!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_stats", result = "invalid_snapshot", error = %error, "bucket metrics snapshot rejected");
+                        }
+                    }).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_stats", state = "cancelled", "metrics runtime state changed");
@@ -570,15 +1727,22 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // Spawn task for node/disk metrics
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(node_interval);
+        let mut interval = metrics_interval(node_interval, Duration::ZERO);
+        let mut snapshot = storage_snapshot_metrics("local", node_interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let (disk_stats, drive_stats, drive_counts) = collect_disk_and_system_drive_stats().await;
-                    let mut metrics = collect_node_metrics(&disk_stats);
-                    metrics.extend(collect_drive_detailed_metrics(&drive_stats));
-                    metrics.extend(collect_drive_count_metrics(&drive_counts));
-                    report_metrics(&metrics);
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::NodeDiskStats, "node_disk_stats", async {
+                        let collection_started = std::time::Instant::now();
+                        if let Some((disk_stats, drive_stats, drive_counts)) = collect_disk_and_system_drive_runtime_stats().await {
+                            let mut metrics = collect_node_metrics(&disk_stats);
+                            metrics.extend(collect_drive_runtime_detailed_metrics(&drive_stats));
+                            metrics.extend(collect_drive_count_metrics(&drive_counts));
+                            if let Err(error) = snapshot.replace_collected(metrics, collection_started) {
+                                error!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "node_disk_stats", result = "invalid_snapshot", error = %error, "storage metrics snapshot rejected");
+                            }
+                        }
+                    }).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "node_disk_stats", state = "cancelled", "metrics runtime state changed");
@@ -591,43 +1755,169 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // Spawn task for bucket replication bandwidth metrics
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(bucket_replication_bandwidth_interval);
+        let mut interval = metrics_interval(bucket_replication_bandwidth_interval, Duration::ZERO);
         let repl_bw_zero_tombstone_cycles = config.replication_bandwidth_zero_tombstone_cycles;
         let mut prev_live_keys: HashSet<ReplBwKey> = HashSet::new();
         let mut zero_tombstones: HashMap<ReplBwKey, u8> = HashMap::new();
         let mut has_seen_valid_snapshot = false;
+        let mut prev_backlog_live_keys: HashSet<BucketKey> = HashSet::new();
+        let mut backlog_zero_tombstones: HashMap<BucketKey, u8> = HashMap::new();
+        let mut has_seen_valid_backlog_snapshot = false;
+        let mut prev_backlog_target_live_keys: HashSet<ReplBwKey> = HashSet::new();
+        let mut backlog_target_zero_tombstones: HashMap<ReplBwKey, u8> = HashMap::new();
+        let mut has_seen_valid_backlog_target_snapshot = false;
+        let mut prev_flow_live_keys: HashSet<ReplBwKey> = HashSet::new();
+        let mut flow_zero_tombstones: HashMap<ReplBwKey, u8> = HashMap::new();
+        let mut has_seen_valid_flow_snapshot = false;
+        let mut prev_proxy_bucket_live_keys: HashSet<BucketKey> = HashSet::new();
+        let mut has_seen_proxy_bucket_snapshot = false;
+        let mut prev_on_demand_migration_live_keys: HashSet<BucketKey> = HashSet::new();
+        let mut has_seen_on_demand_migration_snapshot = false;
+        let mut prev_on_demand_migration_backfill_live_keys: HashSet<BucketKey> = HashSet::new();
+        let mut has_seen_on_demand_migration_backfill_snapshot = false;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let monitor_available = get_global_bucket_monitor().is_some();
-                    let stats = collect_bucket_replication_bandwidth_stats();
+                    run_metrics_collector_tick(
+                        health,
+                        MetricsCollectorTaskId::BucketReplicationBandwidth,
+                        "bucket_replication_bandwidth",
+                        async {
+                            let monitor_available = bucket_monitor_available();
+                            let stats = collect_bucket_replication_bandwidth_stats();
 
-                    let current_live_keys = repl_bw_live_keys(&stats);
+                            let current_live_keys = repl_bw_live_keys(&stats);
 
-                    if !monitor_available {
-                        warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_replication_bandwidth", result = "bucket_monitor_unavailable", "metrics runtime state changed");
-                    }
-                    update_repl_bw_zero_tombstones(
-                        monitor_available,
-                        &mut has_seen_valid_snapshot,
-                        &mut prev_live_keys,
-                        &mut zero_tombstones,
-                        current_live_keys,
-                        repl_bw_zero_tombstone_cycles,
-                    );
-                    let mut metrics = collect_bucket_replication_bandwidth_metrics(&stats);
+                            if !monitor_available {
+                                warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_replication_bandwidth", result = "bucket_monitor_unavailable", "metrics runtime state changed");
+                            }
+                            update_repl_bw_zero_tombstones(
+                                monitor_available,
+                                &mut has_seen_valid_snapshot,
+                                &mut prev_live_keys,
+                                &mut zero_tombstones,
+                                current_live_keys,
+                                repl_bw_zero_tombstone_cycles,
+                            );
+                            let mut metrics = collect_bucket_replication_bandwidth_metrics(&stats);
 
-                    // Phase-1 action: force zero for removed keys during tombstone cycles.
-                    metrics.extend(collect_repl_bw_zero_tombstone_metrics(&zero_tombstones));
+                            // Phase-1 action: force zero for removed keys during tombstone cycles.
+                            metrics.extend(collect_repl_bw_zero_tombstone_metrics(&zero_tombstones));
 
-                    let bucket_replication = collect_bucket_replication_detail_stats().await;
-                    metrics.extend(collect_bucket_replication_metrics(&bucket_replication));
-                    let replication = collect_replication_stats().await;
-                    metrics.extend(collect_replication_metrics(&replication));
-                    report_metrics(&metrics);
+                            let (bucket_replication, bucket_replication_backlog) = collect_bucket_replication_stats_bundle().await;
+                            let current_proxy_bucket_live_keys = repl_proxy_bucket_live_keys(&bucket_replication);
+                            let retire_proxy_buckets = if has_seen_proxy_bucket_snapshot {
+                                prev_proxy_bucket_live_keys
+                                    .difference(&current_proxy_bucket_live_keys)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            } else {
+                                Vec::new()
+                            };
+                            prev_proxy_bucket_live_keys = current_proxy_bucket_live_keys;
+                            has_seen_proxy_bucket_snapshot = true;
+                            let durable_mrf_available = bucket_replication_backlog.iter().any(|stat| stat.durable_mrf_available);
+                            let backlog_target_metrics_available =
+                                durable_mrf_available || monitor_available || !bucket_replication_backlog.is_empty();
+                            update_repl_backlog_zero_tombstones(
+                                monitor_available,
+                                &mut has_seen_valid_backlog_snapshot,
+                                &mut prev_backlog_live_keys,
+                                &mut backlog_zero_tombstones,
+                                repl_backlog_live_keys(&bucket_replication_backlog),
+                                repl_bw_zero_tombstone_cycles,
+                            );
+                            if backlog_target_metrics_available {
+                                update_series_zero_tombstones(
+                                    &mut has_seen_valid_backlog_target_snapshot,
+                                    &mut prev_backlog_target_live_keys,
+                                    &mut backlog_target_zero_tombstones,
+                                    repl_backlog_target_live_keys(&bucket_replication_backlog),
+                                    repl_bw_zero_tombstone_cycles,
+                                );
+                            }
+                            metrics.extend(collect_bucket_replication_runtime_metrics(&bucket_replication));
+                            update_series_zero_tombstones(
+                                &mut has_seen_valid_flow_snapshot,
+                                &mut prev_flow_live_keys,
+                                &mut flow_zero_tombstones,
+                                repl_flow_live_keys(&bucket_replication),
+                                repl_bw_zero_tombstone_cycles,
+                            );
+                            metrics.extend(collect_bucket_replication_backlog_metrics(&bucket_replication_backlog));
+                            metrics.extend(collect_repl_backlog_zero_tombstone_metrics(&backlog_zero_tombstones));
+                            metrics.extend(collect_repl_backlog_target_zero_tombstone_metrics(&backlog_target_zero_tombstones));
+                            metrics.extend(collect_repl_flow_zero_tombstone_metrics(&flow_zero_tombstones));
+                            // A bucket whose on-demand migration config is gone leaves the
+                            // snapshot; its series are retired after this cycle's report.
+                            let on_demand_migration = collect_on_demand_migration_stats();
+                            let current_on_demand_migration_live_keys = on_demand_migration_bucket_live_keys(&on_demand_migration);
+                            let retire_on_demand_migration_buckets = if has_seen_on_demand_migration_snapshot {
+                                prev_on_demand_migration_live_keys
+                                    .difference(&current_on_demand_migration_live_keys)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            } else {
+                                Vec::new()
+                            };
+                            prev_on_demand_migration_live_keys = current_on_demand_migration_live_keys;
+                            has_seen_on_demand_migration_snapshot = true;
+                            metrics.extend(collect_on_demand_migration_metrics(&on_demand_migration));
+                            // Backfill jobs come and go independently of the bucket's config,
+                            // so their series are retired on their own key set.
+                            let on_demand_migration_backfill = collect_on_demand_migration_backfill_stats();
+                            let current_on_demand_migration_backfill_live_keys =
+                                on_demand_migration_backfill_bucket_live_keys(&on_demand_migration_backfill);
+                            let retire_on_demand_migration_backfill_buckets = if has_seen_on_demand_migration_backfill_snapshot
+                            {
+                                prev_on_demand_migration_backfill_live_keys
+                                    .difference(&current_on_demand_migration_backfill_live_keys)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            } else {
+                                Vec::new()
+                            };
+                            prev_on_demand_migration_backfill_live_keys = current_on_demand_migration_backfill_live_keys;
+                            has_seen_on_demand_migration_backfill_snapshot = true;
+                            let on_demand_migration_backfill_server = on_demand_migration_backfill.server.clone();
+                            metrics.extend(collect_on_demand_migration_backfill_metrics(&on_demand_migration_backfill));
+                            let replication = collect_replication_stats().await;
+                            metrics.extend(collect_replication_runtime_metrics(&ReplicationRuntimeStats {
+                                server: current_local_node_identity(),
+                                stats: replication,
+                            }));
+                            report_metrics(&metrics);
 
-                    // Phase-2: after N cycles, stop reporting -> series becomes absent after expiration.
-                    expire_repl_bw_zero_tombstones(monitor_available, &mut zero_tombstones);
+                            // Phase-2: after N cycles, stop reporting -> series becomes absent after expiration.
+                            for (bucket, target_arn) in expire_repl_bw_zero_tombstones(monitor_available, &mut zero_tombstones) {
+                                let _ = retire_repl_bw_metric_series(&bucket, &target_arn);
+                            }
+                            for bucket in expire_repl_backlog_zero_tombstones(monitor_available, &mut backlog_zero_tombstones) {
+                                let _ = retire_repl_backlog_metric_series(&bucket);
+                            }
+                            for (bucket, target_arn) in expire_repl_backlog_target_zero_tombstones(
+                                backlog_target_metrics_available,
+                                &mut backlog_target_zero_tombstones,
+                            ) {
+                                let _ = retire_repl_backlog_target_metric_series(&bucket, &target_arn);
+                            }
+                            for (bucket, target_arn) in expire_series_zero_tombstones(&mut flow_zero_tombstones) {
+                                let _ = retire_repl_flow_metric_series(&bucket, &target_arn);
+                            }
+                            for bucket in retire_proxy_buckets {
+                                let _ = retire_bucket_replication_proxy_request_metric_series(&bucket);
+                            }
+                            for bucket in retire_on_demand_migration_buckets {
+                                let _ = retire_on_demand_migration_metric_series(&bucket);
+                            }
+                            for bucket in retire_on_demand_migration_backfill_buckets {
+                                let _ = retire_on_demand_migration_backfill_metric_series(
+                                    &on_demand_migration_backfill_server,
+                                    &bucket,
+                                );
+                            }
+                        },
+                    ).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "bucket_replication_bandwidth", state = "cancelled", "metrics runtime state changed");
@@ -640,21 +1930,57 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // Spawn task for audit target delivery metrics
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(audit_interval);
+        let mut interval = metrics_interval(audit_interval, Duration::ZERO);
+        let tombstone_cycles = config.replication_bandwidth_zero_tombstone_cycles;
+        let mut has_seen_audit_snapshot = false;
+        let mut prev_audit_target_keys: HashSet<AuditTargetKey> = HashSet::new();
+        let mut audit_zero_tombstones: HashMap<AuditTargetKey, u8> = HashMap::new();
+        let mut has_seen_audit_legacy_snapshot = false;
+        let mut prev_audit_legacy_target_keys: HashSet<AuditLegacyTargetKey> = HashSet::new();
+        let mut audit_legacy_zero_tombstones: HashMap<AuditLegacyTargetKey, u8> = HashMap::new();
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let stats = audit_target_metrics().await
-                        .into_iter()
-                        .map(|snapshot| AuditTargetStats {
-                            failed_messages: snapshot.failed_messages,
-                            queue_length: snapshot.queue_length,
-                            target_id: snapshot.target_id,
-                            total_messages: snapshot.total_messages,
-                        })
-                        .collect::<Vec<_>>();
-                    let metrics = collect_audit_metrics(&stats);
-                    report_metrics(&metrics);
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::AuditTargetStats, "audit_target_stats", async {
+                        let server = current_local_node_identity();
+                        let stats = audit_target_metrics().await
+                            .into_iter()
+                            .map(|snapshot| AuditTargetRuntimeStats {
+                                server: server.clone(),
+                                target: AuditTargetStats {
+                                    failed_messages: snapshot.failed_messages,
+                                    failed_store_length: snapshot.failed_store_length,
+                                    queue_length: snapshot.queue_length,
+                                    target_id: snapshot.target_id,
+                                    total_messages: snapshot.total_messages,
+                                },
+                            })
+                            .collect::<Vec<_>>();
+                        update_series_zero_tombstones(
+                            &mut has_seen_audit_snapshot,
+                            &mut prev_audit_target_keys,
+                            &mut audit_zero_tombstones,
+                            audit_target_live_keys(&stats),
+                            tombstone_cycles,
+                        );
+                        update_series_zero_tombstones(
+                            &mut has_seen_audit_legacy_snapshot,
+                            &mut prev_audit_legacy_target_keys,
+                            &mut audit_legacy_zero_tombstones,
+                            audit_legacy_target_live_keys(&stats),
+                            tombstone_cycles,
+                        );
+                        let mut metrics = collect_audit_runtime_metrics(&stats);
+                        metrics.extend(collect_audit_legacy_zero_tombstone_metrics(&audit_legacy_zero_tombstones));
+                        metrics.extend(collect_audit_zero_tombstone_metrics(&audit_zero_tombstones));
+                        report_metrics(&metrics);
+                        for target_id in expire_series_zero_tombstones(&mut audit_legacy_zero_tombstones) {
+                            let _ = retire_audit_legacy_target_metric_series(&target_id);
+                        }
+                        for (server, target_id) in expire_series_zero_tombstones(&mut audit_zero_tombstones) {
+                            let _ = retire_audit_target_metric_series(&server, &target_id);
+                        }
+                    }).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "audit_target_stats", state = "cancelled", "metrics runtime state changed");
@@ -667,30 +1993,70 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // Spawn task for notification delivery metrics
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(notification_interval);
+        let mut interval = metrics_interval(notification_interval, Duration::ZERO);
+        let tombstone_cycles = config.replication_bandwidth_zero_tombstone_cycles;
+        let mut has_seen_notification_target_snapshot = false;
+        let mut prev_notification_target_keys: HashSet<NotificationTargetKey> = HashSet::new();
+        let mut notification_target_zero_tombstones: HashMap<NotificationTargetKey, u8> = HashMap::new();
+        let mut has_seen_notification_legacy_target_snapshot = false;
+        let mut prev_notification_legacy_target_keys: HashSet<NotificationLegacyTargetKey> = HashSet::new();
+        let mut notification_legacy_target_zero_tombstones: HashMap<NotificationLegacyTargetKey, u8> = HashMap::new();
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let snapshot = notification_metrics_snapshot();
-                    let mut metrics = collect_notification_metrics(&NotificationStats {
-                        current_send_in_progress: snapshot.current_send_in_progress,
-                        events_errors_total: snapshot.events_errors_total,
-                        events_sent_total: snapshot.events_sent_total,
-                        events_skipped_total: snapshot.events_skipped_total,
-                    });
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::NotificationStats, "notification_stats", async {
+                        let snapshot = notification_metrics_snapshot();
+                        let server = current_local_node_identity();
+                        let mut metrics = collect_notification_runtime_metrics(&NotificationStats {
+                            current_send_in_progress: snapshot.current_send_in_progress,
+                            events_errors_total: snapshot.events_errors_total,
+                            events_sent_total: snapshot.events_sent_total,
+                            events_skipped_total: snapshot.events_skipped_total,
+                        }, &server);
 
-                    let target_stats = notification_target_metrics().await
-                        .into_iter()
-                        .map(|snapshot| NotificationTargetStats {
-                            failed_messages: snapshot.failed_messages,
-                            queue_length: snapshot.queue_length,
-                            target_id: snapshot.target_id,
-                            target_type: snapshot.target_type,
-                            total_messages: snapshot.total_messages,
-                        })
-                        .collect::<Vec<_>>();
-                    metrics.extend(collect_notification_target_metrics(&target_stats));
-                    report_metrics(&metrics);
+                        let target_stats = notification_target_metrics().await
+                            .into_iter()
+                            .map(|snapshot| NotificationTargetRuntimeStats {
+                                server: server.clone(),
+                                target: NotificationTargetStats {
+                                    failed_messages: snapshot.failed_messages,
+                                    failed_store_length: snapshot.failed_store_length,
+                                    queue_length: snapshot.queue_length,
+                                    target_id: snapshot.target_id,
+                                    target_type: snapshot.target_type,
+                                    total_messages: snapshot.total_messages,
+                                },
+                            })
+                            .collect::<Vec<_>>();
+                        update_series_zero_tombstones(
+                            &mut has_seen_notification_target_snapshot,
+                            &mut prev_notification_target_keys,
+                            &mut notification_target_zero_tombstones,
+                            notification_target_live_keys(&target_stats),
+                            tombstone_cycles,
+                        );
+                        update_series_zero_tombstones(
+                            &mut has_seen_notification_legacy_target_snapshot,
+                            &mut prev_notification_legacy_target_keys,
+                            &mut notification_legacy_target_zero_tombstones,
+                            notification_legacy_target_live_keys(&target_stats),
+                            tombstone_cycles,
+                        );
+                        metrics.extend(collect_notification_target_runtime_metrics(&target_stats));
+                        metrics.extend(collect_notification_legacy_target_zero_tombstone_metrics(
+                            &notification_legacy_target_zero_tombstones,
+                        ));
+                        metrics.extend(collect_notification_target_zero_tombstone_metrics(
+                            &notification_target_zero_tombstones,
+                        ));
+                        report_metrics(&metrics);
+                        for (target_id, target_type) in expire_series_zero_tombstones(&mut notification_legacy_target_zero_tombstones) {
+                            let _ = retire_notification_legacy_target_metric_series(&target_id, &target_type);
+                        }
+                        for (server, target_id, target_type) in expire_series_zero_tombstones(&mut notification_target_zero_tombstones) {
+                            let _ = retire_notification_target_metric_series(&server, &target_id, &target_type);
+                        }
+                    }).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "notification_stats", state = "cancelled", "metrics runtime state changed");
@@ -703,26 +2069,94 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     // Spawn task for background workflow metrics such as ILM and scanner.
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(cluster_interval);
+        let mut interval = metrics_interval(cluster_interval, stagger_duration(cluster_interval, 2, 3));
+        let mut has_seen_scanner_snapshot = false;
+        let mut prev_scanner_cycle_bucket_drive_result_keys: HashSet<ScannerCycleBucketDriveResultKey> = HashSet::new();
+        let mut prev_scanner_bucket_drive_result_keys: HashSet<ScannerBucketDriveResultKey> = HashSet::new();
+        let mut prev_scanner_active_bucket_drive_keys: HashSet<ScannerActiveBucketDriveKey> = HashSet::new();
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let mut metrics = Vec::new();
+                    run_metrics_collector_tick(
+                        health,
+                        MetricsCollectorTaskId::BackgroundWorkflowStats,
+                        "background_workflow_stats",
+                        async {
+                            let mut metrics = Vec::new();
 
-                    if let Some(stats) = collect_ilm_metric_stats().await {
-                        metrics.extend(collect_ilm_metrics(&stats));
-                    }
+                            if let Some(stats) = collect_ilm_runtime_metric_stats().await {
+                                metrics.extend(collect_ilm_runtime_metrics(&stats));
+                            }
 
-                    if let Some(stats) = collect_scanner_metric_stats().await {
-                        metrics.extend(collect_scanner_metrics(&stats));
-                    }
+                            metrics.extend(collect_tier_request_metrics(&collect_tier_request_metric_stats()));
 
-                    if !metrics.is_empty() {
-                        report_metrics(&metrics);
-                    }
+                            let mut retire_scanner_cycle_bucket_drive_result_keys = Vec::new();
+                            let mut retire_scanner_bucket_drive_result_keys = Vec::new();
+                            let mut retire_scanner_active_bucket_drive_keys = Vec::new();
+                            if let Some(stats) = collect_scanner_runtime_metric_stats().await {
+                                let current_cycle_keys = scanner_cycle_bucket_drive_result_live_keys(&stats);
+                                let current_keys = scanner_bucket_drive_result_live_keys(&stats);
+                                let current_active_keys = scanner_active_bucket_drive_live_keys(&stats);
+                                if has_seen_scanner_snapshot {
+                                    retire_scanner_cycle_bucket_drive_result_keys = prev_scanner_cycle_bucket_drive_result_keys
+                                        .difference(&current_cycle_keys)
+                                        .cloned()
+                                        .collect();
+                                    retire_scanner_bucket_drive_result_keys = prev_scanner_bucket_drive_result_keys
+                                        .difference(&current_keys)
+                                        .cloned()
+                                        .collect();
+                                    retire_scanner_active_bucket_drive_keys = prev_scanner_active_bucket_drive_keys
+                                        .difference(&current_active_keys)
+                                        .cloned()
+                                        .collect();
+                                }
+                                prev_scanner_cycle_bucket_drive_result_keys = current_cycle_keys;
+                                prev_scanner_bucket_drive_result_keys = current_keys;
+                                prev_scanner_active_bucket_drive_keys = current_active_keys;
+                                has_seen_scanner_snapshot = true;
+                                metrics.extend(collect_scanner_runtime_metrics(&stats));
+                            }
+
+                            if !metrics.is_empty() {
+                                report_metrics(&metrics);
+                            }
+                            for key in retire_scanner_cycle_bucket_drive_result_keys {
+                                let _ = retire_scanner_cycle_bucket_drive_result_metric_series(&key);
+                            }
+                            for key in retire_scanner_bucket_drive_result_keys {
+                                let _ = retire_scanner_bucket_drive_result_metric_series(&key);
+                            }
+                            for key in retire_scanner_active_bucket_drive_keys {
+                                let _ = retire_scanner_active_bucket_drive_metric_series(&key);
+                            }
+                        },
+                    ).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "background_workflow_stats", state = "cancelled", "metrics runtime state changed");
+                    return;
+                }
+            }
+        }
+    });
+
+    // Spawn task for API request metrics.
+    let token_clone = token.clone();
+    tokio::spawn(async move {
+        let mut interval = metrics_interval(resource_interval, stagger_duration(resource_interval, 1, 2));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::RequestStats, "request_stats", async {
+                        let metrics = collect_request_metrics(&collect_api_request_stats());
+                        if !metrics.is_empty() {
+                            report_metrics(&metrics);
+                        }
+                    }).await;
+                }
+                _ = token_clone.cancelled() => {
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "request_stats", state = "cancelled", "metrics runtime state changed");
                     return;
                 }
             }
@@ -734,13 +2168,25 @@ pub fn init_metrics_runtime(token: CancellationToken) {
 
     let token_clone = token.clone();
     tokio::spawn(async move {
-        let labels = current_process_metric_labels();
-        let mut host_system = System::new_all();
+        let process_attribute_labels = current_process_attribute_labels();
+        let mut host_system = System::new_all().inspect_err(|error| {
+            warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, result = "system_info_unavailable", collector = "system_monitoring", error = %error, "metrics source unavailable");
+        }).ok();
+        let mut host_networks = Networks::new().inspect_err(|error| {
+            warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, result = "network_info_unavailable", collector = "system_monitoring", error = %error, "metrics source unavailable");
+        }).ok();
+        let mut process_sampler = ProcessSampler::new();
         let process_interval = config.process_interval;
-        let mut interval = tokio::time::interval(process_interval);
+        let mut interval = metrics_interval(process_interval, Duration::ZERO);
         let now = Instant::now();
         let mut next_resource_run = now;
         let mut next_system_run = now;
+
+        if let Some(system) = host_system.as_mut() {
+            system.refresh_cpu_all();
+            tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
+            system.refresh_cpu_all();
+        }
 
         #[cfg(feature = "gpu")]
         let current_pid = match sysinfo::get_current_pid() {
@@ -751,47 +2197,62 @@ pub fn init_metrics_runtime(token: CancellationToken) {
             }
         };
 
+        #[cfg(feature = "gpu")]
+        let gpu_collector = current_pid.and_then(|pid| {
+            use crate::metrics::collectors::GpuCollector;
+
+            match GpuCollector::new(pid) {
+                Ok(collector) => Some(collector),
+                Err(e) => {
+                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "gpu_metrics", result = "collector_init_failed", error = %e, "metrics runtime state changed");
+                    None
+                }
+            }
+        });
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let now = Instant::now();
-                    let bundle = collect_process_metric_bundle();
+                    run_metrics_collector_tick(health, MetricsCollectorTaskId::ProcessMetrics, "process_metrics", async {
+                        let now = Instant::now();
+                    let bundle = collect_process_metric_bundle_with(&mut process_sampler);
 
-                    if now >= next_resource_run {
-                        let mut metrics = collect_resource_metrics(&bundle.resource);
-                        metrics.extend(collect_process_metrics(&bundle.process));
-                        report_metrics(&metrics);
-                        advance_deadline(&mut next_resource_run, resource_interval, now);
-                    }
+                        if now >= next_resource_run {
+                            let mut metrics = collect_resource_metrics(&bundle.resource);
+                            metrics.extend(collect_process_metrics(&bundle.process));
+                            report_metrics(&metrics);
+                            advance_deadline(&mut next_resource_run, resource_interval, now);
+                        }
 
-                    if now >= next_system_run {
-                        #[cfg(feature = "gpu")]
-                        let mut metrics = collect_system_monitoring_metrics(&bundle, &labels, &mut host_system);
-                        #[cfg(not(feature = "gpu"))]
-                        let metrics = collect_system_monitoring_metrics(&bundle, &labels, &mut host_system);
+                        if now >= next_system_run {
+                            let labels = current_process_metric_labels(&process_attribute_labels);
+                            #[cfg(feature = "gpu")]
+                            let mut metrics =
+                                collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
+                            #[cfg(not(feature = "gpu"))]
+                            let mut metrics =
+                                collect_system_monitoring_metrics(&bundle, &labels, &mut host_system, &mut host_networks);
 
-                        #[cfg(feature = "gpu")]
-                        if let Some(pid) = current_pid {
-                            use crate::metrics::collectors::{GpuCollector, collect_gpu_metrics};
+                            metrics.extend(collect_current_dial9_metrics());
 
-                            match GpuCollector::new(pid) {
-                                Ok(collector) => match collector.collect() {
+                            #[cfg(feature = "gpu")]
+                            if let Some(collector) = gpu_collector.as_ref() {
+                                use crate::metrics::collectors::collect_gpu_metrics;
+
+                                match collector.collect() {
                                     Ok(gpu_stats) => {
                                         metrics.extend(collect_gpu_metrics(&gpu_stats, &labels));
                                     }
                                     Err(e) => {
                                         warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "gpu_metrics", result = "collect_failed", error = %e, "metrics runtime state changed");
                                     }
-                                },
-                                Err(e) => {
-                                    warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "gpu_metrics", result = "collector_init_failed", error = %e, "metrics runtime state changed");
                                 }
                             }
-                        }
 
-                        report_metrics(&metrics);
-                        advance_deadline(&mut next_system_run, system_interval, now);
-                    }
+                            report_metrics(&metrics);
+                            advance_deadline(&mut next_system_run, system_interval, now);
+                        }
+                    }).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "process_metrics", state = "cancelled", "metrics runtime state changed");
@@ -801,19 +2262,57 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         }
     });
 
+    // Spawn task for compression metrics.
+    if compression_enabled {
+        let token_clone = token.clone();
+        tokio::spawn(async move {
+            let mut interval = metrics_interval(cluster_interval, stagger_duration(cluster_interval, 3, 4));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        run_metrics_collector_tick(
+                            health,
+                            MetricsCollectorTaskId::CompressionClusterStats,
+                            "compression_cluster_stats",
+                            async {
+                                if let Some(stats) = collect_compression_cluster_stats().await {
+                                    let metrics = collect_compression_cluster_metrics(&stats);
+                                    if !metrics.is_empty() {
+                                        report_metrics(&metrics);
+                                    }
+                                }
+                            }
+                        ).await;
+                    }
+                    _ = token_clone.cancelled() => {
+                        warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "compression_cluster_stats", state = "cancelled", "metrics runtime state changed");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     // Spawn task for internode/system network metrics.
     let token_clone = token;
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(system_interval);
+        let mut interval = metrics_interval(system_interval, Duration::ZERO);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Some(stats) = collect_internode_network_stats() {
-                        let metrics = collect_network_metrics(&stats);
-                        if !metrics.is_empty() {
-                            report_metrics(&metrics);
-                        }
-                    }
+                    run_metrics_collector_tick(
+                        health,
+                        MetricsCollectorTaskId::InternodeNetworkStats,
+                        "internode_network_stats",
+                        async {
+                            if let Some(stats) = collect_internode_network_stats() {
+                                let metrics = collect_network_metrics(&stats);
+                                if !metrics.is_empty() {
+                                    report_metrics(&metrics);
+                                }
+                            }
+                        },
+                    ).await;
                 }
                 _ = token_clone.cancelled() => {
                     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "internode_network_stats", state = "cancelled", "metrics runtime state changed");
@@ -822,11 +2321,6 @@ pub fn init_metrics_runtime(token: CancellationToken) {
             }
         }
     });
-}
-
-/// Backward-compatible alias kept during migration.
-pub fn init_metrics_collectors(token: CancellationToken) {
-    init_metrics_runtime(token);
 }
 
 fn advance_deadline(deadline: &mut Instant, interval: Duration, now: Instant) {
@@ -858,28 +2352,38 @@ fn advance_deadline(deadline: &mut Instant, interval: Duration, now: Instant) {
     }
 }
 
-fn current_process_metric_labels() -> Vec<(&'static str, Cow<'static, str>)> {
+fn current_process_attribute_labels() -> Vec<(&'static str, Cow<'static, str>)> {
     match collect_process_attributes() {
         Ok(attrs) => vec![
-            ("process_pid", Cow::Owned(attrs.pid.to_string())),
-            ("process_executable_name", Cow::Owned(attrs.executable_name)),
+            (PROCESS_PID_LABEL, Cow::Owned(attrs.pid.to_string())),
+            (PROCESS_EXECUTABLE_NAME_LABEL, Cow::Owned(attrs.executable_name)),
         ],
-        Err(err) => fallback_process_metric_labels(err),
+        Err(err) => fallback_process_attribute_labels(err),
     }
 }
 
-fn fallback_process_metric_labels(err: ProcessAttributeError) -> Vec<(&'static str, Cow<'static, str>)> {
+fn fallback_process_attribute_labels(err: ProcessAttributeError) -> Vec<(&'static str, Cow<'static, str>)> {
     warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, collector = "process_metric_labels", result = "collect_failed", error = %err, "metrics runtime state changed");
     vec![
-        ("process_pid", Cow::Owned(std::process::id().to_string())),
-        ("process_executable_name", Cow::Borrowed("unknown")),
+        (PROCESS_PID_LABEL, Cow::Owned(std::process::id().to_string())),
+        (PROCESS_EXECUTABLE_NAME_LABEL, Cow::Borrowed("unknown")),
     ]
+}
+
+fn current_process_metric_labels(
+    process_attribute_labels: &[(&'static str, Cow<'static, str>)],
+) -> Vec<(&'static str, Cow<'static, str>)> {
+    let mut labels = Vec::with_capacity(process_attribute_labels.len() + 1);
+    labels.push((SERVER_LABEL, Cow::Owned(current_local_node_identity())));
+    labels.extend(process_attribute_labels.iter().map(|(key, value)| (*key, value.clone())));
+    labels
 }
 
 fn collect_system_monitoring_metrics(
     bundle: &ProcessMetricBundle,
     labels: &[(&'static str, Cow<'static, str>)],
-    host_system: &mut System,
+    host_system: &mut Option<System>,
+    host_networks: &mut Option<Networks>,
 ) -> Vec<PrometheusMetric> {
     let cpu_stats = ProcessCpuStats {
         usage: bundle.resource.cpu_percent,
@@ -893,26 +2397,44 @@ fn collect_system_monitoring_metrics(
         read_bytes: bundle.disk_read_bytes,
         written_bytes: bundle.disk_write_bytes,
     };
-    let network_stats = collect_host_network_stats();
-    let (system_cpu_stats, system_memory_stats) = collect_system_cpu_and_memory_stats_with(host_system);
-
     let mut metrics = Vec::new();
-    metrics.extend(collect_cpu_metrics(&system_cpu_stats));
-    metrics.extend(collect_memory_metrics(&system_memory_stats));
+    if let Some(system) = host_system.as_mut() {
+        let (system_cpu_stats, system_memory_stats) = collect_system_cpu_and_memory_stats_with(system);
+        metrics.extend(collect_cpu_metrics(&system_cpu_stats));
+        metrics.extend(collect_memory_metrics(&system_memory_stats));
+    }
     metrics.extend(collect_process_cpu_metrics(&cpu_stats, Some(labels)));
     metrics.extend(collect_process_memory_metrics(&memory_stats, Some(labels)));
     metrics.extend(collect_process_disk_metrics(&disk_stats, Some(labels)));
     // Interface counters are host-wide, so keep these metrics free of process labels.
-    metrics.extend(collect_host_network_metrics(&network_stats, None));
+    if let Some(networks) = host_networks.as_mut() {
+        let network_stats = collect_host_network_stats(networks);
+        metrics.extend(collect_host_network_metrics(&network_stats, None));
+    }
     metrics
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::collectors::scanner::ScannerActiveBucketDriveStats;
     use std::collections::{HashMap, HashSet};
     use std::time::Duration;
     use tokio::time::Instant;
+
+    #[test]
+    fn unavailable_host_sources_preserve_process_metrics() {
+        let bundle = ProcessMetricBundle::default();
+        let metrics = collect_system_monitoring_metrics(&bundle, &[], &mut None, &mut None);
+        let names = metrics.iter().map(|metric| metric.name.as_ref()).collect::<HashSet<_>>();
+        assert!(names.iter().any(|name| name.contains("process_cpu")));
+        assert!(names.iter().any(|name| name.contains("process_resident_memory")));
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.contains("network_host") && !name.contains("system_cpu"))
+        );
+    }
 
     fn fixed_metrics_runtime_config() -> MetricsRuntimeConfig {
         MetricsRuntimeConfig {
@@ -929,6 +2451,19 @@ mod tests {
         }
     }
 
+    fn reset_metrics_runtime_collector_health_for_test() {
+        let health = metrics_runtime_collector_health();
+        for entry in &health.last_success_unix_secs {
+            entry.store(0, Ordering::Relaxed);
+        }
+        for entry in &health.collector_panics_total {
+            entry.store(0, Ordering::Relaxed);
+        }
+        for entry in &health.failure_state {
+            entry.store(false, Ordering::Relaxed);
+        }
+    }
+
     fn repl_bw_key(bucket: &str, target_arn: &str) -> ReplBwKey {
         (bucket.to_string(), target_arn.to_string())
     }
@@ -939,14 +2474,287 @@ mod tests {
             .collect()
     }
 
+    fn bucket_key(bucket: &str) -> BucketKey {
+        bucket.to_string()
+    }
+
+    fn bucket_keys(keys: &[&str]) -> HashSet<BucketKey> {
+        keys.iter().map(|bucket| bucket_key(bucket)).collect()
+    }
+
+    fn audit_target_key(server: &str, target_id: &str) -> AuditTargetKey {
+        (server.to_string(), target_id.to_string())
+    }
+
+    fn notification_target_key(server: &str, target_id: &str, target_type: &str) -> NotificationTargetKey {
+        (server.to_string(), target_id.to_string(), target_type.to_string())
+    }
+
+    fn scanner_stats_with_last_result(bucket: &str) -> ScannerRuntimeStats {
+        ScannerRuntimeStats {
+            server: "server-a".to_string(),
+            last_cycle_bucket_drive_results: vec![crate::metrics::scanner::ScannerBucketDriveResultStats {
+                bucket: bucket.to_string(),
+                drive: "/data1".to_string(),
+                result: "success".to_string(),
+                count: 1,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn scanner_stats_with_lifetime_result(bucket: &str) -> ScannerRuntimeStats {
+        ScannerRuntimeStats {
+            server: "server-a".to_string(),
+            bucket_drive_results: vec![crate::metrics::scanner::ScannerBucketDriveResultStats {
+                bucket: bucket.to_string(),
+                drive: "/data1".to_string(),
+                result: "success".to_string(),
+                count: 1,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn scanner_stats_with_current_result(bucket: &str) -> ScannerRuntimeStats {
+        ScannerRuntimeStats {
+            server: "server-a".to_string(),
+            current_cycle_bucket_drive_results: vec![crate::metrics::scanner::ScannerBucketDriveResultStats {
+                bucket: bucket.to_string(),
+                drive: "/data1".to_string(),
+                result: "success".to_string(),
+                count: 1,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn scanner_last_bucket_drive_result_keys_detect_superseded_cycle_results() {
+        let previous = scanner_cycle_bucket_drive_result_live_keys(&scanner_stats_with_last_result("photos"));
+        let current = scanner_cycle_bucket_drive_result_live_keys(&scanner_stats_with_last_result("logs"));
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert!(retired.contains(&(
+            "server-a".to_string(),
+            "last".to_string(),
+            "photos".to_string(),
+            "/data1".to_string(),
+            "success".to_string(),
+        )));
+        assert!(current.contains(&(
+            "server-a".to_string(),
+            "last".to_string(),
+            "logs".to_string(),
+            "/data1".to_string(),
+            "success".to_string(),
+        )));
+    }
+
+    #[test]
+    fn scanner_bucket_drive_result_keys_detect_completed_current_cycle_results() {
+        let previous = scanner_cycle_bucket_drive_result_live_keys(&scanner_stats_with_current_result("photos"));
+        let current = scanner_cycle_bucket_drive_result_live_keys(&ScannerRuntimeStats {
+            server: "server-a".to_string(),
+            ..Default::default()
+        });
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert!(retired.contains(&(
+            "server-a".to_string(),
+            "current".to_string(),
+            "photos".to_string(),
+            "/data1".to_string(),
+            "success".to_string(),
+        )));
+    }
+
+    #[test]
+    fn scanner_bucket_drive_result_keys_detect_evicted_lifetime_results() {
+        let previous = scanner_bucket_drive_result_live_keys(&scanner_stats_with_lifetime_result("photos"));
+        let current = scanner_bucket_drive_result_live_keys(&scanner_stats_with_lifetime_result("logs"));
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert!(retired.contains(&("server-a".to_string(), "photos".to_string(), "/data1".to_string(), "success".to_string(),)));
+        assert!(current.contains(&("server-a".to_string(), "logs".to_string(), "/data1".to_string(), "success".to_string(),)));
+    }
+
+    #[test]
+    fn scanner_active_bucket_drive_keys_detect_completed_scans() {
+        let previous = scanner_active_bucket_drive_live_keys(&ScannerRuntimeStats {
+            server: "server-a".to_string(),
+            active_bucket_drive_scans: vec![ScannerActiveBucketDriveStats {
+                source: "usage".to_string(),
+                bucket: "photos".to_string(),
+                drive: "/data1".to_string(),
+                count: 1,
+                age_seconds: 3,
+            }],
+            ..Default::default()
+        });
+        let current = scanner_active_bucket_drive_live_keys(&ScannerRuntimeStats {
+            server: "server-a".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            previous
+                .difference(&current)
+                .any(|key| key == &("server-a".to_string(), "usage".to_string(), "photos".to_string(), "/data1".to_string()))
+        );
+    }
+
+    #[test]
+    fn replication_proxy_bucket_keys_detect_removed_buckets() {
+        let previous = repl_proxy_bucket_live_keys(&[BucketReplicationRuntimeStats {
+            stats: crate::metrics::BucketReplicationMetricsSnapshot {
+                bucket: "photos".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        let current = repl_proxy_bucket_live_keys(&[BucketReplicationRuntimeStats {
+            stats: crate::metrics::BucketReplicationMetricsSnapshot {
+                bucket: "logs".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert_eq!(retired, bucket_keys(&["photos"]));
+        assert_eq!(current, bucket_keys(&["logs"]));
+    }
+
+    #[test]
+    fn on_demand_migration_bucket_keys_detect_removed_buckets() {
+        let previous = on_demand_migration_bucket_live_keys(&[
+            OnDemandMigrationBucketStats {
+                bucket: "photos".to_string(),
+                ..Default::default()
+            },
+            OnDemandMigrationBucketStats {
+                bucket: "logs".to_string(),
+                ..Default::default()
+            },
+        ]);
+        let current = on_demand_migration_bucket_live_keys(&[OnDemandMigrationBucketStats {
+            bucket: "logs".to_string(),
+            ..Default::default()
+        }]);
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert_eq!(retired, bucket_keys(&["photos"]));
+        assert_eq!(current, bucket_keys(&["logs"]));
+        assert!(on_demand_migration_bucket_live_keys(&[]).is_empty());
+    }
+
+    /// Retirement must name exactly the series the collector emitted for the
+    /// bucket, with identical label order, or the recorder keeps them alive.
+    #[test]
+    fn on_demand_migration_retirement_covers_every_emitted_series() {
+        let stats = crate::metrics::collectors::on_demand_migration::tests::golden_stats("photos");
+        let emitted = collect_on_demand_migration_metrics(&[stats])
+            .into_iter()
+            .map(|metric| {
+                (
+                    metric.name.to_string(),
+                    metric
+                        .labels
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        let retired = on_demand_migration_metric_series("photos")
+            .into_iter()
+            .map(|(name, labels)| {
+                (
+                    name,
+                    labels
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashSet<_>>();
+
+        assert_eq!(retired, emitted);
+        // Without a process-global recorder there is nothing to retire; the
+        // walk itself must still cover every series.
+        assert_eq!(retire_on_demand_migration_metric_series("photos"), 0);
+        assert_eq!(on_demand_migration_metric_series("photos").len(), emitted.len());
+    }
+
+    #[test]
+    fn on_demand_migration_backfill_bucket_keys_detect_finished_jobs() {
+        let stats = crate::metrics::collectors::on_demand_migration::tests::backfill_golden_stats("node1:9000");
+        let previous = on_demand_migration_backfill_bucket_live_keys(&stats);
+        let current = on_demand_migration_backfill_bucket_live_keys(&OdmBackfillRuntimeStats {
+            server: stats.server.clone(),
+            buckets: stats.buckets[..1].to_vec(),
+        });
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert_eq!(retired, bucket_keys(&["docs"]));
+        assert_eq!(current, bucket_keys(&["photos"]));
+        assert!(on_demand_migration_backfill_bucket_live_keys(&OdmBackfillRuntimeStats::default()).is_empty());
+    }
+
+    /// Every emitted backfill series must be named by the retirement walk.
+    /// The walk is wider than one cycle's emission on purpose: only the
+    /// job's current `state` gauge is emitted, so retirement enumerates all
+    /// lifecycle values to clear whichever one is live.
+    #[test]
+    fn on_demand_migration_backfill_retirement_covers_every_emitted_series() {
+        let stats = crate::metrics::collectors::on_demand_migration::tests::backfill_golden_stats("node1:9000");
+        let emitted = collect_on_demand_migration_backfill_metrics(&stats)
+            .into_iter()
+            .map(|metric| {
+                (
+                    metric.name.to_string(),
+                    metric
+                        .labels
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        let retired = stats
+            .buckets
+            .iter()
+            .flat_map(|bucket| on_demand_migration_backfill_metric_series(&stats.server, &bucket.bucket))
+            .map(|(name, labels)| {
+                (
+                    name,
+                    labels
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashSet<_>>();
+
+        assert!(emitted.is_subset(&retired), "emitted: {emitted:?}, retired: {retired:?}");
+        assert_eq!(
+            on_demand_migration_backfill_metric_series("node1:9000", "photos").len(),
+            ODM_BACKFILL_STATES.len() + 6
+        );
+        // Without a process-global recorder there is nothing to retire; the
+        // walk itself must still cover every series.
+        assert_eq!(retire_on_demand_migration_backfill_metric_series("node1:9000", "photos"), 0);
+    }
+
     #[test]
     fn metrics_runtime_status_reports_disabled_state() {
-        let snapshot = build_metrics_runtime_status_snapshot(false, false, fixed_metrics_runtime_config());
+        let snapshot = build_metrics_runtime_status_snapshot(false, false, fixed_metrics_runtime_config(), false);
 
         assert_eq!(snapshot.service, METRICS_RUNTIME_SERVICE_NAME);
         assert_eq!(snapshot.state, MetricsRuntimeServiceState::Disabled);
         assert!(!snapshot.metrics_enabled);
-        assert_eq!(snapshot.collector_tasks, METRICS_RUNTIME_COLLECTOR_TASKS);
+        assert_eq!(snapshot.collector_tasks, METRICS_RUNTIME_BASE_COLLECTOR_TASKS);
+        assert_eq!(snapshot.collector_health, MetricsRuntimeCollectorHealthSnapshot::default());
         assert_eq!(snapshot.intervals.cluster_interval_secs, 60);
         assert_eq!(snapshot.intervals.bucket_interval_secs, 300);
         assert_eq!(snapshot.intervals.process_interval_secs, 10);
@@ -957,19 +2765,21 @@ mod tests {
 
     #[test]
     fn metrics_runtime_status_reports_running_and_stopping_states() {
-        let running = build_metrics_runtime_status_snapshot(true, false, fixed_metrics_runtime_config());
-        let stopping = build_metrics_runtime_status_snapshot(true, true, fixed_metrics_runtime_config());
+        reset_metrics_runtime_collector_health_for_test();
+        let running = build_metrics_runtime_status_snapshot(true, false, fixed_metrics_runtime_config(), false);
+        let stopping = build_metrics_runtime_status_snapshot(true, true, fixed_metrics_runtime_config(), false);
 
         assert_eq!(running.state, MetricsRuntimeServiceState::Running);
         assert_eq!(stopping.state, MetricsRuntimeServiceState::Stopping);
         assert!(running.metrics_enabled);
         assert!(stopping.metrics_enabled);
+        assert_eq!(running.collector_health.unhealthy_collectors, METRICS_RUNTIME_BASE_COLLECTOR_TASKS);
     }
 
     #[test]
     fn metrics_runtime_controller_reconcile_is_idempotent() {
         let controller = MetricsRuntimeController;
-        let snapshot = build_metrics_runtime_controller_snapshot(true, false, fixed_metrics_runtime_config());
+        let snapshot = build_metrics_runtime_controller_snapshot(true, false, fixed_metrics_runtime_config(), false);
 
         let first = controller.reconcile_snapshot(snapshot);
         let second = controller.reconcile_snapshot(snapshot);
@@ -984,7 +2794,7 @@ mod tests {
     #[test]
     fn metrics_runtime_controller_reports_disabled_without_worker_mutation() {
         let controller = MetricsRuntimeController;
-        let snapshot = build_metrics_runtime_controller_snapshot(false, false, fixed_metrics_runtime_config());
+        let snapshot = build_metrics_runtime_controller_snapshot(false, false, fixed_metrics_runtime_config(), false);
         let plan = controller.reconcile_snapshot(snapshot);
 
         assert_eq!(snapshot.desired.state, MetricsRuntimeDesiredState::Disabled);
@@ -1007,6 +2817,44 @@ mod tests {
         let mut deadline = base;
         advance_deadline(&mut deadline, Duration::from_secs(5), base + Duration::from_secs(12));
         assert_eq!(deadline, base + Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn metrics_interval_uses_delay_missed_tick_behavior() {
+        let interval = metrics_interval(Duration::from_secs(5), Duration::from_secs(1));
+        assert_eq!(interval.missed_tick_behavior(), MissedTickBehavior::Delay);
+    }
+
+    #[test]
+    fn metrics_runtime_collector_tasks_expand_when_compression_enabled() {
+        assert_eq!(
+            metrics_runtime_collector_tasks(false),
+            u8::try_from(BASE_COLLECTOR_TASK_IDS.len()).expect("base collector count fits in u8")
+        );
+        assert_eq!(
+            metrics_runtime_collector_tasks(true),
+            u8::try_from(ALL_COLLECTOR_TASK_IDS.len()).expect("all collector count fits in u8")
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_tick_records_success_and_panic_health() {
+        let health = MetricsRuntimeCollectorHealth::new();
+
+        run_metrics_collector_tick(&health, MetricsCollectorTaskId::ClusterStats, "cluster_stats", async {}).await;
+        let success = health.snapshot(&[MetricsCollectorTaskId::ClusterStats]);
+        assert_eq!(success.healthy_collectors, 1);
+        assert_eq!(success.unhealthy_collectors, 0);
+        assert_eq!(success.collector_panics_total, 0);
+
+        run_metrics_collector_tick(&health, MetricsCollectorTaskId::ClusterStats, "cluster_stats", async {
+            panic!("collector panic");
+        })
+        .await;
+        let failed = health.snapshot(&[MetricsCollectorTaskId::ClusterStats]);
+        assert_eq!(failed.healthy_collectors, 0);
+        assert_eq!(failed.unhealthy_collectors, 1);
+        assert_eq!(failed.collector_panics_total, 1);
     }
 
     #[test]
@@ -1056,11 +2904,158 @@ mod tests {
             assert_eq!(labels.get(TARGET_ARN_L).map(String::as_str), Some("arn:rustfs:replication:target-a"));
         }
 
-        expire_repl_bw_zero_tombstones(true, &mut zero_tombstones);
+        let expired = expire_repl_bw_zero_tombstones(true, &mut zero_tombstones);
+        assert!(expired.is_empty());
         assert_eq!(zero_tombstones.get(&key), Some(&1));
 
-        expire_repl_bw_zero_tombstones(true, &mut zero_tombstones);
+        let expired = expire_repl_bw_zero_tombstones(true, &mut zero_tombstones);
+        assert_eq!(expired, vec![key]);
         assert!(zero_tombstones.is_empty());
+    }
+
+    #[test]
+    fn repl_flow_tombstones_zero_latency_and_retire_target_counters() {
+        let zero_tombstones = HashMap::from([(repl_bw_key("photos", "arn:rustfs:replication:target-a"), 2)]);
+
+        let metrics = collect_repl_flow_zero_tombstone_metrics(&zero_tombstones);
+
+        assert_eq!(metrics.len(), 1);
+        assert!(metrics.iter().all(|metric| metric.value == 0.0));
+        let names = metrics.iter().map(|metric| metric.name.to_string()).collect::<HashSet<_>>();
+        assert!(names.contains(&BUCKET_REPL_LATENCY_MS_MD.get_full_metric_name()));
+        for metric in metrics {
+            let labels = metric
+                .labels
+                .into_iter()
+                .map(|(key, value)| (key, value.to_string()))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(labels.get(BUCKET_L).map(String::as_str), Some("photos"));
+            assert_eq!(labels.get(TARGET_ARN_L).map(String::as_str), Some("arn:rustfs:replication:target-a"));
+            if metric.name == BUCKET_REPL_LATENCY_MS_MD.get_full_metric_name() {
+                assert_eq!(labels.get(OPERATION_L).map(String::as_str), Some("object_replication"));
+                assert_eq!(labels.get(RANGE_L).map(String::as_str), Some("all"));
+            }
+        }
+    }
+
+    #[test]
+    fn audit_target_tombstones_include_server_detail_metrics() {
+        let zero_tombstones = HashMap::from([(audit_target_key("node1:9000", "audit-webhook"), 2)]);
+        let metrics = collect_audit_zero_tombstone_metrics(&zero_tombstones);
+
+        assert_eq!(metrics.len(), 4);
+        assert!(metrics.iter().any(|metric| {
+            metric.name == AUDIT_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name()
+                && metric.value == 0.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == AUDIT_SERVER_LABEL && value == "node1:9000")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == AUDIT_TARGET_ID_LABEL && value == "audit-webhook")
+        }));
+    }
+
+    #[test]
+    fn audit_legacy_tombstones_follow_target_only_liveness() {
+        let mut has_seen_snapshot = true;
+        let mut prev_live_keys = HashSet::from(["audit-webhook".to_string()]);
+        let mut zero_tombstones = HashMap::new();
+        let stats = vec![AuditTargetRuntimeStats {
+            server: "node2:9000".to_string(),
+            target: AuditTargetStats {
+                target_id: "audit-webhook".to_string(),
+                ..Default::default()
+            },
+        }];
+
+        update_series_zero_tombstones(
+            &mut has_seen_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            audit_legacy_target_live_keys(&stats),
+            2,
+        );
+
+        assert!(zero_tombstones.is_empty());
+        let metrics = collect_audit_legacy_zero_tombstone_metrics(&HashMap::from([("removed-webhook".to_string(), 2)]));
+        assert_eq!(metrics.len(), 4);
+        assert!(metrics.iter().any(|metric| {
+            metric.name == AUDIT_FAILED_STORE_LENGTH_MD.get_full_metric_name()
+                && metric.value == 0.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == AUDIT_TARGET_ID_LABEL && value == "removed-webhook")
+        }));
+    }
+
+    #[test]
+    fn notification_target_tombstones_include_server_detail_metrics() {
+        let zero_tombstones = HashMap::from([(notification_target_key("node1:9000", "primary:webhook", "webhook"), 2)]);
+        let metrics = collect_notification_target_zero_tombstone_metrics(&zero_tombstones);
+
+        assert_eq!(metrics.len(), 4);
+        assert!(metrics.iter().any(|metric| {
+            metric.name == NOTIFICATION_TARGET_QUEUE_LENGTH_BY_SERVER_MD.get_full_metric_name()
+                && metric.value == 0.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == NOTIFICATION_SERVER_LABEL && value == "node1:9000")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == NOTIFICATION_TARGET_ID_LABEL && value == "primary:webhook")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == NOTIFICATION_TARGET_TYPE_LABEL && value == "webhook")
+        }));
+    }
+
+    #[test]
+    fn notification_legacy_tombstones_follow_target_only_liveness() {
+        let mut has_seen_snapshot = true;
+        let mut prev_live_keys = HashSet::from([("primary:webhook".to_string(), "webhook".to_string())]);
+        let mut zero_tombstones = HashMap::new();
+        let stats = vec![NotificationTargetRuntimeStats {
+            server: "node2:9000".to_string(),
+            target: NotificationTargetStats {
+                target_id: "primary:webhook".to_string(),
+                target_type: "webhook".to_string(),
+                ..Default::default()
+            },
+        }];
+
+        update_series_zero_tombstones(
+            &mut has_seen_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            notification_legacy_target_live_keys(&stats),
+            2,
+        );
+
+        assert!(zero_tombstones.is_empty());
+        let metrics = collect_notification_legacy_target_zero_tombstone_metrics(&HashMap::from([(
+            ("removed:webhook".to_string(), "webhook".to_string()),
+            2,
+        )]));
+        assert_eq!(metrics.len(), 4);
+        assert!(metrics.iter().any(|metric| {
+            metric.name == NOTIFICATION_TARGET_FAILED_STORE_LENGTH_MD.get_full_metric_name()
+                && metric.value == 0.0
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == NOTIFICATION_TARGET_ID_LABEL && value == "removed:webhook")
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(name, value)| *name == NOTIFICATION_TARGET_TYPE_LABEL && value == "webhook")
+        }));
     }
 
     #[test]
@@ -1120,7 +3115,302 @@ mod tests {
         assert_eq!(prev_live_keys, repl_bw_keys(&[("photos", "arn:rustfs:replication:target-a")]));
         assert_eq!(zero_tombstones.get(&repl_bw_key("videos", "arn:rustfs:replication:target-b")), Some(&1));
 
-        expire_repl_bw_zero_tombstones(false, &mut zero_tombstones);
+        let expired = expire_repl_bw_zero_tombstones(false, &mut zero_tombstones);
+        assert!(expired.is_empty());
         assert_eq!(zero_tombstones.get(&repl_bw_key("videos", "arn:rustfs:replication:target-b")), Some(&1));
+    }
+
+    #[test]
+    fn repl_backlog_tombstones_zero_removed_buckets_then_expire() {
+        let mut has_seen_valid_snapshot = false;
+        let mut prev_live_keys = HashSet::new();
+        let mut zero_tombstones = HashMap::new();
+        let key = bucket_key("photos");
+
+        update_repl_backlog_zero_tombstones(
+            true,
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            bucket_keys(&["photos"]),
+            2,
+        );
+        assert!(has_seen_valid_snapshot);
+        assert_eq!(prev_live_keys, bucket_keys(&["photos"]));
+        assert!(zero_tombstones.is_empty());
+
+        update_repl_backlog_zero_tombstones(
+            true,
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            HashSet::new(),
+            2,
+        );
+        assert_eq!(zero_tombstones.get(&key), Some(&2));
+
+        let metrics = collect_repl_backlog_zero_tombstone_metrics(&zero_tombstones);
+        assert_eq!(metrics.len(), 11);
+
+        let expected_names = HashSet::from([
+            BUCKET_REPL_CURRENT_BACKLOG_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_CURRENT_BACKLOG_BYTES_MD.get_full_metric_name(),
+            BUCKET_REPL_DURABLE_MRF_AVAILABLE_MD.get_full_metric_name(),
+            BUCKET_REPL_DURABLE_MRF_BACKLOG_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_DURABLE_MRF_BACKLOG_BYTES_MD.get_full_metric_name(),
+            BUCKET_REPL_MRF_PENDING_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_MRF_PENDING_BYTES_MD.get_full_metric_name(),
+            BUCKET_REPL_MRF_DROPPED_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_MRF_MISSED_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_MRF_FLUSH_FAILURES_MD.get_full_metric_name(),
+            BUCKET_REPL_MRF_LAST_FLUSH_DURATION_MILLIS_MD.get_full_metric_name(),
+        ]);
+        let mut actual_names = HashSet::new();
+        for metric in metrics {
+            actual_names.insert(metric.name.to_string());
+            assert_eq!(metric.value, 0.0);
+
+            let labels = metric
+                .labels
+                .into_iter()
+                .map(|(key, value)| (key, value.to_string()))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(labels.get(BUCKET_L).map(String::as_str), Some("photos"));
+        }
+        assert_eq!(actual_names, expected_names);
+
+        let expired = expire_repl_backlog_zero_tombstones(true, &mut zero_tombstones);
+        assert!(expired.is_empty());
+        assert_eq!(zero_tombstones.get(&key), Some(&1));
+
+        let expired = expire_repl_backlog_zero_tombstones(true, &mut zero_tombstones);
+        assert_eq!(expired, vec![key]);
+        assert!(zero_tombstones.is_empty());
+    }
+
+    #[test]
+    fn repl_backlog_tombstones_stop_zeroing_when_bucket_becomes_live_again() {
+        let mut has_seen_valid_snapshot = false;
+        let mut prev_live_keys = HashSet::new();
+        let mut zero_tombstones = HashMap::new();
+        let live_keys = bucket_keys(&["photos"]);
+
+        update_repl_backlog_zero_tombstones(
+            true,
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            live_keys.clone(),
+            3,
+        );
+        update_repl_backlog_zero_tombstones(
+            true,
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            HashSet::new(),
+            3,
+        );
+        assert_eq!(zero_tombstones.get(&bucket_key("photos")), Some(&3));
+
+        update_repl_backlog_zero_tombstones(
+            true,
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            live_keys.clone(),
+            3,
+        );
+
+        assert!(zero_tombstones.is_empty());
+        assert_eq!(prev_live_keys, live_keys);
+    }
+
+    #[test]
+    fn repl_backlog_tombstones_do_not_advance_when_monitor_unavailable() {
+        let mut has_seen_valid_snapshot = true;
+        let mut prev_live_keys = bucket_keys(&["photos"]);
+        let mut zero_tombstones = HashMap::from([(bucket_key("videos"), 1)]);
+
+        update_repl_backlog_zero_tombstones(
+            false,
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            HashSet::new(),
+            3,
+        );
+
+        assert!(has_seen_valid_snapshot);
+        assert_eq!(prev_live_keys, bucket_keys(&["photos"]));
+        assert_eq!(zero_tombstones.get(&bucket_key("videos")), Some(&1));
+
+        let expired = expire_repl_backlog_zero_tombstones(false, &mut zero_tombstones);
+        assert!(expired.is_empty());
+        assert_eq!(zero_tombstones.get(&bucket_key("videos")), Some(&1));
+
+        update_repl_backlog_zero_tombstones(
+            false,
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            bucket_keys(&["videos"]),
+            3,
+        );
+
+        assert!(zero_tombstones.is_empty());
+        assert_eq!(prev_live_keys, bucket_keys(&["photos"]));
+    }
+
+    #[test]
+    fn repl_backlog_target_tombstones_zero_removed_targets_then_expire() {
+        let mut has_seen_valid_snapshot = false;
+        let mut prev_live_keys = HashSet::new();
+        let mut zero_tombstones = HashMap::new();
+        let key = repl_bw_key("photos", "arn:rustfs:replication:target-a");
+
+        update_series_zero_tombstones(
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            repl_bw_keys(&[("photos", "arn:rustfs:replication:target-a")]),
+            2,
+        );
+        assert!(has_seen_valid_snapshot);
+        assert_eq!(prev_live_keys, repl_bw_keys(&[("photos", "arn:rustfs:replication:target-a")]));
+        assert!(zero_tombstones.is_empty());
+
+        update_series_zero_tombstones(&mut has_seen_valid_snapshot, &mut prev_live_keys, &mut zero_tombstones, HashSet::new(), 2);
+        assert_eq!(zero_tombstones.get(&key), Some(&2));
+
+        let metrics = collect_repl_backlog_target_zero_tombstone_metrics(&zero_tombstones);
+        assert_eq!(metrics.len(), 4);
+        let expected_names = HashSet::from([
+            BUCKET_REPL_CURRENT_TARGET_BACKLOG_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_CURRENT_TARGET_BACKLOG_BYTES_MD.get_full_metric_name(),
+            BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_COUNT_MD.get_full_metric_name(),
+            BUCKET_REPL_DURABLE_MRF_TARGET_BACKLOG_BYTES_MD.get_full_metric_name(),
+        ]);
+        let mut actual_names = HashSet::new();
+        for metric in metrics {
+            actual_names.insert(metric.name.to_string());
+            assert_eq!(metric.value, 0.0);
+            let labels = metric
+                .labels
+                .into_iter()
+                .map(|(key, value)| (key, value.to_string()))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(labels.get(BUCKET_L).map(String::as_str), Some("photos"));
+            assert_eq!(labels.get(TARGET_ARN_L).map(String::as_str), Some("arn:rustfs:replication:target-a"));
+        }
+        assert_eq!(actual_names, expected_names);
+
+        let expired = expire_repl_backlog_target_zero_tombstones(true, &mut zero_tombstones);
+        assert!(expired.is_empty());
+        assert_eq!(zero_tombstones.get(&key), Some(&1));
+
+        let expired = expire_repl_backlog_target_zero_tombstones(true, &mut zero_tombstones);
+        assert_eq!(expired, vec![key]);
+        assert!(zero_tombstones.is_empty());
+    }
+
+    #[test]
+    fn repl_backlog_target_tombstones_do_not_advance_when_target_metrics_unavailable() {
+        let key = repl_bw_key("videos", "arn:rustfs:replication:target-b");
+        let mut zero_tombstones = HashMap::from([(key.clone(), 1)]);
+
+        let expired = expire_repl_backlog_target_zero_tombstones(false, &mut zero_tombstones);
+
+        assert!(expired.is_empty());
+        assert_eq!(zero_tombstones.get(&key), Some(&1));
+    }
+
+    #[test]
+    fn bucket_tombstones_zero_removed_buckets_then_expire() {
+        let mut has_seen_valid_snapshot = false;
+        let mut prev_live_keys = HashSet::new();
+        let mut zero_tombstones = HashMap::new();
+        let live_stats = vec![crate::metrics::collectors::BucketStats {
+            name: "tmp".to_string(),
+            size_bytes: Some(1024),
+            objects_count: Some(8),
+            quota_bytes: 2048,
+        }];
+
+        update_series_zero_tombstones(
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            bucket_live_keys(&live_stats),
+            2,
+        );
+        assert!(zero_tombstones.is_empty());
+
+        update_series_zero_tombstones(&mut has_seen_valid_snapshot, &mut prev_live_keys, &mut zero_tombstones, HashSet::new(), 2);
+        assert_eq!(zero_tombstones.get("tmp"), Some(&2));
+
+        let metrics = collect_bucket_zero_tombstone_metrics(&zero_tombstones);
+        assert_eq!(metrics.len(), 3);
+        assert!(metrics.iter().all(|metric| metric.value == 0.0));
+        assert!(
+            metrics
+                .iter()
+                .all(|metric| { metric.labels.iter().any(|(key, value)| *key == "bucket" && value == "tmp") })
+        );
+
+        let expired = expire_series_zero_tombstones(&mut zero_tombstones);
+        assert!(expired.is_empty());
+        assert_eq!(zero_tombstones.get("tmp"), Some(&1));
+
+        let expired = expire_series_zero_tombstones(&mut zero_tombstones);
+        assert_eq!(expired, vec!["tmp".to_string()]);
+        assert!(zero_tombstones.is_empty());
+    }
+
+    #[test]
+    fn unavailable_bucket_snapshot_preserves_metric_series_state() {
+        let mut state = BucketSeriesState::default();
+        let initial = [crate::metrics::collectors::BucketStats {
+            name: "bucket".to_string(),
+            size_bytes: Some(512),
+            objects_count: Some(2),
+            quota_bytes: 1024,
+        }];
+        assert!(state.observe(Some(&initial), 2).is_some());
+
+        let live_keys = state.live_keys.clone();
+        let zero_tombstones = state.zero_tombstones.clone();
+
+        assert!(state.observe(None, 2).is_none());
+        assert_eq!(state.live_keys, live_keys);
+        assert_eq!(state.zero_tombstones, zero_tombstones);
+    }
+
+    #[test]
+    fn parse_system_metrics_interval_rounds_legacy_millis_up_to_one_second() {
+        temp_env::with_vars(
+            [
+                (ENV_SYSTEM_METRICS_INTERVAL, None::<&str>),
+                (LEGACY_SYSTEM_METRICS_INTERVAL, Some("500")),
+                (ENV_DEFAULT_METRICS_INTERVAL, None::<&str>),
+            ],
+            || {
+                assert_eq!(parse_system_metrics_interval(), Duration::from_secs(1));
+            },
+        );
+    }
+
+    #[test]
+    fn parse_system_metrics_interval_rounds_legacy_millis_up() {
+        temp_env::with_vars(
+            [
+                (ENV_SYSTEM_METRICS_INTERVAL, None::<&str>),
+                (LEGACY_SYSTEM_METRICS_INTERVAL, Some("1500")),
+                (ENV_DEFAULT_METRICS_INTERVAL, None::<&str>),
+            ],
+            || {
+                assert_eq!(parse_system_metrics_interval(), Duration::from_secs(2));
+            },
+        );
     }
 }

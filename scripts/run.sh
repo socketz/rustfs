@@ -52,10 +52,6 @@ if [ -z "${RUSTFS_UNSAFE_BYPASS_DISK_CHECK+x}" ] && [ -z "${MINIO_CI+x}" ]; then
     export RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
 fi
 
-if [ -z "${RUSTFS_ALLOCATOR_RECLAIM_ENABLED+x}" ]; then
-    export RUSTFS_ALLOCATOR_RECLAIM_ENABLED=true
-fi
-
 export RUSTFS_VOLUMES="${RUSTFS_VOLUMES:-./target/volume/test{1...4}}"
 # export RUSTFS_VOLUMES="./target/volume/test"
 export RUSTFS_ADDRESS="${RUSTFS_ADDRESS:-127.0.0.1:9000}"
@@ -115,18 +111,29 @@ export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 # ============================================================================
 # dial9 Tokio Runtime Telemetry Configuration
 # ============================================================================
-# dial9 provides low-overhead Tokio runtime-level telemetry for performance diagnostics.
-# It captures events like PollStart/End, WorkerPark/Unpark, QueueSample, TaskSpawn.
+# dial9 captures Tokio runtime-level events (poll start/end, worker park/unpark,
+# task spawn/terminate) into binary trace segments. It sees long polls that stall
+# a worker — something request-level metrics and spans cannot show.
 #
-# Features:
-# - CPU overhead < 5% (with sampling rate 1.0)
-# - Automatic file rotation (configurable size and count)
-# - Graceful degradation if initialization fails
+# It does NOT see a drive stall: RustFS does its disk I/O on the blocking pool
+# and via io_uring, never on an async worker, so a slow drive does not lengthen
+# any poll. Measured: injecting 200ms of drive latency cut throughput by 64% and
+# left the poll-duration distribution unchanged.
 #
-# Note: Disabled by default. Enable only when needed for runtime diagnostics.
-# Note: Requires build flag --cfg tokio_unstable (set in .cargo/config.toml).
+# This is an on-demand profiler, not always-on telemetry:
+#
+# - The stock binary does NOT support it. Build with `make build-profiling`,
+#   which enables the `dial9` feature and `--cfg tokio_unstable`. Setting the
+#   variables below on a stock binary logs a warning and changes nothing.
+# - Trace segments are written continuously, and the oldest are deleted once
+#   MAX_FILE_SIZE * ROTATION_COUNT bytes are retained. Measured at ~0.16 MiB/s
+#   under a 66 MiB/s warp workload, so the default 1 GiB budget wraps after
+#   roughly 108 minutes. Scale that by your event rate.
+# - Turn it off again when the investigation is over.
+#
+# See docs/operations/dial9-runtime-profiling.md.
 
-# Enable dial9 telemetry (default: false)
+# Enable dial9 telemetry (default: false; requires a `make build-profiling` binary)
 #export RUSTFS_RUNTIME_DIAL9_ENABLED=true
 
 # Output directory for trace files (default: /var/log/rustfs/telemetry)
@@ -138,33 +145,25 @@ export RUSTFS_RUNTIME_GLOBAL_QUEUE_INTERVAL=31
 # Maximum trace file size in bytes (default: 104857600 = 100MB)
 #export RUSTFS_RUNTIME_DIAL9_MAX_FILE_SIZE=104857600
 
-# Number of rotated files to keep (default: 10)
+# Number of rotated files to keep (default: 10). Total disk budget is
+# MAX_FILE_SIZE * ROTATION_COUNT; older segments are evicted, not kept.
 #export RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT=10
 
-# Sampling rate: 0.0 to 1.0 (default: 1.0 = 100% sampling)
-# Lower values reduce CPU overhead. Recommended: 0.1-0.5 for production.
-#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=1.0
-
-# S3 upload settings (not yet implemented; reserved for future use):
+# S3 upload is NOT available: dial9's uploader depends on a rustls-webpki with
+# known CVEs, so the feature is not built. These are parsed and warned about,
+# never honoured. Collect segments from OUTPUT_DIR instead.
 #export RUSTFS_RUNTIME_DIAL9_S3_BUCKET=my-trace-bucket
 #export RUSTFS_RUNTIME_DIAL9_S3_PREFIX=telemetry/
 
-# --- Scenario 1: Development / Debugging ---
-# Full tracing with local storage, high sampling rate
+# --- Scenario 1: local development ---
 #export RUSTFS_RUNTIME_DIAL9_ENABLED=true
 #export RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR="$current_dir/deploy/telemetry"
-#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=1.0
 
-# --- Scenario 2: Production Diagnostics ---
-# Reduced sampling rate to minimize overhead
-#export RUSTFS_RUNTIME_DIAL9_ENABLED=true
-#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=0.1
-
-# --- Scenario 3: Performance Investigation ---
-# Short-term tracing with high detail, manual cleanup
+# --- Scenario 2: investigating a worker stall ---
+# Trace shows which task held a worker and for how long, but not where it was
+# stuck: task dumps need dial9's own spawner (see backlog#1157 D9-16).
 #export RUSTFS_RUNTIME_DIAL9_ENABLED=true
 #export RUSTFS_RUNTIME_DIAL9_OUTPUT_DIR=/tmp/rustfs-telemetry-investigation
-#export RUSTFS_RUNTIME_DIAL9_SAMPLING_RATE=1.0
 #export RUSTFS_RUNTIME_DIAL9_ROTATION_COUNT=3
 
 export OTEL_INSTRUMENTATION_NAME="rustfs"
@@ -206,6 +205,7 @@ export RUSTFS_NS_SCANNER_INTERVAL=60  # Object scanning interval in seconds
 
 # Storage level compression (compression at object storage level)
 # export RUSTFS_COMPRESSION_ENABLED=true # Whether to enable storage-level compression for objects
+# export RUSTFS_COMPRESSION_MULTIPART_ENABLED=true # Additionally compress multipart uploads (staged rollout switch: enable only after the whole fleet runs a build with the resumable decompressor; see docs/architecture/compat-cleanup-register.md)
 
 # HTTP Response Compression (whitelist-based, aligned with MinIO)
 # By default, HTTP response compression is DISABLED (aligned with MinIO behavior)
@@ -312,46 +312,46 @@ export RUSTFS_TRUST_SYSTEM_CA=true
 # --- Basic Configuration ---
 # Scheduled update interval (seconds)
 # How often to perform full capacity recalculation
-# Default: 300 (5 minutes)
+# Default: 600 (10 minutes)
 # Recommended: 300-600 for production, 60-120 for testing
-export RUSTFS_CAPACITY_SCHEDULED_INTERVAL=300
+export RUSTFS_CAPACITY_SCHEDULED_INTERVAL=600
 
 # Write trigger delay (seconds)
 # Delay after write operation before triggering capacity update
-# Default: 10
-# Recommended: 5-15
-export RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY=10
+# Default: 30
+# Recommended: 5-30
+export RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY=30
 
 # Write frequency threshold (writes per minute)
 # Threshold for triggering fast updates during high write frequency
-# Default: 10
+# Default: 20
 # Recommended: 5-20
-export RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD=10
+export RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD=20
 
 # Fast update threshold (seconds)
 # Cache age threshold for considering data as fresh
-# Default: 60
+# Default: 120
 # Recommended: 30-120
-export RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD=60
+export RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD=120
 
 # --- Performance Protection ---
 # Maximum files threshold
 # When file count exceeds this, sampling is used for performance
-# Default: 1000000 (1 million)
-# Recommended: 500000-2000000
-export RUSTFS_CAPACITY_MAX_FILES_THRESHOLD=1000000
+# Default: 200000
+# Recommended: 200000-2000000
+export RUSTFS_CAPACITY_MAX_FILES_THRESHOLD=200000
 
 # Statistics timeout (seconds)
 # Maximum time to wait for capacity calculation
-# Default: 5
+# Default: 3
 # Recommended: 3-10
-export RUSTFS_CAPACITY_STAT_TIMEOUT=5
+export RUSTFS_CAPACITY_STAT_TIMEOUT=3
 
 # Sample rate
 # When sampling is enabled, check every N files
-# Default: 100
+# Default: 200
 # Recommended: 50-200
-export RUSTFS_CAPACITY_SAMPLE_RATE=100
+export RUSTFS_CAPACITY_SAMPLE_RATE=200
 
 # --- Monitoring Configuration ---
 # Metrics logging interval (seconds)

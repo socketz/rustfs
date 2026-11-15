@@ -85,10 +85,12 @@ pub use core::LogCleaner;
 mod tests {
     use super::core::LogCleaner;
     use super::scanner;
-    use super::types::FileMatchMode;
+    use super::types::{CompressionAlgorithm, FileMatchMode};
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
+    use std::sync::mpsc;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     /// Create a test log file with deterministic contents and size.
@@ -108,6 +110,73 @@ mod tests {
             .min_file_age_seconds(0) // 0 = no age gate in tests
             .delete_empty_files(true)
             .build()
+    }
+
+    fn make_parallel_compress_cleaner(dir: std::path::PathBuf, workers: usize) -> LogCleaner {
+        LogCleaner::builder(dir, "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(0)
+            .compress_old_files(true)
+            .parallel_compress(true)
+            .parallel_workers(workers)
+            .min_file_age_seconds(0)
+            .delete_empty_files(true)
+            .build()
+    }
+
+    fn assert_parallel_cleanup_completes(file_count: usize, workers: usize) -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        for i in 0..file_count {
+            create_log_file(&dir, &format!("app.log.2024-01-{i:03}"), 256)?;
+        }
+
+        let cleaner = make_parallel_compress_cleaner(dir.clone(), workers);
+        let (tx, rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = tx.send(cleaner.cleanup());
+        });
+
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("parallel cleanup should finish without blocking on the bounded results channel")?;
+
+        let compressed_suffixes = CompressionAlgorithm::compressed_suffixes();
+        let archive_count = std::fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                compressed_suffixes.iter().any(|suffix| name.ends_with(suffix))
+            })
+            .count();
+        let original_count = std::fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("app.log.") && !compressed_suffixes.iter().any(|suffix| name.ends_with(suffix))
+            })
+            .count();
+        let archive_bytes: u64 = std::fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                compressed_suffixes.iter().any(|suffix| name.ends_with(suffix))
+            })
+            .map(|entry| entry.metadata().map(|metadata| metadata.len()).unwrap_or(0))
+            .sum();
+
+        assert_eq!(result.0, file_count, "all rotated logs should be deleted after compression");
+        assert_eq!(
+            result.1,
+            (file_count * 256) as u64 - archive_bytes,
+            "freed bytes should exclude archive bytes that still remain on disk"
+        );
+        assert_eq!(archive_count, file_count, "each rotated log should leave behind one archive");
+        assert_eq!(original_count, 0, "compressed source logs should be removed");
+        Ok(())
     }
 
     #[test]
@@ -222,6 +291,456 @@ mod tests {
 
         assert_eq!(deleted, 1, "should delete exactly one file");
         assert_eq!(freed, 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parallel_cleanup_handles_more_results_than_channel_capacity() -> std::io::Result<()> {
+        assert_parallel_cleanup_completes(12, 4)
+    }
+
+    #[test]
+    fn test_parallel_cleanup_handles_results_within_channel_capacity() -> std::io::Result<()> {
+        assert_parallel_cleanup_completes(6, 4)
+    }
+
+    // ---- OLC-14: safety/correctness regression coverage ----
+
+    use std::time::SystemTime;
+
+    fn set_mtime_ago(path: &Path, ago: Duration) {
+        let when = SystemTime::now() - ago;
+        File::options()
+            .write(true)
+            .open(path)
+            .expect("open for mtime")
+            .set_modified(when)
+            .expect("set mtime");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_matching_pattern_is_never_deleted() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        let outside = TempDir::new()?;
+        let target = outside.path().join("precious.txt");
+        std::fs::write(&target, b"precious")?;
+        // A symlink named to match the managed pattern.
+        std::os::unix::fs::symlink(&target, dir.join("app.log.2024-01-01"))?;
+        create_log_file(&dir, "app.log.2024-01-02", 1024)?;
+
+        // keep_files=0 would delete every managed *regular* file.
+        let cleaner = make_cleaner(dir.clone(), 0, 0);
+        let _ = cleaner.cleanup()?;
+
+        assert!(target.exists(), "external symlink target must never be deleted");
+        assert!(
+            dir.join("app.log.2024-01-01").exists(),
+            "symlink entry must survive (skipped via symlink_metadata, not followed)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expired_archives_deleted_fresh_kept() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01.gz", 100)?;
+        create_log_file(&dir, "app.log.2024-01-02.gz", 100)?;
+        set_mtime_ago(&dir.join("app.log.2024-01-01.gz"), Duration::from_secs(2 * 24 * 3600));
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(100)
+            .compressed_file_retention_days(1)
+            .min_file_age_seconds(0)
+            .build();
+        let (deleted, _) = cleaner.cleanup()?;
+
+        assert_eq!(deleted, 1, "only the aged archive should expire");
+        assert!(!dir.join("app.log.2024-01-01.gz").exists());
+        assert!(dir.join("app.log.2024-01-02.gz").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn archives_bounded_by_byte_cap_when_retention_disabled() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01.gz", 100)?;
+        create_log_file(&dir, "app.log.2024-01-02.gz", 100)?;
+        // Age the first so the oldest-first byte-cap trim evicts it.
+        set_mtime_ago(&dir.join("app.log.2024-01-01.gz"), Duration::from_secs(100));
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(100)
+            .compressed_file_retention_days(0) // retention disabled
+            .max_total_size_bytes(150) // 200 total > 150 -> trim the oldest
+            .min_file_age_seconds(0)
+            .build();
+        let (deleted, _) = cleaner.cleanup()?;
+
+        assert_eq!(deleted, 1, "byte cap must bound archives even with retention off");
+        assert!(!dir.join("app.log.2024-01-01.gz").exists(), "oldest archive trimmed");
+        assert!(dir.join("app.log.2024-01-02.gz").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn gz_and_zst_files_classified_as_archives() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01.gz", 100)?;
+        create_log_file(&dir, "app.log.2024-01-02.zst", 100)?;
+        create_log_file(&dir, "app.log.2024-01-03", 100)?; // plain log
+
+        let result = scanner::scan_log_directory(&dir, "app.log.", Some("app.log"), FileMatchMode::Prefix, &[], 0, false, false)?;
+        assert_eq!(result.compressed_archives.len(), 2, "gz and zst are archives");
+        assert_eq!(result.logs.len(), 1, "only the plain file is a regular log");
+        Ok(())
+    }
+
+    #[test]
+    fn max_single_file_size_deletes_only_oversized() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01", 100)?;
+        create_log_file(&dir, "app.log.2024-01-02", 100)?;
+        create_log_file(&dir, "app.log.2024-01-03", 5000)?;
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(3)
+            .max_total_size_bytes(0)
+            .max_single_file_size_bytes(1000)
+            .min_file_age_seconds(0)
+            .build();
+        let (deleted, _) = cleaner.cleanup()?;
+
+        assert_eq!(deleted, 1);
+        assert!(!dir.join("app.log.2024-01-03").exists(), "oversized file removed");
+        assert!(dir.join("app.log.2024-01-01").exists());
+        assert!(dir.join("app.log.2024-01-02").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn min_age_protects_fresh_nonempty_log() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01", 1024)?;
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(0)
+            .min_file_age_seconds(3600)
+            .build();
+        let (deleted, _) = cleaner.cleanup()?;
+
+        assert_eq!(deleted, 0, "fresh non-empty log younger than min age must be untouched");
+        assert!(dir.join("app.log.2024-01-01").exists());
+        Ok(())
+    }
+
+    /// Rolled files inside `min_file_age_seconds` occupy the disk too: once
+    /// they push the directory over the byte budget, the oldest are processed
+    /// regardless of age until the budget holds again.
+    #[test]
+    fn byte_budget_overrides_min_age_for_fresh_logs() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        for i in 0..6u64 {
+            let name = format!("app.log.2024-01-0{i}");
+            create_log_file(&dir, &name, 1024)?;
+            // All well inside the age gate, oldest first by name.
+            set_mtime_ago(&dir.join(&name), Duration::from_secs(60 - i * 5));
+        }
+        create_log_file(&dir, "app.log", 1024)?;
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(30)
+            .max_total_size_bytes(3 * 1024)
+            .min_file_age_seconds(3600)
+            .build();
+        let (deleted, freed) = cleaner.cleanup()?;
+
+        assert_eq!((deleted, freed), (3, 3 * 1024), "the three oldest fresh logs go; the budget then holds");
+        for i in 0..3 {
+            assert!(!dir.join(format!("app.log.2024-01-0{i}")).exists());
+        }
+        for i in 3..6 {
+            assert!(dir.join(format!("app.log.2024-01-0{i}")).exists(), "the newest fresh logs stay");
+        }
+        assert!(dir.join("app.log").exists(), "the active file is never touched");
+        Ok(())
+    }
+
+    /// Within the byte budget the age gate is unchanged: fresh logs are not
+    /// touched, even above `keep_files`.
+    #[test]
+    fn min_age_still_protects_fresh_logs_within_the_byte_budget() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        for i in 0..4 {
+            create_log_file(&dir, &format!("app.log.2024-01-0{i}"), 1024)?;
+        }
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(1)
+            .max_total_size_bytes(4 * 1024)
+            .min_file_age_seconds(3600)
+            .build();
+        assert_eq!(cleaner.cleanup()?, (0, 0), "exactly at the budget nothing is over it");
+        for i in 0..4 {
+            assert!(dir.join(format!("app.log.2024-01-0{i}")).exists());
+        }
+
+        // No byte budget configured: fresh files are never counted.
+        let unbounded = LogCleaner::builder(dir, "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(1)
+            .max_total_size_bytes(0)
+            .min_file_age_seconds(3600)
+            .build();
+        assert_eq!(unbounded.cleanup()?, (0, 0));
+        Ok(())
+    }
+
+    /// The budget override is a byte trim only: `keep_files` is not applied
+    /// to fresh files, so one byte over the budget costs one file, not all
+    /// but `keep_files` of them.
+    #[test]
+    fn byte_budget_override_removes_only_what_the_budget_needs() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        for i in 0..5u64 {
+            let name = format!("app.log.2024-01-0{i}");
+            create_log_file(&dir, &name, 1024)?;
+            set_mtime_ago(&dir.join(&name), Duration::from_secs(50 - i * 10));
+        }
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(1)
+            .max_single_file_size_bytes(512)
+            .max_total_size_bytes(4 * 1024)
+            .min_file_age_seconds(3600)
+            .build();
+        let (deleted, freed) = cleaner.cleanup()?;
+
+        assert_eq!(
+            (deleted, freed),
+            (1, 1024),
+            "neither keep_files nor the per-file limit applies to fresh files"
+        );
+        assert!(!dir.join("app.log.2024-01-00").exists(), "the oldest fresh file goes");
+        for i in 1..5 {
+            assert!(dir.join(format!("app.log.2024-01-0{i}")).exists());
+        }
+        Ok(())
+    }
+
+    /// Aged files keep their regular selection; the byte trim then counts the
+    /// fresh files and takes the oldest remaining files first.
+    #[test]
+    fn regular_selection_and_budget_override_compose() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        for i in 0..3u64 {
+            let name = format!("app.log.aged-{i}");
+            create_log_file(&dir, &name, 1024)?;
+            set_mtime_ago(&dir.join(&name), Duration::from_secs((5 - i) * 3600));
+        }
+        for i in 0..3u64 {
+            let name = format!("app.log.fresh-{i}");
+            create_log_file(&dir, &name, 1024)?;
+            set_mtime_ago(&dir.join(&name), Duration::from_secs(30 - i * 10));
+        }
+
+        // keep_files(2) takes aged-0. Five files remain against a budget of
+        // three, so the two oldest of them go as well: aged-1 and aged-2.
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(2)
+            .max_total_size_bytes(3 * 1024)
+            .min_file_age_seconds(3600)
+            .build();
+        let (deleted, freed) = cleaner.cleanup()?;
+
+        assert_eq!((deleted, freed), (3, 3 * 1024));
+        for i in 0..3 {
+            assert!(!dir.join(format!("app.log.aged-{i}")).exists());
+            assert!(dir.join(format!("app.log.fresh-{i}")).exists());
+        }
+        Ok(())
+    }
+
+    /// Aged and fresh logs share one budget: aged files alone fit, the fresh
+    /// ones put the directory over it, and the oldest files overall go first.
+    #[test]
+    fn aged_and_fresh_logs_share_the_byte_budget() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.aged-0", 1024)?;
+        create_log_file(&dir, "app.log.aged-1", 1024)?;
+        set_mtime_ago(&dir.join("app.log.aged-0"), Duration::from_secs(3 * 3600));
+        set_mtime_ago(&dir.join("app.log.aged-1"), Duration::from_secs(2 * 3600));
+        create_log_file(&dir, "app.log.fresh-0", 1024)?;
+        create_log_file(&dir, "app.log.fresh-1", 1024)?;
+        set_mtime_ago(&dir.join("app.log.fresh-0"), Duration::from_secs(30));
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(30)
+            .max_total_size_bytes(2 * 1024)
+            .min_file_age_seconds(3600)
+            .build();
+        let (deleted, _) = cleaner.cleanup()?;
+
+        assert_eq!(deleted, 2);
+        assert!(!dir.join("app.log.aged-0").exists());
+        assert!(!dir.join("app.log.aged-1").exists());
+        assert!(dir.join("app.log.fresh-0").exists());
+        assert!(dir.join("app.log.fresh-1").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn active_file_matching_pattern_is_protected() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        // The active file both equals active_filename AND matches the suffix pattern.
+        create_log_file(&dir, "current.rustfs.log", 1024)?;
+        create_log_file(&dir, "old.rustfs.log", 1024)?;
+
+        let cleaner = LogCleaner::builder(dir.clone(), ".rustfs.log".to_string(), "current.rustfs.log".to_string())
+            .match_mode(FileMatchMode::Suffix)
+            .keep_files(0)
+            .min_file_age_seconds(0)
+            .build();
+        let _ = cleaner.cleanup()?;
+
+        assert!(dir.join("current.rustfs.log").exists(), "active file must never be deleted");
+        assert!(!dir.join("old.rustfs.log").exists(), "non-active rotated log removed");
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_exclude_glob_does_not_abort_build() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.keep", 100)?;
+        create_log_file(&dir, "app.log.drop", 100)?;
+
+        // "[invalid" is dropped with a warning; "*keep*" is a valid exclude.
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(0)
+            .exclude_patterns(vec!["[invalid".to_string(), "*keep*".to_string()])
+            .min_file_age_seconds(0)
+            .build();
+        let _ = cleaner.cleanup()?;
+
+        assert!(dir.join("app.log.keep").exists(), "valid exclude must still protect its file");
+        assert!(!dir.join("app.log.drop").exists(), "non-excluded rotated log removed");
+        Ok(())
+    }
+
+    #[test]
+    fn dry_run_with_compression_creates_no_archive() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        create_log_file(&dir, "app.log.2024-01-01", 1024)?;
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(0)
+            .compress_old_files(true)
+            .compression_algorithm(CompressionAlgorithm::Gzip)
+            .parallel_compress(false)
+            .min_file_age_seconds(0)
+            .dry_run(true)
+            .build();
+        let (deleted, freed) = cleaner.cleanup()?;
+
+        assert!(deleted > 0, "dry-run reports intended deletions");
+        assert!(freed > 0, "dry-run reports projected freed bytes");
+        assert!(dir.join("app.log.2024-01-01").exists(), "dry-run must not delete");
+        assert!(!dir.join("app.log.2024-01-01.gz").exists(), "dry-run must not create an archive");
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_archive_round_trips_and_source_removed() -> std::io::Result<()> {
+        use std::io::Read;
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        let content = vec![b'A'; 4096];
+        {
+            let mut f = File::create(dir.join("app.log.2024-01-01"))?;
+            f.write_all(&content)?;
+            f.flush()?;
+        }
+
+        let cleaner = LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+            .match_mode(FileMatchMode::Prefix)
+            .keep_files(0)
+            .compress_old_files(true)
+            .compression_algorithm(CompressionAlgorithm::Gzip)
+            .parallel_compress(false)
+            .min_file_age_seconds(0)
+            .build();
+        let _ = cleaner.cleanup()?;
+
+        assert!(!dir.join("app.log.2024-01-01").exists(), "source removed after compression");
+        let gz = dir.join("app.log.2024-01-01.gz");
+        assert!(gz.exists(), "archive created");
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(File::open(&gz)?).read_to_end(&mut decoded)?;
+        assert_eq!(decoded, content, "archive must decompress to the original bytes");
+        Ok(())
+    }
+
+    #[test]
+    fn idempotent_archive_branch_trusts_valid_archive() -> std::io::Result<()> {
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().to_path_buf();
+        let content = vec![b'B'; 2048];
+        let write_source = || -> std::io::Result<()> {
+            let mut f = File::create(dir.join("app.log.2024-01-01"))?;
+            f.write_all(&content)?;
+            f.flush()
+        };
+        write_source()?;
+
+        let build = || {
+            LogCleaner::builder(dir.clone(), "app.log.".to_string(), "app.log".to_string())
+                .match_mode(FileMatchMode::Prefix)
+                .keep_files(0)
+                .compress_old_files(true)
+                .compression_algorithm(CompressionAlgorithm::Gzip)
+                .parallel_compress(false)
+                .min_file_age_seconds(0)
+                .build()
+        };
+
+        // Pass 1: create the archive and delete the source.
+        let _ = build().cleanup()?;
+        let gz = dir.join("app.log.2024-01-01.gz");
+        assert!(gz.exists());
+        let archive_len = std::fs::metadata(&gz)?.len();
+
+        // Recreate the source; pass 2 must trust the existing valid archive and
+        // delete the source again without rewriting the archive.
+        write_source()?;
+        let (deleted, _) = build().cleanup()?;
+        assert_eq!(deleted, 1);
+        assert!(!dir.join("app.log.2024-01-01").exists(), "source deleted via idempotent branch");
+        assert_eq!(std::fs::metadata(&gz)?.len(), archive_len, "existing valid archive unchanged");
         Ok(())
     }
 }

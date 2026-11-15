@@ -15,29 +15,27 @@
 use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, TryStreamExt as _};
-use http::HeaderMap;
+use http::{HeaderMap, Version};
 use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
 use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
-    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
+    INTERNODE_OPERATION_NS_SCANNER, INTERNODE_OPERATION_PUT_FILE_CAPABILITY, INTERNODE_OPERATION_PUT_FILE_STREAM,
+    INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
 };
-use rustfs_tls_runtime::{
-    load_cert_bundle_der_bytes, load_global_outbound_tls_generation, load_global_outbound_tls_state,
-    record_tls_consumer_stale_generation,
-};
-use rustfs_utils::get_env_opt_str;
+use rustfs_tls_runtime::load_cert_bundle_der_bytes;
+use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_opt_u64, get_env_opt_usize};
 use rustls_pki_types::pem::PemObject;
 use std::io::IoSlice;
 use std::io::{self, Error};
 use std::net::IpAddr;
 use std::ops::Not as _;
 use std::pin::Pin;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::{self, Sleep};
 use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
@@ -45,7 +43,21 @@ use tracing::{error, warn};
 
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
+const PUT_FILE_AUTH_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream_v1";
+const PUT_FILE_CAPABILITY_PATH: &str = "/rustfs/rpc/put_file_capability";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
+const NS_SCANNER_PATH: &str = "/rustfs/rpc/ns_scanner";
+const HTTP_VERSION_09_LABEL: &str = "http/0.9";
+const HTTP_VERSION_10_LABEL: &str = "http/1.0";
+const HTTP_VERSION_11_LABEL: &str = "http/1.1";
+const HTTP_VERSION_2_LABEL: &str = "h2";
+const HTTP_VERSION_UNKNOWN_LABEL: &str = "unknown";
+const MAX_CONSECUTIVE_EMPTY_CHUNKS: usize = 64;
+const EXCESSIVE_EMPTY_CHUNKS_ERROR: &str = "HTTP body returned too many empty chunks";
+pub const INTERNODE_DISK_ERROR_HEADER: &str = "x-rustfs-disk-error";
+pub const INTERNODE_FILE_NOT_FOUND: &str = "file-not-found";
+pub const INTERNODE_VOLUME_NOT_FOUND: &str = "volume-not-found";
+pub const INTERNODE_FILE_CORRUPT: &str = "file-corrupt";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InternodeHttpErrorKind {
@@ -61,7 +73,17 @@ pub enum InternodeHttpErrorKind {
 impl InternodeHttpErrorKind {
     pub fn is_retryable(self) -> bool {
         match self {
-            Self::ConnectTimeout | Self::ConnectionRefused | Self::ConnectionReset | Self::BodyStreamAborted => true,
+            // `DnsResolutionFailed` is retryable: MinIO's `IsNetworkOrHostDown`
+            // treats `*net.DNSError` as network-or-host-down (=> retryable), and
+            // RustFS already retries transient DNS failures at
+            // `crates/ecstore/src/layout/endpoints.rs:580` (`is_retryable_dns_error`).
+            // Consumers apply bounded retries, so a permanent NXDOMAIN costs at
+            // most one extra attempt while transient resolution failures recover.
+            Self::ConnectTimeout
+            | Self::ConnectionRefused
+            | Self::ConnectionReset
+            | Self::BodyStreamAborted
+            | Self::DnsResolutionFailed => true,
             Self::HttpStatus(status) => matches!(
                 status,
                 reqwest::StatusCode::TOO_MANY_REQUESTS
@@ -69,7 +91,7 @@ impl InternodeHttpErrorKind {
                     | reqwest::StatusCode::SERVICE_UNAVAILABLE
                     | reqwest::StatusCode::GATEWAY_TIMEOUT
             ),
-            Self::DnsResolutionFailed | Self::Unknown => false,
+            Self::Unknown => false,
         }
     }
 
@@ -117,6 +139,12 @@ impl std::fmt::Display for InternodeHttpErrorKind {
     }
 }
 
+#[derive(thiserror::Error, Debug, Clone, Copy, Eq, PartialEq)]
+#[error("internode body stalled for {timeout:?}")]
+pub struct BodyStalled {
+    pub timeout: Duration,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct InternodeHttpRequestContext {
     method: String,
@@ -144,13 +172,32 @@ impl std::fmt::Display for InternodeHttpRequestContext {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[error("{kind}: {context}")]
 pub struct InternodeHttpError {
     kind: InternodeHttpErrorKind,
     context: InternodeHttpRequestContext,
+    remote_disk_error: Option<RemoteDiskErrorKind>,
     #[source]
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RemoteDiskErrorKind {
+    FileNotFound,
+    VolumeNotFound,
+    FileCorrupt,
+}
+
+impl std::fmt::Debug for InternodeHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InternodeHttpError")
+            .field("kind", &self.kind)
+            .field("context", &self.context)
+            .field("remote_disk_error_present", &self.remote_disk_error.is_some())
+            .field("source_present", &self.source.is_some())
+            .finish()
+    }
 }
 
 impl InternodeHttpError {
@@ -162,10 +209,23 @@ impl InternodeHttpError {
         &self.context
     }
 
+    pub fn is_remote_file_not_found(&self) -> bool {
+        self.remote_disk_error == Some(RemoteDiskErrorKind::FileNotFound)
+    }
+
+    pub fn is_remote_volume_not_found(&self) -> bool {
+        self.remote_disk_error == Some(RemoteDiskErrorKind::VolumeNotFound)
+    }
+
+    pub fn is_remote_file_corrupt(&self) -> bool {
+        self.remote_disk_error == Some(RemoteDiskErrorKind::FileCorrupt)
+    }
+
     fn new(kind: InternodeHttpErrorKind, context: InternodeHttpRequestContext) -> Self {
         Self {
             kind,
             context,
+            remote_disk_error: None,
             source: None,
         }
     }
@@ -189,6 +249,7 @@ impl InternodeHttpError {
         Self {
             kind,
             context,
+            remote_disk_error: None,
             source: Some(Box::new(source)),
         }
     }
@@ -196,11 +257,95 @@ impl InternodeHttpError {
     fn into_io_error(self) -> io::Error {
         io::Error::new(self.kind.io_error_kind(), self)
     }
+
+    fn with_remote_disk_error(
+        kind: InternodeHttpErrorKind,
+        context: InternodeHttpRequestContext,
+        remote_disk_error: RemoteDiskErrorKind,
+    ) -> Self {
+        Self {
+            kind,
+            context,
+            remote_disk_error: Some(remote_disk_error),
+            source: None,
+        }
+    }
 }
 
 #[doc(hidden)]
 pub fn new_test_internode_http_io_error(kind: InternodeHttpErrorKind) -> io::Error {
     InternodeHttpError::new_for_test(kind).into_io_error()
+}
+
+/// Build a retryable internode timeout error with the request's operation context.
+#[doc(hidden)]
+pub fn internode_http_timeout_error(method: &Method, url: &str) -> io::Error {
+    internode_kind_error(method, url, internode_rpc_operation(url), InternodeHttpErrorKind::ConnectTimeout)
+}
+
+fn body_stalled_error(stall_timeout: Duration) -> io::Error {
+    Error::new(io::ErrorKind::TimedOut, BodyStalled { timeout: stall_timeout })
+}
+
+/// Clone an internode HTTP I/O error while retaining its structured classification.
+///
+/// The underlying transport source is intentionally omitted because it is not
+/// cloneable. The request context and remote disk marker remain available to
+/// retry and error-mapping code.
+#[doc(hidden)]
+pub fn clone_internode_http_io_error(error: &io::Error) -> Option<io::Error> {
+    let source = error.get_ref()?.downcast_ref::<InternodeHttpError>()?;
+    Some(
+        InternodeHttpError {
+            kind: source.kind,
+            context: source.context.clone(),
+            remote_disk_error: source.remote_disk_error,
+            source: None,
+        }
+        .into_io_error(),
+    )
+}
+
+#[doc(hidden)]
+pub fn new_test_remote_file_not_found_http_io_error() -> io::Error {
+    InternodeHttpError::with_remote_disk_error(
+        InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        InternodeHttpRequestContext {
+            method: "GET".to_string(),
+            target: READ_FILE_STREAM_PATH.to_string(),
+            operation: Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        },
+        RemoteDiskErrorKind::FileNotFound,
+    )
+    .into_io_error()
+}
+
+#[doc(hidden)]
+pub fn new_test_remote_volume_not_found_http_io_error() -> io::Error {
+    InternodeHttpError::with_remote_disk_error(
+        InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        InternodeHttpRequestContext {
+            method: "GET".to_string(),
+            target: READ_FILE_STREAM_PATH.to_string(),
+            operation: Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        },
+        RemoteDiskErrorKind::VolumeNotFound,
+    )
+    .into_io_error()
+}
+
+#[doc(hidden)]
+pub fn new_test_remote_file_corrupt_http_io_error() -> io::Error {
+    InternodeHttpError::with_remote_disk_error(
+        InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        InternodeHttpRequestContext {
+            method: "GET".to_string(),
+            target: READ_FILE_STREAM_PATH.to_string(),
+            operation: Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        },
+        RemoteDiskErrorKind::FileCorrupt,
+    )
+    .into_io_error()
 }
 
 fn add_root_certificates_from_der(builder: reqwest::ClientBuilder, certs_der: &[Vec<u8>]) -> reqwest::ClientBuilder {
@@ -217,19 +362,263 @@ fn add_root_certificates_from_der(builder: reqwest::ClientBuilder, certs_der: &[
 struct CachedClients {
     generation: u64,
     client: Client,
-    local_client: Client,
+    no_proxy_client: Client,
 }
 
-static CLIENT_CACHE: LazyLock<Mutex<Option<CachedClients>>> = LazyLock::new(|| Mutex::new(None));
+impl CachedClients {
+    fn client_for(&self, disable_proxy: bool) -> Client {
+        if disable_proxy {
+            self.no_proxy_client.clone()
+        } else {
+            self.client.clone()
+        }
+    }
+}
 
-async fn build_http_client(disable_proxy: bool, outbound_tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState) -> Client {
-    let mut builder = Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .tcp_keepalive(std::time::Duration::from_secs(10))
-        .http2_keep_alive_interval(std::time::Duration::from_secs(5))
-        .http2_keep_alive_timeout(std::time::Duration::from_secs(3))
-        .http2_keep_alive_while_idle(true);
+// Lock-free reads: this cache is hit once per stream open (data_shards times per
+// GET), so the hot path must not serialize on a mutex. Writes only happen on
+// outbound-TLS generation bumps (cert rotation), which are rare.
+static CLIENT_CACHE: arc_swap::ArcSwapOption<CachedClients> = arc_swap::ArcSwapOption::const_empty();
 
+const INTERNODE_HTTP_PROFILE_LEGACY: &str = "legacy";
+const INTERNODE_HTTP_PROFILE_BALANCED: &str = "balanced";
+const INTERNODE_HTTP_PROFILE_THROUGHPUT: &str = "throughput";
+const INTERNODE_HTTP_PROXY_LEGACY: &str = "legacy";
+const INTERNODE_HTTP_PROXY_OFF: &str = "off";
+const INTERNODE_HTTP_PROXY_SYSTEM: &str = "system";
+const INTERNODE_HTTP2_WINDOW_MIN: u32 = 65_535;
+const INTERNODE_HTTP2_WINDOW_MAX: u32 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InternodeHttpTuningProfile {
+    Legacy,
+    Balanced,
+    Throughput,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InternodeHttpProxyMode {
+    Legacy,
+    NoProxy,
+    System,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InternodeHttpProtocol {
+    Http1,
+    Auto,
+}
+
+fn parse_internode_http_protocol(value: Option<&str>) -> InternodeHttpProtocol {
+    match value {
+        Some(value) if value.trim().eq_ignore_ascii_case("auto") => InternodeHttpProtocol::Auto,
+        _ => InternodeHttpProtocol::Http1,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InternodeHttpClientTuning {
+    protocol: InternodeHttpProtocol,
+    profile: InternodeHttpTuningProfile,
+    pool_max_idle_per_host: Option<usize>,
+    pool_idle_timeout_secs: Option<u64>,
+    http2_initial_stream_window_size: Option<u32>,
+    http2_initial_connection_window_size: Option<u32>,
+    http2_adaptive_window: bool,
+    proxy_mode: InternodeHttpProxyMode,
+    /// True when the operator explicitly configured an HTTP/2 window or a
+    /// non-default tuning profile.
+    /// Used to warn once when that tuning is inert because the internode
+    /// connection negotiated HTTP/1.1 over plaintext (backlog#805-C3).
+    h2_tuning_explicit: bool,
+}
+
+fn internode_http_client_tuning() -> InternodeHttpClientTuning {
+    // The tuning env vars cannot change at runtime; parse them once instead of
+    // re-reading the environment on every internode request.
+    static TUNING: LazyLock<InternodeHttpClientTuning> = LazyLock::new(InternodeHttpClientTuning::from_env);
+    *TUNING
+}
+
+impl InternodeHttpClientTuning {
+    fn from_env() -> Self {
+        let profile =
+            parse_internode_http_tuning_profile(get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_TUNING_PROFILE).as_deref());
+        Self {
+            protocol: parse_internode_http_protocol(get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_PROTOCOL).as_deref()),
+            ..Self::from_values(
+                profile,
+                get_env_opt_usize(rustfs_config::ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST),
+                get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS),
+                get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE),
+                get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE),
+                get_env_bool(
+                    rustfs_config::ENV_INTERNODE_HTTP2_ADAPTIVE_WINDOW,
+                    profile.default_http2_adaptive_window(),
+                ),
+                get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_PROXY).as_deref(),
+            )
+        }
+    }
+
+    fn from_values(
+        profile: InternodeHttpTuningProfile,
+        pool_max_idle_per_host: Option<usize>,
+        pool_idle_timeout_secs: Option<u64>,
+        stream_window_size: Option<u64>,
+        connection_window_size: Option<u64>,
+        http2_adaptive_window: bool,
+        proxy_mode: Option<&str>,
+    ) -> Self {
+        // Explicit h2 tuning = an operator-set window size (raw arg, before the
+        // profile fallback) or a non-default (non-Legacy) tuning profile. The
+        let h2_tuning_explicit =
+            stream_window_size.is_some() || connection_window_size.is_some() || profile != InternodeHttpTuningProfile::Legacy;
+        Self {
+            protocol: InternodeHttpProtocol::Http1,
+            profile,
+            pool_max_idle_per_host: pool_max_idle_per_host.or_else(|| profile.default_pool_max_idle_per_host()),
+            pool_idle_timeout_secs: pool_idle_timeout_secs.or_else(|| profile.default_pool_idle_timeout_secs()),
+            http2_initial_stream_window_size: clamp_http2_window(
+                stream_window_size.or_else(|| profile.default_stream_window_size()),
+            ),
+            http2_initial_connection_window_size: clamp_http2_window(
+                connection_window_size.or_else(|| profile.default_connection_window_size()),
+            ),
+            http2_adaptive_window,
+            proxy_mode: parse_internode_http_proxy_mode(proxy_mode, profile),
+            h2_tuning_explicit,
+        }
+    }
+}
+
+impl InternodeHttpTuningProfile {
+    fn default_pool_max_idle_per_host(self) -> Option<usize> {
+        match self {
+            Self::Legacy => None,
+            Self::Balanced => Some(64),
+            Self::Throughput => Some(256),
+        }
+    }
+
+    fn default_pool_idle_timeout_secs(self) -> Option<u64> {
+        match self {
+            Self::Legacy => None,
+            Self::Balanced => Some(120),
+            Self::Throughput => Some(300),
+        }
+    }
+
+    fn default_stream_window_size(self) -> Option<u64> {
+        match self {
+            Self::Legacy => None,
+            Self::Balanced => Some(1024 * 1024),
+            Self::Throughput => Some(4 * 1024 * 1024),
+        }
+    }
+
+    fn default_connection_window_size(self) -> Option<u64> {
+        match self {
+            Self::Legacy => None,
+            Self::Balanced => Some(4 * 1024 * 1024),
+            Self::Throughput => Some(16 * 1024 * 1024),
+        }
+    }
+
+    fn default_http2_adaptive_window(self) -> bool {
+        matches!(self, Self::Throughput)
+    }
+}
+
+fn parse_internode_http_tuning_profile(value: Option<&str>) -> InternodeHttpTuningProfile {
+    match value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == INTERNODE_HTTP_PROFILE_LEGACY => InternodeHttpTuningProfile::Legacy,
+        Some(value) if value == INTERNODE_HTTP_PROFILE_BALANCED => InternodeHttpTuningProfile::Balanced,
+        Some(value) if value == INTERNODE_HTTP_PROFILE_THROUGHPUT => InternodeHttpTuningProfile::Throughput,
+        _ => InternodeHttpTuningProfile::Legacy,
+    }
+}
+
+fn parse_internode_http_proxy_mode(value: Option<&str>, profile: InternodeHttpTuningProfile) -> InternodeHttpProxyMode {
+    match value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == INTERNODE_HTTP_PROXY_SYSTEM => InternodeHttpProxyMode::System,
+        Some(value) if value == INTERNODE_HTTP_PROXY_LEGACY => InternodeHttpProxyMode::Legacy,
+        Some(value) if matches!(value.as_str(), INTERNODE_HTTP_PROXY_OFF | "none" | "no_proxy" | "disabled") => {
+            InternodeHttpProxyMode::NoProxy
+        }
+        Some(_) | None if matches!(profile, InternodeHttpTuningProfile::Legacy) => InternodeHttpProxyMode::Legacy,
+        Some(_) | None => InternodeHttpProxyMode::NoProxy,
+    }
+}
+
+fn clamp_http2_window(value: Option<u64>) -> Option<u32> {
+    let value = value?;
+    let value = value.clamp(u64::from(INTERNODE_HTTP2_WINDOW_MIN), u64::from(INTERNODE_HTTP2_WINDOW_MAX));
+    u32::try_from(value).ok()
+}
+
+/// Applies internode HTTP client tuning (connection pool + HTTP/2 window
+/// sizes) to a reqwest client builder.
+///
+/// IMPORTANT (backlog#805-C3): the HTTP/2 window settings only
+/// take effect when the internode connection actually negotiates HTTP/2, which
+/// requires both the `auto` protocol policy and TLS-ALPN. With the default
+/// `http1` policy or plaintext transport, the HTTP/2 window settings are inert.
+/// `should_warn_h2_inert` emits a one-time warning when explicitly-configured
+/// h2 tuning is observed to be inert on a live connection.
+fn apply_http_client_tuning(mut builder: reqwest::ClientBuilder, tuning: InternodeHttpClientTuning) -> reqwest::ClientBuilder {
+    // A paused shard response must not consume receive credit needed by another
+    // shard on the same peer. HTTP/1.1 isolates active bodies while retaining
+    // idle connection reuse and TLS session support.
+    if tuning.protocol == InternodeHttpProtocol::Http1 {
+        builder = builder.http1_only();
+    }
+    if let Some(pool_max_idle_per_host) = tuning.pool_max_idle_per_host {
+        builder = builder.pool_max_idle_per_host(pool_max_idle_per_host);
+    }
+    if let Some(pool_idle_timeout_secs) = tuning.pool_idle_timeout_secs {
+        builder = builder.pool_idle_timeout(std::time::Duration::from_secs(pool_idle_timeout_secs));
+    }
+    if tuning.http2_adaptive_window {
+        builder = builder.http2_adaptive_window(true);
+    } else {
+        if let Some(stream_window_size) = tuning.http2_initial_stream_window_size {
+            builder = builder.http2_initial_stream_window_size(stream_window_size);
+        }
+        if let Some(connection_window_size) = tuning.http2_initial_connection_window_size {
+            builder = builder.http2_initial_connection_window_size(connection_window_size);
+        }
+    }
+    builder
+}
+
+/// Apply liveness detection for the internode HTTP data plane.
+///
+/// Hyper does not cancel a pending HTTP/2 keepalive deadline when DATA resumes.
+/// Under connection-level backpressure, a PING ACK can therefore remain queued
+/// behind healthy stream traffic until the timeout closes every multiplexed
+/// stream. Long-running data-plane paths already enforce operation-specific
+/// stall and total deadlines, while TCP keepalive covers a dead peer, so
+/// HTTP/2 PING keepalive is deliberately disabled for this client.
+fn apply_http_data_plane_liveness(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder
+        .tcp_keepalive(std::time::Duration::from_secs(rustfs_config::DEFAULT_INTERNODE_TCP_KEEPALIVE_SECS))
+        .http2_keep_alive_interval(None::<std::time::Duration>)
+}
+
+async fn build_http_client<const DIRECT: bool>(
+    disable_proxy: bool,
+    tuning: InternodeHttpClientTuning,
+    outbound_tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState,
+) -> io::Result<Client> {
+    let mut builder = apply_http_data_plane_liveness(Client::builder().connect_timeout(std::time::Duration::from_secs(5)));
+    builder = apply_http_client_tuning(builder, tuning);
+
+    if DIRECT {
+        builder = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never());
+    }
     if disable_proxy {
         builder = builder.no_proxy();
     }
@@ -281,7 +670,11 @@ async fn build_http_client(disable_proxy: bool, outbound_tls: &rustfs_tls_runtim
         }
     }
 
-    builder.build().expect("Failed to create global HTTP client")
+    // This runs lazily on the first internode request and again on every TLS
+    // generation bump, so a build failure must surface as an error, not a panic.
+    builder
+        .build()
+        .map_err(|err| Error::other(format!("failed to build internode HTTP client: {err}")))
 }
 
 fn should_bypass_proxy_for_url(url: &str) -> bool {
@@ -296,63 +689,124 @@ fn should_bypass_proxy_for_url(url: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
 }
 
-async fn get_http_client(url: &str) -> Client {
-    // Reuse HTTP connection pools while keeping loopback traffic away from
-    // system proxies so local RPC/tests do not leak to proxy listeners.
-    let disable_proxy = should_bypass_proxy_for_url(url);
+fn should_disable_proxy_for_url(url: &str, tuning: InternodeHttpClientTuning) -> bool {
+    match tuning.proxy_mode {
+        InternodeHttpProxyMode::System => false,
+        InternodeHttpProxyMode::NoProxy => true,
+        InternodeHttpProxyMode::Legacy => should_bypass_proxy_for_url(url),
+    }
+}
+
+const fn http_client_cache<const DIRECT: bool>() -> &'static arc_swap::ArcSwapOption<CachedClients> {
+    #[cfg(feature = "internode-transport")]
+    if DIRECT {
+        static DIRECT_CLIENT_CACHE: arc_swap::ArcSwapOption<CachedClients> = arc_swap::ArcSwapOption::const_empty();
+        return &DIRECT_CLIENT_CACHE;
+    }
+    &CLIENT_CACHE
+}
+
+/// Sends one internode request with the pooled internode client and returns
+/// its status, headers and body. Meant for small control exchanges whose data
+/// moves out of band (for example over NIXL); large bodies use `HttpReader`.
+pub async fn internode_http_request(
+    url: &str,
+    method: Method,
+    headers: HeaderMap,
+    timeout: Option<Duration>,
+) -> io::Result<(reqwest::StatusCode, HeaderMap, Bytes)> {
+    let client = get_http_client::<false>(url).await?;
+    let mut request = client.request(method.clone(), url).headers(headers);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|err| io::Error::other(format!("internode {method} request failed: {err}")))?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|err| io::Error::other(format!("internode {method} response body failed: {err}")))?;
+    Ok((status, headers, body))
+}
+
+async fn get_http_client<const DIRECT: bool>(url: &str) -> io::Result<Client> {
+    let tuning = internode_http_client_tuning();
+    // Reuse HTTP connection pools while honoring the configured internode proxy
+    // policy. The legacy profile only bypasses loopback URLs to preserve defaults.
+    let disable_proxy = should_disable_proxy_for_url(url, tuning);
 
     // Fast path: check generation first (cheap atomic read) to avoid cloning
     // the full PEM + identity bytes when the TLS state hasn't changed.
-    let generation = load_global_outbound_tls_generation().0;
+    let generation = crate::http_runtime_sources::outbound_tls_generation();
 
-    let guard = CLIENT_CACHE.lock().await;
-    if let Some(cached) = guard.as_ref() {
+    let cache = const { http_client_cache::<DIRECT>() };
+    let previous = cache.load_full();
+    if let Some(cached) = previous.as_ref() {
         if cached.generation == generation {
-            return if disable_proxy {
-                cached.local_client.clone()
-            } else {
-                cached.client.clone()
-            };
+            return Ok(cached.client_for(disable_proxy));
         }
-        record_tls_consumer_stale_generation("rio_http_reader");
+        crate::http_runtime_sources::record_stale_outbound_tls_generation("rio_http_reader");
     }
-    drop(guard);
 
     // Cache miss or stale generation — load full outbound TLS state.
-    let outbound_tls = load_global_outbound_tls_state().await;
+    let outbound_tls = crate::http_runtime_sources::outbound_tls_state().await;
 
-    let client = build_http_client(false, &outbound_tls).await;
-    let local_client = build_http_client(true, &outbound_tls).await;
-    let cached = CachedClients {
+    let built = match build_http_client::<DIRECT>(false, tuning, &outbound_tls).await {
+        Ok(client) => match build_http_client::<DIRECT>(true, tuning, &outbound_tls).await {
+            Ok(no_proxy_client) => Ok((client, no_proxy_client)),
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err),
+    };
+    let (client, no_proxy_client) = match built {
+        Ok(pair) => pair,
+        Err(err) => {
+            // Prefer serving with the previous TLS generation over failing the
+            // request outright; the stale-generation metric already fired above.
+            if !DIRECT && let Some(cached) = previous {
+                warn!(
+                    error = %err,
+                    stale_generation = cached.generation,
+                    target_generation = generation,
+                    "failed to rebuild internode HTTP client; falling back to previous TLS generation"
+                );
+                return Ok(cached.client_for(disable_proxy));
+            }
+            return Err(err);
+        }
+    };
+    let cached = std::sync::Arc::new(CachedClients {
         generation,
         client,
-        local_client,
-    };
+        no_proxy_client,
+    });
 
-    let return_client = if disable_proxy {
-        cached.local_client.clone()
-    } else {
-        cached.client.clone()
-    };
+    // Guard against races: only overwrite the cache if it is empty or contains an
+    // older generation, so a slower task cannot regress the TLS state after a
+    // faster task already cached a newer generation.
+    cache.rcu(|current| match current {
+        Some(existing) if existing.generation > generation => Some(existing.clone()),
+        _ => Some(cached.clone()),
+    });
+    Ok(cached.client_for(disable_proxy))
+}
 
-    let mut guard = CLIENT_CACHE.lock().await;
-    // Guard against races: only overwrite the cache if it is empty or
-    // contains an older generation, so a slower task cannot regress the
-    // TLS state after a faster task already cached a newer generation.
-    if guard.as_ref().is_none_or(|c| c.generation <= generation) {
-        *guard = Some(cached);
-    }
-    return_client
+async fn get_fresh_http_client(url: &str) -> io::Result<Client> {
+    let tuning = internode_http_client_tuning();
+    let disable_proxy = should_disable_proxy_for_url(url, tuning);
+    let outbound_tls = crate::http_runtime_sources::outbound_tls_state().await;
+    build_http_client::<false>(disable_proxy, tuning, &outbound_tls).await
 }
 
 fn internode_request_context(method: &Method, url: &str, operation: Option<&'static str>) -> InternodeHttpRequestContext {
     let target = reqwest::Url::parse(url)
         .ok()
-        .map(|parsed| match parsed.query() {
-            Some(query) => format!("{}?{query}", parsed.path()),
-            None => parsed.path().to_string(),
-        })
-        .unwrap_or_else(|| url.to_string());
+        .map(|parsed| parsed.path().to_string())
+        .unwrap_or_else(|| "<invalid-internode-url>".to_string());
     InternodeHttpRequestContext {
         method: method.to_string(),
         target,
@@ -360,36 +814,138 @@ fn internode_request_context(method: &Method, url: &str, operation: Option<&'sta
     }
 }
 
-fn classify_reqwest_error(err: &reqwest::Error) -> InternodeHttpErrorKind {
-    if err.is_timeout() {
+/// Classify a transport-level error into an [`InternodeHttpErrorKind`].
+///
+/// Strategy is "typed-first, string-only-for-DNS", mirroring MinIO's
+/// `xnet.IsNetworkOrHostDown`: we trust structured signals (reqwest flags and
+/// the `io::Error` chain) and only fall back to fragile message matching for
+/// DNS detection, which reqwest/hyper do not expose as a typed error kind.
+///
+/// Ordering matters:
+/// 1. A caller-reported timeout wins outright (`ConnectTimeout`).
+/// 2. A typed I/O error or HTTP EOF anywhere in the source chain wins over any
+///    string or body signal — a real `ConnectionRefused` must never be
+///    mislabeled `DnsResolutionFailed` just because "dns" appears in the text.
+/// 3. Only for connect-phase failures with no typed kind do we consult the
+///    DNS string heuristic, then default to `ConnectionRefused`.
+/// 4. Body-phase failures map to `BodyStreamAborted`.
+/// 5. Anything else is `Unknown`.
+fn classify_transport_error(
+    err: &(dyn std::error::Error + 'static),
+    is_timeout: bool,
+    is_connect: bool,
+    is_body: bool,
+) -> InternodeHttpErrorKind {
+    if is_timeout {
         return InternodeHttpErrorKind::ConnectTimeout;
     }
 
-    let message = err.to_string().to_ascii_lowercase();
-    if err.is_connect() {
-        if message.contains("dns")
-            || message.contains("name or service not known")
-            || message.contains("failed to lookup address")
-        {
-            return InternodeHttpErrorKind::DnsResolutionFailed;
-        }
-        if message.contains("refused") {
-            return InternodeHttpErrorKind::ConnectionRefused;
-        }
+    if let Some(kind) = find_transport_error_kind_in_chain(err) {
+        return kind;
     }
 
-    if message.contains("connection reset") || message.contains("broken pipe") || message.contains("connection aborted") {
-        return InternodeHttpErrorKind::ConnectionReset;
+    if is_connect {
+        if chain_contains_dns_marker(err) {
+            return InternodeHttpErrorKind::DnsResolutionFailed;
+        }
+        return InternodeHttpErrorKind::ConnectionRefused;
     }
-    if message.contains("body") || message.contains("stream") {
+
+    if is_body {
         return InternodeHttpErrorKind::BodyStreamAborted;
     }
 
     InternodeHttpErrorKind::Unknown
 }
 
+/// Map typed I/O failures and HTTP EOFs from the error source chain.
+fn find_transport_error_kind_in_chain(err: &(dyn std::error::Error + 'static)) -> Option<InternodeHttpErrorKind> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(current) = source {
+        if let Some(io_err) = current.downcast_ref::<io::Error>() {
+            match io_err.kind() {
+                io::ErrorKind::ConnectionRefused => return Some(InternodeHttpErrorKind::ConnectionRefused),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionAborted => {
+                    return Some(InternodeHttpErrorKind::ConnectionReset);
+                }
+                io::ErrorKind::TimedOut => return Some(InternodeHttpErrorKind::ConnectTimeout),
+                io::ErrorKind::HostUnreachable | io::ErrorKind::NetworkUnreachable => {
+                    return Some(InternodeHttpErrorKind::ConnectionRefused);
+                }
+                _ => {}
+            }
+        }
+        if current
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message)
+        {
+            return Some(InternodeHttpErrorKind::ConnectionReset);
+        }
+        source = current.source();
+    }
+    None
+}
+
+/// The SOLE remaining string heuristic, gated behind `is_connect`: reqwest and
+/// hyper surface DNS resolution failures only as opaque messages, so we walk the
+/// source chain and match well-known DNS wordings across OS locales/resolvers.
+fn chain_contains_dns_marker(err: &(dyn std::error::Error + 'static)) -> bool {
+    const DNS_MARKERS: [&str; 6] = [
+        "dns",
+        "failed to lookup address",
+        "name or service not known",
+        "nodename nor servname",
+        "no such host",
+        "temporary failure in name resolution",
+    ];
+
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(current) = source {
+        let message = current.to_string().to_ascii_lowercase();
+        if DNS_MARKERS.iter().any(|marker| message.contains(marker)) {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
+fn classify_reqwest_error(err: &reqwest::Error) -> InternodeHttpErrorKind {
+    classify_transport_error(err, err.is_timeout(), err.is_connect(), err.is_body())
+}
+
 fn classify_http_status(status: reqwest::StatusCode) -> InternodeHttpErrorKind {
     InternodeHttpErrorKind::HttpStatus(status)
+}
+
+#[derive(Debug)]
+struct ClassifiedHttpResponse {
+    kind: InternodeHttpErrorKind,
+    remote_disk_error: Option<RemoteDiskErrorKind>,
+}
+
+fn classify_http_response(
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+    operation: Option<&'static str>,
+) -> ClassifiedHttpResponse {
+    let kind = classify_http_status(status);
+    if status != reqwest::StatusCode::INTERNAL_SERVER_ERROR {
+        return ClassifiedHttpResponse {
+            kind,
+            remote_disk_error: None,
+        };
+    }
+    let token = headers.get(INTERNODE_DISK_ERROR_HEADER).and_then(|value| value.to_str().ok());
+    let remote_disk_error = match (operation, token) {
+        (Some(INTERNODE_OPERATION_READ_FILE_STREAM), Some(INTERNODE_FILE_NOT_FOUND))
+        | (Some(INTERNODE_OPERATION_WALK_DIR), Some(INTERNODE_FILE_NOT_FOUND)) => Some(RemoteDiskErrorKind::FileNotFound),
+        (Some(INTERNODE_OPERATION_READ_FILE_STREAM), Some(INTERNODE_VOLUME_NOT_FOUND))
+        | (Some(INTERNODE_OPERATION_WALK_DIR), Some(INTERNODE_VOLUME_NOT_FOUND)) => Some(RemoteDiskErrorKind::VolumeNotFound),
+        (Some(INTERNODE_OPERATION_READ_FILE_STREAM), Some(INTERNODE_FILE_CORRUPT)) => Some(RemoteDiskErrorKind::FileCorrupt),
+        _ => None,
+    };
+    ClassifiedHttpResponse { kind, remote_disk_error }
 }
 
 fn internode_reqwest_error(method: &Method, url: &str, operation: Option<&'static str>, err: reqwest::Error) -> io::Error {
@@ -398,20 +954,60 @@ fn internode_reqwest_error(method: &Method, url: &str, operation: Option<&'stati
     InternodeHttpError::with_source(classified, context, err).into_io_error()
 }
 
+fn internode_reqwest_body_error(method: &Method, url: &str, operation: Option<&'static str>, err: reqwest::Error) -> io::Error {
+    let context = internode_request_context(method, url, operation);
+    let classified = classify_transport_error(&err, err.is_timeout(), err.is_connect(), true);
+    InternodeHttpError::with_source(classified, context, err).into_io_error()
+}
+
 fn internode_classified_error(
     method: &Method,
     url: &str,
     operation: Option<&'static str>,
-    kind: InternodeHttpErrorKind,
+    classified: ClassifiedHttpResponse,
 ) -> io::Error {
     let context = internode_request_context(method, url, operation);
-    InternodeHttpError::new(kind, context).into_io_error()
+    match classified.remote_disk_error {
+        Some(remote_disk_error) => InternodeHttpError::with_remote_disk_error(classified.kind, context, remote_disk_error),
+        None => InternodeHttpError::new(classified.kind, context),
+    }
+    .into_io_error()
+}
+
+fn internode_kind_error(
+    method: &Method,
+    url: &str,
+    operation: Option<&'static str>,
+    classified: InternodeHttpErrorKind,
+) -> io::Error {
+    let context = internode_request_context(method, url, operation);
+    InternodeHttpError::new(classified, context).into_io_error()
 }
 
 fn internode_status_error(method: &Method, url: &str, operation: Option<&'static str>, status: reqwest::StatusCode) -> io::Error {
     let context = internode_request_context(method, url, operation);
     let classified = classify_http_status(status);
     InternodeHttpError::new(classified, context).into_io_error()
+}
+
+type HttpByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send + Sync>>;
+
+/// An async reader that can also transfer received HTTP body chunks without
+/// copying their contents into an intermediate caller buffer.
+pub trait ChunkReader: AsyncRead + Send + Sync + Unpin {
+    /// Returns the next non-empty owned chunk, limited to `max` bytes.
+    /// `None` is EOF.
+    fn poll_read_chunk(self: Pin<&mut Self>, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>>;
+}
+
+pub type ChunkReaderBox = Box<dyn ChunkReader>;
+
+struct HttpReaderInit {
+    stream: HttpByteStream,
+    track_internode_metrics: bool,
+    internode_operation: Option<&'static str>,
+    stall_timeout: Option<Duration>,
+    request_started: Instant,
 }
 
 pin_project! {
@@ -423,9 +1019,34 @@ pin_project! {
         internode_operation: Option<&'static str>,
         stall_timeout: Option<Duration>,
         stall_timer: Option<Pin<Box<Sleep>>>,
+        request_started: Instant,
+        duration_recorded: bool,
         #[pin]
-        inner: StreamReader<Pin<Box<dyn Stream<Item=std::io::Result<Bytes>>+Send+Sync>>, Bytes>,
+        inner: StreamReader<HttpByteStream, Bytes>,
     }
+}
+
+pin_project! {
+    pub struct HttpChunkReader {
+        track_internode_metrics: bool,
+        internode_operation: Option<&'static str>,
+        stall_timeout: Option<Duration>,
+        stall_timer: Option<Pin<Box<Sleep>>>,
+        request_started: Instant,
+        duration_recorded: bool,
+        consecutive_empty_chunks: usize,
+        #[pin]
+        inner: HttpByteStream,
+        current: Option<Bytes>,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReaderConnection {
+    Pooled,
+    Fresh,
+    #[cfg(feature = "internode-transport")]
+    Direct,
 }
 
 impl HttpReader {
@@ -442,6 +1063,46 @@ impl HttpReader {
         stall_timeout: Option<Duration>,
     ) -> io::Result<Self> {
         Self::with_capacity_and_stall_timeout(url, method, headers, body, 0, stall_timeout).await
+    }
+
+    /// Send one authenticated POST without HTTP redirects or automatic resubmission.
+    /// Uses the current internode TLS configuration and a pooled connection for the selected peer.
+    #[cfg(feature = "internode-transport")]
+    pub async fn post_without_redirects(
+        url: String,
+        headers: HeaderMap,
+        body: Vec<u8>,
+        stall_timeout: Duration,
+    ) -> io::Result<Self> {
+        let method = Method::POST;
+        let init = Self::open(&url, &method, &headers, Some(body), Some(stall_timeout), ReaderConnection::Direct).await?;
+        Ok(Self::from_response(url, method, headers, init))
+    }
+
+    fn from_response(url: String, method: Method, headers: HeaderMap, init: HttpReaderInit) -> Self {
+        Self {
+            inner: StreamReader::new(init.stream),
+            url,
+            method,
+            headers,
+            track_internode_metrics: init.track_internode_metrics,
+            internode_operation: init.internode_operation,
+            stall_timer: None,
+            stall_timeout: init.stall_timeout,
+            request_started: init.request_started,
+            duration_recorded: false,
+        }
+    }
+
+    pub async fn new_fresh_connection_with_stall_timeout(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        stall_timeout: Option<Duration>,
+    ) -> io::Result<Self> {
+        let init = Self::open(&url, &method, &headers, body, stall_timeout, ReaderConnection::Fresh).await?;
+        Ok(Self::from_response(url, method, headers, init))
     }
 
     /// Create a new HttpReader from a URL. The request is performed immediately.
@@ -463,45 +1124,88 @@ impl HttpReader {
         _read_buf_size: usize,
         stall_timeout: Option<Duration>,
     ) -> io::Result<Self> {
-        let track_internode_metrics = is_internode_rpc_url(&url);
-        let internode_operation = internode_rpc_operation(&url);
-        let client = get_http_client(&url).await;
-        let mut request: RequestBuilder = client.request(method.clone(), url.clone()).headers(headers.clone());
+        let init = Self::open(&url, &method, &headers, body, stall_timeout, ReaderConnection::Pooled).await?;
+        Ok(Self::from_response(url, method, headers, init))
+    }
+
+    async fn open(
+        url: &str,
+        method: &Method,
+        headers: &HeaderMap,
+        body: Option<Vec<u8>>,
+        stall_timeout: Option<Duration>,
+        connection: ReaderConnection,
+    ) -> io::Result<HttpReaderInit> {
+        let track_internode_metrics = is_internode_rpc_url(url);
+        let internode_operation = internode_rpc_operation(url);
+        let client = match connection {
+            ReaderConnection::Fresh => get_fresh_http_client(url).await,
+            ReaderConnection::Pooled => get_http_client::<false>(url).await,
+            #[cfg(feature = "internode-transport")]
+            ReaderConnection::Direct => get_http_client::<true>(url).await,
+        }
+        .inspect_err(|_| {
+            record_internode_error(track_internode_metrics, internode_operation);
+        })?;
+        let mut request: RequestBuilder = client.request(method.clone(), url).headers(headers.clone());
         if let Some(body) = body {
             request = request.body(body);
         }
 
-        let resp = request.send().await.map_err(|e| {
+        let request_started = Instant::now();
+        // `send()` resolves at the response headers, before the body stall timer
+        // in `poll_read` can run. A restarted peer (or a pooled connection left
+        // half-open when its pod network namespace disappeared) accepts the TCP
+        // connection and then never sends headers. Without this bound the shard
+        // open waits out kernel retransmits, long after the client has given up
+        // on the GET. The body stall budget is the same deadline: a header
+        // black hole is the same failure as a body that stops mid-shard.
+        let send_result = match stall_timeout {
+            Some(stall_timeout) => match time::timeout(stall_timeout, request.send()).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
+                    record_internode_stall_timeout(track_internode_metrics, internode_operation);
+                    record_internode_error(track_internode_metrics, internode_operation);
+                    return Err(body_stalled_error(stall_timeout));
+                }
+            },
+            None => request.send().await,
+        };
+        let resp = send_result.map_err(|e| {
+            record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
             record_internode_error(track_internode_metrics, internode_operation);
             record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
-            internode_reqwest_error(&method, &url, internode_operation, e)
+            internode_reqwest_error(method, url, internode_operation, e)
         })?;
 
+        record_internode_http_version(track_internode_metrics, internode_operation, http_version_metric_label(resp.version()));
+        maybe_warn_h2_inert(resp.version());
         if resp.status().is_success().not() {
+            let classified = classify_http_response(resp.status(), resp.headers(), internode_operation);
+            record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
             record_internode_error(track_internode_metrics, internode_operation);
-            record_internode_classified_error(track_internode_metrics, internode_operation, classify_http_status(resp.status()));
-            return Err(internode_status_error(&method, &url, internode_operation, resp.status()));
+            record_internode_classified_error(track_internode_metrics, internode_operation, classified.kind);
+            return Err(internode_classified_error(method, url, internode_operation, classified));
         }
 
         record_internode_outgoing_request(track_internode_metrics, internode_operation);
 
-        let stream_error_url = url.clone();
+        let stream_error_url = url.to_owned();
         let stream_error_method = method.clone();
         let stream = resp.bytes_stream().map_err(move |e| {
             record_internode_error(track_internode_metrics, internode_operation);
-            record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
-            internode_reqwest_error(&stream_error_method, &stream_error_url, internode_operation, e)
+            let classified = classify_transport_error(&e, e.is_timeout(), e.is_connect(), true);
+            record_internode_classified_error(track_internode_metrics, internode_operation, classified);
+            internode_reqwest_body_error(&stream_error_method, &stream_error_url, internode_operation, e)
         });
 
-        Ok(Self {
-            inner: StreamReader::new(Box::pin(stream)),
-            url,
-            method,
-            headers,
+        Ok(HttpReaderInit {
+            stream: Box::pin(stream),
             track_internode_metrics,
             internode_operation,
-            stall_timer: stall_timeout.map(|timeout| Box::pin(time::sleep(timeout))),
             stall_timeout,
+            request_started,
         })
     }
     pub fn url(&self) -> &str {
@@ -518,37 +1222,192 @@ impl HttpReader {
 impl AsyncRead for HttpReader {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let mut this = self.project();
-
         let filled_before = buf.filled().len();
         match this.inner.as_mut().poll_read(cx, buf) {
             Poll::Ready(Ok(())) => {
                 let bytes_read = buf.filled().len().saturating_sub(filled_before);
                 if bytes_read > 0 {
                     record_internode_recv_bytes(*this.track_internode_metrics, *this.internode_operation, bytes_read);
-                }
-                if bytes_read > 0 {
-                    if let Some(stall_timeout) = *this.stall_timeout {
-                        *this.stall_timer = Some(Box::pin(time::sleep(stall_timeout)));
-                    }
                 } else {
-                    *this.stall_timer = None;
+                    record_internode_operation_duration_once(
+                        *this.track_internode_metrics,
+                        *this.internode_operation,
+                        *this.request_started,
+                        this.duration_recorded,
+                    );
                 }
+                *this.stall_timer = None;
                 Poll::Ready(Ok(()))
             }
             Poll::Pending => {
-                if let Some(timer) = this.stall_timer.as_mut()
-                    && timer.as_mut().poll(cx).is_ready()
-                {
+                let Some(stall_timeout) = *this.stall_timeout else {
+                    return Poll::Pending;
+                };
+                let timer = this.stall_timer.get_or_insert_with(|| Box::pin(time::sleep(stall_timeout)));
+                if timer.as_mut().poll(cx).is_ready() {
+                    record_internode_operation_duration_once(
+                        *this.track_internode_metrics,
+                        *this.internode_operation,
+                        *this.request_started,
+                        this.duration_recorded,
+                    );
+                    record_internode_stall_timeout(*this.track_internode_metrics, *this.internode_operation);
                     record_internode_error(*this.track_internode_metrics, *this.internode_operation);
-                    Poll::Ready(Err(Error::new(
-                        io::ErrorKind::TimedOut,
-                        "HttpReader stall timeout: no data received before deadline",
-                    )))
+                    Poll::Ready(Err(body_stalled_error(stall_timeout)))
                 } else {
                     Poll::Pending
                 }
             }
-            other => other,
+            Poll::Ready(Err(err)) => {
+                record_internode_operation_duration_once(
+                    *this.track_internode_metrics,
+                    *this.internode_operation,
+                    *this.request_started,
+                    this.duration_recorded,
+                );
+                Poll::Ready(Err(err))
+            }
+        }
+    }
+}
+
+impl HttpChunkReader {
+    pub async fn new_with_stall_timeout(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        stall_timeout: Option<Duration>,
+    ) -> io::Result<Self> {
+        let init = HttpReader::open(&url, &method, &headers, body, stall_timeout, ReaderConnection::Pooled).await?;
+        Ok(Self {
+            inner: init.stream,
+            current: None,
+            track_internode_metrics: init.track_internode_metrics,
+            internode_operation: init.internode_operation,
+            stall_timer: None,
+            stall_timeout: init.stall_timeout,
+            request_started: init.request_started,
+            duration_recorded: false,
+            consecutive_empty_chunks: 0,
+        })
+    }
+
+    pub async fn new_fresh_connection_with_stall_timeout(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        body: Option<Vec<u8>>,
+        stall_timeout: Option<Duration>,
+    ) -> io::Result<Self> {
+        let init = HttpReader::open(&url, &method, &headers, body, stall_timeout, ReaderConnection::Fresh).await?;
+        Ok(Self {
+            inner: init.stream,
+            current: None,
+            track_internode_metrics: init.track_internode_metrics,
+            internode_operation: init.internode_operation,
+            stall_timer: None,
+            stall_timeout: init.stall_timeout,
+            request_started: init.request_started,
+            duration_recorded: false,
+            consecutive_empty_chunks: 0,
+        })
+    }
+}
+
+fn excessive_empty_chunks_error() -> Error {
+    Error::new(io::ErrorKind::InvalidData, EXCESSIVE_EMPTY_CHUNKS_ERROR)
+}
+
+impl AsyncRead for HttpChunkReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        match ChunkReader::poll_read_chunk(self.as_mut(), cx, buf.remaining()) {
+            Poll::Ready(Ok(Some(chunk))) => {
+                buf.put_slice(&chunk);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(None)) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl ChunkReader for HttpChunkReader {
+    fn poll_read_chunk(self: Pin<&mut Self>, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
+        if max == 0 {
+            return Poll::Ready(Err(Error::new(io::ErrorKind::InvalidInput, "chunk read limit must be non-zero")));
+        }
+
+        let mut this = self.project();
+        if *this.consecutive_empty_chunks >= MAX_CONSECUTIVE_EMPTY_CHUNKS {
+            return Poll::Ready(Err(excessive_empty_chunks_error()));
+        }
+        loop {
+            if let Some(mut current) = this.current.take() {
+                let take = current.len().min(max);
+                let chunk = current.split_to(take);
+                if !current.is_empty() {
+                    *this.current = Some(current);
+                }
+                record_internode_recv_bytes(*this.track_internode_metrics, *this.internode_operation, take);
+                *this.stall_timer = None;
+                return Poll::Ready(Ok(Some(chunk)));
+            }
+
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => {
+                    *this.consecutive_empty_chunks += 1;
+                    if *this.consecutive_empty_chunks == MAX_CONSECUTIVE_EMPTY_CHUNKS {
+                        record_internode_error(*this.track_internode_metrics, *this.internode_operation);
+                        return Poll::Ready(Err(excessive_empty_chunks_error()));
+                    }
+                }
+                Poll::Ready(Some(Ok(bytes))) => {
+                    *this.consecutive_empty_chunks = 0;
+                    *this.current = Some(bytes);
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    record_internode_operation_duration_once(
+                        *this.track_internode_metrics,
+                        *this.internode_operation,
+                        *this.request_started,
+                        this.duration_recorded,
+                    );
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Ready(None) => {
+                    record_internode_operation_duration_once(
+                        *this.track_internode_metrics,
+                        *this.internode_operation,
+                        *this.request_started,
+                        this.duration_recorded,
+                    );
+                    *this.stall_timer = None;
+                    return Poll::Ready(Ok(None));
+                }
+                Poll::Pending => {
+                    let Some(stall_timeout) = *this.stall_timeout else {
+                        return Poll::Pending;
+                    };
+                    let timer = this.stall_timer.get_or_insert_with(|| Box::pin(time::sleep(stall_timeout)));
+                    if timer.as_mut().poll(cx).is_ready() {
+                        record_internode_operation_duration_once(
+                            *this.track_internode_metrics,
+                            *this.internode_operation,
+                            *this.request_started,
+                            this.duration_recorded,
+                        );
+                        record_internode_stall_timeout(*this.track_internode_metrics, *this.internode_operation);
+                        record_internode_error(*this.track_internode_metrics, *this.internode_operation);
+                        return Poll::Ready(Err(body_stalled_error(stall_timeout)));
+                    }
+                    return Poll::Pending;
+                }
+            }
         }
     }
 }
@@ -608,18 +1467,41 @@ impl Stream for ReceiverStream {
     }
 }
 
-pin_project! {
-    pub struct HttpWriter {
-        url:String,
-        method: Method,
-        headers: HeaderMap,
-        err_rx: tokio::sync::oneshot::Receiver<std::io::Error>,
-        sender: PollSender<Option<Bytes>>,
-        handle: tokio::task::JoinHandle<std::io::Result<()>>,
-        pending_chunk: BytesMut,
-        finish:bool,
+/// Owns a caller's memory reservation until the associated allocation is freed.
+pub type HttpWriterMemoryReservation = Box<dyn Send + Sync + 'static>;
 
+/// Reserves a full buffer capacity before the writer allocates or copies data.
+pub type HttpWriterMemoryReserver = Arc<dyn Fn(usize) -> io::Result<HttpWriterMemoryReservation> + Send + Sync + 'static>;
+
+struct ReservedHttpBytes {
+    // Release the allocation before its reservation, including its last slice.
+    bytes: Bytes,
+    _reservation: Arc<HttpWriterMemoryReservation>,
+}
+
+impl AsRef<[u8]> for ReservedHttpBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
     }
+}
+
+// Not pin-projected: every field is `Unpin` and the `AsyncWrite` impl accesses
+// them through `get_mut()`, so a plain struct lets us add a manual `Drop`
+// (pin-project forbids one) to abort the background HTTP task — see below.
+pub struct HttpWriter {
+    url: String,
+    method: Method,
+    headers: HeaderMap,
+    err_rx: tokio::sync::oneshot::Receiver<std::io::Error>,
+    start_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    sender: PollSender<Option<Bytes>>,
+    handle: tokio::task::JoinHandle<std::io::Result<()>>,
+    pending_chunk: BytesMut,
+    pending_reservation: Option<Arc<HttpWriterMemoryReservation>>,
+    memory_reserver: Option<HttpWriterMemoryReserver>,
+    finish: bool,
+    track_internode_metrics: bool,
+    internode_operation: Option<&'static str>,
 }
 
 const HTTP_WRITER_CHANNEL_CAPACITY: usize = 8;
@@ -628,6 +1510,32 @@ const HTTP_WRITER_BUFFER_SIZE: usize = 1024 * 1024;
 impl HttpWriter {
     /// Create a new HttpWriter for the given URL. The HTTP request is performed in the background.
     pub async fn new(url: String, method: Method, headers: HeaderMap) -> io::Result<Self> {
+        Self::with_memory_reserver(url, method, headers, None).await
+    }
+
+    /// Keep each pending and queued allocation charged through its last byte slice.
+    pub async fn new_with_memory_reserver(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        memory_reserver: HttpWriterMemoryReserver,
+    ) -> io::Result<Self> {
+        Self::with_memory_reserver(url, method, headers, Some(memory_reserver)).await
+    }
+
+    async fn with_memory_reserver(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        memory_reserver: Option<HttpWriterMemoryReserver>,
+    ) -> io::Result<Self> {
+        // A rejected reservation must not leave an HTTP task or payload allocation.
+        let pending_reservation = memory_reserver
+            .as_ref()
+            .map(|reserve| reserve(HTTP_WRITER_BUFFER_SIZE))
+            .transpose()?
+            .map(Arc::new);
+        let pending_chunk = BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE);
         // http_log!("[HttpWriter::new] url: {url}, method: {method:?}, headers: {headers:?}");
         let url_clone = url.clone();
         let method_clone = method.clone();
@@ -637,8 +1545,14 @@ impl HttpWriter {
 
         let (sender, receiver) = tokio::sync::mpsc::channel::<Option<Bytes>>(HTTP_WRITER_CHANNEL_CAPACITY);
         let (err_tx, err_rx) = tokio::sync::oneshot::channel::<io::Error>();
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
 
         let handle = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return Ok(());
+            }
+            record_internode_outgoing_request(track_internode_metrics, internode_operation);
+
             let stream = ReceiverStream {
                 receiver,
                 track_internode_metrics,
@@ -649,17 +1563,32 @@ impl HttpWriter {
             //     "[HttpWriter::spawn] sending HTTP request: url={url_clone}, method={method_clone:?}, headers={headers_clone:?}"
             // );
 
-            let client = get_http_client(&url_clone).await;
+            let client = match get_http_client::<false>(&url_clone).await {
+                Ok(client) => client,
+                Err(err) => {
+                    record_internode_error(track_internode_metrics, internode_operation);
+                    let _ = err_tx.send(Error::new(err.kind(), err.to_string()));
+                    return Err(err);
+                }
+            };
             let request = client
                 .request(method_clone.clone(), url_clone.clone())
                 .headers(headers_clone.clone())
                 .body(body);
 
             // Hold the request until the shutdown signal is received
+            let request_started = Instant::now();
             let response = request.send().await;
 
             match response {
                 Ok(resp) => {
+                    record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
+                    record_internode_http_version(
+                        track_internode_metrics,
+                        internode_operation,
+                        http_version_metric_label(resp.version()),
+                    );
+                    maybe_warn_h2_inert(resp.version());
                     // http_log!("[HttpWriter::spawn] got response: status={}", resp.status());
                     if !resp.status().is_success() {
                         record_internode_error(track_internode_metrics, internode_operation);
@@ -675,10 +1604,11 @@ impl HttpWriter {
                     }
                 }
                 Err(e) => {
+                    record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
                     record_internode_error(track_internode_metrics, internode_operation);
                     let classified = classify_reqwest_error(&e);
                     record_internode_classified_error(track_internode_metrics, internode_operation, classified);
-                    let _ = err_tx.send(internode_classified_error(&method_clone, &url_clone, internode_operation, classified));
+                    let _ = err_tx.send(internode_kind_error(&method_clone, &url_clone, internode_operation, classified));
                     let io_err = internode_reqwest_error(&method_clone, &url_clone, internode_operation, e);
                     return Err(io_err);
                 }
@@ -689,16 +1619,20 @@ impl HttpWriter {
         });
 
         // http_log!("[HttpWriter::new] connection established successfully");
-        record_internode_outgoing_request(track_internode_metrics, internode_operation);
         Ok(Self {
             url,
             method,
             headers,
             err_rx,
+            start_tx: Some(start_tx),
             sender: PollSender::new(sender),
             handle,
-            pending_chunk: BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE),
+            pending_chunk,
+            pending_reservation,
+            memory_reserver,
             finish: false,
+            track_internode_metrics,
+            internode_operation,
         })
     }
 
@@ -723,9 +1657,25 @@ fn internode_rpc_operation(url: &str) -> Option<&'static str> {
     let url = reqwest::Url::parse(url).ok()?;
     match url.path() {
         READ_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_READ_FILE_STREAM),
-        PUT_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        PUT_FILE_STREAM_PATH | PUT_FILE_AUTH_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        PUT_FILE_CAPABILITY_PATH => Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY),
         WALK_DIR_PATH => Some(INTERNODE_OPERATION_WALK_DIR),
+        NS_SCANNER_PATH => Some(INTERNODE_OPERATION_NS_SCANNER),
         _ => None,
+    }
+}
+
+fn http_version_metric_label(version: Version) -> &'static str {
+    if version == Version::HTTP_09 {
+        HTTP_VERSION_09_LABEL
+    } else if version == Version::HTTP_10 {
+        HTTP_VERSION_10_LABEL
+    } else if version == Version::HTTP_11 {
+        HTTP_VERSION_11_LABEL
+    } else if version == Version::HTTP_2 {
+        HTTP_VERSION_2_LABEL
+    } else {
+        HTTP_VERSION_UNKNOWN_LABEL
     }
 }
 
@@ -734,11 +1684,7 @@ fn record_internode_outgoing_request(track: bool, operation: Option<&'static str
         return;
     }
 
-    match operation {
-        Some(operation) => global_internode_metrics()
-            .record_outgoing_request_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP),
-        None => global_internode_metrics().record_outgoing_request(),
-    }
+    crate::http_runtime_sources::record_outgoing_request(operation);
 }
 
 fn record_internode_sent_bytes(track: bool, operation: Option<&'static str>, bytes: usize) {
@@ -746,14 +1692,7 @@ fn record_internode_sent_bytes(track: bool, operation: Option<&'static str>, byt
         return;
     }
 
-    match operation {
-        Some(operation) => global_internode_metrics().record_sent_bytes_for_operation_and_backend(
-            operation,
-            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-            bytes,
-        ),
-        None => global_internode_metrics().record_sent_bytes(bytes),
-    }
+    crate::http_runtime_sources::record_sent_bytes(operation, bytes);
 }
 
 fn record_internode_recv_bytes(track: bool, operation: Option<&'static str>, bytes: usize) {
@@ -761,14 +1700,7 @@ fn record_internode_recv_bytes(track: bool, operation: Option<&'static str>, byt
         return;
     }
 
-    match operation {
-        Some(operation) => global_internode_metrics().record_recv_bytes_for_operation_and_backend(
-            operation,
-            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-            bytes,
-        ),
-        None => global_internode_metrics().record_recv_bytes(bytes),
-    }
+    crate::http_runtime_sources::record_recv_bytes(operation, bytes);
 }
 
 fn record_internode_error(track: bool, operation: Option<&'static str>) {
@@ -776,12 +1708,7 @@ fn record_internode_error(track: bool, operation: Option<&'static str>) {
         return;
     }
 
-    match operation {
-        Some(operation) => {
-            global_internode_metrics().record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP)
-        }
-        None => global_internode_metrics().record_error(),
-    }
+    crate::http_runtime_sources::record_error(operation);
 }
 
 fn record_internode_classified_error(track: bool, operation: Option<&'static str>, classification: InternodeHttpErrorKind) {
@@ -790,11 +1717,101 @@ fn record_internode_classified_error(track: bool, operation: Option<&'static str
     }
 
     if let Some(operation) = operation {
-        global_internode_metrics().record_classified_error_for_operation_and_backend(
-            operation,
-            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-            classification.metric_label(),
+        crate::http_runtime_sources::record_classified_error(operation, classification.metric_label());
+    }
+}
+
+fn record_internode_operation_duration(track: bool, operation: Option<&'static str>, duration: Duration) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        crate::http_runtime_sources::record_duration(operation, duration);
+    }
+}
+
+fn record_internode_operation_duration_once(
+    track: bool,
+    operation: Option<&'static str>,
+    request_started: Instant,
+    duration_recorded: &mut bool,
+) {
+    if *duration_recorded {
+        return;
+    }
+
+    *duration_recorded = true;
+    record_internode_operation_duration(track, operation, request_started.elapsed());
+}
+
+fn record_internode_http_version(track: bool, operation: Option<&'static str>, http_version: &'static str) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        crate::http_runtime_sources::record_http_version(operation, http_version);
+    }
+}
+
+/// Set once the inert-HTTP/2-tuning warning has been emitted, so it fires at
+/// most once for the process lifetime (backlog#805-C3).
+static H2_INERT_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Pure predicate deciding whether to warn that configured HTTP/2 tuning is
+/// inert. Warn only when the negotiated protocol is not HTTP/2, the operator
+/// explicitly configured h2 tuning, and we have not warned before. HTTP/2 for
+/// internode is negotiated via TLS-ALPN; over plaintext the connection is
+/// HTTP/1.1 and the h2 window knobs are silently ignored.
+fn should_warn_h2_inert(
+    protocol: InternodeHttpProtocol,
+    negotiated_is_http2: bool,
+    h2_tuning_explicit: bool,
+    already_warned: bool,
+) -> bool {
+    protocol == InternodeHttpProtocol::Auto && !negotiated_is_http2 && h2_tuning_explicit && !already_warned
+}
+
+/// Emit a single process-lifetime warning if explicitly-configured HTTP/2
+/// tuning is inert under the `auto` policy because the observed internode
+/// connection negotiated HTTP/1.1. The default `http1` policy deliberately
+/// disables HTTP/2, so it does not need a warning. See backlog#805-C3.
+fn maybe_warn_h2_inert(negotiated_version: Version) {
+    let negotiated_is_http2 = negotiated_version == Version::HTTP_2;
+    let tuning = internode_http_client_tuning();
+    if should_warn_h2_inert(
+        tuning.protocol,
+        negotiated_is_http2,
+        tuning.h2_tuning_explicit,
+        H2_INERT_WARNED.load(Ordering::Relaxed),
+    ) && H2_INERT_WARNED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        warn!(
+            "internode connection negotiated HTTP/1.1 while HTTP/2 tuning is configured; the HTTP/2 window settings apply only over internode TLS (h2 is negotiated via ALPN) — enable internode TLS to use them."
         );
+    }
+}
+
+fn record_internode_stall_timeout(track: bool, operation: Option<&'static str>) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        crate::http_runtime_sources::record_stall_timeout(operation);
+    }
+}
+
+fn record_internode_write_shutdown_error(track: bool, operation: Option<&'static str>) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        crate::http_runtime_sources::record_write_shutdown_error(operation);
     }
 }
 
@@ -807,6 +1824,63 @@ fn send_error_to_io<T>(err: tokio_util::sync::PollSendError<T>, context: &str) -
 }
 
 impl HttpWriter {
+    fn ensure_pending_capacity(&mut self) -> io::Result<()> {
+        if let Some(reserve) = &self.memory_reserver {
+            if self.pending_reservation.is_some() {
+                if self.pending_chunk.capacity() != 0 || self.pending_chunk.try_reclaim(HTTP_WRITER_BUFFER_SIZE) {
+                    return Ok(());
+                }
+                // Outstanding output still owns this allocation. Release the
+                // empty tail before its guard, then reserve separate storage.
+                self.pending_chunk = BytesMut::new();
+                self.pending_reservation = None;
+            }
+            let reservation = reserve(HTTP_WRITER_BUFFER_SIZE)?;
+            self.pending_chunk = BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE);
+            self.pending_reservation = Some(Arc::new(reservation));
+        }
+        Ok(())
+    }
+
+    fn take_pending_chunk(&mut self) -> io::Result<Bytes> {
+        if self.memory_reserver.is_none() {
+            return Ok(self.pending_chunk.split().freeze());
+        }
+        let reservation = self
+            .pending_reservation
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| io::Error::other("HTTP writer buffer has no memory reservation"))?;
+        let bytes = self.pending_chunk.split().freeze();
+        // The tail keeps this allocation charged until it can be reclaimed
+        // without allocating, or is dropped before requesting new storage.
+        Ok(Bytes::from_owner(ReservedHttpBytes {
+            bytes,
+            _reservation: reservation,
+        }))
+    }
+
+    fn pending_capacity(&self) -> usize {
+        if self.memory_reserver.is_some() {
+            self.pending_chunk.capacity()
+        } else {
+            HTTP_WRITER_BUFFER_SIZE
+        }
+    }
+
+    fn start_request(&mut self) {
+        if let Some(start_tx) = self.start_tx.take() {
+            let _ = start_tx.send(());
+        }
+    }
+
+    fn take_background_error(&mut self) -> io::Result<()> {
+        match self.err_rx.try_recv() {
+            Ok(err) => Err(err),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty | tokio::sync::oneshot::error::TryRecvError::Closed) => Ok(()),
+        }
+    }
+
     fn poll_send_pending_chunk(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.pending_chunk.is_empty() {
             return Poll::Ready(Ok(()));
@@ -814,7 +1888,7 @@ impl HttpWriter {
 
         match self.sender.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
-                let chunk = self.pending_chunk.split().freeze();
+                let chunk = self.take_pending_chunk()?;
                 self.sender
                     .send_item(Some(chunk))
                     .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
@@ -834,13 +1908,12 @@ impl AsyncWrite for HttpWriter {
         //     self.method,
         //     buf.len()
         // );
-        if let Ok(e) = Pin::new(&mut self.err_rx).try_recv() {
-            return Poll::Ready(Err(e));
+        let this = self.as_mut().get_mut();
+        if let Err(err) = this.take_background_error() {
+            return Poll::Ready(Err(err));
         }
 
-        let this = self.as_mut().get_mut();
-
-        if this.pending_chunk.len() >= HTTP_WRITER_BUFFER_SIZE {
+        if !this.pending_chunk.is_empty() && this.pending_chunk.len() >= this.pending_capacity() {
             match this.poll_send_pending_chunk(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -851,33 +1924,60 @@ impl AsyncWrite for HttpWriter {
         if buf.len() >= HTTP_WRITER_BUFFER_SIZE && this.pending_chunk.is_empty() {
             match this.sender.poll_reserve(cx) {
                 Poll::Ready(Ok(())) => {
+                    let (chunk, written) = if this.memory_reserver.is_some() {
+                        if let Err(error) = this.ensure_pending_capacity() {
+                            this.sender.abort_send();
+                            return Poll::Ready(Err(error));
+                        }
+                        let written = buf.len().min(this.pending_capacity());
+                        this.pending_chunk.extend_from_slice(&buf[..written]);
+                        (this.take_pending_chunk()?, written)
+                    } else {
+                        (Bytes::copy_from_slice(&buf[..HTTP_WRITER_BUFFER_SIZE]), HTTP_WRITER_BUFFER_SIZE)
+                    };
                     this.sender
-                        .send_item(Some(Bytes::copy_from_slice(buf)))
+                        .send_item(Some(chunk))
                         .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
-                    return Poll::Ready(Ok(buf.len()));
+                    this.start_request();
+                    return Poll::Ready(Ok(written));
                 }
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter send error"))),
                 Poll::Pending => return Poll::Pending,
             }
         }
 
-        this.pending_chunk.extend_from_slice(buf);
+        // A slot bounds memory only when every queued and pending chunk is bounded.
+        if !buf.is_empty() {
+            this.ensure_pending_capacity()?;
+        }
+        let written = buf.len().min(this.pending_capacity() - this.pending_chunk.len());
+        this.pending_chunk.extend_from_slice(&buf[..written]);
+        if written > 0 {
+            this.start_request();
+        }
 
-        Poll::Ready(Ok(buf.len()))
+        Poll::Ready(Ok(written))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        self.as_mut().get_mut().poll_send_pending_chunk(cx)
+        let this = self.as_mut().get_mut();
+        if let Err(err) = this.take_background_error() {
+            return Poll::Ready(Err(err));
+        }
+
+        this.poll_send_pending_chunk(cx)
     }
 
     fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
-        if let Ok(e) = Pin::new(&mut self.err_rx).try_recv() {
-            return Poll::Ready(Err(e));
+        if bufs.len() == 1 {
+            return self.poll_write(cx, &bufs[0]);
+        }
+        let this = self.as_mut().get_mut();
+        if let Err(err) = this.take_background_error() {
+            return Poll::Ready(Err(err));
         }
 
-        let this = self.as_mut().get_mut();
-
-        if this.pending_chunk.len() >= HTTP_WRITER_BUFFER_SIZE {
+        if !this.pending_chunk.is_empty() && this.pending_chunk.len() >= this.pending_capacity() {
             match this.poll_send_pending_chunk(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -885,29 +1985,27 @@ impl AsyncWrite for HttpWriter {
             }
         }
 
-        let total_len = bufs.iter().map(|buf| buf.len()).sum::<usize>();
-        if total_len == 0 {
-            return Poll::Ready(Ok(0));
+        if this.memory_reserver.is_some() && bufs.iter().any(|buf| !buf.is_empty()) {
+            this.ensure_pending_capacity()?;
         }
-
-        if bufs.len() == 1 && this.pending_chunk.is_empty() && total_len >= HTTP_WRITER_BUFFER_SIZE {
-            match this.sender.poll_reserve(cx) {
-                Poll::Ready(Ok(())) => {
-                    this.sender
-                        .send_item(Some(Bytes::copy_from_slice(bufs[0].as_ref())))
-                        .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
-                    return Poll::Ready(Ok(total_len));
-                }
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter send error"))),
-                Poll::Pending => return Poll::Pending,
+        let available = this.pending_capacity() - this.pending_chunk.len();
+        let mut written = 0;
+        for buf in bufs {
+            let len = buf.len().min(available - written);
+            if len > 0 {
+                this.ensure_pending_capacity()?;
+            }
+            this.pending_chunk.extend_from_slice(&buf[..len]);
+            written += len;
+            if written == available {
+                break;
             }
         }
-
-        for buf in bufs {
-            this.pending_chunk.extend_from_slice(buf);
+        if written > 0 {
+            this.start_request();
         }
 
-        Poll::Ready(Ok(total_len))
+        Poll::Ready(Ok(written))
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -918,9 +2016,18 @@ impl AsyncWrite for HttpWriter {
         // let url = self.url.clone();
         // let method = self.method.clone();
 
+        self.as_mut().get_mut().start_request();
+        if let Err(err) = self.as_mut().get_mut().take_background_error() {
+            record_internode_write_shutdown_error(self.track_internode_metrics, self.internode_operation);
+            return Poll::Ready(Err(err));
+        }
+
         match self.as_mut().get_mut().poll_send_pending_chunk(cx) {
             Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Ready(Err(err)) => {
+                record_internode_write_shutdown_error(self.track_internode_metrics, self.internode_operation);
+                return Poll::Ready(Err(err));
+            }
             Poll::Pending => return Poll::Pending,
         }
 
@@ -929,11 +2036,15 @@ impl AsyncWrite for HttpWriter {
             let this = self.as_mut().get_mut();
             match this.sender.poll_reserve(cx) {
                 Poll::Ready(Ok(())) => {
-                    this.sender
-                        .send_item(None)
-                        .map_err(|e| send_error_to_io(e, "HttpWriter shutdown error"))?;
+                    this.sender.send_item(None).map_err(|e| {
+                        record_internode_write_shutdown_error(this.track_internode_metrics, this.internode_operation);
+                        send_error_to_io(e, "HttpWriter shutdown error")
+                    })?;
                 }
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter shutdown error"))),
+                Poll::Ready(Err(err)) => {
+                    record_internode_write_shutdown_error(this.track_internode_metrics, this.internode_operation);
+                    return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter shutdown error")));
+                }
                 Poll::Pending => return Poll::Pending,
             }
             // http_log!(
@@ -943,18 +2054,28 @@ impl AsyncWrite for HttpWriter {
             // );
 
             self.finish = true;
+            if self.memory_reserver.is_some() {
+                // EOF has been queued, so this writer no longer needs its tail.
+                self.pending_chunk = BytesMut::new();
+                self.pending_reservation = None;
+            }
         }
         // Wait for the HTTP request to complete
         use futures::FutureExt;
-        match Pin::new(&mut self.get_mut().handle).poll_unpin(cx) {
-            Poll::Ready(Ok(_)) => {
+        match Pin::new(&mut self.as_mut().get_mut().handle).poll_unpin(cx) {
+            Poll::Ready(Ok(Ok(()))) => {
                 // http_log!(
                 //     "[HttpWriter::poll_shutdown] HTTP request finished successfully, url: {}, method: {:?}",
                 //     url,
                 //     method
                 // );
             }
+            Poll::Ready(Ok(Err(err))) => {
+                record_internode_write_shutdown_error(self.track_internode_metrics, self.internode_operation);
+                return Poll::Ready(Err(err));
+            }
             Poll::Ready(Err(e)) => {
+                record_internode_write_shutdown_error(self.track_internode_metrics, self.internode_operation);
                 // http_log!("[HttpWriter::poll_shutdown] HTTP request failed: {e}, url: {}, method: {:?}", url, method);
                 return Poll::Ready(Err(Error::other(format!("HTTP request failed: {e}"))));
             }
@@ -968,12 +2089,30 @@ impl AsyncWrite for HttpWriter {
     }
 }
 
+impl Drop for HttpWriter {
+    /// Abort the background HTTP request when the writer is dropped without a
+    /// clean shutdown. On a stall timeout the caller drops this writer to fail
+    /// its shard (rustfs/backlog#1319); a black-hole peer would otherwise leave
+    /// the spawned task holding the connection and its buffered body alive. A
+    /// cleanly shut-down writer has already joined the task, so aborting a
+    /// finished handle is a no-op. This does not — and cannot — unsend bytes
+    /// already handed to the transport: those land only in the upload's unique
+    /// tmp path and are reclaimed by tmp GC, never touching a committed object.
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{Router, body::Body, extract::State, http::StatusCode, response::IntoResponse, routing::get};
     use futures::stream::{self, StreamExt as _};
     use http_body_util::BodyExt as _;
+    use hyper::{Request, Response, body::Incoming, server::conn::http2, service::service_fn};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use rustfs_io_metrics::internode_metrics::global_internode_metrics;
+    use std::convert::Infallible;
     use std::io::{self, IoSlice};
     use std::sync::{
         Arc,
@@ -982,8 +2121,367 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
-        sync::Mutex,
+        sync::{Mutex, Notify},
     };
+
+    /// Minimal error wrapper whose `source()` returns a boxed inner error, used
+    /// to exercise `classify_transport_error` (reqwest::Error cannot be built by
+    /// hand). The inner error may itself be an `io::Error` or another wrapper.
+    #[derive(Debug)]
+    struct WrapperError {
+        message: String,
+        source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    }
+
+    impl WrapperError {
+        fn new(message: &str, source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>) -> Self {
+            Self {
+                message: message.to_string(),
+                source,
+            }
+        }
+    }
+
+    impl std::fmt::Display for WrapperError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for WrapperError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source.as_ref().map(|s| s.as_ref() as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    fn io_source(kind: io::ErrorKind) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+        Box::new(io::Error::new(kind, "io"))
+    }
+
+    #[test]
+    fn classify_io_connection_refused() {
+        let err = WrapperError::new("transport", Some(io_source(io::ErrorKind::ConnectionRefused)));
+        let kind = classify_transport_error(&err, false, true, false);
+        assert_eq!(kind, InternodeHttpErrorKind::ConnectionRefused);
+        assert!(kind.is_retryable());
+    }
+
+    #[test]
+    fn classify_io_reset_variants() {
+        for io_kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionAborted,
+        ] {
+            let err = WrapperError::new("transport", Some(io_source(io_kind)));
+            assert_eq!(
+                classify_transport_error(&err, false, false, false),
+                InternodeHttpErrorKind::ConnectionReset,
+                "{io_kind:?} should map to ConnectionReset"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_io_unreachable_variants() {
+        for io_kind in [io::ErrorKind::HostUnreachable, io::ErrorKind::NetworkUnreachable] {
+            let err = WrapperError::new("transport", Some(io_source(io_kind)));
+            assert_eq!(
+                classify_transport_error(&err, false, true, false),
+                InternodeHttpErrorKind::ConnectionRefused,
+                "{io_kind:?} should map to ConnectionRefused"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_io_timed_out_without_timeout_flag() {
+        let err = WrapperError::new("transport", Some(io_source(io::ErrorKind::TimedOut)));
+        assert_eq!(
+            classify_transport_error(&err, false, false, false),
+            InternodeHttpErrorKind::ConnectTimeout
+        );
+    }
+
+    #[test]
+    fn classify_timeout_flag_short_circuits() {
+        // Even with an io ConnectionRefused in the chain, is_timeout wins.
+        let err = WrapperError::new("transport", Some(io_source(io::ErrorKind::ConnectionRefused)));
+        assert_eq!(classify_transport_error(&err, true, true, false), InternodeHttpErrorKind::ConnectTimeout);
+    }
+
+    #[test]
+    fn classify_connect_dns_marker_without_io_kind() {
+        let err = WrapperError::new("connect error: nodename nor servname provided", None);
+        assert_eq!(
+            classify_transport_error(&err, false, true, false),
+            InternodeHttpErrorKind::DnsResolutionFailed
+        );
+    }
+
+    #[test]
+    fn classify_connect_no_dns_marker_defaults_refused() {
+        let err = WrapperError::new("connect error", None);
+        assert_eq!(
+            classify_transport_error(&err, false, true, false),
+            InternodeHttpErrorKind::ConnectionRefused
+        );
+    }
+
+    #[test]
+    fn classify_body_only() {
+        let err = WrapperError::new("body error", None);
+        assert_eq!(
+            classify_transport_error(&err, false, false, true),
+            InternodeHttpErrorKind::BodyStreamAborted
+        );
+    }
+
+    #[test]
+    fn classify_nothing_is_unknown() {
+        let err = WrapperError::new("mystery", None);
+        assert_eq!(classify_transport_error(&err, false, false, false), InternodeHttpErrorKind::Unknown);
+    }
+
+    #[tokio::test]
+    async fn peer_close_before_upload_response_remains_retryable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let address = listener.local_addr().expect("peer address should be available");
+        let peer = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("peer should receive the upload");
+                let mut received = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let count = socket.read(&mut buffer).await.expect("peer should read the request");
+                    assert_ne!(count, 0, "upload should reach the peer before it closes");
+                    received.extend_from_slice(&buffer[..count]);
+                    if received
+                        .windows(b"restart-mid-upload".len())
+                        .any(|part| part == b"restart-mid-upload")
+                    {
+                        break;
+                    }
+                }
+                socket
+                    .shutdown()
+                    .await
+                    .expect("peer should close before returning response headers");
+            }
+        });
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("upload client should build")
+            .put(format!("http://{address}/rustfs/rpc/put_file_stream_v1"))
+            .body("restart-mid-upload")
+            .send()
+            .await
+            .expect_err("closing the peer before its response should fail the upload");
+        let kind = classify_reqwest_error(&error);
+        assert_eq!(kind, InternodeHttpErrorKind::ConnectionReset);
+        assert!(kind.is_retryable(), "a peer close during an upload must retain bounded retry eligibility");
+
+        let mut writer =
+            HttpWriter::new(format!("http://{address}/rustfs/rpc/put_file_stream_v1"), Method::PUT, HeaderMap::new())
+                .await
+                .expect("internode writer should be created");
+        writer.write_all(b"restart-mid-upload").await.expect("upload should start");
+        let error = writer.shutdown().await.expect_err("peer close should fail the shard writer");
+        let source = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("shard failure should preserve the internode error classification");
+        assert_eq!(source.kind(), InternodeHttpErrorKind::ConnectionReset);
+        assert!(source.kind().is_retryable());
+        assert_eq!(source.context().operation(), Some(INTERNODE_OPERATION_PUT_FILE_STREAM));
+        peer.await.expect("peer should finish normally");
+    }
+
+    #[tokio::test]
+    async fn malformed_upload_response_is_not_an_eof_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener should bind");
+        let address = listener.local_addr().expect("peer address should be available");
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("peer should receive the upload");
+            let mut buffer = [0_u8; 4096];
+            assert!(socket.read(&mut buffer).await.expect("peer should read the request") > 0);
+            socket
+                .write_all(b"invalid HTTP response\r\n\r\n")
+                .await
+                .expect("peer should send the invalid response");
+            socket.shutdown().await.expect("peer should close");
+        });
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("upload client should build")
+            .put(format!("http://{address}/rustfs/rpc/put_file_stream_v1"))
+            .body("payload")
+            .send()
+            .await
+            .expect_err("invalid response headers should fail the request");
+        let kind = classify_reqwest_error(&error);
+        assert_eq!(kind, InternodeHttpErrorKind::Unknown);
+        assert!(!kind.is_retryable(), "a malformed response must not become a transport retry");
+        peer.await.expect("peer should finish normally");
+    }
+
+    #[test]
+    fn classify_typed_wins_over_body() {
+        // io ConnectionReset present AND is_body: typed classification wins.
+        let err = WrapperError::new("stream body error", Some(io_source(io::ErrorKind::ConnectionReset)));
+        assert_eq!(
+            classify_transport_error(&err, false, false, true),
+            InternodeHttpErrorKind::ConnectionReset
+        );
+    }
+
+    #[test]
+    fn classify_typed_wins_over_dns_message() {
+        // Message says "dns" but a real io ConnectionRefused is in the chain and
+        // is_connect is set: typed signal wins, never mislabeled as DNS.
+        let err = WrapperError::new("dns lookup failure", Some(io_source(io::ErrorKind::ConnectionRefused)));
+        assert_eq!(
+            classify_transport_error(&err, false, true, false),
+            InternodeHttpErrorKind::ConnectionRefused
+        );
+    }
+
+    #[test]
+    fn is_retryable_table() {
+        use InternodeHttpErrorKind::*;
+        for kind in [
+            ConnectTimeout,
+            ConnectionRefused,
+            ConnectionReset,
+            BodyStreamAborted,
+            DnsResolutionFailed,
+            HttpStatus(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            HttpStatus(reqwest::StatusCode::BAD_GATEWAY),
+            HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            HttpStatus(reqwest::StatusCode::GATEWAY_TIMEOUT),
+        ] {
+            assert!(kind.is_retryable(), "{kind:?} should be retryable");
+        }
+        for kind in [
+            Unknown,
+            HttpStatus(reqwest::StatusCode::NOT_FOUND),
+            HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            HttpStatus(reqwest::StatusCode::BAD_REQUEST),
+        ] {
+            assert!(!kind.is_retryable(), "{kind:?} should not be retryable");
+        }
+    }
+
+    #[test]
+    fn disk_error_wire_tokens_are_stable() {
+        assert_eq!(INTERNODE_DISK_ERROR_HEADER, "x-rustfs-disk-error");
+        assert_eq!(INTERNODE_FILE_NOT_FOUND, "file-not-found");
+        assert_eq!(INTERNODE_VOLUME_NOT_FOUND, "volume-not-found");
+        assert_eq!(INTERNODE_FILE_CORRUPT, "file-corrupt");
+    }
+
+    #[test]
+    fn classify_http_response_requires_an_explicit_missing_disk_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, INTERNODE_FILE_NOT_FOUND.parse().unwrap());
+        let classified = classify_http_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &headers,
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        );
+        assert_eq!(
+            classified.kind,
+            InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert_eq!(classified.kind.io_error_kind(), io::ErrorKind::Other);
+        assert_eq!(classified.kind.metric_label(), "http_status_other");
+        assert!(matches!(classified.remote_disk_error, Some(RemoteDiskErrorKind::FileNotFound)));
+
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, INTERNODE_VOLUME_NOT_FOUND.parse().unwrap());
+        let classified = classify_http_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &headers,
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        );
+        assert!(matches!(classified.remote_disk_error, Some(RemoteDiskErrorKind::VolumeNotFound)));
+
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, "permission-denied".parse().unwrap());
+        let classified = classify_http_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &headers,
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        );
+        assert!(classified.remote_disk_error.is_none());
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, INTERNODE_FILE_NOT_FOUND.parse().unwrap());
+        let wrong_status =
+            classify_http_response(reqwest::StatusCode::NOT_FOUND, &headers, Some(INTERNODE_OPERATION_READ_FILE_STREAM));
+        assert!(wrong_status.remote_disk_error.is_none());
+        let walk_dir_missing =
+            classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, Some(INTERNODE_OPERATION_WALK_DIR));
+        assert_eq!(walk_dir_missing.remote_disk_error, Some(RemoteDiskErrorKind::FileNotFound));
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, INTERNODE_VOLUME_NOT_FOUND.parse().unwrap());
+        let walk_dir_volume_missing =
+            classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, Some(INTERNODE_OPERATION_WALK_DIR));
+        assert_eq!(walk_dir_volume_missing.remote_disk_error, Some(RemoteDiskErrorKind::VolumeNotFound));
+        let wrong_operation = classify_http_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &headers,
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+        );
+        assert!(wrong_operation.remote_disk_error.is_none());
+    }
+
+    #[test]
+    fn classify_http_response_scopes_corrupt_disk_error_to_read_failures() {
+        let mut headers = HeaderMap::new();
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, INTERNODE_FILE_CORRUPT.parse().expect("valid error token"));
+        let classified = classify_http_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &headers,
+            Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+        );
+        assert_eq!(classified.remote_disk_error, Some(RemoteDiskErrorKind::FileCorrupt));
+        for status in [reqwest::StatusCode::NOT_FOUND, reqwest::StatusCode::SERVICE_UNAVAILABLE] {
+            assert!(
+                classify_http_response(status, &headers, Some(INTERNODE_OPERATION_READ_FILE_STREAM))
+                    .remote_disk_error
+                    .is_none()
+            );
+        }
+        for operation in [
+            None,
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
+            Some(INTERNODE_OPERATION_WALK_DIR),
+        ] {
+            assert!(
+                classify_http_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &headers, operation)
+                    .remote_disk_error
+                    .is_none()
+            );
+        }
+        headers.insert(INTERNODE_DISK_ERROR_HEADER, "unknown-disk-error".parse().expect("valid unknown token"));
+        for headers in [&headers, &HeaderMap::new()] {
+            assert!(
+                classify_http_response(
+                    reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                    headers,
+                    Some(INTERNODE_OPERATION_READ_FILE_STREAM),
+                )
+                .remote_disk_error
+                .is_none()
+            );
+        }
+    }
 
     #[derive(Clone, Default)]
     struct TestState {
@@ -991,6 +2489,7 @@ mod tests {
         get_count: Arc<AtomicUsize>,
         put_count: Arc<AtomicUsize>,
         put_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+        delayed_body: Arc<Notify>,
     }
 
     async fn get_stream(State(state): State<TestState>) -> impl IntoResponse {
@@ -1001,6 +2500,26 @@ mod tests {
     async fn get_stalling_stream(State(state): State<TestState>) -> impl IntoResponse {
         state.get_count.fetch_add(1, Ordering::SeqCst);
         let body_stream = stream::once(async { Ok::<Bytes, io::Error>(Bytes::from_static(b"hello")) }).chain(stream::pending());
+        (StatusCode::OK, Body::from_stream(body_stream))
+    }
+
+    async fn get_delayed_first_chunk(State(state): State<TestState>) -> impl IntoResponse {
+        state.get_count.fetch_add(1, Ordering::SeqCst);
+        let delayed_body = state.delayed_body;
+        let body_stream = stream::once(async move {
+            delayed_body.notified().await;
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"hello"))
+        });
+        (StatusCode::OK, Body::from_stream(body_stream))
+    }
+
+    async fn get_failing_stream(State(state): State<TestState>) -> impl IntoResponse {
+        state.get_count.fetch_add(1, Ordering::SeqCst);
+        let body_stream =
+            stream::once(async { Ok::<Bytes, io::Error>(Bytes::from_static(b"partial")) }).chain(stream::once(async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                Err(io::Error::other("stream failed"))
+            }));
         (StatusCode::OK, Body::from_stream(body_stream))
     }
 
@@ -1016,19 +2535,196 @@ mod tests {
         StatusCode::OK
     }
 
-    async fn start_test_server(state: TestState) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn reject_put(State(state): State<TestState>, body: Body) -> impl IntoResponse {
+        state.put_count.fetch_add(1, Ordering::SeqCst);
+        let bytes = body.collect().await.unwrap().to_bytes();
+        state.put_bodies.lock().await.push(bytes.to_vec());
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+
+    async fn start_test_server(state: TestState) -> Option<(String, tokio::task::JoinHandle<()>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
         let app = Router::new()
             .route("/stream", get(get_stream).head(reject_head).put(accept_put))
+            .route(
+                READ_FILE_STREAM_PATH,
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [(INTERNODE_DISK_ERROR_HEADER, INTERNODE_FILE_CORRUPT)],
+                        "read file err file corrupt",
+                    )
+                }),
+            )
+            .route(WALK_DIR_PATH, get(get_stream))
+            .route("/reject-put", get(get_stream).put(reject_put))
             .route("/stall", get(get_stalling_stream))
+            .route("/delayed-first", get(get_delayed_first_chunk))
+            .route("/fail-after-partial", get(get_failing_stream))
             .with_state(state);
 
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
 
-        (format!("http://{addr}/stream"), handle)
+        Some((format!("http://{addr}/stream"), handle))
+    }
+
+    #[tokio::test]
+    async fn http_readers_preserve_remote_file_corruption() {
+        let (url, server) = start_test_server(TestState::default())
+            .await
+            .expect("corruption regression server must bind");
+        let url = format!("{}{READ_FILE_STREAM_PATH}", url.strip_suffix("/stream").expect("test server URL suffix"));
+        let byte_error = HttpReader::new(url.clone(), Method::GET, HeaderMap::new(), None)
+            .await
+            .err()
+            .expect("byte reader must reject corrupt shard response");
+        let chunk_error = HttpChunkReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, None)
+            .await
+            .err()
+            .expect("chunk reader must reject corrupt shard response");
+        for error in [byte_error, chunk_error] {
+            let source = error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                .expect("HTTP error must retain typed internode source");
+            assert!(source.is_remote_file_corrupt());
+            assert!(!source.is_remote_file_not_found());
+            assert!(!source.is_remote_volume_not_found());
+            assert_eq!(
+                source.kind(),
+                InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+            );
+            let cloned = clone_internode_http_io_error(&error).expect("typed transport error must be cloneable");
+            assert!(
+                cloned
+                    .get_ref()
+                    .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                    .expect("clone must retain typed internode source")
+                    .is_remote_file_corrupt()
+            );
+        }
+        server.abort();
+    }
+
+    struct BlockedH2Server {
+        url: String,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    fn start_temporarily_blocked_h2_server(blocked_for: Duration) -> Option<BlockedH2Server> {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("HTTP/2 test listener should bind: {err}"),
+        };
+        let addr = listener
+            .local_addr()
+            .expect("HTTP/2 test listener address should be available");
+        listener
+            .set_nonblocking(true)
+            .expect("HTTP/2 test listener should become nonblocking");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("HTTP/2 test runtime should build");
+            runtime.block_on(async move {
+                let listener = TcpListener::from_std(listener).expect("HTTP/2 test listener should attach to its runtime");
+                let (stream, _) = listener.accept().await.expect("HTTP/2 test server should accept client");
+                let service = service_fn(move |_request: Request<Incoming>| async move {
+                    let body_stream = stream::once(async { Ok::<_, Infallible>(Bytes::from_static(b"partial")) }).chain(
+                        stream::once(async move {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            // Model a saturated peer whose connection task cannot
+                            // process a PING ACK even though an active response body
+                            // remains valid. The server has its own runtime so this
+                            // cannot starve the client-side keepalive timer.
+                            std::thread::sleep(blocked_for);
+                            Ok::<_, Infallible>(Bytes::from_static(b"complete"))
+                        }),
+                    );
+                    Ok::<_, Infallible>(Response::new(Body::from_stream(body_stream)))
+                });
+                tokio::select! {
+                    _ = http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(stream), service) => {},
+                    _ = shutdown_rx => {},
+                }
+            });
+        });
+
+        Some(BlockedH2Server {
+            url: format!("http://{addr}"),
+            shutdown: shutdown_tx,
+            handle,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn data_plane_liveness_does_not_abort_a_valid_h2_stream_while_peer_is_busy() {
+        let Some(baseline_server) = start_temporarily_blocked_h2_server(Duration::from_secs(2)) else {
+            return;
+        };
+        let aggressive_keepalive_client = Client::builder()
+            .no_proxy()
+            .http2_prior_knowledge()
+            .http2_keep_alive_interval(Duration::from_millis(20))
+            .http2_keep_alive_timeout(Duration::from_millis(40))
+            .http2_keep_alive_while_idle(true)
+            .build()
+            .expect("aggressive HTTP/2 keepalive client should build");
+
+        let baseline_result = tokio::time::timeout(Duration::from_secs(4), async {
+            aggressive_keepalive_client
+                .get(&baseline_server.url)
+                .send()
+                .await?
+                .bytes()
+                .await
+        })
+        .await
+        .expect("aggressive keepalive body should finish before the outer test deadline");
+        assert!(
+            baseline_result.is_err(),
+            "fixture must reproduce a PING timeout while the server connection task is blocked"
+        );
+        let _ = baseline_server.shutdown.send(());
+        baseline_server
+            .handle
+            .join()
+            .expect("baseline HTTP/2 test server should exit");
+
+        let Some(candidate_server) = start_temporarily_blocked_h2_server(Duration::from_millis(500)) else {
+            return;
+        };
+        let candidate_client = apply_http_data_plane_liveness(Client::builder().no_proxy().http2_prior_knowledge())
+            .build()
+            .expect("internode data-plane HTTP/2 client should build");
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            let response = candidate_client.get(&candidate_server.url).send().await?;
+            let version = response.version();
+            let body = response.bytes().await?;
+            Ok::<_, reqwest::Error>((version, body))
+        })
+        .await
+        .expect("data-plane request should finish before the outer test deadline")
+        .expect("disabled HTTP/2 PING keepalive should preserve the valid stream");
+
+        assert_eq!(response.0, Version::HTTP_2);
+        assert_eq!(response.1, Bytes::from_static(b"partialcomplete"));
+        let _ = candidate_server.shutdown.send(());
+        candidate_server
+            .handle
+            .join()
+            .expect("candidate HTTP/2 test server should exit");
     }
 
     #[test]
@@ -1042,8 +2738,20 @@ mod tests {
             Some(INTERNODE_OPERATION_PUT_FILE_STREAM)
         );
         assert_eq!(
+            internode_rpc_operation(&format!("http://node:9000{PUT_FILE_AUTH_STREAM_PATH}?disk=d")),
+            Some(INTERNODE_OPERATION_PUT_FILE_STREAM)
+        );
+        assert_eq!(
+            internode_rpc_operation(&format!("http://node:9000{PUT_FILE_CAPABILITY_PATH}?put_file_capability=1")),
+            Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY)
+        );
+        assert_eq!(
             internode_rpc_operation(&format!("http://node:9000{WALK_DIR_PATH}?disk=d")),
             Some(INTERNODE_OPERATION_WALK_DIR)
+        );
+        assert_eq!(
+            internode_rpc_operation(&format!("http://node:9000{NS_SCANNER_PATH}?disk=d")),
+            Some(INTERNODE_OPERATION_NS_SCANNER)
         );
         assert_eq!(internode_rpc_operation("http://node:9000/rustfs/rpc/unknown"), None);
         assert_eq!(
@@ -1052,10 +2760,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn internode_http_timeout_error_retains_operation_context() {
+        let error =
+            internode_http_timeout_error(&Method::GET, "http://node:9000/rustfs/rpc/put_file_capability?put_file_capability=1");
+        let source = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("timeout should retain internode classification");
+
+        assert_eq!(source.kind(), InternodeHttpErrorKind::ConnectTimeout);
+        assert_eq!(source.context().method(), "GET");
+        assert_eq!(source.context().target(), PUT_FILE_CAPABILITY_PATH);
+        assert_eq!(source.context().operation(), Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY));
+    }
+
+    #[test]
+    fn http_version_metrics_labels_are_low_cardinality() {
+        assert_eq!(http_version_metric_label(Version::HTTP_09), HTTP_VERSION_09_LABEL);
+        assert_eq!(http_version_metric_label(Version::HTTP_10), HTTP_VERSION_10_LABEL);
+        assert_eq!(http_version_metric_label(Version::HTTP_11), HTTP_VERSION_11_LABEL);
+        assert_eq!(http_version_metric_label(Version::HTTP_2), HTTP_VERSION_2_LABEL);
+    }
+
     #[tokio::test]
     async fn http_reader_does_not_send_preflight_head() {
         let state = TestState::default();
-        let (url, handle) = start_test_server(state.clone()).await;
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
 
         let mut reader = HttpReader::new(url, Method::GET, HeaderMap::new(), None).await.unwrap();
         let mut buf = Vec::new();
@@ -1069,9 +2802,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_chunk_reader_handoff_preserves_boundaries_and_eof() {
+        let state = TestState::default();
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
+        let mut reader = HttpChunkReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, None)
+            .await
+            .expect("reader should open");
+        assert_eq!(reader.consecutive_empty_chunks, 0);
+        let zero = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 0))
+            .await
+            .expect_err("zero chunk bound is invalid");
+        assert_eq!(zero.kind(), io::ErrorKind::InvalidInput);
+
+        let first = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 2))
+            .await
+            .expect("first chunk read should succeed")
+            .expect("first chunk should not be EOF");
+        assert_eq!(first, b"he"[..]);
+
+        let second = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 8))
+            .await
+            .expect("second chunk read should succeed")
+            .expect("second chunk should not be EOF");
+        assert_eq!(second, b"llo"[..]);
+
+        let eof = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 8))
+            .await
+            .expect("EOF should not be an error");
+        assert!(eof.is_none());
+        assert_eq!(state.get_count.load(Ordering::SeqCst), 1);
+        handle.abort();
+    }
+
+    #[test]
+    fn http_chunk_reader_rejects_excessive_empty_chunks_on_both_interfaces() {
+        let make_reader = |inner: HttpByteStream| HttpChunkReader {
+            track_internode_metrics: false,
+            internode_operation: None,
+            stall_timeout: None,
+            stall_timer: None,
+            request_started: Instant::now(),
+            duration_recorded: false,
+            consecutive_empty_chunks: 0,
+            inner,
+            current: None,
+        };
+        let empty_chunks_then_data = |empty_chunks| {
+            let items = (0..empty_chunks)
+                .map(|_| Ok(Bytes::new()))
+                .chain(std::iter::once(Ok(Bytes::from_static(b"data"))));
+            make_reader(Box::pin(stream::iter(items)))
+        };
+
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut chunk_reader = empty_chunks_then_data(MAX_CONSECUTIVE_EMPTY_CHUNKS - 1);
+        let Poll::Ready(Ok(Some(chunk))) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 4) else {
+            panic!("data after fewer than the maximum empty chunks should be returned");
+        };
+        assert_eq!(chunk, b"data"[..]);
+
+        let mut async_reader = empty_chunks_then_data(MAX_CONSECUTIVE_EMPTY_CHUNKS - 1);
+        let mut storage = [0; 4];
+        let mut read_buf = ReadBuf::new(&mut storage);
+        let Poll::Ready(Ok(())) = Pin::new(&mut async_reader).poll_read(&mut cx, &mut read_buf) else {
+            panic!("AsyncRead should return data after fewer than the maximum empty chunks");
+        };
+        assert_eq!(read_buf.filled(), b"data");
+
+        let mut chunk_reader = empty_chunks_then_data(MAX_CONSECUTIVE_EMPTY_CHUNKS);
+        let Poll::Ready(Err(err)) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 4) else {
+            panic!("excessive empty chunks should fail closed");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let Poll::Ready(Err(err)) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 4) else {
+            panic!("empty chunk limit failure should remain sticky");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let mut async_reader = empty_chunks_then_data(MAX_CONSECUTIVE_EMPTY_CHUNKS);
+        let mut storage = [0; 4];
+        let mut read_buf = ReadBuf::new(&mut storage);
+        let Poll::Ready(Err(err)) = Pin::new(&mut async_reader).poll_read(&mut cx, &mut read_buf) else {
+            panic!("excessive empty chunks should fail closed through AsyncRead");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let mut read_buf = ReadBuf::new(&mut storage);
+        let Poll::Ready(Err(err)) = Pin::new(&mut async_reader).poll_read(&mut cx, &mut read_buf) else {
+            panic!("AsyncRead empty chunk limit failure should remain sticky");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let make_pending_reader = || {
+            let mut empty_chunks = 0;
+            let mut returned_pending = false;
+            let items = stream::poll_fn(move |cx| {
+                if empty_chunks < MAX_CONSECUTIVE_EMPTY_CHUNKS - 1 {
+                    empty_chunks += 1;
+                    return Poll::Ready(Some(Ok(Bytes::new())));
+                }
+                if !returned_pending {
+                    returned_pending = true;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                if empty_chunks < MAX_CONSECUTIVE_EMPTY_CHUNKS {
+                    empty_chunks += 1;
+                    return Poll::Ready(Some(Ok(Bytes::new())));
+                }
+                Poll::Ready(None)
+            });
+            make_reader(Box::pin(items))
+        };
+
+        let mut chunk_reader = make_pending_reader();
+        assert!(Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 4).is_pending());
+        let Poll::Ready(Err(err)) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 4) else {
+            panic!("the consecutive empty chunk limit must survive Pending");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let items = (0..MAX_CONSECUTIVE_EMPTY_CHUNKS - 1)
+            .map(|_| Ok(Bytes::new()))
+            .chain(std::iter::once(Ok(Bytes::from_static(b"one"))))
+            .chain((0..MAX_CONSECUTIVE_EMPTY_CHUNKS - 1).map(|_| Ok(Bytes::new())))
+            .chain(std::iter::once(Ok(Bytes::from_static(b"two"))));
+        let mut chunk_reader = make_reader(Box::pin(stream::iter(items)));
+        let Poll::Ready(Ok(Some(first))) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 3) else {
+            panic!("data should reset the consecutive empty chunk count");
+        };
+        assert_eq!(first, b"one"[..]);
+        let Poll::Ready(Ok(Some(second))) = Pin::new(&mut chunk_reader).poll_read_chunk(&mut cx, 3) else {
+            panic!("empty chunks after data should start a new sequence");
+        };
+        assert_eq!(second, b"two"[..]);
+    }
+
+    #[tokio::test]
+    async fn http_reader_records_walk_dir_recv_bytes() {
+        let state = TestState::default();
+        let Some((base_url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
+        let metrics = global_internode_metrics();
+        let before = metrics.snapshot().recv_bytes_total;
+        let url = base_url.replace("/stream", WALK_DIR_PATH);
+
+        let mut reader = HttpReader::new(url, Method::GET, HeaderMap::new(), None)
+            .await
+            .expect("walk_dir reader should open");
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.expect("walk_dir body should read to EOF");
+        let after = metrics.snapshot().recv_bytes_total;
+
+        assert_eq!(buf, b"hello");
+        assert_eq!(state.get_count.load(Ordering::SeqCst), 1);
+        assert!(
+            after >= before.saturating_add(5),
+            "walk_dir HttpReader should record streamed bytes as internode recv bytes: before={before}, after={after}"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn http_reader_stall_timeout_triggers_after_progress_stops() {
         let state = TestState::default();
-        let (base_url, handle) = start_test_server(state.clone()).await;
+        let Some((base_url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
         let url = base_url.replace("/stream", "/stall");
 
         let mut reader =
@@ -1092,14 +2992,772 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let stalled = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<BodyStalled>())
+            .expect("stall timeout should retain typed body-stalled source");
+        assert_eq!(stalled.timeout, Duration::from_millis(20));
 
+        handle.abort();
+    }
+
+    /// A peer that accepts the connection and then never sends response headers.
+    /// This is the restarted-pod case: the pooled TCP connection stays open, so
+    /// connect timeout does not fire, and the body stall timer has not started
+    /// because `send()` has not returned. The open itself must fail as
+    /// `BodyStalled` inside the stall budget.
+    #[tokio::test]
+    async fn http_reader_header_stall_fails_open_within_stall_budget() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
+        let app = Router::new().route(
+            "/hang-headers",
+            axum::routing::get(|| async {
+                std::future::pending::<()>().await;
+                StatusCode::OK
+            }),
+        );
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/hang-headers");
+        let stall = Duration::from_millis(50);
+        let opened = tokio::time::timeout(
+            Duration::from_secs(2),
+            HttpReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, Some(stall)),
+        )
+        .await
+        .expect("header stall must fail the open instead of hanging until the test deadline");
+        let err = match opened {
+            Ok(_reader) => panic!("a peer that never sends headers must fail the reader open"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let stalled = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<BodyStalled>())
+            .expect("header stall should retain the typed body-stalled source");
+        assert_eq!(stalled.timeout, stall);
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_chunk_reader_stall_timeout_retains_typed_source() {
+        let state = TestState::default();
+        let Some((base_url, handle)) = start_test_server(state).await else {
+            return;
+        };
+        let url = base_url.replace("/stream", "/stall");
+        let mut reader =
+            HttpChunkReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, Some(Duration::from_millis(20)))
+                .await
+                .expect("chunk reader should open");
+
+        let first = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 64))
+            .await
+            .expect("initial body chunk should arrive")
+            .expect("initial body chunk should not be EOF");
+        assert_eq!(first, b"hello"[..]);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 64)),
+        )
+        .await
+        .expect("stall timeout should wake chunk reader")
+        .expect_err("chunk reader should return a timeout error");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let stalled = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<BodyStalled>())
+            .expect("chunk stall timeout should retain typed body-stalled source");
+        assert_eq!(stalled.timeout, Duration::from_millis(20));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_reader_stall_timeout_starts_when_read_is_polled() {
+        let state = TestState::default();
+        let Some((base_url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
+        let url = base_url.replace("/stream", "/delayed-first");
+
+        let mut reader =
+            HttpReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, Some(Duration::from_millis(30)))
+                .await
+                .expect("reader should be created before the body is ready");
+
+        time::sleep(Duration::from_millis(60)).await;
+
+        let delayed_body = state.delayed_body.clone();
+        let read_result = tokio::time::timeout(Duration::from_secs(1), async move {
+            let mut first = [0u8; 5];
+            let read = tokio::spawn(async move {
+                reader.read_exact(&mut first).await?;
+                Ok::<_, io::Error>(first)
+            });
+            time::sleep(Duration::from_millis(5)).await;
+            delayed_body.notify_waiters();
+            read.await.expect("read task should not panic")
+        })
+        .await
+        .expect("delayed body should arrive before the active stall timeout")
+        .expect("reader should not time out before its first active poll");
+
+        assert_eq!(&read_result, b"hello");
+
+        handle.abort();
+    }
+
+    fn paused_http_writer() -> (HttpWriter, tokio::sync::mpsc::Receiver<Option<Bytes>>) {
+        paused_http_writer_with_memory(None).expect("unrestricted writer")
+    }
+
+    fn paused_http_writer_with_memory(
+        memory_reserver: Option<HttpWriterMemoryReserver>,
+    ) -> io::Result<(HttpWriter, tokio::sync::mpsc::Receiver<Option<Bytes>>)> {
+        let pending_reservation = memory_reserver
+            .as_ref()
+            .map(|reserve| reserve(HTTP_WRITER_BUFFER_SIZE))
+            .transpose()?
+            .map(Arc::new);
+        let (sender, receiver) = tokio::sync::mpsc::channel(HTTP_WRITER_CHANNEL_CAPACITY);
+        let (_, err_rx) = tokio::sync::oneshot::channel();
+        let writer = HttpWriter {
+            url: "http://127.0.0.1/paused".to_string(),
+            method: Method::PUT,
+            headers: HeaderMap::new(),
+            err_rx,
+            start_tx: None,
+            sender: PollSender::new(sender),
+            handle: tokio::spawn(std::future::pending()),
+            pending_chunk: BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE),
+            pending_reservation,
+            memory_reserver,
+            finish: false,
+            track_internode_metrics: false,
+            internode_operation: None,
+        };
+        Ok((writer, receiver))
+    }
+
+    struct HttpWriterTestMemory {
+        limit: AtomicUsize,
+        used: AtomicUsize,
+        calls: AtomicUsize,
+    }
+
+    struct HttpWriterTestReservation {
+        memory: Arc<HttpWriterTestMemory>,
+        capacity: usize,
+    }
+
+    impl Drop for HttpWriterTestReservation {
+        fn drop(&mut self) {
+            self.memory.used.fetch_sub(self.capacity, Ordering::SeqCst);
+        }
+    }
+
+    impl HttpWriterTestMemory {
+        fn new(limit: usize) -> Arc<Self> {
+            Arc::new(Self {
+                limit: AtomicUsize::new(limit),
+                used: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn reserver(self: &Arc<Self>) -> HttpWriterMemoryReserver {
+            let memory = self.clone();
+            Arc::new(move |capacity| {
+                assert_eq!(capacity, HTTP_WRITER_BUFFER_SIZE, "reserve full allocation capacity");
+                memory.calls.fetch_add(1, Ordering::SeqCst);
+                memory
+                    .used
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                        used.checked_add(capacity)
+                            .filter(|next| *next <= memory.limit.load(Ordering::SeqCst))
+                    })
+                    .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+                Ok(Box::new(HttpWriterTestReservation {
+                    memory: memory.clone(),
+                    capacity,
+                }) as HttpWriterMemoryReservation)
+            })
+        }
+
+        fn used(&self) -> usize {
+            self.used.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn http_writer_memory_denial_precedes_runtime_or_allocation() {
+        use std::future::Future;
+
+        for limit in [0, HTTP_WRITER_BUFFER_SIZE - 1] {
+            let memory = HttpWriterTestMemory::new(limit);
+            let mut create = Box::pin(HttpWriter::new_with_memory_reserver(
+                "http://127.0.0.1/unpolled".to_owned(),
+                Method::PUT,
+                HeaderMap::new(),
+                memory.reserver(),
+            ));
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            // Spawning before admission would panic without a Tokio runtime.
+            assert!(
+                matches!(create.as_mut().poll(&mut cx), Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+            assert_eq!(memory.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_tracks_pending_and_last_output_slice() {
+        let memory = HttpWriterTestMemory::new(2 * HTTP_WRITER_BUFFER_SIZE);
+        let (mut writer, mut receiver) = paused_http_writer_with_memory(Some(memory.reserver())).expect("reserved writer");
+        assert_eq!(writer.pending_chunk.capacity(), HTTP_WRITER_BUFFER_SIZE);
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        memory.limit.store(0, Ordering::SeqCst);
+        writer.write_all(b"first").await.expect("pending payload");
+        writer.flush().await.expect("emit partial allocation");
+        assert_eq!(writer.pending_chunk.capacity(), HTTP_WRITER_BUFFER_SIZE - 5);
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE, "the empty tail still owns this allocation");
+        let frame = receiver.recv().await.expect("queued frame").expect("payload");
+        let clone = frame.clone();
+        let last = frame.slice(4..);
+        memory.limit.store(2 * HTTP_WRITER_BUFFER_SIZE, Ordering::SeqCst);
+        writer
+            .write_all(b"next")
+            .await
+            .expect("reuse the allocation's remaining tail");
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        drop(frame);
+        drop(clone);
+        drop(writer);
+        assert_eq!(last.as_ref(), b"t");
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        drop(last);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_shrink_rejects_new_scalar_and_vectored_storage() {
+        for mode in ["scalar", "fast", "vectored"] {
+            let memory = HttpWriterTestMemory::new(2 * HTTP_WRITER_BUFFER_SIZE);
+            let (mut writer, mut receiver) = paused_http_writer_with_memory(Some(memory.reserver())).expect("reserved writer");
+            writer
+                .write_all(&vec![0x5a; HTTP_WRITER_BUFFER_SIZE])
+                .await
+                .expect("fill the first allocation");
+            writer
+                .flush()
+                .await
+                .expect("first allocation transferred without a remaining tail");
+            let retained = receiver.recv().await.expect("first frame").expect("payload");
+            memory.limit.store(0, Ordering::SeqCst);
+            let error = match mode {
+                "vectored" => writer.write_vectored(&[IoSlice::new(b"lost"), IoSlice::new(b"bytes")]).await,
+                "fast" => writer.write(&vec![0xff; HTTP_WRITER_BUFFER_SIZE]).await,
+                _ => writer.write(b"lost bytes").await,
+            }
+            .expect_err("new storage must be rejected after shrink");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(writer.pending_chunk.capacity(), 0);
+            assert!(receiver.try_recv().is_err(), "rejected bytes must not be queued");
+            assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+            let calls = memory.calls.load(Ordering::SeqCst);
+            assert_eq!(writer.write(&[]).await.expect("empty write"), 0);
+            assert_eq!(memory.calls.load(Ordering::SeqCst), calls);
+            memory.limit.store(2 * HTTP_WRITER_BUFFER_SIZE, Ordering::SeqCst);
+            writer.write_all(b"accepted").await.expect("restored capacity");
+            writer.flush().await.expect("emit accepted bytes");
+            let accepted = receiver.recv().await.expect("accepted frame").expect("payload");
+            assert_eq!(accepted.as_ref(), b"accepted");
+            drop(writer);
+            drop(retained);
+            drop(accepted);
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_full_queue_keeps_backpressure_and_capacity() {
+        for vectored in [false, true] {
+            let memory = HttpWriterTestMemory::new((HTTP_WRITER_CHANNEL_CAPACITY + 1) * HTTP_WRITER_BUFFER_SIZE);
+            let (mut writer, mut receiver) = paused_http_writer_with_memory(Some(memory.reserver())).expect("reserved writer");
+            let payload = vec![0xa5; HTTP_WRITER_BUFFER_SIZE];
+            for _ in 0..HTTP_WRITER_CHANNEL_CAPACITY {
+                let written = if vectored {
+                    writer
+                        .write_vectored(&[IoSlice::new(&payload[..32]), IoSlice::new(&payload[32..])])
+                        .await
+                } else {
+                    writer.write(&payload).await
+                }
+                .expect("free queue slot");
+                assert_eq!(written, HTTP_WRITER_BUFFER_SIZE);
+                writer.flush().await.expect("queue the complete allocation");
+            }
+            assert_eq!(memory.used(), HTTP_WRITER_CHANNEL_CAPACITY * HTTP_WRITER_BUFFER_SIZE);
+            assert_eq!(writer.pending_chunk.capacity(), 0);
+            if vectored {
+                let written = writer
+                    .write_vectored(&[IoSlice::new(&payload[..32]), IoSlice::new(&payload[32..])])
+                    .await
+                    .expect("one bounded pending allocation beside the full queue");
+                assert_eq!(written, HTTP_WRITER_BUFFER_SIZE);
+                assert_eq!(memory.used(), (HTTP_WRITER_CHANNEL_CAPACITY + 1) * HTTP_WRITER_BUFFER_SIZE);
+            }
+            let calls = memory.calls.load(Ordering::SeqCst);
+            {
+                let write = writer.write(&payload);
+                tokio::pin!(write);
+                assert!(
+                    futures::poll!(&mut write).is_pending(),
+                    "a full queue must not accept another large write"
+                );
+            }
+            assert_eq!(
+                memory.calls.load(Ordering::SeqCst),
+                calls,
+                "backpressure must not allocate a fast-path copy"
+            );
+            if !vectored {
+                drop(receiver.recv().await.expect("free a queue slot"));
+                assert_eq!(writer.write(&payload).await.expect("resumed write"), HTTP_WRITER_BUFFER_SIZE);
+            }
+            drop(writer);
+            assert_eq!(memory.used(), HTTP_WRITER_CHANNEL_CAPACITY * HTTP_WRITER_BUFFER_SIZE);
+            while let Ok(frame) = receiver.try_recv() {
+                let frame = frame.expect("payload");
+                assert_eq!(frame.as_ref(), payload.as_slice());
+            }
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[test]
+    fn http_writer_memory_cancellation_and_runtime_shutdown_release_queued_storage() {
+        for cancel_writer in [false, true] {
+            let memory = HttpWriterTestMemory::new(2 * HTTP_WRITER_BUFFER_SIZE);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("writer runtime");
+            let writer = runtime.block_on(async {
+                let (mut writer, receiver) = paused_http_writer_with_memory(Some(memory.reserver())).expect("reserved writer");
+                writer.handle.abort();
+                writer.handle = tokio::spawn(async move {
+                    std::future::pending::<()>().await;
+                    drop(receiver);
+                    Ok(())
+                });
+                writer.write_all(b"queued").await.expect("pending bytes");
+                writer.flush().await.expect("queued allocation");
+                writer
+            });
+            assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+            if cancel_writer {
+                drop(writer);
+                runtime.block_on(tokio::task::yield_now());
+                assert_eq!(memory.used(), 0, "cancelled task must release its queue");
+                drop(runtime);
+            } else {
+                drop(runtime);
+                assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE, "the writer still owns the shared tail");
+                drop(writer);
+                assert_eq!(memory.used(), 0, "the final pending owner releases its allocation");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_short_flushes_share_the_pending_allocation() {
+        let memory = HttpWriterTestMemory::new(2 * HTTP_WRITER_BUFFER_SIZE);
+        let (mut writer, mut receiver) =
+            paused_http_writer_with_memory(Some(memory.reserver())).expect("reserve the shared short-frame allocation");
+        let base = writer.pending_chunk.as_ptr();
+        for index in 0..16 {
+            writer
+                .write_all(&[0x37; 4096])
+                .await
+                .expect("write a short frame into the existing tail");
+            writer
+                .flush()
+                .await
+                .expect("flush a short frame without replacing its allocation");
+            let frame = receiver
+                .recv()
+                .await
+                .expect("receive the short frame")
+                .expect("short frame payload");
+            assert_eq!(frame.as_ptr(), base.wrapping_add(index * 4096), "split the original payload allocation");
+            assert_eq!(frame.as_ref(), &[0x37; 4096]);
+            drop(frame);
+            assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE, "the pending tail remains a real owner");
+        }
+        assert_eq!(memory.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(writer.pending_chunk.capacity(), HTTP_WRITER_BUFFER_SIZE - 16 * 4096);
+        drop(writer);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_consumed_full_frames_reclaim_without_a_new_reservation() {
+        let memory = HttpWriterTestMemory::new(HTTP_WRITER_BUFFER_SIZE);
+        let (mut writer, mut receiver) =
+            paused_http_writer_with_memory(Some(memory.reserver())).expect("reserve the reclaimable allocation");
+        let base = writer.pending_chunk.as_ptr();
+        let payload = vec![0x37; HTTP_WRITER_BUFFER_SIZE];
+        memory.limit.store(0, Ordering::SeqCst);
+        for _ in 0..16 {
+            assert_eq!(
+                writer
+                    .write(&payload)
+                    .await
+                    .expect("reuse charged storage after the cap closes"),
+                payload.len()
+            );
+            writer.flush().await.expect("flush a complete reusable allocation");
+            let frame = receiver
+                .recv()
+                .await
+                .expect("receive the complete frame")
+                .expect("complete frame payload");
+            assert_eq!(frame.as_ptr(), base, "try_reclaim must reuse the allocation in place");
+            assert_eq!(frame.as_ref(), payload.as_slice());
+            drop(frame);
+            assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        }
+        assert_eq!(memory.calls.load(Ordering::SeqCst), 1, "reusing old storage is allowed after shrink");
+        drop(writer);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_last_slice_prevents_reclaim_and_keeps_both_allocations_charged() {
+        let memory = HttpWriterTestMemory::new(2 * HTTP_WRITER_BUFFER_SIZE);
+        let (mut writer, mut receiver) =
+            paused_http_writer_with_memory(Some(memory.reserver())).expect("reserve the first retained allocation");
+        writer
+            .write_all(&vec![0x5a; HTTP_WRITER_BUFFER_SIZE])
+            .await
+            .expect("queue the complete first allocation");
+        let first = receiver
+            .recv()
+            .await
+            .expect("receive the retained first frame")
+            .expect("first frame payload");
+        let last = first.slice(0..1);
+        drop(first);
+        memory.limit.store(0, Ordering::SeqCst);
+        let error = writer
+            .write(b"n")
+            .await
+            .expect_err("a live slice prevents reclaim under the closed cap");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(writer.pending_chunk.capacity(), 0);
+        assert!(writer.pending_reservation.is_none(), "failed reclaim drops the empty view and its guard");
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        memory.limit.store(2 * HTTP_WRITER_BUFFER_SIZE, Ordering::SeqCst);
+        writer
+            .write_all(b"new")
+            .await
+            .expect("reserve a separate allocation beside the live slice");
+        writer.flush().await.expect("queue bytes from the second allocation");
+        let second = receiver
+            .recv()
+            .await
+            .expect("receive the second frame")
+            .expect("second frame payload");
+        assert_ne!(second.as_ptr(), last.as_ptr(), "a live slice prevents storage reuse");
+        assert_eq!(memory.used(), 2 * HTTP_WRITER_BUFFER_SIZE);
+        drop(last);
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        drop(second);
+        assert_eq!(
+            memory.used(),
+            HTTP_WRITER_BUFFER_SIZE,
+            "new pending tail still owns the second allocation"
+        );
+        drop(writer);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_half_full_tail_bounds_scalar_fast_and_vectored_writes() {
+        for mode in ["scalar", "fast", "vectored"] {
+            let memory = HttpWriterTestMemory::new(2 * HTTP_WRITER_BUFFER_SIZE);
+            let (mut writer, mut receiver) =
+                paused_http_writer_with_memory(Some(memory.reserver())).expect("reserve the half-filled allocation");
+            let prefix = vec![0x11; HTTP_WRITER_BUFFER_SIZE / 2];
+            writer.write_all(&prefix).await.expect("fill half of the original allocation");
+            writer.flush().await.expect("split off the first half and retain the tail");
+            let first = receiver
+                .recv()
+                .await
+                .expect("receive the first half")
+                .expect("first half payload");
+            assert_eq!(writer.pending_chunk.capacity(), HTTP_WRITER_BUFFER_SIZE / 2);
+            memory.limit.store(0, Ordering::SeqCst);
+            let payload = vec![0x5a; HTTP_WRITER_BUFFER_SIZE];
+            let written = match mode {
+                "fast" => writer.write(&payload).await,
+                "vectored" => {
+                    writer
+                        .write_vectored(&[IoSlice::new(&payload[..32]), IoSlice::new(&payload[32..])])
+                        .await
+                }
+                _ => writer.write(&payload[..payload.len() - 1]).await,
+            }
+            .expect("the half-capacity tail remains usable after the budget shrinks");
+            assert_eq!(written, HTTP_WRITER_BUFFER_SIZE / 2, "bound {mode} writes by actual tail capacity");
+            writer
+                .flush()
+                .await
+                .expect("flush the full remaining half without growing storage");
+            let tail = receiver
+                .recv()
+                .await
+                .expect("receive the remaining half")
+                .expect("tail payload");
+            assert_eq!(tail.as_ref(), &payload[..written]);
+            assert_eq!(tail.as_ptr(), first.as_ptr().wrapping_add(prefix.len()));
+            assert_eq!(memory.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+            let error = writer
+                .write(b"new storage")
+                .await
+                .expect_err("exhausted shared storage needs a new reservation");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert!(receiver.try_recv().is_err(), "rejected bytes must not be queued");
+            drop(writer);
+            drop(first);
+            assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+            drop(tail);
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_short_queue_keeps_backpressure_and_one_allocation() {
+        let memory = HttpWriterTestMemory::new(HTTP_WRITER_BUFFER_SIZE);
+        let (mut writer, mut receiver) =
+            paused_http_writer_with_memory(Some(memory.reserver())).expect("reserve the shared queued allocation");
+        for _ in 0..HTTP_WRITER_CHANNEL_CAPACITY {
+            writer.write_all(&[0x37; 4096]).await.expect("write one short queued frame");
+            writer.flush().await.expect("occupy one available queue slot");
+        }
+        assert_eq!(memory.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        let large = vec![0x37; HTTP_WRITER_BUFFER_SIZE];
+        {
+            let blocked = writer.write(&large);
+            tokio::pin!(blocked);
+            assert!(futures::poll!(&mut blocked).is_pending());
+        }
+        assert_eq!(memory.calls.load(Ordering::SeqCst), 1, "full queue cannot allocate a fast path");
+        writer
+            .write_all(b"pending")
+            .await
+            .expect("the charged tail accepts one pending short write");
+        {
+            let blocked = writer.flush();
+            tokio::pin!(blocked);
+            assert!(futures::poll!(&mut blocked).is_pending());
+        }
+        drop(writer);
+        for remaining in (0..HTTP_WRITER_CHANNEL_CAPACITY).rev() {
+            let frame = receiver
+                .recv()
+                .await
+                .expect("drain a queued short frame")
+                .expect("queued short payload");
+            assert_eq!(frame.as_ref(), &[0x37; 4096]);
+            drop(frame);
+            assert_eq!(memory.used(), if remaining == 0 { 0 } else { HTTP_WRITER_BUFFER_SIZE });
+        }
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_clean_shutdown_releases_only_its_unused_tail() {
+        let memory = HttpWriterTestMemory::new(HTTP_WRITER_BUFFER_SIZE);
+        let (mut writer, mut receiver) =
+            paused_http_writer_with_memory(Some(memory.reserver())).expect("reserve the shutdown body allocation");
+        writer.handle.abort();
+        writer.handle = tokio::spawn(async { Ok(()) });
+        writer.write_all(b"body").await.expect("buffer the final body bytes");
+        writer
+            .shutdown()
+            .await
+            .expect("send the body and EOF, then join the completed request");
+        assert_eq!(writer.pending_chunk.capacity(), 0);
+        assert!(writer.pending_reservation.is_none());
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE, "queued body still owns this allocation");
+        let frame = receiver
+            .recv()
+            .await
+            .expect("receive the final body frame")
+            .expect("final body payload");
+        let last = frame.slice(1..2);
+        drop(frame);
+        assert!(receiver.recv().await.expect("receive the queued EOF").is_none());
+        drop(writer);
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        drop(last);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_round_trip_preserves_vectored_body_and_shutdown() {
+        let state = TestState::default();
+        let (url, handle) = start_test_server(state.clone()).await.expect("memory writer test server");
+        let memory = HttpWriterTestMemory::new((HTTP_WRITER_CHANNEL_CAPACITY + 1) * HTTP_WRITER_BUFFER_SIZE);
+        let header = [0x11; 32];
+        let payload = vec![0xa5; 3 * HTTP_WRITER_BUFFER_SIZE + 17];
+        let mut writer = HttpWriter::new_with_memory_reserver(url, Method::PUT, HeaderMap::new(), memory.reserver())
+            .await
+            .expect("reserved HTTP writer");
+        let mut slices = [IoSlice::new(&[]), IoSlice::new(&header), IoSlice::new(&payload)];
+        let mut remaining = slices.as_mut_slice();
+        while remaining.iter().any(|slice| !slice.is_empty()) {
+            let written = writer.write_vectored(remaining).await.expect("reserved vectored write");
+            assert!(written > 0 && written <= HTTP_WRITER_BUFFER_SIZE);
+            IoSlice::advance_slices(&mut remaining, written);
+        }
+        writer.flush().await.expect("flush final reserved allocation");
+        writer.shutdown().await.expect("complete reserved HTTP request");
+        let bodies = state.put_bodies.lock().await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(&bodies[0][..header.len()], &header);
+        assert_eq!(&bodies[0][header.len()..], payload.as_slice());
+        assert_eq!(memory.used(), 0, "completed transport retains no payload reservation");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_writer_bounds_large_writes_under_backpressure() {
+        let payload = vec![0xa5; 3 * HTTP_WRITER_BUFFER_SIZE + 17];
+        for vectored in [false, true] {
+            let (mut writer, mut receiver) = paused_http_writer();
+            for _ in 0..HTTP_WRITER_CHANNEL_CAPACITY {
+                let written = std::future::poll_fn(|cx| {
+                    if vectored {
+                        Pin::new(&mut writer).poll_write_vectored(cx, &[IoSlice::new(&payload)])
+                    } else {
+                        Pin::new(&mut writer).poll_write(cx, &payload)
+                    }
+                })
+                .await
+                .expect("a free queue slot should accept one bounded chunk");
+                assert_eq!(written, HTTP_WRITER_BUFFER_SIZE, "large writes must be partial");
+            }
+            {
+                let write = std::future::poll_fn(|cx| {
+                    if vectored {
+                        Pin::new(&mut writer).poll_write_vectored(cx, &[IoSlice::new(&payload)])
+                    } else {
+                        Pin::new(&mut writer).poll_write(cx, &payload)
+                    }
+                });
+                tokio::pin!(write);
+                assert!(futures::poll!(&mut write).is_pending(), "a stalled receiver must exert backpressure");
+                let chunk = receiver.recv().await.expect("queued body chunk").expect("body, not EOF");
+                assert_eq!(chunk.as_ref(), &payload[..HTTP_WRITER_BUFFER_SIZE]);
+                let written = tokio::time::timeout(Duration::from_secs(1), write)
+                    .await
+                    .expect("draining a queue slot should wake the blocked writer")
+                    .expect("resumed write should succeed");
+                assert_eq!(written, HTTP_WRITER_BUFFER_SIZE);
+            }
+            assert!(writer.pending_chunk.len() <= HTTP_WRITER_BUFFER_SIZE);
+            for _ in 0..HTTP_WRITER_CHANNEL_CAPACITY {
+                let chunk = receiver.try_recv().expect("queued body chunk").expect("body, not EOF");
+                assert_eq!(chunk.as_ref(), &payload[..HTTP_WRITER_BUFFER_SIZE]);
+            }
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn http_writer_bounds_mixed_writes_and_preserves_bytes() {
+        let header = [0x11; 32];
+        let payload = vec![0xa5; 3 * HTTP_WRITER_BUFFER_SIZE + 17];
+        for vectored in [false, true] {
+            let (mut writer, mut receiver) = paused_http_writer();
+            writer.write_all(&header).await.expect("small prefix should be buffered");
+            let mut remaining = payload.as_slice();
+            while !remaining.is_empty() {
+                let written = if vectored {
+                    writer
+                        .write_vectored(&[IoSlice::new(&[]), IoSlice::new(remaining), IoSlice::new(&[])])
+                        .await
+                } else {
+                    writer.write(remaining).await
+                }
+                .expect("payload write should succeed");
+                assert!(written > 0 && written <= HTTP_WRITER_BUFFER_SIZE);
+                assert!(writer.pending_chunk.len() <= HTTP_WRITER_BUFFER_SIZE, "pending bytes must stay bounded");
+                remaining = &remaining[written..];
+            }
+            writer.flush().await.expect("remaining prefix should flush");
+            let mut actual = Vec::new();
+            while let Ok(chunk) = receiver.try_recv() {
+                let chunk = chunk.expect("body, not EOF");
+                assert!(chunk.len() <= HTTP_WRITER_BUFFER_SIZE, "queued bytes must stay bounded");
+                actual.extend_from_slice(&chunk);
+            }
+            assert_eq!(&actual[..header.len()], &header);
+            assert_eq!(&actual[header.len()..], payload.as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn http_writer_large_vectored_body_preserves_hash_and_payload() {
+        let state = TestState::default();
+        let (url, handle) = start_test_server(state.clone()).await.expect("test server should bind");
+        let header = [0x11; 32];
+        let payload: Vec<_> = (0..3 * HTTP_WRITER_BUFFER_SIZE + 17).map(|i| (i % 251) as u8).collect();
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new())
+            .await
+            .expect("HTTP writer should open");
+        let mut slices = [
+            IoSlice::new(&[]),
+            IoSlice::new(&header),
+            IoSlice::new(&payload),
+            IoSlice::new(&[]),
+        ];
+        let mut remaining = slices.as_mut_slice();
+        while remaining.iter().any(|slice| !slice.is_empty()) {
+            let written = writer.write_vectored(remaining).await.expect("body write should succeed");
+            assert!(written > 0 && written <= HTTP_WRITER_BUFFER_SIZE);
+            IoSlice::advance_slices(&mut remaining, written);
+        }
+        writer.shutdown().await.expect("request should finish");
+        let bodies = state.put_bodies.lock().await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(&bodies[0][..header.len()], &header);
+        assert_eq!(&bodies[0][header.len()..], payload.as_slice());
         handle.abort();
     }
 
     #[tokio::test]
     async fn http_writer_does_not_send_empty_preflight_put() {
         let state = TestState::default();
-        let (url, handle) = start_test_server(state.clone()).await;
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
 
         let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
         writer.write_all(b"payload").await.unwrap();
@@ -1112,9 +3770,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_writer_drop_before_first_write_does_not_send_put() {
+        let state = TestState::default();
+        let Some((url, server_handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
+
+        let writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        // Dropping an unstarted writer aborts its parked background task
+        // (rustfs/backlog#1319) before it can ever send a PUT.
+        drop(writer);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 0);
+        assert!(state.put_bodies.lock().await.is_empty());
+
+        server_handle.abort();
+    }
+
+    /// A PUT handler that registers the request, then parks forever without ever
+    /// sending a response — modeling a black-hole peer that accepts the
+    /// connection but never completes the request, so the writer's background
+    /// task stays parked at `request.send().await` until it is aborted.
+    async fn hanging_put(State(state): State<TestState>, _body: Body) -> impl IntoResponse {
+        state.put_count.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        StatusCode::OK
+    }
+
+    // rustfs/backlog#1319: when a stalled remote writer is dropped (the encode
+    // path drops it to fail its shard), the background HTTP task must be aborted
+    // so it stops holding the connection and buffered body — it must not linger.
+    #[tokio::test]
+    async fn http_writer_drop_aborts_background_request_to_hanging_peer() {
+        let state = TestState::default();
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
+        let app = Router::new()
+            .route("/hang", axum::routing::put(hanging_put))
+            .with_state(state.clone());
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/hang");
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        // A >1MiB write starts the request and hands the body to the background
+        // task, which then parks in the handler that never responds.
+        writer.write_all(&vec![0xa5u8; HTTP_WRITER_BUFFER_SIZE + 1]).await.unwrap();
+        // Let the server register the request, so the background task is parked
+        // (alive) at send() before we drop the writer.
+        for _ in 0..100 {
+            if state.put_count.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 1, "server should have accepted the request");
+
+        // Observe the background task via its abort handle; it must still be
+        // running before the drop, then be aborted (finished) after it.
+        let task = writer.handle.abort_handle();
+        assert!(!task.is_finished(), "background task should still be running before drop");
+
+        drop(writer);
+
+        let mut aborted = false;
+        for _ in 0..500 {
+            if task.is_finished() {
+                aborted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(aborted, "dropping the writer must abort the background HTTP task");
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_writer_shutdown_without_write_sends_empty_put() {
+        let state = TestState::default();
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
+
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_bodies.lock().await.as_slice(), &[Vec::<u8>::new()]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn http_writer_handles_many_small_writes() {
         let state = TestState::default();
-        let (url, handle) = start_test_server(state.clone()).await;
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
 
         let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
         let chunk = b"0123456789abcdef";
@@ -1134,7 +3893,9 @@ mod tests {
     #[tokio::test]
     async fn http_writer_supports_vectored_writes() {
         let state = TestState::default();
-        let (url, handle) = start_test_server(state.clone()).await;
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
 
         let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
         let bufs = [IoSlice::new(b"hello "), IoSlice::new(b"world")];
@@ -1149,9 +3910,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_writer_shutdown_reports_http_status_error() {
+        let state = TestState::default();
+        let Some((base_url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
+        let url = base_url.replace("/stream", "/reject-put");
+
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        writer.write_all(b"payload").await.unwrap();
+        let err = writer
+            .shutdown()
+            .await
+            .expect_err("shutdown should report the HTTP response failure");
+
+        let source = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("expected shutdown error to carry InternodeHttpError source");
+        assert_eq!(
+            source.kind(),
+            InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert_eq!(source.context().method(), "PUT");
+        assert!(source.context().target().contains("/reject-put"));
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_bodies.lock().await.as_slice(), &[b"payload".to_vec()]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn http_reader_request_error_includes_method_and_url() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
         drop(listener);
 
         let url = format!("http://{addr}/stream");
@@ -1168,6 +3964,65 @@ mod tests {
         assert!(source.context().target().contains("/stream"));
     }
 
+    #[tokio::test]
+    async fn http_reader_surfaces_body_error_after_partial_data() {
+        let state = TestState::default();
+        let Some((base_url, handle)) = start_test_server(state).await else {
+            return;
+        };
+        let url = base_url.replace("/stream", "/fail-after-partial");
+        let mut reader = HttpReader::new(url, Method::GET, HeaderMap::new(), None)
+            .await
+            .expect("reader should accept the successful response headers");
+        let mut partial = [0_u8; 7];
+
+        reader
+            .read_exact(&mut partial)
+            .await
+            .expect("partial response bytes should arrive before the terminal error");
+        let err = reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("terminal body errors must not become clean EOF");
+
+        assert_eq!(&partial, b"partial");
+        let source = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("body error should retain internode classification");
+        assert_eq!(source.kind(), InternodeHttpErrorKind::BodyStreamAborted);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_chunk_reader_surfaces_body_error_after_partial_data() {
+        let state = TestState::default();
+        let Some((base_url, handle)) = start_test_server(state).await else {
+            return;
+        };
+        let url = base_url.replace("/stream", "/fail-after-partial");
+        let mut reader = HttpChunkReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, None)
+            .await
+            .expect("chunk reader should accept the successful response headers");
+        let chunk = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 64))
+            .await
+            .expect("partial response bytes should arrive before the terminal error")
+            .expect("partial response should not be EOF");
+        let err = std::future::poll_fn(|cx| Pin::new(&mut reader).poll_read_chunk(cx, 64))
+            .await
+            .expect_err("terminal body errors must not become clean EOF");
+
+        assert_eq!(chunk, b"partial"[..]);
+        let source = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("body error should retain internode classification");
+        assert_eq!(source.kind(), InternodeHttpErrorKind::BodyStreamAborted);
+
+        handle.abort();
+    }
+
     #[test]
     fn classify_http_status_marks_retryable_gateway_errors() {
         let unavailable = classify_http_status(reqwest::StatusCode::SERVICE_UNAVAILABLE);
@@ -1181,7 +4036,7 @@ mod tests {
 
     #[test]
     fn dns_resolution_error_uses_network_io_kind() {
-        let err = internode_classified_error(
+        let err = internode_kind_error(
             &Method::GET,
             "http://missing.invalid/rustfs/rpc/read_file_stream",
             Some(INTERNODE_OPERATION_READ_FILE_STREAM),
@@ -1211,7 +4066,36 @@ mod tests {
             InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE)
         );
         assert_eq!(source.context().method(), "PUT");
-        assert!(source.context().target().contains(PUT_FILE_STREAM_PATH));
+        assert_eq!(source.context().target(), PUT_FILE_STREAM_PATH);
+        assert!(!err.to_string().contains("disk-a"));
+    }
+
+    #[test]
+    fn internode_request_context_redacts_malformed_targets() {
+        let context =
+            internode_request_context(&Method::GET, "not a url?disk=/sensitive/path", Some(INTERNODE_OPERATION_READ_FILE_STREAM));
+
+        assert_eq!(context.target(), "<invalid-internode-url>");
+        assert!(!context.to_string().contains("sensitive"));
+    }
+
+    #[test]
+    fn internode_http_error_debug_redacts_source_details() {
+        let context = InternodeHttpRequestContext {
+            method: "GET".to_string(),
+            target: WALK_DIR_PATH.to_string(),
+            operation: Some(INTERNODE_OPERATION_WALK_DIR),
+        };
+        let error = InternodeHttpError::with_source(
+            InternodeHttpErrorKind::BodyStreamAborted,
+            context,
+            io::Error::other("http://node/rustfs/rpc/walk_dir?disk=/sensitive/path&token=private"),
+        );
+        let debug = format!("{error:?}");
+
+        assert!(debug.contains("source_present: true"));
+        assert!(!debug.contains("sensitive"));
+        assert!(!debug.contains("private"));
     }
 
     #[test]
@@ -1229,6 +4113,42 @@ mod tests {
     }
 
     #[test]
+    fn cloned_internode_http_error_retains_classification_and_context() {
+        let original = internode_status_error(
+            &Method::GET,
+            "http://node:9000/rustfs/rpc/put_file_capability?put_file_capability=1",
+            Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        );
+        let cloned = clone_internode_http_io_error(&original).expect("internode error should clone");
+        let source = cloned
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("clone should retain internode source");
+
+        assert_eq!(
+            source.kind(),
+            InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert!(source.kind().is_retryable());
+        assert_eq!(source.context().method(), "GET");
+        assert_eq!(source.context().target(), PUT_FILE_CAPABILITY_PATH);
+        assert_eq!(source.context().operation(), Some(INTERNODE_OPERATION_PUT_FILE_CAPABILITY));
+    }
+
+    #[test]
+    fn cloned_internode_http_error_retains_remote_disk_marker() {
+        let original = new_test_remote_file_not_found_http_io_error();
+        let cloned = clone_internode_http_io_error(&original).expect("internode error should clone");
+        let source = cloned
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("clone should retain internode source");
+
+        assert!(source.is_remote_file_not_found());
+    }
+
+    #[test]
     fn loopback_urls_bypass_proxy_selection() {
         assert!(should_bypass_proxy_for_url("http://127.0.0.1:9000/stream"));
         assert!(should_bypass_proxy_for_url("http://localhost:9000/stream"));
@@ -1237,4 +4157,185 @@ mod tests {
         assert!(!should_bypass_proxy_for_url("http://example.com/stream"));
         assert!(!should_bypass_proxy_for_url("not-a-url"));
     }
+
+    #[test]
+    fn internode_http_tuning_profile_parses_known_values_and_falls_back_to_legacy() {
+        assert_eq!(parse_internode_http_tuning_profile(None), InternodeHttpTuningProfile::Legacy);
+        assert_eq!(
+            parse_internode_http_tuning_profile(Some("balanced")),
+            InternodeHttpTuningProfile::Balanced
+        );
+        assert_eq!(
+            parse_internode_http_tuning_profile(Some(" Throughput ")),
+            InternodeHttpTuningProfile::Throughput
+        );
+        assert_eq!(
+            parse_internode_http_tuning_profile(Some("aggressive")),
+            InternodeHttpTuningProfile::Legacy
+        );
+    }
+
+    #[test]
+    fn legacy_internode_http_tuning_keeps_existing_defaults() {
+        let tuning = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Legacy,
+            None,
+            None,
+            None,
+            None,
+            InternodeHttpTuningProfile::Legacy.default_http2_adaptive_window(),
+            None,
+        );
+
+        assert_eq!(tuning.pool_max_idle_per_host, None);
+        assert_eq!(tuning.pool_idle_timeout_secs, None);
+        assert_eq!(tuning.http2_initial_stream_window_size, None);
+        assert_eq!(tuning.http2_initial_connection_window_size, None);
+        assert!(!tuning.http2_adaptive_window);
+        assert_eq!(tuning.proxy_mode, InternodeHttpProxyMode::Legacy);
+    }
+
+    #[test]
+    fn balanced_and_throughput_profiles_apply_conservative_defaults() {
+        let balanced = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Balanced,
+            None,
+            None,
+            None,
+            None,
+            InternodeHttpTuningProfile::Balanced.default_http2_adaptive_window(),
+            None,
+        );
+        let throughput = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Throughput,
+            None,
+            None,
+            None,
+            None,
+            InternodeHttpTuningProfile::Throughput.default_http2_adaptive_window(),
+            None,
+        );
+
+        assert_eq!(balanced.pool_max_idle_per_host, Some(64));
+        assert_eq!(balanced.pool_idle_timeout_secs, Some(120));
+        assert_eq!(balanced.http2_initial_stream_window_size, Some(1024 * 1024));
+        assert_eq!(balanced.http2_initial_connection_window_size, Some(4 * 1024 * 1024));
+        assert!(!balanced.http2_adaptive_window);
+        assert_eq!(balanced.proxy_mode, InternodeHttpProxyMode::NoProxy);
+
+        assert_eq!(throughput.pool_max_idle_per_host, Some(256));
+        assert_eq!(throughput.pool_idle_timeout_secs, Some(300));
+        assert!(throughput.http2_adaptive_window);
+        assert_eq!(throughput.proxy_mode, InternodeHttpProxyMode::NoProxy);
+    }
+
+    #[test]
+    fn internode_http_tuning_overrides_are_clamped() {
+        let tuning = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Balanced,
+            Some(8),
+            Some(30),
+            Some(1),
+            Some(u64::MAX),
+            false,
+            Some("system"),
+        );
+
+        assert_eq!(tuning.pool_max_idle_per_host, Some(8));
+        assert_eq!(tuning.pool_idle_timeout_secs, Some(30));
+        assert_eq!(tuning.http2_initial_stream_window_size, Some(INTERNODE_HTTP2_WINDOW_MIN));
+        assert_eq!(tuning.http2_initial_connection_window_size, Some(INTERNODE_HTTP2_WINDOW_MAX));
+        assert_eq!(tuning.proxy_mode, InternodeHttpProxyMode::System);
+    }
+
+    #[test]
+    fn internode_http_proxy_policy_matches_profile_and_overrides() {
+        let legacy =
+            InternodeHttpClientTuning::from_values(InternodeHttpTuningProfile::Legacy, None, None, None, None, false, None);
+        let balanced =
+            InternodeHttpClientTuning::from_values(InternodeHttpTuningProfile::Balanced, None, None, None, None, false, None);
+        let system_proxy = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Throughput,
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some("system"),
+        );
+        let no_proxy = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Legacy,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("off"),
+        );
+
+        assert!(should_disable_proxy_for_url("http://127.0.0.1:9000/stream", legacy));
+        assert!(!should_disable_proxy_for_url("http://192.168.1.10:9000/stream", legacy));
+        assert!(should_disable_proxy_for_url("http://192.168.1.10:9000/stream", balanced));
+        assert!(!should_disable_proxy_for_url("http://127.0.0.1:9000/stream", system_proxy));
+        assert!(should_disable_proxy_for_url("http://example.com/stream", no_proxy));
+    }
+
+    // backlog#805-C3: warn once when configured HTTP/2 tuning is inert over
+    // plaintext internode (HTTP/1.1) transport.
+
+    #[test]
+    fn should_warn_h2_inert_truth_table() {
+        assert!(!should_warn_h2_inert(InternodeHttpProtocol::Http1, false, true, false));
+        // HTTP/1.1 + explicit tuning + not yet warned -> warn.
+        assert!(should_warn_h2_inert(InternodeHttpProtocol::Auto, false, true, false));
+        // Negotiated HTTP/2 -> tuning is actually active, never warn.
+        assert!(!should_warn_h2_inert(InternodeHttpProtocol::Auto, true, true, false));
+        // No explicit tuning -> nothing to warn about.
+        assert!(!should_warn_h2_inert(InternodeHttpProtocol::Auto, false, false, false));
+        // Already warned -> never warn again (Once semantics).
+        assert!(!should_warn_h2_inert(InternodeHttpProtocol::Auto, false, true, true));
+        // HTTP/2 and already warned combinations stay false too.
+        assert!(!should_warn_h2_inert(InternodeHttpProtocol::Auto, true, false, false));
+        assert!(!should_warn_h2_inert(InternodeHttpProtocol::Auto, true, true, true));
+    }
+
+    #[test]
+    fn h2_tuning_explicit_reflects_windows_and_profile() {
+        // Legacy profile with no explicit windows -> not explicit.
+        let legacy =
+            InternodeHttpClientTuning::from_values(InternodeHttpTuningProfile::Legacy, None, None, None, None, false, None);
+        assert!(!legacy.h2_tuning_explicit);
+
+        // Explicit stream window on the Legacy profile -> explicit.
+        let explicit_stream = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Legacy,
+            None,
+            None,
+            Some(1024 * 1024),
+            None,
+            false,
+            None,
+        );
+        assert!(explicit_stream.h2_tuning_explicit);
+
+        // Explicit connection window on the Legacy profile -> explicit.
+        let explicit_conn = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Legacy,
+            None,
+            None,
+            None,
+            Some(4 * 1024 * 1024),
+            false,
+            None,
+        );
+        assert!(explicit_conn.h2_tuning_explicit);
+
+        // A non-default (Balanced) profile implies explicit h2 tuning.
+        let balanced =
+            InternodeHttpClientTuning::from_values(InternodeHttpTuningProfile::Balanced, None, None, None, None, false, None);
+        assert!(balanced.h2_tuning_explicit);
+    }
 }
+
+#[cfg(test)]
+mod protocol_tests;

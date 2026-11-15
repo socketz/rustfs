@@ -15,14 +15,19 @@
 //! Worker slot limiter used by long-running background workflows.
 
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Semaphore, watch};
 use tracing::{debug, trace};
 
 /// Cooperative worker-slot controller for async tasks.
+///
+/// Slot acquisition is backed by a fair FIFO [`Semaphore`], while drain
+/// waiters observe the in-use count through a dedicated [`watch`] channel.
+/// The two wakeup sources are deliberately separate so a drain waiter can
+/// never consume a wakeup destined for a pending [`take`](Self::take).
 pub struct Workers {
-    available: Mutex<usize>, // Available working slots
-    notify: Notify,          // Used to notify waiting tasks
-    limit: usize,            // Maximum number of concurrent jobs
+    semaphore: Semaphore,         // Available working slots
+    in_use: watch::Sender<usize>, // Slots currently held; drain waiters watch it
+    limit: usize,                 // Maximum number of concurrent jobs
 }
 
 impl Workers {
@@ -31,86 +36,89 @@ impl Workers {
         if n == 0 {
             return Err("n must be > 0");
         }
+        if n > Semaphore::MAX_PERMITS {
+            return Err("n exceeds the maximum supported number of slots");
+        }
 
         Ok(Arc::new(Self {
-            available: Mutex::new(n),
-            notify: Notify::new(),
+            semaphore: Semaphore::new(n),
+            in_use: watch::Sender::new(0),
             limit: n,
         }))
     }
 
     /// Acquire a worker slot, waiting until one becomes available.
     pub async fn take(&self) {
-        loop {
-            let mut available = self.available.lock().await;
-            if *available == 0 {
-                trace!(
-                    event = "worker_slot.acquire",
-                    component = "concurrency",
-                    subsystem = "workers",
-                    state = "waiting",
-                    available_slots = *available,
-                    total_slots = self.limit,
-                    "worker slot pending"
-                );
-                drop(available);
-                self.notify.notified().await;
-            } else {
-                *available -= 1;
-                trace!(
-                    event = "worker_slot.acquire",
-                    component = "concurrency",
-                    subsystem = "workers",
-                    state = "granted",
-                    available_slots = *available,
-                    total_slots = self.limit,
-                    permits_in_use = self.limit.saturating_sub(*available),
-                    "worker slot updated"
-                );
-                break;
+        struct AcquireCancelGuard<'a> {
+            workers: &'a Workers,
+            completed: bool,
+        }
+        impl Drop for AcquireCancelGuard<'_> {
+            fn drop(&mut self) {
+                if !self.completed {
+                    self.workers.in_use.send_modify(|_| {});
+                }
             }
         }
+        let mut guard = AcquireCancelGuard {
+            workers: self,
+            completed: false,
+        };
+        let permit = match self.semaphore.acquire().await {
+            Ok(permit) => permit,
+            // The semaphore is owned by `self` and never closed.
+            Err(_) => unreachable!("worker semaphore is never closed"),
+        };
+        permit.forget(); // returned manually via give()
+        guard.completed = true;
+        self.in_use.send_modify(|held| *held += 1);
+        trace!(
+            event = "worker_slot.acquire",
+            component = "concurrency",
+            subsystem = "workers",
+            state = "granted",
+            available_slots = self.semaphore.available_permits(),
+            total_slots = self.limit,
+            permits_in_use = *self.in_use.borrow(),
+            "worker slot updated"
+        );
     }
 
     /// Release a worker slot.
+    ///
+    /// A `give()` that is not paired with a prior [`take`](Self::take) is
+    /// clamped: it never inflates capacity beyond `limit`.
     pub async fn give(&self) {
-        let mut available = self.available.lock().await;
-        *available = (*available).saturating_add(1).min(self.limit); // avoid over-release beyond limit
+        let mut released = false;
+        self.in_use.send_modify(|held| {
+            if *held > 0 {
+                *held -= 1;
+                released = true;
+            }
+        });
+        if released {
+            self.semaphore.add_permits(1);
+            self.in_use.send_modify(|_| {});
+        }
         trace!(
             event = "worker_slot.release",
             component = "concurrency",
             subsystem = "workers",
             state = "released",
-            available_slots = *available,
+            available_slots = self.semaphore.available_permits(),
             total_slots = self.limit,
-            permits_in_use = self.limit.saturating_sub(*available),
+            permits_in_use = *self.in_use.borrow(),
             "worker slot updated"
         );
-        self.notify.notify_one(); // Notify a waiting task
     }
 
     /// Wait until all worker slots are released.
     pub async fn wait(&self) {
-        loop {
-            {
-                let available = self.available.lock().await;
-                if *available == self.limit {
-                    break;
-                }
-                trace!(
-                    event = "worker_slot.wait",
-                    component = "concurrency",
-                    subsystem = "workers",
-                    state = "waiting",
-                    available_slots = *available,
-                    total_slots = self.limit,
-                    permits_in_use = self.limit.saturating_sub(*available),
-                    "worker drain pending"
-                );
-            }
-            // Wait until all slots are freed
-            self.notify.notified().await;
-        }
+        let mut rx = self.in_use.subscribe();
+        // The sender is owned by `self`, so it outlives this borrow.
+        let _ = rx
+            .wait_for(|&held| held == 0 && self.semaphore.available_permits() == self.limit)
+            .await;
         debug!(
             event = "worker_slot.wait",
             component = "concurrency",
@@ -125,7 +133,9 @@ impl Workers {
 
     /// Return the current number of available worker slots.
     pub async fn available(&self) -> usize {
-        *self.available.lock().await
+        self.limit
+            .saturating_sub(*self.in_use.borrow())
+            .min(self.semaphore.available_permits())
     }
 }
 
@@ -133,7 +143,7 @@ impl Workers {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
 
     #[tokio::test]
     async fn test_workers() {
@@ -167,5 +177,97 @@ mod tests {
         workers.give().await;
 
         assert_eq!(workers.available().await, 2);
+    }
+
+    /// Regression for S08: with limit=1, a pending drain waiter must never
+    /// steal the wakeup destined for a pending taker.
+    #[tokio::test]
+    async fn test_drain_waiter_does_not_steal_take_wakeup() {
+        let workers = Workers::new(1).unwrap();
+        workers.take().await;
+
+        let taker = {
+            let workers = workers.clone();
+            tokio::spawn(async move { workers.take().await })
+        };
+        let drainer = {
+            let workers = workers.clone();
+            tokio::spawn(async move { workers.wait().await })
+        };
+        // Let both tasks block before releasing the slot.
+        sleep(Duration::from_millis(50)).await;
+        workers.give().await;
+
+        timeout(Duration::from_secs(1), taker)
+            .await
+            .expect("taker must be woken by give()")
+            .unwrap();
+
+        workers.give().await;
+        timeout(Duration::from_secs(1), drainer)
+            .await
+            .expect("drain waiter must complete once all slots are free")
+            .unwrap();
+        assert_eq!(workers.available().await, 1);
+    }
+
+    /// Regression for S17: two rapid give() calls must wake two pending
+    /// takers; permits must not merge into a single wakeup.
+    #[tokio::test]
+    async fn test_rapid_gives_wake_all_pending_takers() {
+        let workers = Workers::new(2).unwrap();
+        workers.take().await;
+        workers.take().await;
+
+        let takers: Vec<_> = (0..2)
+            .map(|_| {
+                let workers = workers.clone();
+                tokio::spawn(async move { workers.take().await })
+            })
+            .collect();
+        // Let both takers queue up before any slot is released.
+        sleep(Duration::from_millis(50)).await;
+        workers.give().await;
+        workers.give().await;
+
+        for taker in takers {
+            timeout(Duration::from_secs(1), taker)
+                .await
+                .expect("every pending taker must be woken")
+                .unwrap();
+        }
+        assert_eq!(workers.available().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_wait_does_not_complete_while_permit_is_in_transit_to_queued_taker() {
+        use std::future::Future;
+        use std::pin::pin;
+        use std::task::{Context, Poll, Waker};
+
+        let workers = Workers::new(1).unwrap();
+        workers.take().await;
+
+        let mut taker = pin!(workers.take());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(taker.as_mut().poll(&mut cx), Poll::Pending));
+
+        let mut waiter = pin!(workers.wait());
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+
+        // Hand off the slot to the queued taker before `taker` is polled again.
+        workers.give().await;
+        assert_eq!(workers.available().await, 0);
+        assert!(
+            matches!(waiter.as_mut().poll(&mut cx), Poll::Pending),
+            "wait() must not complete while a permit is in transit to a woken taker"
+        );
+
+        assert!(matches!(taker.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Pending));
+
+        workers.give().await;
+        assert!(matches!(waiter.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert_eq!(workers.available().await, 1);
     }
 }

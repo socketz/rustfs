@@ -1,0 +1,4294 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::persistence::DataUsageCacheLoadAttempt;
+use super::*;
+use crate::storage_api::scanner_io::{HTTPRangeSpec, ObjectIO};
+use crate::{ScannerGetObjectReader, ScannerPutObjReader};
+use rustfs_data_usage::{ReplicationAllStats, ReplicationTargetUsage};
+use serde_json::Value;
+use std::io::Cursor;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
+use temp_env::{with_var, with_var_unset};
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
+use tokio::sync::Mutex;
+
+const TEST_PLAN_DIGEST: DataUsageScanPlanDigest = DataUsageScanPlanDigest([3; 32]);
+
+mod cache_cost;
+mod save_metrics;
+
+#[test]
+fn scoped_scan_coverage_metadata_preserves_map_compatibility() {
+    #[derive(serde::Deserialize)]
+    struct LegacyInfo {
+        name: String,
+        next_cycle: u64,
+    }
+    let mut info = DataUsageCacheInfo {
+        name: DATA_USAGE_ROOT.to_string(),
+        next_cycle: 7,
+        ..Default::default()
+    };
+    let old = serde_json::to_value(&info).expect("legacy metadata should encode");
+    assert!(old.get("scan_coverage_digest").is_none());
+    let old: DataUsageCacheInfo = serde_json::from_value(old).expect("missing coverage must remain readable");
+    assert!(old.scan_coverage_digest.is_none());
+    info.scan_coverage_digest = Some(TEST_PLAN_DIGEST);
+    let encoded = rmp_serde::to_vec(&info).expect("coverage metadata should remain map encoded");
+    let legacy: LegacyInfo = rmp_serde::from_slice(&encoded).expect("old map readers should ignore additive proof fields");
+    assert_eq!(legacy.name, DATA_USAGE_ROOT);
+    assert_eq!(legacy.next_cycle, 7);
+    let decoded: DataUsageCacheInfo = rmp_serde::from_slice(&encoded).expect("new reader should restore the coverage proof");
+    assert_eq!(decoded.scan_coverage_digest, Some(TEST_PLAN_DIGEST));
+}
+
+#[test]
+fn raw_enumeration_path_indexes_preserve_map_compatibility_and_validation() {
+    #[derive(serde::Deserialize)]
+    struct LegacyInfo {
+        name: String,
+        scan_raw_enumeration_page_index: Option<RawEnumerationPageIndex>,
+    }
+    let index_for = |parent: &str| RawEnumerationPageIndex::new(parent, 8).expect("fixture index");
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_identity: Some(DataUsageScanIdentity {
+                version: 1,
+                bucket_incarnation: uuid::Uuid::from_u128(1),
+                set_layout: DataUsageScanPlanDigest([2; 32]),
+                publication_epoch: 1,
+                tier_registry_generation: 0,
+                scan_mode: HealScanMode::Normal,
+            }),
+            source: Some(DataUsageCacheSource::new(0, 0)),
+            scan_raw_enumeration_page_index: Some(index_for("bucket/wide")),
+            scan_raw_enumeration_path_page_indexes: vec![index_for("bucket"), index_for("other-bucket/wide")],
+            ..Default::default()
+        },
+        cache: HashMap::new(),
+    };
+    assert!(cache.validated_raw_enumeration_page_index_for_parent("bucket").is_some());
+    assert!(
+        cache
+            .validated_raw_enumeration_page_index_for_parent("other-bucket/wide")
+            .is_none(),
+        "a saved path index must stay inside its bucket"
+    );
+
+    let encoded = rmp_serde::to_vec(&cache.info).expect("path indexes should remain map encoded");
+    let legacy: LegacyInfo = rmp_serde::from_slice(&encoded).expect("old map readers should ignore the path indexes");
+    assert_eq!(legacy.name, "bucket");
+    assert_eq!(
+        legacy
+            .scan_raw_enumeration_page_index
+            .and_then(|index| index.parent().map(str::to_owned)),
+        Some("bucket/wide".to_string())
+    );
+    let decoded: DataUsageCacheInfo = rmp_serde::from_slice(&encoded).expect("new reader should restore the path indexes");
+    assert_eq!(decoded.scan_raw_enumeration_path_page_indexes.len(), 2);
+
+    cache.info.scan_raw_enumeration_path_page_indexes.clear();
+    let encoded = rmp_serde::to_vec(&cache.info).expect("empty path indexes should encode");
+    assert!(
+        !encoded
+            .windows(b"scan_raw_enumeration_path_page_indexes".len())
+            .any(|window| window == b"scan_raw_enumeration_path_page_indexes"),
+        "the default must stay absent from the map"
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CachePutRecord {
+    object: String,
+    if_match: Option<String>,
+    if_none_match: Option<String>,
+}
+
+#[derive(Debug)]
+struct BackupFallbackStore {
+    backup: Vec<u8>,
+    recovered_main: Vec<u8>,
+    main_reads: AtomicUsize,
+    recover_main_revision: AtomicBool,
+    backup_reads: Mutex<usize>,
+    puts: Mutex<Vec<CachePutRecord>>,
+    put_delays: [Duration; 2],
+    read_delays: [Duration; 2],
+    put_attempts: [AtomicUsize; 2],
+    main_put_failures: usize,
+    publication_admitted: bool,
+    payloads: Mutex<Vec<(usize, Vec<u8>)>>,
+}
+
+impl BackupFallbackStore {
+    fn new(backup: Vec<u8>, recover_main_revision: bool) -> Self {
+        Self {
+            backup,
+            recovered_main: Vec::new(),
+            main_reads: AtomicUsize::new(0),
+            recover_main_revision: AtomicBool::new(recover_main_revision),
+            backup_reads: Mutex::new(0),
+            puts: Mutex::new(Vec::new()),
+            put_delays: [Duration::ZERO; 2],
+            read_delays: [Duration::ZERO; 2],
+            put_attempts: std::array::from_fn(|_| AtomicUsize::new(0)),
+            main_put_failures: 0,
+            publication_admitted: true,
+            payloads: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn with_recovered_main(backup: Vec<u8>, recovered_main: Vec<u8>) -> Self {
+        Self {
+            backup,
+            recovered_main,
+            main_reads: AtomicUsize::new(0),
+            recover_main_revision: AtomicBool::new(true),
+            backup_reads: Mutex::new(0),
+            puts: Mutex::new(Vec::new()),
+            put_delays: [Duration::ZERO; 2],
+            read_delays: [Duration::ZERO; 2],
+            put_attempts: std::array::from_fn(|_| AtomicUsize::new(0)),
+            main_put_failures: 0,
+            publication_admitted: true,
+            payloads: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn reader(data: Vec<u8>, etag: &str) -> ScannerGetObjectReader {
+        ScannerGetObjectReader {
+            stream: Box::new(Cursor::new(data)),
+            object_info: ObjectInfo {
+                etag: Some(etag.to_string()),
+                ..Default::default()
+            },
+            buffered_body: None,
+            body_source: Default::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CacheReadBody {
+    Bytes(Vec<u8>),
+    PrefixThenError(Vec<u8>),
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    Pending,
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+struct PendingCacheReader;
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+impl AsyncRead for PendingCacheReader {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
+}
+
+#[derive(Debug)]
+struct PrefixThenErrorReader {
+    prefix: Cursor<Vec<u8>>,
+    failed: bool,
+}
+
+impl AsyncRead for PrefixThenErrorReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if self.prefix.position() < u64::try_from(self.prefix.get_ref().len()).unwrap_or(u64::MAX) {
+            return Pin::new(&mut self.prefix).poll_read(cx, buf);
+        }
+        if !self.failed {
+            self.failed = true;
+            return Poll::Ready(Err(std::io::Error::other("injected cache body read failure")));
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[derive(Debug)]
+struct CacheReadStore {
+    main: CacheReadBody,
+    backup: Option<Vec<u8>>,
+    legacy: Option<Vec<u8>>,
+    puts: AtomicUsize,
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    entry_sources: Mutex<Vec<Option<crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource>>>,
+}
+
+#[derive(Debug, Default)]
+struct AmbiguousCacheCommitStore {
+    data: Mutex<Option<Vec<u8>>>,
+    puts: AtomicUsize,
+}
+
+impl CacheReadStore {
+    fn new(main: CacheReadBody, backup: Option<Vec<u8>>) -> Self {
+        Self {
+            main,
+            backup,
+            legacy: None,
+            puts: AtomicUsize::new(0),
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            entry_sources: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn reader(body: CacheReadBody, etag: &str) -> ScannerGetObjectReader {
+        let stream: Box<dyn AsyncRead + Unpin + Send + Sync> = match body {
+            CacheReadBody::Bytes(data) => Box::new(Cursor::new(data)),
+            CacheReadBody::PrefixThenError(prefix) => Box::new(PrefixThenErrorReader {
+                prefix: Cursor::new(prefix),
+                failed: false,
+            }),
+            #[cfg(feature = "diagnostic-read-version-caller")]
+            CacheReadBody::Pending => Box::new(PendingCacheReader),
+        };
+        ScannerGetObjectReader {
+            stream,
+            object_info: ObjectInfo {
+                etag: Some(etag.to_string()),
+                ..Default::default()
+            },
+            buffered_body: None,
+            body_source: Default::default(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectIO for CacheReadStore {
+    type Error = Error;
+    type RangeSpec = HTTPRangeSpec;
+    type HeaderMap = HeaderMap;
+    type ObjectOptions = ObjectOptions;
+    type ObjectInfo = ObjectInfo;
+    type GetObjectReader = ScannerGetObjectReader;
+    type PutObjectReader = ScannerPutObjReader;
+
+    async fn get_object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        _range: Option<Self::RangeSpec>,
+        _h: Self::HeaderMap,
+        _opts: &Self::ObjectOptions,
+    ) -> StorageResult<Self::GetObjectReader> {
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        self.entry_sources
+            .lock()
+            .await
+            .push(crate::storage_api::ecstore_diagnostic::current_read_version_entry_source());
+        if bucket == DATA_USAGE_BUCKET.as_str() {
+            return self
+                .legacy
+                .clone()
+                .map(|data| Self::reader(CacheReadBody::Bytes(data), "legacy-etag"))
+                .ok_or(Error::FileNotFound);
+        }
+        if bucket != RUSTFS_META_BUCKET {
+            return Err(Error::FileNotFound);
+        }
+
+        let main_path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
+        let backup_path = format!("{main_path}.bkp");
+        if object == main_path {
+            return Ok(Self::reader(self.main.clone(), "main-etag"));
+        }
+        if object == backup_path {
+            return self
+                .backup
+                .clone()
+                .map(|data| Self::reader(CacheReadBody::Bytes(data), "backup-etag"))
+                .ok_or(Error::FileNotFound);
+        }
+        Err(Error::FileNotFound)
+    }
+
+    async fn put_object(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _data: &mut Self::PutObjectReader,
+        _opts: &Self::ObjectOptions,
+    ) -> StorageResult<Self::ObjectInfo> {
+        self.puts.fetch_add(1, Ordering::SeqCst);
+        Ok(ObjectInfo::default())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ScannerConfigObjectDelete for CacheReadStore {
+    async fn delete_config_object(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _opts: crate::ScannerObjectOptions,
+    ) -> crate::EcstoreResult<crate::ScannerObjectInfo> {
+        Err(crate::EcstoreError::NotImplemented)
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<crate::ScannerDataUsagePublicationAdmission> {
+        Some(crate::ScannerDataUsagePublicationAdmission::unfenced())
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectIO for AmbiguousCacheCommitStore {
+    type Error = Error;
+    type RangeSpec = HTTPRangeSpec;
+    type HeaderMap = HeaderMap;
+    type ObjectOptions = ObjectOptions;
+    type ObjectInfo = ObjectInfo;
+    type GetObjectReader = ScannerGetObjectReader;
+    type PutObjectReader = ScannerPutObjReader;
+
+    async fn get_object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        _range: Option<Self::RangeSpec>,
+        _h: Self::HeaderMap,
+        _opts: &Self::ObjectOptions,
+    ) -> StorageResult<Self::GetObjectReader> {
+        let expected_path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
+        if bucket != RUSTFS_META_BUCKET || object != expected_path {
+            return Err(Error::FileNotFound);
+        }
+        let data = self.data.lock().await.clone().ok_or(Error::FileNotFound)?;
+        Ok(CacheReadStore::reader(CacheReadBody::Bytes(data), "committed-etag"))
+    }
+
+    async fn put_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut Self::PutObjectReader,
+        _opts: &Self::ObjectOptions,
+    ) -> StorageResult<Self::ObjectInfo> {
+        let expected_path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
+        if bucket != RUSTFS_META_BUCKET || object != expected_path {
+            return Err(Error::FileNotFound);
+        }
+        let mut bytes = Vec::new();
+        data.stream.read_to_end(&mut bytes).await?;
+        *self.data.lock().await = Some(bytes);
+        self.puts.fetch_add(1, Ordering::SeqCst);
+        Err(StorageError::PreconditionFailed)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ScannerConfigObjectDelete for AmbiguousCacheCommitStore {
+    async fn delete_config_object(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _opts: crate::ScannerObjectOptions,
+    ) -> crate::EcstoreResult<crate::ScannerObjectInfo> {
+        Err(crate::EcstoreError::NotImplemented)
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<crate::ScannerDataUsagePublicationAdmission> {
+        Some(crate::ScannerDataUsagePublicationAdmission::unfenced())
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectIO for BackupFallbackStore {
+    type Error = Error;
+    type RangeSpec = HTTPRangeSpec;
+    type HeaderMap = HeaderMap;
+    type ObjectOptions = ObjectOptions;
+    type ObjectInfo = ObjectInfo;
+    type GetObjectReader = ScannerGetObjectReader;
+    type PutObjectReader = ScannerPutObjReader;
+
+    async fn get_object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        _range: Option<Self::RangeSpec>,
+        _h: Self::HeaderMap,
+        _opts: &Self::ObjectOptions,
+    ) -> StorageResult<Self::GetObjectReader> {
+        if bucket != RUSTFS_META_BUCKET {
+            return Err(Error::FileNotFound);
+        }
+
+        let main_path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
+        let backup_path = format!("{main_path}.bkp");
+        let delay = self.read_delays[usize::from(object.ends_with(".bkp"))];
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+        if object == main_path {
+            let read = self.main_reads.fetch_add(1, Ordering::SeqCst);
+            if read == 0 || !self.recover_main_revision.load(Ordering::SeqCst) {
+                return Err(Error::ErasureReadQuorum);
+            }
+            return Ok(Self::reader(self.recovered_main.clone(), "main-etag"));
+        }
+        if object == backup_path {
+            *self.backup_reads.lock().await += 1;
+            return Ok(Self::reader(self.backup.clone(), "backup-etag"));
+        }
+
+        Err(Error::FileNotFound)
+    }
+
+    async fn put_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut Self::PutObjectReader,
+        opts: &Self::ObjectOptions,
+    ) -> StorageResult<Self::ObjectInfo> {
+        if bucket != RUSTFS_META_BUCKET {
+            return Err(Error::FileNotFound);
+        }
+        let if_match = opts
+            .http_preconditions
+            .as_ref()
+            .and_then(HTTPPreconditions::if_match_value)
+            .map(str::to_owned);
+        let if_none_match = opts
+            .http_preconditions
+            .as_ref()
+            .and_then(HTTPPreconditions::if_none_match_value)
+            .map(str::to_owned);
+        let path_index = usize::from(object.ends_with(".bkp"));
+        let attempt = self.put_attempts[path_index].fetch_add(1, Ordering::SeqCst);
+        let mut payload = Vec::new();
+        data.stream.read_to_end(&mut payload).await?;
+        self.payloads.lock().await.push((path_index, payload));
+        let delay = self.put_delays[path_index];
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+        if path_index == 0 && attempt < self.main_put_failures {
+            return Err(Error::other("ambiguous cache write failure"));
+        }
+        self.puts.lock().await.push(CachePutRecord {
+            object: object.to_string(),
+            if_match,
+            if_none_match,
+        });
+        Ok(ObjectInfo {
+            etag: Some(format!("saved-{object}")),
+            ..Default::default()
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ScannerConfigObjectDelete for BackupFallbackStore {
+    async fn delete_config_object(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _opts: crate::ScannerObjectOptions,
+    ) -> crate::EcstoreResult<crate::ScannerObjectInfo> {
+        Err(crate::EcstoreError::NotImplemented)
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<crate::ScannerDataUsagePublicationAdmission> {
+        self.publication_admitted
+            .then(crate::ScannerDataUsagePublicationAdmission::unfenced)
+    }
+}
+
+#[test]
+fn cache_revisions_map_to_compare_and_swap_preconditions() {
+    let missing = DataUsageCacheRevision::Missing.preconditions();
+    let existing = DataUsageCacheRevision::Etag("etag-1".to_string()).preconditions();
+
+    assert_eq!(missing.if_none_match_value(), Some("*"));
+    assert!(missing.if_match_value().is_none());
+    assert_eq!(existing.if_match_value(), Some("etag-1"));
+    assert!(existing.if_none_match_value().is_none());
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[tokio::test]
+async fn diagnostic_revision_readers_keep_scanner_or_earlier_entry() {
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
+    let path = path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]);
+    let payload = b"scanner revision diagnostic".to_vec();
+    for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
+        let store = Arc::new(CacheReadStore::new(CacheReadBody::Bytes(payload.clone()), None));
+        let read = async {
+            let (body, revision) = read_config_with_revision(store.clone(), &path)
+                .await
+                .expect("revision and body read");
+            assert_eq!(body, Some(payload.clone()));
+            assert_eq!(revision, DataUsageCacheRevision::Etag("main-etag".to_string()));
+            assert_eq!(
+                read_config_revision(store.clone(), &path).await.expect("revision-only read"),
+                DataUsageCacheRevision::Etag("main-etag".to_string())
+            );
+            let missing = format!("{path}.missing");
+            assert_eq!(
+                read_config_with_revision(store.clone(), &missing)
+                    .await
+                    .expect("missing body is harmless"),
+                (None, DataUsageCacheRevision::Missing)
+            );
+            assert_eq!(
+                read_config_revision(store.clone(), &missing)
+                    .await
+                    .expect("missing revision is harmless"),
+                DataUsageCacheRevision::Missing
+            );
+        };
+        match earlier {
+            Some(source) => with_read_version_entry(source, read).await,
+            None => read.await,
+        }
+        assert_eq!(
+            *store.entry_sources.lock().await,
+            vec![Some(earlier.unwrap_or(ReadVersionEntrySource::ScannerRevisionRead)); 4],
+            "both readers and missing paths preserve the earliest diagnostic source"
+        );
+        assert_eq!(current_read_version_entry_source(), None, "reader scopes must not leak to the caller");
+    }
+}
+
+#[tokio::test]
+async fn backup_cache_load_recovers_main_revision_before_cas_save() {
+    let mut expected = DataUsageCache::default();
+    expected.info.name = "bucket".to_string();
+    let store = Arc::new(BackupFallbackStore::new(expected.marshal_msg().expect("serialize backup cache"), true));
+    let mut loaded = DataUsageCache::default();
+
+    let revisions = loaded
+        .load_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("backup cache should load after the main revision recovers");
+
+    assert_eq!(loaded.info.name, "bucket");
+    assert_eq!(store.main_reads.load(Ordering::SeqCst), 2);
+    assert!(matches!(revisions.main, DataUsageCacheRevision::Etag(ref etag) if etag == "main-etag"));
+    assert!(matches!(
+        revisions.backup,
+        Some(DataUsageCacheRevision::Etag(ref etag)) if etag == "backup-etag"
+    ));
+    assert_eq!(*store.backup_reads.lock().await, 1);
+
+    loaded
+        .save_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME, &revisions)
+        .await
+        .expect("recovered revisions should protect both cache writes");
+    let puts = store.puts.lock().await;
+    assert_eq!(
+        *puts,
+        vec![
+            CachePutRecord {
+                object: path_join_buf(&[BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME]),
+                if_match: Some("main-etag".to_string()),
+                if_none_match: None,
+            },
+            CachePutRecord {
+                object: path_join_buf(&[BUCKET_META_PREFIX, &format!("{DATA_USAGE_CACHE_NAME}.bkp")]),
+                if_match: Some("backup-etag".to_string()),
+                if_none_match: None,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn recovered_main_cache_wins_over_stale_backup() {
+    let mut main = DataUsageCache::default();
+    main.info.name = "current-main".to_string();
+    let mut backup = DataUsageCache::default();
+    backup.info.name = "stale-backup".to_string();
+    let store = Arc::new(BackupFallbackStore::with_recovered_main(
+        backup.marshal_msg().expect("serialize stale backup cache"),
+        main.marshal_msg().expect("serialize recovered main cache"),
+    ));
+    let mut loaded = DataUsageCache::default();
+
+    let revisions = loaded
+        .load_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("a recovered valid main cache should supersede the fallback backup");
+
+    assert_eq!(loaded.info.name, "current-main");
+    assert_eq!(store.main_reads.load(Ordering::SeqCst), 2);
+    assert_eq!(*store.backup_reads.lock().await, 1);
+    assert!(matches!(revisions.main, DataUsageCacheRevision::Etag(ref etag) if etag == "main-etag"));
+    assert!(matches!(
+        revisions.backup,
+        Some(DataUsageCacheRevision::Etag(ref etag)) if etag == "backup-etag"
+    ));
+}
+
+#[tokio::test]
+async fn cache_save_reconciles_an_ambiguous_committed_write() {
+    let store = Arc::new(AmbiguousCacheCommitStore::default());
+    let mut cache = DataUsageCache::default();
+    cache.info.name = "bucket".to_string();
+    cache.replace("bucket", "", DataUsageEntry::default());
+    let revisions = DataUsageCacheRevisions {
+        main: DataUsageCacheRevision::Missing,
+        backup: None,
+    };
+
+    cache
+        .save_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME, &revisions)
+        .await
+        .expect("read-after-error reconciliation should recognize the committed cache");
+
+    assert_eq!(store.puts.load(Ordering::SeqCst), 1);
+    let persisted = store.data.lock().await.clone().expect("cache should be committed");
+    assert_eq!(
+        DataUsageCache::unmarshal(&persisted)
+            .expect("committed cache should decode")
+            .info
+            .name,
+        "bucket"
+    );
+}
+
+#[cfg(feature = "diagnostic-read-version-caller")]
+#[tokio::test]
+async fn diagnostic_cache_load_attempts_preserve_source_through_fallback_and_timeout() {
+    use crate::storage_api::ecstore_diagnostic::{
+        ReadVersionEntrySource, current_read_version_entry_source, with_read_version_entry,
+    };
+
+    let mut cache = DataUsageCache::default();
+    cache.info.name = "diagnostic-cache".to_string();
+    let bytes = cache.marshal_msg().expect("cache fixture should serialize");
+    for earlier in [None, Some(ReadVersionEntrySource::TierConfigReload)] {
+        for case in ["primary", "legacy", "missing", "body_error", "timeout"] {
+            let body = match case {
+                "body_error" => CacheReadBody::PrefixThenError(vec![0x81, 0xa4, b'n', b'a']),
+                "timeout" => CacheReadBody::Pending,
+                _ => CacheReadBody::Bytes(bytes.clone()),
+            };
+            let mut fixture = CacheReadStore::new(body, None);
+            if case == "legacy" {
+                fixture.legacy = Some(bytes.clone());
+            }
+            let store = Arc::new(fixture);
+            let name = if matches!(case, "legacy" | "missing") {
+                "diagnostic-legacy-cache"
+            } else {
+                DATA_USAGE_CACHE_NAME
+            };
+            let timeout = if case == "timeout" {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_secs(1)
+            };
+            let load = DataUsageCache::try_load_inner(store.clone(), name, timeout);
+            let attempt = match earlier {
+                Some(source) => with_read_version_entry(source, load).await,
+                None => load.await,
+            }
+            .expect("diagnostic wrapper must preserve load-attempt results");
+            match (case, attempt) {
+                ("primary", DataUsageCacheLoadAttempt::Loaded { cache, revision }) => {
+                    assert_eq!(cache.info.name, "diagnostic-cache");
+                    assert_eq!(revision, Some(DataUsageCacheRevision::Etag("main-etag".to_string())));
+                }
+                ("legacy", DataUsageCacheLoadAttempt::Loaded { cache, revision }) => {
+                    assert_eq!(cache.info.name, "diagnostic-cache");
+                    assert_eq!(revision, Some(DataUsageCacheRevision::Missing));
+                }
+                ("missing", DataUsageCacheLoadAttempt::Missing { revision }) => {
+                    assert_eq!(revision, Some(DataUsageCacheRevision::Missing));
+                }
+                ("body_error" | "timeout", DataUsageCacheLoadAttempt::Retryable(_)) => {}
+                _ => panic!("unexpected load-attempt outcome for {case}"),
+            }
+            let calls = if matches!(case, "legacy" | "missing") { 2 } else { 1 };
+            assert_eq!(
+                *store.entry_sources.lock().await,
+                vec![Some(earlier.unwrap_or(ReadVersionEntrySource::DataUsageCacheRead)); calls],
+                "primary and legacy reads must retain this attempt's entry source: {case}"
+            );
+            assert_eq!(store.puts.load(Ordering::SeqCst), 0, "load attempts must not save: {case}");
+            assert_eq!(current_read_version_entry_source(), None, "scope must restore even after timeout: {case}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn backup_cache_load_fails_closed_without_main_revision_quorum() {
+    let backup = DataUsageCache::default().marshal_msg().expect("serialize backup cache");
+    let store = Arc::new(BackupFallbackStore::new(backup, false));
+    let mut loaded = DataUsageCache::default();
+
+    let error = loaded
+        .load_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect_err("missing main revision quorum must prevent a CAS save");
+
+    assert!(matches!(error, Error::ErasureReadQuorum));
+    assert_eq!(store.main_reads.load(Ordering::SeqCst), 5);
+    assert_eq!(*store.backup_reads.lock().await, 0);
+}
+
+#[tokio::test]
+async fn corrupt_primary_cache_loads_valid_backup() {
+    let mut expected = DataUsageCache::default();
+    expected.info.name = "recovered".to_string();
+    let store = Arc::new(CacheReadStore::new(
+        CacheReadBody::Bytes(b"not-msgpack".to_vec()),
+        Some(expected.marshal_msg().expect("serialize backup cache")),
+    ));
+    let mut loaded = DataUsageCache::default();
+
+    loaded
+        .load(store.clone(), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("valid backup must recover a corrupt primary cache");
+
+    assert_eq!(loaded.info.name, "recovered");
+    assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn corrupt_cache_without_valid_backup_rebuilds_with_cas_revisions() {
+    for backup in [None, Some(b"also-not-msgpack".to_vec())] {
+        let store = Arc::new(CacheReadStore::new(CacheReadBody::Bytes(b"not-msgpack".to_vec()), backup));
+        let mut loaded = DataUsageCache::default();
+
+        let revisions = loaded
+            .load_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME)
+            .await
+            .expect("corrupt scanner caches should be discarded for a full rebuild");
+
+        assert!(loaded.info.name.is_empty());
+        assert!(loaded.cache.is_empty());
+        assert!(matches!(
+            revisions.main,
+            DataUsageCacheRevision::Etag(ref etag) if etag == "main-etag"
+        ));
+        assert!(matches!(
+            revisions.backup,
+            Some(DataUsageCacheRevision::Missing | DataUsageCacheRevision::Etag(_))
+        ));
+
+        loaded
+            .save_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME, &revisions)
+            .await
+            .expect("rebuilt cache should replace corrupt cache objects with CAS protection");
+        assert_eq!(store.puts.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn partial_cache_body_read_is_retryable_and_does_not_save() {
+    let store = Arc::new(CacheReadStore::new(CacheReadBody::PrefixThenError(vec![0x81, 0xa4, b'n', b'a']), None));
+
+    let attempt = DataUsageCache::try_load_inner(store.clone(), DATA_USAGE_CACHE_NAME, Duration::from_secs(1))
+        .await
+        .expect("body read failures should remain recoverable load attempts");
+
+    assert!(matches!(attempt, DataUsageCacheLoadAttempt::Retryable(_)));
+    assert_eq!(store.puts.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn test_data_usage_info_creation() {
+    let mut info = DataUsageInfo::new();
+    info.update_capacity(1000, 500, 500);
+
+    assert_eq!(info.total_capacity, 1000);
+    assert_eq!(info.total_used_capacity, 500);
+    assert_eq!(info.total_free_capacity, 500);
+    assert!(info.last_update.is_some());
+}
+
+#[test]
+fn test_bucket_usage_info_merge() {
+    let mut usage1 = BucketUsageInfo::new();
+    usage1.size = 100;
+    usage1.objects_count = 10;
+    usage1.versions_count = 5;
+
+    let mut usage2 = BucketUsageInfo::new();
+    usage2.size = 200;
+    usage2.objects_count = 20;
+    usage2.versions_count = 10;
+
+    usage1.merge(&usage2);
+
+    assert_eq!(usage1.size, 300);
+    assert_eq!(usage1.objects_count, 30);
+    assert_eq!(usage1.versions_count, 15);
+}
+
+#[test]
+fn test_size_summary_add() {
+    let mut summary1 = SizeSummary::new();
+    summary1.total_size = 100;
+    summary1.versions = 5;
+
+    let mut summary2 = SizeSummary::new();
+    summary2.total_size = 200;
+    summary2.versions = 10;
+
+    summary1.add(&summary2);
+
+    assert_eq!(summary1.total_size, 300);
+    assert_eq!(summary1.versions, 15);
+}
+
+#[test]
+fn size_summary_add_saturates_all_usage_counters() {
+    let target = "arn:minio:replication::target".to_string();
+    let mut summary = SizeSummary {
+        total_size: usize::MAX,
+        versions: usize::MAX,
+        delete_markers: usize::MAX,
+        replicated_size: i64::MAX,
+        replicated_count: usize::MAX,
+        pending_size: i64::MAX,
+        failed_size: i64::MAX,
+        replica_size: i64::MAX,
+        replica_count: usize::MAX,
+        pending_count: usize::MAX,
+        failed_count: usize::MAX,
+        ..Default::default()
+    };
+    summary.repl_target_stats.insert(
+        target.clone(),
+        ReplTargetSizeSummary {
+            replicated_size: i64::MAX,
+            replicated_count: usize::MAX,
+            pending_size: i64::MAX,
+            failed_size: i64::MAX,
+            pending_count: usize::MAX,
+            failed_count: usize::MAX,
+        },
+    );
+    let mut increment = SizeSummary {
+        total_size: 1,
+        versions: 1,
+        delete_markers: 1,
+        replicated_size: 1,
+        replicated_count: 1,
+        pending_size: 1,
+        failed_size: 1,
+        replica_size: 1,
+        replica_count: 1,
+        pending_count: 1,
+        failed_count: 1,
+        ..Default::default()
+    };
+    summary.tier_stats.insert(
+        UNKNOWN_TIER.to_string(),
+        TierStats {
+            total_size: u64::MAX,
+            num_versions: u64::MAX,
+            num_objects: u64::MAX,
+        },
+    );
+    increment.tier_stats.insert(
+        UNKNOWN_TIER.to_string(),
+        TierStats {
+            total_size: 1,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    );
+    increment.unknown_tier_stats.unknown_bytes = 1;
+    increment.unknown_tier_stats.unknown_physical_bytes = 1;
+    increment.repl_target_stats.insert(
+        target.clone(),
+        ReplTargetSizeSummary {
+            replicated_size: 1,
+            replicated_count: 1,
+            pending_size: 1,
+            failed_size: 1,
+            pending_count: 1,
+            failed_count: 1,
+        },
+    );
+
+    summary.add(&increment);
+
+    assert_eq!(summary.total_size, usize::MAX);
+    assert_eq!(summary.versions, usize::MAX);
+    assert_eq!(summary.delete_markers, usize::MAX);
+    assert_eq!(summary.replicated_size, i64::MAX);
+    assert_eq!(summary.replicated_count, usize::MAX);
+    assert_eq!(summary.pending_size, i64::MAX);
+    assert_eq!(summary.failed_size, i64::MAX);
+    assert_eq!(summary.replica_size, i64::MAX);
+    assert_eq!(summary.replica_count, usize::MAX);
+    assert_eq!(summary.pending_count, usize::MAX);
+    assert_eq!(summary.failed_count, usize::MAX);
+
+    let target_summary = summary
+        .repl_target_stats
+        .get(&target)
+        .expect("replication target summary should remain present");
+    assert_eq!(target_summary.replicated_size, i64::MAX);
+    assert_eq!(target_summary.replicated_count, usize::MAX);
+    assert_eq!(target_summary.pending_size, i64::MAX);
+    assert_eq!(target_summary.failed_size, i64::MAX);
+    assert_eq!(target_summary.pending_count, usize::MAX);
+    assert_eq!(target_summary.failed_count, usize::MAX);
+    assert_eq!(summary.tier_stats[UNKNOWN_TIER].total_size, u64::MAX);
+    assert_eq!(summary.unknown_tier_stats.unknown_bytes, 1);
+}
+
+#[test]
+fn size_summary_counts_delete_markers_separately_from_versions() {
+    let mut summary = SizeSummary::new();
+    let marker = ObjectInfo {
+        delete_marker: true,
+        version_id: Some(uuid::Uuid::new_v4()),
+        ..Default::default()
+    };
+
+    summary.actions_accounting(&marker, 0, 0);
+
+    assert_eq!(summary.delete_markers, 1);
+    assert_eq!(summary.versions, 0);
+    assert_eq!(summary.total_size, 0);
+}
+
+#[test]
+fn size_summary_actions_accounting_accumulates_tier_stats() {
+    let mut summary = SizeSummary::new();
+    summary
+        .tier_stats
+        .insert(storageclass::STANDARD.to_string(), TierStats::default());
+
+    let object = ObjectInfo {
+        storage_class: Some(storageclass::STANDARD.to_string()),
+        size: 10,
+        is_latest: true,
+        ..Default::default()
+    };
+
+    summary.actions_accounting(&object, 10, 10);
+    summary.actions_accounting(&object, 10, 10);
+
+    let stats = summary
+        .tier_stats
+        .get(storageclass::STANDARD)
+        .expect("standard tier stats should remain present");
+    assert_eq!(
+        *stats,
+        TierStats {
+            total_size: 20,
+            num_versions: 2,
+            num_objects: 2,
+        }
+    );
+}
+
+#[test]
+fn unknown_tier_is_bounded_and_accounted() {
+    let mut summary = SizeSummary::new();
+    summary.tier_stats.insert("WARM".to_string(), TierStats::default());
+    let object = ObjectInfo {
+        storage_class: Some("retired-tier".to_string()),
+        size: 11,
+        is_latest: true,
+        ..Default::default()
+    };
+
+    summary.actions_accounting(&object, 11, 11);
+
+    assert_eq!(summary.tier_stats.len(), 2);
+    assert_eq!(summary.tier_stats.get(UNKNOWN_TIER).map(|stats| stats.total_size), Some(11));
+    assert_eq!(summary.unknown_tier_stats.unknown_bytes, 11);
+    assert_eq!(summary.unknown_tier_stats.unknown_physical_bytes, 11);
+    assert_eq!(summary.unknown_tier_stats.unknown_objects, 1);
+    assert_eq!(summary.tier_accounting_proof.logical_total, 11);
+    assert_eq!(summary.tier_accounting_proof.logical_known, 0);
+    assert_eq!(summary.tier_accounting_proof.physical_total, 11);
+    assert_eq!(summary.tier_accounting_proof.physical_known, 0);
+    assert!(summary.unknown_tier_stats.diagnostics.len() <= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP);
+    assert!(summary.unknown_tier_stats.diagnostics.iter().map(String::len).sum::<usize>() <= UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP);
+    assert!(
+        summary
+            .unknown_tier_stats
+            .diagnostics
+            .iter()
+            .all(|entry| !entry.contains("retired"))
+    );
+}
+
+#[test]
+fn unknown_tier_is_accounted_when_no_remote_tier_is_configured() {
+    let mut summary = SizeSummary::new();
+    let object = ObjectInfo {
+        storage_class: Some("retired-tier".to_string()),
+        size: 3,
+        is_latest: true,
+        ..Default::default()
+    };
+
+    summary.actions_accounting(&object, 9, 9);
+
+    assert_eq!(summary.tier_stats.len(), 1);
+    assert_eq!(summary.tier_stats[UNKNOWN_TIER].total_size, 3);
+    assert_eq!(summary.unknown_tier_stats.unknown_bytes, 9);
+    assert_eq!(summary.unknown_tier_stats.unknown_physical_bytes, 3);
+
+    let standard = ObjectInfo {
+        storage_class: Some(storageclass::STANDARD.to_string()),
+        size: 4,
+        is_latest: true,
+        ..Default::default()
+    };
+    summary.actions_accounting(&standard, 4, 4);
+    assert_eq!(summary.tier_accounting_proof.logical_total, 13);
+    assert_eq!(summary.tier_accounting_proof.logical_known, 4);
+    assert_eq!(summary.tier_accounting_proof.physical_total, 3 + 4);
+    assert_eq!(summary.tier_accounting_proof.physical_known, 4);
+    assert_eq!(summary.tier_stats.len(), 1, "built-ins preserve the no-tier map shape");
+}
+
+#[test]
+fn million_unique_tier_keys_do_not_grow_stats_map() {
+    let mut summary = SizeSummary::new();
+    summary.tier_stats.insert("WARM".to_string(), TierStats::default());
+    for index in 0..1_000_000_u64 {
+        let object = ObjectInfo {
+            storage_class: Some(format!("untrusted-tier-{index}")),
+            size: 1,
+            ..Default::default()
+        };
+        summary.actions_accounting(&object, 1, 1);
+    }
+
+    assert_eq!(summary.tier_stats.len(), 2);
+    assert_eq!(summary.tier_stats[UNKNOWN_TIER].total_size, 1_000_000);
+    assert_eq!(summary.unknown_tier_stats.unknown_bytes, 1_000_000);
+    assert!(summary.unknown_tier_stats.diagnostics.len() <= UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP);
+    assert!(summary.unknown_tier_stats.diagnostics.iter().map(String::len).sum::<usize>() <= UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP);
+}
+
+#[test]
+fn unknown_tier_never_triggers_transition() {
+    let mut summary = SizeSummary::new();
+    summary.tier_stats.insert("WARM".to_string(), TierStats::default());
+    let mut object = ObjectInfo {
+        storage_class: Some("removed-tier".to_string()),
+        size: 7,
+        ..Default::default()
+    };
+    object.transitioned_object.status = TRANSITION_COMPLETE.to_string();
+    object.transitioned_object.tier = "removed-tier".to_string();
+
+    summary.actions_accounting(&object, 7, 7);
+
+    assert_eq!(summary.tier_stats.get("removed-tier"), None);
+    assert_eq!(summary.tier_stats[UNKNOWN_TIER].total_size, 7);
+}
+
+#[test]
+fn removed_tier_survives_restart_as_unknown() {
+    let mut summary = SizeSummary::new();
+    summary.tier_stats.insert("COLD".to_string(), TierStats::default());
+    summary.tier_stats.insert(
+        "RETIRED".to_string(),
+        TierStats {
+            total_size: 5,
+            num_versions: 1,
+            num_objects: 1,
+        },
+    );
+    let object = ObjectInfo {
+        storage_class: Some("COLD".to_string()),
+        size: 5,
+        ..Default::default()
+    };
+    summary.actions_accounting(&object, 5, 5);
+    let mut entry = DataUsageEntry::default();
+    entry.add_tier_sizes(&summary.tier_stats);
+    entry.add_unknown_tier_stats(&UnknownTierStats {
+        unknown_bytes: 2,
+        unknown_physical_bytes: 2,
+        unknown_objects: 1,
+        unknown_versions: 1,
+        ..Default::default()
+    });
+    let encoded = rmp_serde::to_vec(&entry).expect("entry should encode");
+    let restored: DataUsageEntry = rmp_serde::from_slice(&encoded).expect("entry should decode");
+    assert_eq!(restored.unknown_tier_stats.as_ref().map(|stats| stats.unknown_bytes), Some(2));
+    assert_eq!(
+        restored.all_tier_stats.as_ref().expect("tier stats persisted").tiers["RETIRED"].total_size,
+        5
+    );
+
+    let mut cache = DataUsageCache::default();
+    cache.replace("bucket", "", restored);
+    cache.fold_retired_tiers(&["COLD".to_string()]);
+    let folded = cache.cache.get(&hash_path("bucket").key()).expect("folded cache entry");
+    assert_eq!(
+        folded.all_tier_stats.as_ref().expect("tier stats persisted").tiers[UNKNOWN_TIER].total_size,
+        5
+    );
+    assert_eq!(folded.unknown_tier_stats.as_ref().map(|stats| stats.unknown_bytes), Some(2));
+}
+
+#[test]
+fn retired_tier_fold_is_idempotent_and_rejects_mixed_companion_provenance() {
+    let mut cache = DataUsageCache::default();
+    let mut entry = DataUsageEntry {
+        all_tier_stats: Some(AllTierStats {
+            tiers: HashMap::from([(
+                "RETIRED".to_string(),
+                TierStats {
+                    total_size: 5,
+                    num_versions: 1,
+                    num_objects: 1,
+                },
+            )]),
+        }),
+        ..Default::default()
+    };
+    entry.unknown_tier_stats = Some(UnknownTierStats {
+        unknown_physical_bytes: 5,
+        ..Default::default()
+    });
+    entry.tier_accounting_proof = Some(TierAccountingProof {
+        physical_total: 5,
+        physical_known: 5,
+        ..Default::default()
+    });
+    cache.replace("bucket", "", entry);
+
+    cache.fold_retired_tiers(&["COLD".to_string()]);
+    let first = cache.cache.get(&hash_path("bucket").key()).expect("entry").clone();
+    assert_eq!(first.all_tier_stats.as_ref().expect("tiers").tiers[UNKNOWN_TIER].total_size, 5);
+    assert_eq!(first.unknown_tier_stats.as_ref().expect("companion").unknown_physical_bytes, 5);
+    assert!(first.tier_accounting_proof.is_none(), "mixed provenance must not publish");
+
+    cache.fold_retired_tiers(&["COLD".to_string()]);
+    let second = cache.cache.get(&hash_path("bucket").key()).expect("entry");
+    assert_eq!(second.all_tier_stats.as_ref().expect("tiers").tiers[UNKNOWN_TIER].total_size, 5);
+    assert_eq!(second.unknown_tier_stats.as_ref().expect("companion").unknown_physical_bytes, 5);
+}
+
+#[test]
+fn tier_registry_refresh_does_not_mix_cycle_generations() {
+    let first = crate::TierRegistrySnapshot {
+        generation: 1,
+        names: Arc::from(["WARM".to_string()]),
+        refresh_failed: false,
+    };
+    let second = crate::TierRegistrySnapshot {
+        generation: 2,
+        names: Arc::from(["COLD".to_string()]),
+        refresh_failed: false,
+    };
+    assert_ne!(first.generation, second.generation);
+    assert_eq!(first.names.as_ref(), ["WARM".to_string()]);
+    assert_eq!(second.names.as_ref(), ["COLD".to_string()]);
+    assert!(first.refreshed(Err(())).refresh_failed);
+    assert!(!second.refreshed(Ok(Arc::from(["HOT".to_string()]))).refresh_failed);
+    assert_eq!(first.refreshed(Err(())).generation, first.generation);
+    assert_eq!(first.refreshed(Err(())).names, first.names);
+}
+
+#[test]
+fn unknown_tier_counter_uses_checked_arithmetic() {
+    let max = TierStats {
+        total_size: u64::MAX,
+        num_versions: u64::MAX,
+        num_objects: u64::MAX,
+    };
+    assert!(max.checked_add(&TierStats::default()).is_some());
+    assert!(
+        max.checked_add(&TierStats {
+            total_size: 1,
+            ..Default::default()
+        })
+        .is_none()
+    );
+
+    let mut unknown = UnknownTierStats {
+        unknown_bytes: u64::MAX,
+        ..Default::default()
+    };
+    unknown.record("overflow", 1, 1, 1);
+    assert_eq!(unknown.unknown_bytes, u64::MAX);
+    assert_eq!(unknown.unknown_objects, 1);
+    assert!(unknown.counter_overflowed);
+    assert!(unknown.checked_add(&UnknownTierStats::default()).is_none());
+    assert!(
+        unknown
+            .checked_add(&UnknownTierStats {
+                unknown_bytes: 1,
+                ..Default::default()
+            })
+            .is_none()
+    );
+}
+
+#[test]
+fn size_summary_unknown_accounting_keeps_physical_tier_and_version_only() {
+    let mut summary = SizeSummary::default();
+    summary
+        .tier_stats
+        .insert(storageclass::STANDARD.to_string(), TierStats::default());
+    let object = ObjectInfo {
+        size: 12,
+        storage_class: Some(storageclass::STANDARD.to_string()),
+        version_id: Some(uuid::Uuid::new_v4()),
+        is_latest: true,
+        ..Default::default()
+    };
+
+    summary.actions_accounting_unknown(&object);
+
+    assert_eq!(summary.total_size, 0, "unknown logical size must not become zero or physical bytes");
+    assert_eq!(summary.versions, 1);
+    assert_eq!(
+        summary.tier_stats.get(storageclass::STANDARD),
+        Some(&TierStats {
+            total_size: 12,
+            num_versions: 1,
+            num_objects: 1,
+        })
+    );
+}
+
+#[test]
+fn test_data_usage_entry_merge_sums_failed_objects() {
+    let mut left = DataUsageEntry {
+        failed_objects: 2,
+        ..Default::default()
+    };
+
+    let right = DataUsageEntry {
+        failed_objects: 3,
+        ..Default::default()
+    };
+
+    left.merge(&right);
+
+    assert_eq!(left.failed_objects, 5);
+}
+
+#[test]
+fn test_data_usage_entry_deserialize_defaults_failed_objects() {
+    let entry = DataUsageEntry::default();
+    let mut value = serde_json::to_value(&entry).expect("Failed to serialize entry");
+
+    let Value::Object(ref mut map) = value else {
+        panic!("Expected entry to serialize into an object");
+    };
+
+    map.remove("failed_objects");
+
+    let decoded: DataUsageEntry = serde_json::from_value(value).expect("Failed to deserialize entry");
+    assert_eq!(decoded.failed_objects, 0);
+}
+
+#[test]
+fn test_data_usage_cache_info_deserialize_defaults_scan_resume_after() {
+    let value = serde_json::json!({
+        "name": "bucket",
+        "next_cycle": 7,
+        "last_update": null,
+        "skip_healing": false,
+        "lifecycle": null,
+        "replication": null,
+        "failed_objects": {}
+    });
+
+    let decoded: DataUsageCacheInfo = serde_json::from_value(value).expect("Failed to deserialize cache info");
+
+    assert_eq!(decoded.name, "bucket");
+    assert_eq!(decoded.next_cycle, 7);
+    assert_eq!(decoded.leader_epoch, 0);
+    assert!(decoded.scan_resume_after.is_none());
+    assert!(decoded.scan_checkpoint.is_none());
+    assert!(decoded.object_lock.is_none());
+    assert!(decoded.pending_heals.is_empty());
+    assert!(decoded.source.is_none());
+    assert!(!decoded.snapshot_complete);
+    assert!(decoded.scan_plan_digest.is_none());
+    assert!(decoded.scan_execution_digest.is_none());
+    assert!(decoded.segment_invalidation_proof.is_none());
+    assert_eq!(decoded.cache_key_format, 0);
+}
+
+#[test]
+fn test_data_usage_cache_info_unmarshal_old_msgpack_defaults_scan_resume_after() {
+    #[derive(Serialize)]
+    struct OldDataUsageCacheInfo {
+        name: String,
+        next_cycle: u64,
+        last_update: Option<SystemTime>,
+        skip_healing: bool,
+        lifecycle: Option<Arc<s3s::dto::BucketLifecycleConfiguration>>,
+        replication: Option<Arc<ReplicationConfig>>,
+        failed_objects: HashMap<String, u64>,
+    }
+
+    let old_info = OldDataUsageCacheInfo {
+        name: "bucket".to_string(),
+        next_cycle: 7,
+        last_update: None,
+        skip_healing: true,
+        lifecycle: None,
+        replication: None,
+        failed_objects: HashMap::from([("bad-object".to_string(), 11)]),
+    };
+    let mut buf = Vec::new();
+    old_info
+        .serialize(&mut rmp_serde::Serializer::new(&mut buf))
+        .expect("Failed to serialize old cache info");
+
+    let decoded: DataUsageCacheInfo = rmp_serde::from_slice(&buf).expect("Failed to deserialize old cache info");
+
+    assert_eq!(decoded.name, "bucket");
+    assert_eq!(decoded.next_cycle, 7);
+    assert!(decoded.skip_healing);
+    assert_eq!(decoded.failed_objects.get("bad-object"), Some(&11));
+    assert!(decoded.scan_resume_after.is_none());
+    assert!(decoded.scan_checkpoint.is_none());
+    assert!(decoded.scan_raw_enumeration_cursor.is_none());
+    assert!(decoded.pending_heals.is_empty());
+    assert!(decoded.source.is_none());
+    assert!(!decoded.snapshot_complete);
+    assert!(decoded.scan_plan_digest.is_none());
+    assert!(decoded.scan_execution_digest.is_none());
+    assert_eq!(decoded.cache_key_format, 0);
+}
+
+#[test]
+fn test_new_data_usage_cache_msgpack_round_trips_and_supports_old_reader() {
+    #[derive(Deserialize)]
+    struct OldDataUsageCacheInfo {
+        name: String,
+        next_cycle: u64,
+        last_update: Option<SystemTime>,
+        skip_healing: bool,
+        lifecycle: Option<Arc<s3s::dto::BucketLifecycleConfiguration>>,
+        replication: Option<Arc<ReplicationConfig>>,
+        failed_objects: HashMap<String, u64>,
+        scan_resume_after: Option<String>,
+        scan_checkpoint: Option<DataUsageScanCheckpoint>,
+        pending_heals: Vec<PendingScannerHeal>,
+        object_lock: Option<Arc<s3s::dto::ObjectLockConfiguration>>,
+    }
+
+    #[derive(Deserialize)]
+    struct OldDataUsageCache {
+        info: OldDataUsageCacheInfo,
+        cache: HashMap<String, DataUsageEntry>,
+    }
+
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            leader_epoch: 9,
+            skip_healing: true,
+            failed_objects: HashMap::from([("bad-object".to_string(), 11)]),
+            source: Some(DataUsageCacheSource::new(1, 2)),
+            scan_raw_enumeration_cursor: Some(DataUsageRawEnumerationCursor::new(
+                "bucket/prefix".to_string(),
+                Some("last-object".to_string()),
+                7,
+                [7; 32],
+            )),
+            scan_raw_enumeration_page_index: Some(raw_page_index_fixture("bucket/prefix", &["entry-a"], false)),
+            snapshot_complete: true,
+            scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            scan_execution_digest: Some(DataUsageScanPlanDigest([42; 32])),
+            segment_invalidation_proof: Some(DataUsageSegmentInvalidationProof {
+                process_epoch: "scanner-process".to_string(),
+                generation_start: 7,
+                generation_end: 9,
+                producer_identity_coverage_complete: true,
+                cold_zero_walk_oracle: true,
+            }),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace(
+        "bucket",
+        "",
+        DataUsageEntry {
+            objects: 3,
+            ..Default::default()
+        },
+    );
+    let buf = cache.marshal_msg().expect("Failed to serialize new cache");
+    let current = DataUsageCache::unmarshal(&buf).expect("Current reader failed to deserialize new cache");
+    assert_eq!(current.info.leader_epoch, 9);
+    assert_eq!(current.info.source, Some(DataUsageCacheSource::new(1, 2)));
+    assert_eq!(
+        current
+            .info
+            .scan_raw_enumeration_cursor
+            .as_ref()
+            .map(|cursor| cursor.last_entry.as_deref()),
+        Some(Some("last-object"))
+    );
+    assert!(current.info.scan_raw_enumeration_page_index.is_some());
+    assert!(current.info.snapshot_complete);
+    assert_eq!(current.info.scan_plan_digest, Some(TEST_PLAN_DIGEST));
+    assert_eq!(current.info.scan_execution_digest, Some(DataUsageScanPlanDigest([42; 32])));
+    assert_eq!(
+        current.info.segment_invalidation_proof,
+        Some(DataUsageSegmentInvalidationProof {
+            process_epoch: "scanner-process".to_string(),
+            generation_start: 7,
+            generation_end: 9,
+            producer_identity_coverage_complete: true,
+            cold_zero_walk_oracle: true,
+        })
+    );
+    assert_eq!(current.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+    assert_eq!(current.find("bucket").map(|entry| entry.objects), Some(3));
+
+    let decoded: OldDataUsageCache = rmp_serde::from_slice(&buf).expect("Old reader failed to deserialize new cache");
+
+    assert_eq!(decoded.info.name, "bucket");
+    assert_eq!(decoded.info.next_cycle, 7);
+    assert!(decoded.info.last_update.is_none());
+    assert!(decoded.info.skip_healing);
+    assert!(decoded.info.lifecycle.is_none());
+    assert!(decoded.info.replication.is_none());
+    assert_eq!(decoded.info.failed_objects.get("bad-object"), Some(&11));
+    assert!(decoded.info.scan_resume_after.is_none());
+    assert!(decoded.info.scan_checkpoint.is_none());
+    assert!(decoded.info.pending_heals.is_empty());
+    assert!(decoded.info.object_lock.is_none());
+    assert_eq!(decoded.cache.get("bucket").map(|entry| entry.objects), Some(3));
+}
+
+fn valid_scan_identity() -> DataUsageScanIdentity {
+    DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: uuid::Uuid::new_v4(),
+        set_layout: TEST_PLAN_DIGEST,
+        publication_epoch: 5,
+        tier_registry_generation: 9,
+        scan_mode: HealScanMode::Normal,
+    }
+}
+
+fn cache_with_raw_cursor(cursor: DataUsageRawEnumerationCursor) -> DataUsageCache {
+    DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            leader_epoch: 1,
+            source: Some(DataUsageCacheSource::new(1, 2)),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            scan_identity: Some(valid_scan_identity()),
+            tier_registry_generation: Some(9),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_raw_enumeration_cursor: Some(cursor),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn raw_page_index_fixture(parent: &str, entries: &[&str], complete: bool) -> RawEnumerationPageIndex {
+    let mut index = RawEnumerationPageIndex::new(parent, 2).expect("raw page index should initialize");
+    let generation = index.generation().expect("raw page index should expose generation");
+    let outcome = if complete {
+        index.ingest_owner_entries(entries.iter().map(|entry| (*entry).to_string()), entries.len().max(1), generation)
+    } else {
+        index.ingest_partial_owner_entries(entries.iter().map(|entry| (*entry).to_string()), entries.len().max(1), generation)
+    }
+    .expect("raw page index fixture should ingest entries");
+    if outcome.ready_to_commit {
+        let generation = index.generation().expect("raw page index should expose commit generation");
+        index
+            .commit_building_page(generation)
+            .expect("raw page index fixture should commit ready page");
+    }
+    index
+}
+
+#[test]
+fn raw_enumeration_cursor_validation_requires_bucket_identity_and_bounded_marker() {
+    let valid = DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), Some("entry-001".to_string()), 1, [8; 32]);
+    let cache = cache_with_raw_cursor(valid.clone());
+    assert_eq!(cache.validated_raw_enumeration_cursor(), Some(&valid));
+
+    let page_begin = DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), None, 0, [8; 32]);
+    let cache = cache_with_raw_cursor(page_begin.clone());
+    assert_eq!(cache.validated_raw_enumeration_cursor(), Some(&page_begin));
+
+    let seen_without_marker = DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), None, 1, [8; 32]);
+    assert!(
+        cache_with_raw_cursor(seen_without_marker)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let mut missing_identity = cache_with_raw_cursor(valid.clone());
+    missing_identity.info.scan_identity = None;
+    assert!(missing_identity.validated_raw_enumeration_cursor().is_none());
+
+    let mut outside_bucket = valid.clone();
+    outside_bucket.parent = "other/raw".to_string();
+    assert!(
+        cache_with_raw_cursor(outside_bucket)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let mut future_version = valid.clone();
+    future_version.version = DATA_USAGE_RAW_ENUMERATION_CURSOR_VERSION + 1;
+    assert!(
+        cache_with_raw_cursor(future_version)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let mut zero_digest = valid.clone();
+    zero_digest.page_digest = [0; 32];
+    assert!(
+        cache_with_raw_cursor(zero_digest)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let mut nested_marker = valid;
+    nested_marker.last_entry = Some("child/object".to_string());
+    assert!(
+        cache_with_raw_cursor(nested_marker)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+
+    let oversized_marker =
+        DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), Some("x".repeat(16 * 1024 + 1)), 1, [8; 32]);
+    assert!(
+        cache_with_raw_cursor(oversized_marker)
+            .validated_raw_enumeration_cursor()
+            .is_none()
+    );
+}
+
+#[test]
+fn prepare_bucket_checkpoint_preserves_only_valid_raw_enumeration_cursor() {
+    let identity = valid_scan_identity();
+    let source = DataUsageCacheSource::new(1, 2);
+    let cursor = DataUsageRawEnumerationCursor::new("bucket/raw".to_string(), Some("entry-001".to_string()), 1, [9; 32]);
+    let mut cache = cache_with_raw_cursor(cursor.clone());
+    cache.info.scan_identity = Some(identity);
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 2, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(cache.info.scan_raw_enumeration_cursor, Some(cursor));
+
+    let invalid = DataUsageRawEnumerationCursor::new("other/raw".to_string(), Some("entry-001".to_string()), 1, [9; 32]);
+    let mut cache = cache_with_raw_cursor(invalid);
+    cache.info.scan_identity = Some(identity);
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 2, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reset
+    );
+    assert!(cache.info.scan_raw_enumeration_cursor.is_none());
+    assert!(cache.info.scan_progress.is_some());
+}
+
+#[test]
+fn prepare_bucket_checkpoint_preserves_only_valid_raw_page_index() {
+    let identity = valid_scan_identity();
+    let source = DataUsageCacheSource::new(1, 2);
+    let page_index = raw_page_index_fixture("bucket/raw", &["entry-001"], false);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            leader_epoch: 1,
+            source: Some(source),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            scan_identity: Some(identity),
+            tier_registry_generation: Some(9),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_raw_enumeration_page_index: Some(page_index.clone()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 1, 1, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 2, 2, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reused
+    );
+    assert_eq!(cache.info.scan_raw_enumeration_page_index, Some(page_index));
+
+    let invalid = raw_page_index_fixture("other/raw", &["entry-001"], false);
+    cache.info.scan_raw_enumeration_page_index = Some(invalid);
+    assert_eq!(
+        cache.prepare_bucket_checkpoint("bucket", 3, 3, source, TEST_PLAN_DIGEST, identity),
+        DataUsageCachePrepareOutcome::Reset
+    );
+    assert!(cache.info.scan_raw_enumeration_page_index.is_none());
+    assert!(cache.info.scan_progress.is_some());
+}
+
+/// Deterministic, fully populated cache used to pin the persisted
+/// `.usage-cache.bin` wire bytes. Every map/set holds at most one element
+/// so the map-encoded `marshal_msg` output is byte-stable.
+fn wire_fixture_cache() -> DataUsageCache {
+    let mut entry = DataUsageEntry {
+        size: 4096,
+        objects: 3,
+        versions: 5,
+        delete_markers: 1,
+        compacted: true,
+        failed_objects: 2,
+        ..Default::default()
+    };
+    entry.add_tier_sizes(&HashMap::from([(
+        "WARM".to_string(),
+        TierStats {
+            total_size: 2048,
+            num_versions: 2,
+            num_objects: 1,
+        },
+    )]));
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "wire-bucket".to_string(),
+            next_cycle: 7,
+            leader_epoch: 9,
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            skip_healing: true,
+            failed_objects: HashMap::from([("wire-bucket/lost".to_string(), 11)]),
+            scan_resume_after: Some("wire-bucket/resume".to_string()),
+            pending_heals: vec![PendingScannerHeal {
+                kind: PendingScannerHealKind::Object,
+                bucket: "wire-bucket".to_string(),
+                object: Some("broken".to_string()),
+                version_id: None,
+                scan_mode: HealScanMode::Normal,
+                first_seen: 100,
+                last_attempt: 200,
+                attempts: 3,
+                last_admission_result: "deferred".to_string(),
+                last_admission_reason: "budget".to_string(),
+            }],
+            source: Some(DataUsageCacheSource::new(1, 2)),
+            snapshot_complete: true,
+            scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace("wire-bucket", "", entry);
+    cache
+}
+
+/// Persisted `.usage-cache.bin` bytes produced by [`wire_fixture_cache`]
+/// via `DataUsageCache::marshal_msg`: a 2-element array of the 16-field
+/// map-encoded info block and the map of map-encoded entries.
+///
+/// The thin read-only projection in `crates/data-usage` decodes a copy of
+/// this fixture (`thin_usage_cache_decodes_scanner_wire_fixture`); when
+/// the encoding legitimately changes, regenerate both copies from
+/// `wire_fixture_cache().marshal_msg()` and re-verify old readers.
+const USAGE_CACHE_WIRE_FIXTURE: &[u8] = &[
+    0x92, 0xde, 0x00, 0x10, 0xa4, 0x6e, 0x61, 0x6d, 0x65, 0xab, 0x77, 0x69, 0x72, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74,
+    0xaa, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x07, 0xac, 0x6c, 0x65, 0x61, 0x64, 0x65, 0x72, 0x5f, 0x65,
+    0x70, 0x6f, 0x63, 0x68, 0x09, 0xab, 0x6c, 0x61, 0x73, 0x74, 0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x92, 0xce, 0x65, 0x53,
+    0xf1, 0x00, 0x00, 0xac, 0x73, 0x6b, 0x69, 0x70, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x69, 0x6e, 0x67, 0xc3, 0xa9, 0x6c, 0x69, 0x66,
+    0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0xc0, 0xab, 0x72, 0x65, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0xc0, 0xae,
+    0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x5f, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x73, 0x81, 0xb0, 0x77, 0x69, 0x72, 0x65, 0x2d,
+    0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0x2f, 0x6c, 0x6f, 0x73, 0x74, 0x0b, 0xb1, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x72, 0x65, 0x73,
+    0x75, 0x6d, 0x65, 0x5f, 0x61, 0x66, 0x74, 0x65, 0x72, 0xb2, 0x77, 0x69, 0x72, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74,
+    0x2f, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0xaf, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x63, 0x68, 0x65, 0x63, 0x6b, 0x70, 0x6f, 0x69,
+    0x6e, 0x74, 0xc0, 0xad, 0x70, 0x65, 0x6e, 0x64, 0x69, 0x6e, 0x67, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x73, 0x91, 0x9a, 0xa6, 0x6f,
+    0x62, 0x6a, 0x65, 0x63, 0x74, 0xab, 0x77, 0x69, 0x72, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0xa6, 0x62, 0x72, 0x6f,
+    0x6b, 0x65, 0x6e, 0xc0, 0x01, 0x64, 0xcc, 0xc8, 0x03, 0xa8, 0x64, 0x65, 0x66, 0x65, 0x72, 0x72, 0x65, 0x64, 0xa6, 0x62, 0x75,
+    0x64, 0x67, 0x65, 0x74, 0xab, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x5f, 0x6c, 0x6f, 0x63, 0x6b, 0xc0, 0xa6, 0x73, 0x6f, 0x75,
+    0x72, 0x63, 0x65, 0x92, 0x01, 0x02, 0xb1, 0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f, 0x63, 0x6f, 0x6d, 0x70, 0x6c,
+    0x65, 0x74, 0x65, 0xc3, 0xb0, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x70, 0x6c, 0x61, 0x6e, 0x5f, 0x64, 0x69, 0x67, 0x65, 0x73, 0x74,
+    0xdc, 0x00, 0x20, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+    0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0xb0, 0x63, 0x61, 0x63, 0x68, 0x65, 0x5f,
+    0x6b, 0x65, 0x79, 0x5f, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x01, 0x81, 0xab, 0x77, 0x69, 0x72, 0x65, 0x2d, 0x62, 0x75, 0x63,
+    0x6b, 0x65, 0x74, 0x8b, 0xa8, 0x63, 0x68, 0x69, 0x6c, 0x64, 0x72, 0x65, 0x6e, 0x90, 0xa4, 0x73, 0x69, 0x7a, 0x65, 0xcd, 0x10,
+    0x00, 0xa7, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x73, 0x03, 0xa8, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x73, 0x05, 0xae,
+    0x64, 0x65, 0x6c, 0x65, 0x74, 0x65, 0x5f, 0x6d, 0x61, 0x72, 0x6b, 0x65, 0x72, 0x73, 0x01, 0xa9, 0x6f, 0x62, 0x6a, 0x5f, 0x73,
+    0x69, 0x7a, 0x65, 0x73, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xac, 0x6f, 0x62, 0x6a, 0x5f,
+    0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x73, 0x97, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xb1, 0x72, 0x65, 0x70, 0x6c,
+    0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x5f, 0x73, 0x74, 0x61, 0x74, 0x73, 0xc0, 0xa9, 0x63, 0x6f, 0x6d, 0x70, 0x61, 0x63,
+    0x74, 0x65, 0x64, 0xc3, 0xae, 0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x5f, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x73, 0x02, 0xae,
+    0x61, 0x6c, 0x6c, 0x5f, 0x74, 0x69, 0x65, 0x72, 0x5f, 0x73, 0x74, 0x61, 0x74, 0x73, 0x91, 0x81, 0xa4, 0x57, 0x41, 0x52, 0x4d,
+    0x93, 0xcd, 0x08, 0x00, 0x02, 0x01,
+];
+
+#[test]
+fn usage_cache_wire_format_is_pinned() {
+    // Writer: the canonical map-encoded serializer must reproduce the
+    // pinned bytes. Round-trip tests cannot see format drift, so any
+    // encoding change (field rename/reorder, map->array switch) fails
+    // here and forces re-verifying old readers and the thin projection
+    // in crates/data-usage before the fixture is regenerated.
+    let encoded = wire_fixture_cache().marshal_msg().expect("marshal fixture cache");
+    assert_eq!(
+        encoded.as_slice(),
+        USAGE_CACHE_WIRE_FIXTURE,
+        "persisted .usage-cache.bin encoding drifted from the pinned fixture"
+    );
+
+    // Reader: the pinned bytes decode with every field intact.
+    let decoded = DataUsageCache::unmarshal(USAGE_CACHE_WIRE_FIXTURE).expect("decode pinned fixture");
+    assert_eq!(decoded.info.name, "wire-bucket");
+    assert_eq!(decoded.info.next_cycle, 7);
+    assert_eq!(decoded.info.leader_epoch, 9);
+    assert_eq!(
+        decoded.info.last_update,
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+    );
+    assert!(decoded.info.skip_healing);
+    assert_eq!(decoded.info.failed_objects.get("wire-bucket/lost"), Some(&11));
+    assert_eq!(decoded.info.scan_resume_after.as_deref(), Some("wire-bucket/resume"));
+    assert_eq!(decoded.info.pending_heals.len(), 1);
+    assert_eq!(decoded.info.pending_heals[0].kind, PendingScannerHealKind::Object);
+    assert_eq!(decoded.info.pending_heals[0].object.as_deref(), Some("broken"));
+    assert_eq!(decoded.info.source, Some(DataUsageCacheSource::new(1, 2)));
+    assert!(decoded.info.snapshot_complete);
+    assert_eq!(decoded.info.scan_plan_digest, Some(TEST_PLAN_DIGEST));
+    assert_eq!(decoded.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+
+    let entry = decoded.cache.get("wire-bucket").expect("fixture entry decodes");
+    assert_eq!(entry.size, 4096);
+    assert_eq!(entry.objects, 3);
+    assert_eq!(entry.versions, 5);
+    assert_eq!(entry.delete_markers, 1);
+    assert!(entry.compacted);
+    assert_eq!(entry.failed_objects, 2);
+    assert_eq!(
+        entry.all_tier_stats.as_ref().and_then(|tiers| tiers.tiers.get("WARM")),
+        Some(&TierStats {
+            total_size: 2048,
+            num_versions: 2,
+            num_objects: 1,
+        })
+    );
+}
+
+#[test]
+fn usage_cache_lkg_fields_round_trip_when_present() {
+    let mut cache = wire_fixture_cache();
+    cache.info.lkg_snapshot_complete = true;
+    cache.info.lkg_next_cycle = Some(6);
+    cache.info.lkg_last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_699_999_999));
+    cache.info.lkg_leader_epoch = Some(8);
+    cache.info.lkg_scan_plan_digest = Some(DataUsageScanPlanDigest([2; 32]));
+
+    let encoded = cache.marshal_msg().expect("marshal cache with LKG metadata");
+    let decoded = DataUsageCache::unmarshal(&encoded).expect("decode cache with LKG metadata");
+    assert!(decoded.info.lkg_snapshot_complete);
+    assert_eq!(decoded.info.lkg_next_cycle, Some(6));
+    assert_eq!(decoded.info.lkg_last_update, cache.info.lkg_last_update);
+    assert_eq!(decoded.info.lkg_leader_epoch, Some(8));
+    assert_eq!(decoded.info.lkg_scan_plan_digest, Some(DataUsageScanPlanDigest([2; 32])));
+}
+
+#[test]
+fn data_usage_cache_prepare_for_scan_rejects_unscoped_distributed_cache() {
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            scan_resume_after: Some("bucket/prefix".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace(
+        "bucket",
+        "",
+        DataUsageEntry {
+            objects: 3,
+            ..Default::default()
+        },
+    );
+
+    let reused = cache.prepare_for_scan("bucket", 8, 0, DataUsageCacheSource::new(1, 0), TEST_PLAN_DIGEST, true);
+
+    assert_eq!(reused, DataUsageCachePrepareOutcome::Reset);
+    assert_eq!(cache.info.name, "bucket");
+    assert_eq!(cache.info.next_cycle, 8);
+    assert_eq!(cache.info.source, Some(DataUsageCacheSource::new(1, 0)));
+    assert_eq!(cache.info.scan_plan_digest, Some(TEST_PLAN_DIGEST));
+    assert!(!cache.info.snapshot_complete);
+    assert!(cache.info.scan_resume_after.is_none());
+    assert!(cache.cache.is_empty());
+}
+
+#[test]
+fn data_usage_cache_prepare_for_scan_preserves_matching_partial_progress() {
+    let source = DataUsageCacheSource::new(1, 0);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            scan_resume_after: Some("bucket/prefix".to_string()),
+            source: Some(source),
+            snapshot_complete: false,
+            scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace(
+        "bucket",
+        "",
+        DataUsageEntry {
+            objects: 3,
+            ..Default::default()
+        },
+    );
+
+    let reused = cache.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+    assert_eq!(reused, DataUsageCachePrepareOutcome::Reused);
+    assert_eq!(cache.info.scan_resume_after.as_deref(), Some("bucket/prefix"));
+    assert_eq!(cache.find("bucket").map(|entry| entry.objects), Some(3));
+    assert_eq!(cache.info.next_cycle, 8);
+    assert_eq!(cache.info.source, Some(source));
+    assert_eq!(cache.info.scan_plan_digest, Some(TEST_PLAN_DIGEST));
+    assert!(!cache.info.snapshot_complete);
+}
+
+#[test]
+fn data_usage_cache_prepare_for_scan_preserves_pending_heal_only_progress() {
+    let source = DataUsageCacheSource::new(1, 0);
+    let pending_heal = PendingScannerHeal {
+        kind: PendingScannerHealKind::Object,
+        bucket: "bucket".to_string(),
+        object: Some("prefix/object".to_string()),
+        version_id: Some("version-a".to_string()),
+        scan_mode: HealScanMode::Deep,
+        first_seen: 1,
+        last_attempt: 2,
+        attempts: 3,
+        last_admission_result: "full".to_string(),
+        last_admission_reason: "queue_full".to_string(),
+    };
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            source: Some(source),
+            scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            pending_heals: vec![pending_heal.clone()],
+            size_reconciliation: HashMap::from([(
+                "size-key".to_string(),
+                SizeReconciliationEntry {
+                    key: "size-key".to_string(),
+                    bucket: "bucket".to_string(),
+                    object: "prefix/object".to_string(),
+                    reason: "invalid_declared_size".to_string(),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let outcome = cache.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+    assert_eq!(outcome, DataUsageCachePrepareOutcome::Reused);
+    assert_eq!(cache.info.pending_heals, vec![pending_heal]);
+    assert!(cache.info.size_reconciliation.contains_key("size-key"));
+    assert!(cache.cache.is_empty());
+    assert!(!cache.info.snapshot_complete);
+}
+
+#[test]
+fn data_usage_cache_prepare_for_scan_preserves_namespace_pending_heals_during_key_format_rebuild() {
+    let source = DataUsageCacheSource::new(1, 0);
+    let pending_heal = PendingScannerHeal {
+        kind: PendingScannerHealKind::Object,
+        bucket: "bucket".to_string(),
+        object: Some("prefix/object".to_string()),
+        version_id: Some("version-a".to_string()),
+        scan_mode: HealScanMode::Deep,
+        first_seen: 1,
+        last_attempt: 2,
+        attempts: 3,
+        last_admission_result: "full".to_string(),
+        last_admission_reason: "queue_full".to_string(),
+    };
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: DATA_USAGE_ROOT.to_string(),
+            next_cycle: 7,
+            source: Some(source),
+            scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            pending_heals: vec![pending_heal.clone()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace(DATA_USAGE_ROOT, "", DataUsageEntry::default());
+
+    let outcome = cache.prepare_for_scan(DATA_USAGE_ROOT, 8, 0, source, TEST_PLAN_DIGEST, true);
+
+    assert_eq!(outcome, DataUsageCachePrepareOutcome::Reset);
+    assert_eq!(cache.info.pending_heals, vec![pending_heal]);
+    assert!(cache.cache.is_empty());
+    assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+}
+
+#[test]
+fn data_usage_cache_prepare_for_scan_drops_pending_heals_from_a_different_scope() {
+    let source = DataUsageCacheSource::new(1, 0);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "old-bucket".to_string(),
+            next_cycle: 7,
+            source: Some(source),
+            scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            pending_heals: vec![PendingScannerHeal {
+                kind: PendingScannerHealKind::Object,
+                bucket: "old-bucket".to_string(),
+                object: Some("prefix/object".to_string()),
+                version_id: None,
+                scan_mode: HealScanMode::Normal,
+                first_seen: 1,
+                last_attempt: 2,
+                attempts: 3,
+                last_admission_result: "full".to_string(),
+                last_admission_reason: "queue_full".to_string(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let outcome = cache.prepare_for_scan("new-bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+    assert_eq!(outcome, DataUsageCachePrepareOutcome::Reset);
+    assert_eq!(cache.info.name, "new-bucket");
+    assert!(cache.info.pending_heals.is_empty());
+}
+
+#[test]
+fn data_usage_cache_prepare_for_scan_resets_unknown_key_format() {
+    let source = DataUsageCacheSource::new(1, 0);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            source: Some(source),
+            scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT + 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace(
+        "bucket",
+        "",
+        DataUsageEntry {
+            objects: 3,
+            ..Default::default()
+        },
+    );
+
+    let outcome = cache.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+    assert_eq!(outcome, DataUsageCachePrepareOutcome::Reset);
+    assert!(cache.cache.is_empty());
+    assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+}
+
+#[test]
+fn data_usage_cache_prepare_for_scan_resets_persisted_windows_key_mismatch() {
+    let source = DataUsageCacheSource::new(1, 0);
+    let root_key = hash_path("bucket").key();
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            source: Some(source),
+            snapshot_complete: true,
+            scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.cache.insert(
+        root_key,
+        DataUsageEntry {
+            children: HashSet::from(["bucket/prefix".to_string()]),
+            ..Default::default()
+        },
+    );
+    cache.cache.insert(
+        "bucket\\prefix".to_string(),
+        DataUsageEntry {
+            objects: 3,
+            ..Default::default()
+        },
+    );
+
+    let encoded = cache.marshal_msg().expect("legacy Windows cache should serialize");
+    let mut decoded = DataUsageCache::unmarshal(&encoded).expect("legacy Windows cache should deserialize");
+    let outcome = decoded.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+    assert_eq!(outcome, DataUsageCachePrepareOutcome::Reset);
+    assert!(decoded.cache.is_empty());
+    assert_eq!(decoded.info.name, "bucket");
+    assert_eq!(decoded.info.next_cycle, 8);
+    assert_eq!(decoded.info.source, Some(source));
+    assert!(!decoded.info.snapshot_complete);
+}
+
+#[test]
+fn data_usage_cache_prepare_for_scan_resets_current_cache_with_dangling_child() {
+    let source = DataUsageCacheSource::new(1, 0);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            source: Some(source),
+            scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.cache.insert(
+        hash_path("bucket").key(),
+        DataUsageEntry {
+            children: HashSet::from([hash_path("bucket/missing").key()]),
+            ..Default::default()
+        },
+    );
+
+    let outcome = cache.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+    assert_eq!(outcome, DataUsageCachePrepareOutcome::Reset);
+    assert!(cache.cache.is_empty());
+    assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+}
+
+#[test]
+fn data_usage_cache_prepare_for_scan_resets_complete_bucket_cache_with_detached_entry() {
+    let source = DataUsageCacheSource::new(1, 0);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            source: Some(source),
+            snapshot_complete: true,
+            scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.cache.insert(
+        hash_path("bucket").key(),
+        DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    cache.cache.insert(
+        hash_path("bucket/detached").key(),
+        DataUsageEntry {
+            objects: 2,
+            ..Default::default()
+        },
+    );
+    assert_eq!(cache.checked_flatten("bucket").map(|entry| entry.objects), Some(1));
+    assert!(
+        cache.checked_flatten_complete("bucket").is_none(),
+        "complete bucket cache reuse must reject detached entries"
+    );
+
+    let outcome = cache.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, true);
+
+    assert_eq!(outcome, DataUsageCachePrepareOutcome::Reset);
+    assert!(cache.cache.is_empty());
+    assert_eq!(cache.info.cache_key_format, DATA_USAGE_CACHE_KEY_FORMAT);
+}
+
+#[test]
+fn data_usage_cache_prepare_for_scan_rejects_legacy_cache_without_a_bucket_plan() {
+    let source = DataUsageCacheSource::new(0, 0);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace(
+        "bucket",
+        "",
+        DataUsageEntry {
+            objects: 3,
+            ..Default::default()
+        },
+    );
+
+    let reused = cache.prepare_for_scan("bucket", 8, 0, source, TEST_PLAN_DIGEST, false);
+
+    assert_eq!(reused, DataUsageCachePrepareOutcome::Reset);
+    assert!(cache.find("bucket").is_none());
+    assert_eq!(cache.info.source, Some(source));
+    assert_eq!(cache.info.scan_plan_digest, Some(TEST_PLAN_DIGEST));
+    assert!(!cache.info.snapshot_complete);
+}
+
+#[test]
+fn data_usage_cache_prepare_for_scan_rejects_a_different_bucket_plan() {
+    let source = DataUsageCacheSource::new(1, 0);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 7,
+            source: Some(source),
+            scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            scan_resume_after: Some("bucket/prefix".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace(
+        "bucket",
+        "",
+        DataUsageEntry {
+            objects: 3,
+            ..Default::default()
+        },
+    );
+
+    let next_plan = DataUsageScanPlanDigest([4; 32]);
+    let reused = cache.prepare_for_scan("bucket", 8, 0, source, next_plan, true);
+
+    assert_eq!(reused, DataUsageCachePrepareOutcome::Reset);
+    assert_eq!(cache.info.scan_plan_digest, Some(next_plan));
+    assert!(cache.info.scan_resume_after.is_none());
+    assert!(cache.cache.is_empty());
+}
+
+#[test]
+fn data_usage_cache_prepare_for_scan_rejects_cycle_regression_without_mutation() {
+    let source = DataUsageCacheSource::new(1, 0);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 8,
+            source: Some(source),
+            snapshot_complete: true,
+            scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace(
+        "bucket",
+        "",
+        DataUsageEntry {
+            objects: 3,
+            ..Default::default()
+        },
+    );
+
+    let outcome = cache.prepare_for_scan("bucket", 7, 0, source, DataUsageScanPlanDigest([4; 32]), true);
+
+    assert_eq!(outcome, DataUsageCachePrepareOutcome::RejectedNewerCycle);
+    assert_eq!(cache.info.next_cycle, 8);
+    assert_eq!(cache.info.source, Some(source));
+    assert_eq!(cache.info.scan_plan_digest, Some(TEST_PLAN_DIGEST));
+    assert!(cache.info.snapshot_complete);
+    assert_eq!(cache.find("bucket").map(|entry| entry.objects), Some(3));
+}
+
+#[test]
+fn data_usage_cache_prepare_for_scan_fences_leader_epochs() {
+    let source = DataUsageCacheSource::new(1, 0);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 8,
+            leader_epoch: 11,
+            source: Some(source),
+            snapshot_complete: true,
+            scan_plan_digest: Some(TEST_PLAN_DIGEST),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace("bucket", "", DataUsageEntry::default());
+
+    let stale = cache.prepare_for_scan("bucket", 8, 10, source, TEST_PLAN_DIGEST, true);
+    assert_eq!(stale, DataUsageCachePrepareOutcome::RejectedNewerLeader);
+    assert_eq!(cache.info.leader_epoch, 11);
+    assert!(cache.info.snapshot_complete);
+
+    let replacement = cache.prepare_for_scan("bucket", 8, 12, source, TEST_PLAN_DIGEST, true);
+    assert_eq!(replacement, DataUsageCachePrepareOutcome::Reset);
+    assert_eq!(cache.info.leader_epoch, 12);
+    assert!(!cache.info.snapshot_complete);
+    assert!(cache.cache.is_empty());
+}
+
+#[test]
+fn prepare_bucket_checkpoint_migrates_legacy_epoch_bound_receipt() {
+    let identity = valid_scan_identity();
+    let source = DataUsageCacheSource::new(1, 2);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            next_cycle: 8,
+            leader_epoch: 1,
+            source: Some(source),
+            cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
+            scan_identity: Some(identity),
+            tier_registry_generation: Some(identity.tier_registry_generation),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_resume_after: Some("bucket/a".to_string()),
+            scan_checkpoint: Some(DataUsageScanCheckpoint::new(
+                "bucket/a".to_string(),
+                DataUsageScanCheckpointReason::Objects,
+            )),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace("bucket", "", DataUsageEntry::default());
+    cache.replace(
+        "bucket/a",
+        "bucket",
+        DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    for legacy_digest in [
+        cache
+            .legacy_coverage_prefix_digest("bucket/a")
+            .expect("epoch-bound receipt digest"),
+        cache.v2_coverage_prefix_digest("bucket/a").expect("v2 receipt digest"),
+    ] {
+        let mut cache = cache.clone();
+        cache.info.scan_coverage_receipt = Some(DataUsageScanCoverageReceipt {
+            through: "bucket/a".to_string(),
+            digest: legacy_digest,
+        });
+        assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
+        assert_eq!(
+            cache.prepare_bucket_checkpoint("bucket", 9, 2, source, TEST_PLAN_DIGEST, identity),
+            DataUsageCachePrepareOutcome::Reused
+        );
+        assert_eq!(cache.info.leader_epoch, 2);
+        assert_eq!(cache.validated_scan_frontier(), Some("bucket/a"));
+        let digest = cache.info.scan_coverage_receipt.as_ref().expect("migrated receipt").digest;
+        assert_ne!(digest, legacy_digest);
+        assert_ne!(digest, cache.v2_coverage_prefix_digest("bucket/a").expect("old reader v2 digest"));
+        assert_ne!(
+            digest,
+            cache
+                .legacy_coverage_prefix_digest("bucket/a")
+                .expect("old reader epoch digest")
+        );
+        cache.cache.get_mut("bucket/a").expect("covered entry").failed_objects = 1;
+        assert!(cache.validated_scan_frontier().is_none(), "tampered health debt invalidates coverage");
+    }
+}
+
+#[test]
+fn test_data_usage_cache_mutations_update_in_place() {
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            failed_objects: HashMap::from([("bad-object".to_string(), 7)]),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let root_hash = hash_path("bucket");
+    let child_hash = hash_path("bucket/a");
+    let grandchild_hash = hash_path("bucket/a/b");
+
+    cache.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+    cache.replace_hashed(
+        &child_hash,
+        &Some(root_hash.clone()),
+        &DataUsageEntry {
+            objects: 2,
+            size: 20,
+            ..Default::default()
+        },
+    );
+    cache.replace_hashed(
+        &grandchild_hash,
+        &Some(child_hash.clone()),
+        &DataUsageEntry {
+            objects: 3,
+            size: 30,
+            ..Default::default()
+        },
+    );
+
+    assert!(cache.find("bucket").unwrap().children.contains(&child_hash.key()));
+    assert!(cache.find("bucket/a").unwrap().children.contains(&grandchild_hash.key()));
+    assert_eq!(cache.search_parent(&grandchild_hash), Some(child_hash.clone()));
+    assert_eq!(cache.info.failed_objects.get("bad-object"), Some(&7));
+
+    let flat = cache.size_recursive("bucket").unwrap();
+    assert_eq!(flat.objects, 5);
+    assert_eq!(flat.size, 50);
+    assert!(flat.children.is_empty());
+}
+
+#[test]
+fn test_data_usage_cache_copy_and_delete_recursive() {
+    let root_hash = hash_path("bucket");
+    let child_hash = hash_path("bucket/a");
+    let grandchild_hash = hash_path("bucket/a/b");
+
+    let mut src = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    src.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+    src.replace_hashed(
+        &child_hash,
+        &Some(root_hash.clone()),
+        &DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    src.replace_hashed(
+        &grandchild_hash,
+        &Some(child_hash.clone()),
+        &DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+
+    let mut dst = DataUsageCache {
+        info: src.info.clone(),
+        ..Default::default()
+    };
+    dst.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+    dst.copy_with_children(&src, &child_hash, &Some(root_hash.clone()));
+
+    assert!(dst.cache.contains_key(&child_hash.key()));
+    assert!(dst.cache.contains_key(&grandchild_hash.key()));
+    assert!(dst.find("bucket").unwrap().children.contains(&child_hash.key()));
+    assert!(dst.find("bucket/a").unwrap().children.contains(&grandchild_hash.key()));
+
+    dst.delete_recursive(&child_hash);
+
+    assert!(!dst.cache.contains_key(&child_hash.key()));
+    assert!(!dst.cache.contains_key(&grandchild_hash.key()));
+    assert!(dst.cache.contains_key(&root_hash.key()));
+}
+
+#[test]
+fn test_data_usage_cache_recursive_helpers_tolerate_cycles() {
+    let root_hash = hash_path("bucket");
+    let child_hash = hash_path("bucket/a");
+
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+    cache.replace_hashed(
+        &child_hash,
+        &Some(root_hash.clone()),
+        &DataUsageEntry {
+            objects: 2,
+            size: 20,
+            ..Default::default()
+        },
+    );
+    cache.cache.entry(child_hash.key()).or_default().add_child(&root_hash);
+
+    assert_eq!(cache.total_children_rec("bucket"), 1);
+
+    let flat = cache.size_recursive("bucket").expect("cyclic cache should still flatten");
+    assert_eq!(flat.objects, 2);
+    assert_eq!(flat.size, 20);
+    assert!(flat.children.is_empty());
+
+    let mut copied = DataUsageCache {
+        info: cache.info.clone(),
+        ..Default::default()
+    };
+    copied.copy_with_children(&cache, &root_hash, &None);
+    assert!(copied.cache.contains_key(&root_hash.key()));
+    assert!(copied.cache.contains_key(&child_hash.key()));
+
+    copied.delete_recursive(&root_hash);
+    assert!(!copied.cache.contains_key(&root_hash.key()));
+    assert!(!copied.cache.contains_key(&child_hash.key()));
+}
+
+#[test]
+fn delete_recursive_preserves_depth_boundary_and_unrelated_entries() {
+    let mut cache = DataUsageCache::default();
+    for depth in 0..=MAX_DATA_USAGE_CACHE_DEPTH + 1 {
+        let mut entry = DataUsageEntry::default();
+        if depth <= MAX_DATA_USAGE_CACHE_DEPTH {
+            entry.children.insert(format!("node-{}", depth + 1));
+        }
+        cache.cache.insert(format!("node-{depth}"), entry);
+    }
+    cache.cache.insert("unrelated".to_string(), DataUsageEntry::default());
+
+    cache.delete_recursive(&DataUsageHash("node-0".to_string()));
+
+    assert_eq!(cache.cache.len(), 2, "delete only reachable entries within the depth limit");
+    assert!(cache.cache.contains_key(&format!("node-{}", MAX_DATA_USAGE_CACHE_DEPTH + 1)));
+    assert!(cache.cache.contains_key("unrelated"));
+}
+
+#[test]
+fn scanner_summary_releases_wide_child_sets() {
+    let root = hash_path("bucket");
+    let mut cache = DataUsageCache::default();
+    cache.replace_hashed(
+        &root,
+        &None,
+        &DataUsageEntry {
+            size: 17,
+            objects: 1,
+            versions: 2,
+            delete_markers: 1,
+            failed_objects: 1,
+            all_tier_stats: Some(AllTierStats::new()),
+            ..Default::default()
+        },
+    );
+    for index in 0..10_000 {
+        let child = hash_path(&format!("bucket/{index:05}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                size: 3,
+                objects: 1,
+                versions: 2,
+                ..Default::default()
+            },
+        );
+    }
+
+    let summary = cache.size_recursive("bucket").expect("wide bucket summary");
+    assert_eq!((summary.size, summary.objects, summary.versions), (30_017, 10_001, 20_002));
+    assert_eq!((summary.delete_markers, summary.failed_objects), (1, 1));
+    assert_eq!(summary.children.capacity(), 0, "summaries must not retain the wide namespace allocation");
+    assert!(summary.all_tier_stats.is_some(), "preserve the root's optional statistics representation");
+    assert_eq!(cache.find("bucket").expect("unchanged root").children.len(), 10_000);
+
+    cache.cache.insert("unrelated".to_string(), DataUsageEntry::default());
+    cache.delete_recursive(&root);
+    assert_eq!(cache.cache.len(), 1, "wide subtree deletion must consume every child exactly once");
+    assert!(cache.cache.contains_key("unrelated"));
+}
+
+#[test]
+fn test_data_usage_cache_flatten_does_not_count_root_twice_in_cycle() {
+    let root_hash = hash_path("bucket");
+    let child_hash = hash_path("bucket/a");
+
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace_hashed(
+        &root_hash,
+        &None,
+        &DataUsageEntry {
+            objects: 1,
+            size: 10,
+            ..Default::default()
+        },
+    );
+    cache.replace_hashed(
+        &child_hash,
+        &Some(root_hash.clone()),
+        &DataUsageEntry {
+            objects: 2,
+            size: 20,
+            ..Default::default()
+        },
+    );
+    cache.cache.entry(child_hash.key()).or_default().add_child(&root_hash);
+
+    let flat = cache.size_recursive("bucket").expect("cyclic cache should still flatten");
+
+    assert_eq!(flat.objects, 3);
+    assert_eq!(flat.size, 30);
+    assert!(flat.children.is_empty());
+}
+
+#[test]
+fn size_recursive_prunes_empty_and_preserves_threshold_replication_stats() {
+    let root = hash_path("bucket");
+    let child = hash_path("bucket/child");
+    let mut cache = DataUsageCache::default();
+    cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+    cache.replace_hashed(
+        &child,
+        &Some(root.clone()),
+        &DataUsageEntry {
+            replication_stats: Some(ReplicationAllStats::default()),
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        cache
+            .size_recursive("bucket")
+            .expect("scanner bucket usage should flatten")
+            .replication_stats
+            .is_none()
+    );
+
+    cache.replace_hashed(
+        &child,
+        &Some(root.clone()),
+        &DataUsageEntry {
+            replication_stats: Some(ReplicationAllStats {
+                targets: HashMap::from([(
+                    "arn:test:threshold".to_string(),
+                    ReplicationTargetUsage {
+                        after_threshold_count: 1,
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    let flattened = cache.size_recursive("bucket").expect("scanner bucket usage should flatten");
+    let replication = flattened
+        .replication_stats
+        .expect("threshold-only replication stats must survive pruning");
+
+    assert_eq!(replication.targets["arn:test:threshold"].after_threshold_count, 1);
+}
+
+#[test]
+fn checked_flatten_rejects_dangling_child() {
+    let root_key = hash_path("bucket").key();
+    let mut cache = DataUsageCache::default();
+    cache.cache.insert(
+        root_key,
+        DataUsageEntry {
+            objects: 1,
+            children: HashSet::from(["missing-child".to_string()]),
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        cache.checked_flatten("bucket").is_none(),
+        "a missing child must invalidate an exact usage snapshot"
+    );
+}
+
+#[test]
+fn checked_flatten_complete_rejects_detached_entries() {
+    let mut cache = DataUsageCache::default();
+    cache.cache.insert(
+        hash_path("bucket").key(),
+        DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    cache.cache.insert(
+        hash_path("bucket/detached").key(),
+        DataUsageEntry {
+            objects: 2,
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(
+        cache.checked_flatten("bucket").map(|entry| entry.objects),
+        Some(1),
+        "subtree flattening may ignore entries outside the requested subtree"
+    );
+    assert!(
+        cache.checked_flatten_complete("bucket").is_none(),
+        "an authoritative cache root must reach every persisted entry"
+    );
+}
+
+#[test]
+fn checked_flatten_rejects_compacted_entries_with_children() {
+    let root_key = hash_path("bucket").key();
+    let child_key = hash_path("bucket/prefix").key();
+    let mut cache = DataUsageCache::default();
+    cache.cache.insert(
+        root_key,
+        DataUsageEntry {
+            children: HashSet::from([child_key.clone()]),
+            compacted: true,
+            ..Default::default()
+        },
+    );
+    cache.cache.insert(
+        child_key,
+        DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        cache.checked_flatten_complete("bucket").is_none(),
+        "a compacted entry cannot retain child links without double-counting"
+    );
+}
+
+#[test]
+fn checked_flatten_rejects_compacted_descendants_with_children() {
+    let root_key = hash_path("bucket").key();
+    let child_key = hash_path("bucket/prefix").key();
+    let grandchild_key = hash_path("bucket/prefix/object").key();
+    let mut cache = DataUsageCache::default();
+    cache.cache.insert(
+        root_key,
+        DataUsageEntry {
+            children: HashSet::from([child_key.clone()]),
+            ..Default::default()
+        },
+    );
+    cache.cache.insert(
+        child_key,
+        DataUsageEntry {
+            objects: 1,
+            children: HashSet::from([grandchild_key.clone()]),
+            compacted: true,
+            ..Default::default()
+        },
+    );
+    cache.cache.insert(
+        grandchild_key,
+        DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        cache.checked_flatten("bucket").is_none(),
+        "a compacted descendant cannot retain child links without double-counting"
+    );
+}
+
+#[test]
+fn checked_flatten_accepts_depth_limit_and_rejects_deeper_tree() {
+    let root_key = hash_path("bucket").key();
+    let mut cache = DataUsageCache::default();
+    cache.cache.insert(
+        root_key.clone(),
+        DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+
+    let mut parent = root_key;
+    for depth in 1..=MAX_DATA_USAGE_CACHE_DEPTH {
+        let child = format!("depth-{depth}");
+        cache
+            .cache
+            .get_mut(&parent)
+            .expect("parent should exist")
+            .children
+            .insert(child.clone());
+        cache.cache.insert(
+            child.clone(),
+            DataUsageEntry {
+                objects: 1,
+                ..Default::default()
+            },
+        );
+        parent = child;
+    }
+
+    let flattened = cache
+        .checked_flatten("bucket")
+        .expect("a tree ending at the configured depth limit should be valid");
+    assert_eq!(flattened.objects, MAX_DATA_USAGE_CACHE_DEPTH + 1);
+
+    let too_deep = "depth-too-deep".to_string();
+    cache
+        .cache
+        .get_mut(&parent)
+        .expect("last valid node should exist")
+        .children
+        .insert(too_deep.clone());
+    cache.cache.insert(
+        too_deep,
+        DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        cache.checked_flatten("bucket").is_none(),
+        "a tree deeper than the configured limit must be rejected"
+    );
+}
+
+#[test]
+fn test_find_children_copy_does_not_insert_missing_entries() {
+    let cache = DataUsageCache::default();
+    let missing_hash = hash_path("missing");
+
+    assert!(cache.find_children_copy(&missing_hash).is_empty());
+    assert!(cache.cache.is_empty());
+    assert_eq!(cache.cache.capacity(), 0);
+}
+
+#[test]
+fn test_find_children_copy_preserves_existing_children() {
+    let hash = hash_path("bucket");
+    let children = HashSet::from(["bucket/child".to_string()]);
+    let mut cache = DataUsageCache::default();
+    cache.cache.insert(
+        hash.key(),
+        DataUsageEntry {
+            children: children.clone(),
+            ..Default::default()
+        },
+    );
+    let mut copied = cache.find_children_copy(&hash);
+    assert_eq!(copied, children);
+    copied.clear();
+    assert_eq!(cache.cache[&hash.0].children, children);
+    assert_eq!(cache.cache.len(), 1);
+}
+
+#[test]
+fn test_dui_bucket_count_uses_bucket_list_after_compaction() {
+    let root_hash = hash_path("root");
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "root".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace_hashed(
+        &root_hash,
+        &None,
+        &DataUsageEntry {
+            compacted: true,
+            objects: 3,
+            ..Default::default()
+        },
+    );
+
+    let buckets = vec!["bucket-a".to_string(), "bucket-b".to_string()];
+    let info = cache.dui("root", &buckets);
+
+    assert_eq!(info.buckets_count, 2);
+    assert!(info.buckets_usage.is_empty());
+    assert_eq!(info.objects_total_count, 3);
+}
+
+#[test]
+fn test_cache_path_type_distinguishes_main_and_backup() {
+    assert_eq!(DataUsageCache::cache_path_type("buckets/.usage-cache.bin"), "main");
+    assert_eq!(DataUsageCache::cache_path_type("buckets/.usage-cache.bin.bkp"), "backup");
+}
+
+#[tokio::test(start_paused = true)]
+#[serial_test::serial]
+async fn test_save_backup_budget_tracks_primary_cost() {
+    temp_env::async_with_vars([(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("14"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        let mut store = BackupFallbackStore::new(b"old backup".to_vec(), true);
+        store.put_delays = [Duration::from_secs(6); 2];
+        let store = Arc::new(store);
+        let revisions = DataUsageCacheRevisions {
+            main: DataUsageCacheRevision::Missing,
+            backup: Some(DataUsageCacheRevision::Etag("backup-etag".to_string())),
+        };
+        DataUsageCache::default()
+            .save_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME, &revisions)
+            .await
+            .expect("a backup with the observed primary cost should complete");
+        let puts = store.puts.lock().await;
+        assert_eq!(puts.len(), 2, "best-effort save success must not hide a stale backup");
+        assert!(puts[1].object.ends_with(".bkp"));
+        assert_eq!(puts[0].if_none_match.as_deref(), Some("*"));
+        assert_eq!(puts[1].if_match.as_deref(), Some("backup-etag"));
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+#[tokio::test(start_paused = true)]
+#[serial_test::serial]
+async fn test_save_backup_budget_still_bounds_a_stalled_backup() {
+    temp_env::async_with_vars([(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("14"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        let mut store = BackupFallbackStore::new(b"old backup".to_vec(), true);
+        store.put_delays = [Duration::from_secs(6), Duration::from_secs(60)];
+        let store = Arc::new(store);
+        let started = Instant::now();
+        DataUsageCache::default()
+            .save(store.clone(), DATA_USAGE_CACHE_NAME)
+            .await
+            .expect("backup failure remains best effort after a successful main save");
+        assert_eq!(store.puts.lock().await.len(), 1, "stalled backup must not commit");
+        assert_eq!(*store.backup_reads.lock().await, 1, "one bounded reconciliation, no backup retry");
+        assert!(started.elapsed() <= Duration::from_secs(6) + DataUsageCache::cache_save_timeout() + Duration::from_millis(10));
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+#[tokio::test(start_paused = true)]
+#[serial_test::serial]
+async fn test_checkpoint_budget_covers_retries_and_reconciliation() {
+    temp_env::async_with_vars([(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("14"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        let cache = DataUsageCache::default();
+        let encoded = rmp_serde::to_vec(&cache).expect("checkpoint should encode");
+        for main_put_failures in [2, 3] {
+            let mut store = BackupFallbackStore::with_recovered_main(b"old backup".to_vec(), encoded.clone());
+            store.put_delays = [Duration::from_secs(13), Duration::from_secs(60)];
+            store.read_delays = [Duration::from_secs(13); 2];
+            store.main_put_failures = main_put_failures;
+            let store = Arc::new(store);
+            let revisions = DataUsageCacheRevisions {
+                main: DataUsageCacheRevision::Missing,
+                backup: Some(DataUsageCacheRevision::Etag("backup-etag".to_string())),
+            };
+            let started = Instant::now();
+            timeout(
+                DataUsageCache::persistence_timeout(),
+                cache.save_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME, &revisions),
+            )
+            .await
+            .expect("the outer checkpoint budget must cover save and reconciliation")
+            .expect("a successful or reconciled primary must survive a best-effort backup failure");
+            assert_eq!(store.put_attempts[0].load(Ordering::SeqCst), 3);
+            assert_eq!(store.put_attempts[1].load(Ordering::SeqCst), 1, "backup writes must not retry");
+            assert_eq!(*store.backup_reads.lock().await, 1, "backup must finish its bounded reconciliation");
+            assert!(started.elapsed() < DataUsageCache::persistence_timeout());
+        }
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+#[test]
+fn test_cache_save_timeout_uses_default_when_env_missing() {
+    with_var_unset(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, || {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        assert_eq!(
+            DataUsageCache::cache_save_timeout(),
+            Duration::from_secs(rustfs_config::DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS)
+        );
+        assert_eq!(DataUsageCache::persistence_timeout(), Duration::from_millis(117_500));
+    });
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+#[test]
+fn test_cache_save_timeout_respects_env_and_minimum_bound() {
+    with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("7"), || {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        assert_eq!(DataUsageCache::cache_save_timeout(), Duration::from_secs(7));
+    });
+
+    with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("0"), || {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        assert_eq!(DataUsageCache::cache_save_timeout(), Duration::from_secs(1));
+    });
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+#[test]
+fn test_cache_persistence_timeout_covers_all_save_and_reconciliation_attempts() {
+    with_var(ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("7"), || {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        assert_eq!(DataUsageCache::persistence_timeout(), Duration::from_millis(61_500));
+    });
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+#[tokio::test]
+async fn test_retry_save_op_retries_on_error_then_succeeds() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_clone = attempts.clone();
+
+    let result = DataUsageCache::retry_save_op("main", Duration::from_millis(200), DATA_USAGE_CACHE_SAVE_RETRIES, move || {
+        let attempts = attempts_clone.clone();
+        async move {
+            let current = attempts.fetch_add(1, Ordering::SeqCst);
+            if current < 2 {
+                return Err(StorageError::other("transient".to_string()));
+            }
+            Ok(())
+        }
+    })
+    .await;
+
+    assert!(result.is_ok());
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn test_retry_save_op_does_not_retry_namespace_lock_errors() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_clone = attempts.clone();
+
+    let result = DataUsageCache::retry_save_op("main", Duration::from_millis(200), DATA_USAGE_CACHE_SAVE_RETRIES, move || {
+        let attempts = attempts_clone.clone();
+        async move {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "write",
+                bucket: RUSTFS_META_BUCKET.to_string(),
+                object: "buckets/.usage-cache.bin".to_string(),
+                required: 2,
+                achieved: 1,
+            })
+        }
+    })
+    .await;
+
+    assert!(matches!(result, Err(StorageError::NamespaceLockQuorumUnavailable { .. })));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+// --- Tests for `add` function (bug #1: logic inversion) ---
+
+/// Build a small tree: root -> child1 (leaf), child2 -> grandchild (leaf).
+/// Returns (cache, root_hash).
+fn build_test_tree() -> (DataUsageCache, DataUsageHash) {
+    let root = hash_path("bucket");
+    let c1 = hash_path("bucket/a");
+    let c2 = hash_path("bucket/b");
+    let gc = hash_path("bucket/b/c");
+
+    let mut cache = DataUsageCache::default();
+    cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+    cache.replace_hashed(
+        &c1,
+        &Some(root.clone()),
+        &DataUsageEntry {
+            objects: 1,
+            size: 10,
+            ..Default::default()
+        },
+    );
+    cache.replace_hashed(
+        &c2,
+        &Some(root.clone()),
+        &DataUsageEntry {
+            objects: 2,
+            size: 20,
+            ..Default::default()
+        },
+    );
+    cache.replace_hashed(
+        &gc,
+        &Some(c2.clone()),
+        &DataUsageEntry {
+            objects: 3,
+            size: 30,
+            ..Default::default()
+        },
+    );
+    (cache, root)
+}
+
+fn build_underflow_test_tree() -> (DataUsageCache, DataUsageHash) {
+    let root = hash_path("bucket");
+    let small = hash_path("bucket/small");
+    let small_a = hash_path("bucket/small/a");
+    let small_b = hash_path("bucket/small/b");
+    let large = hash_path("bucket/large");
+    let large_a = hash_path("bucket/large/a");
+    let large_b = hash_path("bucket/large/b");
+
+    let mut cache = DataUsageCache::default();
+    cache.replace_hashed(
+        &root,
+        &None,
+        &DataUsageEntry {
+            objects: 100,
+            ..Default::default()
+        },
+    );
+    cache.replace_hashed(&small, &Some(root.clone()), &DataUsageEntry::default());
+    cache.replace_hashed(
+        &small_a,
+        &Some(small.clone()),
+        &DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    cache.replace_hashed(
+        &small_b,
+        &Some(small.clone()),
+        &DataUsageEntry {
+            objects: 1,
+            ..Default::default()
+        },
+    );
+    cache.replace_hashed(&large, &Some(root.clone()), &DataUsageEntry::default());
+    cache.replace_hashed(
+        &large_a,
+        &Some(large.clone()),
+        &DataUsageEntry {
+            objects: 10,
+            ..Default::default()
+        },
+    );
+    cache.replace_hashed(
+        &large_b,
+        &Some(large.clone()),
+        &DataUsageEntry {
+            objects: 10,
+            ..Default::default()
+        },
+    );
+    (cache, root)
+}
+
+#[test]
+fn test_add_collects_internal_nodes_as_compaction_candidates() {
+    // `add()` should collect internal nodes (with children) as compaction candidates.
+    // Leaf nodes have no children to remove, so compacting them is a no-op.
+    let (cache, root) = build_test_tree();
+    let mut candidates = Vec::new();
+    add(&cache, &root, &mut candidates);
+
+    let mut paths: Vec<String> = candidates.iter().map(|l| l.path.key()).collect();
+    paths.sort();
+    // Internal nodes: "bucket" (children: [a, b]) and "bucket/b" (children: [c]).
+    // Leaf nodes "bucket/a" and "bucket/b/c" are NOT collected.
+    assert_eq!(paths.len(), 2, "add() should find internal nodes with children");
+    assert!(paths.contains(&hash_path("bucket").key()));
+    assert!(paths.contains(&hash_path("bucket/b").key()));
+}
+
+#[test]
+fn test_add_returns_empty_for_missing_path() {
+    let cache = DataUsageCache::default();
+    let mut candidates = Vec::new();
+    add(&cache, &hash_path("nonexistent"), &mut candidates);
+    assert!(candidates.is_empty());
+}
+
+#[test]
+fn test_add_skips_leaf_node() {
+    // A leaf node (no children) is not a valid compaction candidate —
+    // total_children_rec returns 0 for leaves, so compacting them has no effect.
+    let mut cache = DataUsageCache::default();
+    let h = hash_path("single-leaf");
+    cache.replace_hashed(
+        &h,
+        &None,
+        &DataUsageEntry {
+            objects: 5,
+            size: 50,
+            ..Default::default()
+        },
+    );
+
+    let mut candidates = Vec::new();
+    add(&cache, &h, &mut candidates);
+    assert!(candidates.is_empty(), "leaf node should not be a compaction candidate");
+}
+
+// --- Tests for `reduce_children_of` (bug #2: usize underflow) ---
+
+#[test]
+fn test_reduce_children_of_compacts_internal_node() {
+    // Build tree: root -> c1(leaf), c2 -> gc(leaf). total=3, limit=2, remove=1.
+    // Internal nodes (compaction candidates): root, c2.
+    // compact_self=false skips root; c2 (objects=2, 1 child) is the only candidate.
+    // Compacting c2 removes gc (removing=1), satisfying remove=1.
+    let (mut cache, root) = build_test_tree();
+    cache.reduce_children_of(&root, 2, false);
+
+    // "bucket/b" should be compacted (its child gc removed).
+    let entry_c2 = cache.find("bucket/b").unwrap();
+    assert!(entry_c2.compacted, "internal node 'bucket/b' should be compacted");
+    // "bucket/a" (leaf, not a candidate) should remain unchanged.
+    let entry_c1 = cache.find("bucket/a").unwrap();
+    assert!(!entry_c1.compacted, "leaf 'bucket/a' should not be compacted");
+    // "bucket/b/c" was deleted when its parent was compacted.
+    assert!(cache.find("bucket/b/c").is_none(), "grandchild should be removed after parent compaction");
+}
+
+#[test]
+fn test_reduce_children_of_no_op_when_under_limit() {
+    let (mut cache, root) = build_test_tree();
+    let before = cache.cache.len();
+    // limit=10 > total children => no compaction
+    cache.reduce_children_of(&root, 10, false);
+    assert_eq!(cache.cache.len(), before);
+}
+
+#[test]
+fn test_reduce_children_of_usize_underflow_saturates() {
+    let (mut cache, root) = build_underflow_test_tree();
+
+    // total children=6, limit=5, remove=1. The smallest candidate removes
+    // two descendants, so plain subtraction would underflow and compact the
+    // next candidate too.
+    cache.reduce_children_of(&root, 5, false);
+
+    assert!(cache.find("bucket/small").is_some_and(|entry| entry.compacted));
+    assert!(cache.find("bucket/small/a").is_none());
+    assert!(cache.find("bucket/small/b").is_none());
+    assert!(cache.find("bucket/large").is_some_and(|entry| !entry.compacted));
+    assert!(cache.find("bucket/large/a").is_some());
+    assert!(cache.find("bucket/large/b").is_some());
+}
+
+#[test]
+fn test_force_compact_flattens_wide_root_above_limit() {
+    // Regression for #8961: a bucket root with fanout between the ordinary
+    // compact limit and the old hardcoded 250_000 ceiling must shrink.
+    // Before the fix, force_compact kept one entry per prefix forever.
+    const PREFIXES: usize = 64;
+    const LIMIT: usize = 16;
+    const {
+        assert!(PREFIXES > LIMIT);
+    }
+
+    let root = hash_path("bucket");
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:04}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                size: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+    assert_eq!(cache.find("bucket").map(|entry| entry.children.len()), Some(PREFIXES));
+    assert_eq!(cache.cache.len(), PREFIXES + 1);
+
+    cache.force_compact(LIMIT);
+
+    let root_entry = cache.find("bucket").expect("root retained");
+    assert!(root_entry.compacted, "wide root must flatten under force_compact");
+    assert!(root_entry.children.is_empty(), "flattened root must drop per-prefix children");
+    assert_eq!((root_entry.objects, root_entry.size), (PREFIXES, PREFIXES));
+    assert_eq!(cache.cache.len(), 1, "prefix leaves must be released after root flatten");
+}
+
+#[test]
+fn test_force_compact_keeps_narrow_root_children() {
+    const PREFIXES: usize = 4;
+    const LIMIT: usize = 16;
+    const {
+        assert!(PREFIXES < LIMIT);
+    }
+
+    let root = hash_path("bucket");
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace_hashed(
+        &root,
+        &None,
+        &DataUsageEntry {
+            objects: PREFIXES,
+            ..Default::default()
+        },
+    );
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:04}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    cache.force_compact(LIMIT);
+
+    let root_entry = cache.find("bucket").expect("root retained");
+    assert!(!root_entry.compacted);
+    assert_eq!(root_entry.children.len(), PREFIXES);
+    assert_eq!(cache.cache.len(), PREFIXES + 1);
+}
+
+#[test]
+fn test_force_compact_interrupted_ceiling_retains_wide_root_children() {
+    // Interrupted sweeps pass the emergency FORCE ceiling into force_compact so
+    // a resume frontier under a 10k–250k-wide root stays addressable.
+    const PREFIXES: usize = 64;
+    const ORDINARY_LIMIT: usize = 16;
+    const INTERRUPTED_CEILING: usize = 250_000;
+    const {
+        assert!(PREFIXES > ORDINARY_LIMIT);
+        assert!(PREFIXES < INTERRUPTED_CEILING);
+    }
+
+    let root = hash_path("bucket");
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:04}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                size: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    cache.force_compact(INTERRUPTED_CEILING);
+
+    let root_entry = cache.find("bucket").expect("root retained");
+    assert!(!root_entry.compacted, "interrupted ceiling must not flatten a 64-wide root");
+    assert_eq!(root_entry.children.len(), PREFIXES);
+    assert_eq!(cache.cache.len(), PREFIXES + 1);
+    // Sanity: the ordinary completion limit would have flattened this layout.
+    let mut completed = cache.clone();
+    completed.force_compact(ORDINARY_LIMIT);
+    assert!(
+        completed.find("bucket").is_some_and(|entry| entry.compacted),
+        "ordinary limit still flattens the same wide root after completion"
+    );
+}
+
+#[test]
+fn test_force_compact_interrupted_ceiling_seals_reloaded_frontier() {
+    // The interrupted call runs before seal_scan_frontier. Flattening at the
+    // ordinary limit deletes the child that frontier names, so a saved cache
+    // reloads with no resume position and the next cycle replays finished prefixes.
+    const PREFIXES: usize = 64;
+    const ORDINARY_LIMIT: usize = 16;
+    const INTERRUPTED_CEILING: usize = 250_000;
+    const {
+        assert!(PREFIXES > ORDINARY_LIMIT);
+        assert!(PREFIXES < INTERRUPTED_CEILING);
+    }
+    let frontier = format!("bucket/prefix-{:04}", PREFIXES / 2);
+
+    let mut cache = DataUsageCache::default();
+    cache.prepare_bucket_checkpoint("bucket", 8, 1, DataUsageCacheSource::new(0, 0), TEST_PLAN_DIGEST, valid_scan_identity());
+    let root = hash_path("bucket");
+    cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:04}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                size: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    let mut interrupted = cache.clone();
+    interrupted.force_compact(INTERRUPTED_CEILING);
+    assert!(interrupted.find(&frontier).is_some(), "interrupted ceiling must keep the frontier child");
+    interrupted
+        .seal_scan_frontier(Some(&frontier))
+        .expect("seal frontier after interrupted compaction");
+    let encoded = rmp_serde::to_vec(&interrupted).expect("partial cache should encode");
+    let reloaded: DataUsageCache = rmp_serde::from_slice(&encoded).expect("partial cache should reload");
+    assert_eq!(reloaded.validated_scan_frontier(), Some(frontier.as_str()));
+    assert!(reloaded.find(&frontier).is_some(), "reloaded frontier child must stay addressable");
+
+    cache.force_compact(ORDINARY_LIMIT);
+    assert!(cache.find(&frontier).is_none(), "ordinary limit removes the frontier child");
+    cache
+        .seal_scan_frontier(Some(&frontier))
+        .expect("seal after a completed flatten");
+    assert!(
+        cache.validated_scan_frontier().is_none(),
+        "a flattened root cannot seal the removed frontier child"
+    );
+}
+
+#[tokio::test]
+async fn test_retry_save_op_times_out_and_returns_error_after_retries() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_clone = attempts.clone();
+
+    let result = DataUsageCache::retry_save_op("main", Duration::from_millis(10), DATA_USAGE_CACHE_SAVE_RETRIES, move || {
+        let attempts = attempts_clone.clone();
+        async move {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<StorageResult<()>>().await
+        }
+    })
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(attempts.load(Ordering::SeqCst), (DATA_USAGE_CACHE_SAVE_RETRIES + 1) as usize);
+}
+
+// Captured from legacy scanner baseline raw SHA256
+// e697a4127257e09fa30e06a8c8f0a576b93d2dd45500d5c43df376ddccf66ea7.
+// These bytes precede the lifecycle family migration; do not regenerate them.
+
+const LEGACY_LIFECYCLE_NONE_TUPLE: &[u8] = &[
+    0x97, 0xb7, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x2d, 0x62, 0x75,
+    0x63, 0x6b, 0x65, 0x74, 0x07, 0xc0, 0xc3, 0xc0, 0xc0, 0x80,
+];
+
+const LEGACY_LIFECYCLE_NONE_MAP: &[u8] = &[
+    0xde, 0x00, 0x10, 0xa4, 0x6e, 0x61, 0x6d, 0x65, 0xb7, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x6c, 0x69, 0x66, 0x65, 0x63,
+    0x79, 0x63, 0x6c, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0xaa, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x63, 0x79, 0x63, 0x6c,
+    0x65, 0x07, 0xac, 0x6c, 0x65, 0x61, 0x64, 0x65, 0x72, 0x5f, 0x65, 0x70, 0x6f, 0x63, 0x68, 0x00, 0xab, 0x6c, 0x61, 0x73, 0x74,
+    0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0xc0, 0xac, 0x73, 0x6b, 0x69, 0x70, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x69, 0x6e, 0x67,
+    0xc3, 0xa9, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0xc0, 0xab, 0x72, 0x65, 0x70, 0x6c, 0x69, 0x63, 0x61, 0x74,
+    0x69, 0x6f, 0x6e, 0xc0, 0xae, 0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x5f, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x73, 0x80, 0xb1,
+    0x73, 0x63, 0x61, 0x6e, 0x5f, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x5f, 0x61, 0x66, 0x74, 0x65, 0x72, 0xc0, 0xaf, 0x73, 0x63,
+    0x61, 0x6e, 0x5f, 0x63, 0x68, 0x65, 0x63, 0x6b, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0xc0, 0xad, 0x70, 0x65, 0x6e, 0x64, 0x69, 0x6e,
+    0x67, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x73, 0x90, 0xab, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x5f, 0x6c, 0x6f, 0x63, 0x6b, 0xc0,
+    0xa6, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0xc0, 0xb1, 0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f, 0x63, 0x6f, 0x6d,
+    0x70, 0x6c, 0x65, 0x74, 0x65, 0xc2, 0xb0, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x70, 0x6c, 0x61, 0x6e, 0x5f, 0x64, 0x69, 0x67, 0x65,
+    0x73, 0x74, 0xc0, 0xb0, 0x63, 0x61, 0x63, 0x68, 0x65, 0x5f, 0x6b, 0x65, 0x79, 0x5f, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x00,
+];
+
+const LEGACY_LIFECYCLE_NONE_PAYLOAD: &[u8] = &[0xc0];
+
+const LEGACY_LIFECYCLE_EMPTY_TUPLE: &[u8] = &[
+    0x97, 0xb7, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x2d, 0x62, 0x75,
+    0x63, 0x6b, 0x65, 0x74, 0x07, 0xc0, 0xc3, 0x92, 0xc0, 0x90, 0xc0, 0x80,
+];
+
+const LEGACY_LIFECYCLE_EMPTY_MAP: &[u8] = &[
+    0xde, 0x00, 0x10, 0xa4, 0x6e, 0x61, 0x6d, 0x65, 0xb7, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x6c, 0x69, 0x66, 0x65, 0x63,
+    0x79, 0x63, 0x6c, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0xaa, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x63, 0x79, 0x63, 0x6c,
+    0x65, 0x07, 0xac, 0x6c, 0x65, 0x61, 0x64, 0x65, 0x72, 0x5f, 0x65, 0x70, 0x6f, 0x63, 0x68, 0x00, 0xab, 0x6c, 0x61, 0x73, 0x74,
+    0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0xc0, 0xac, 0x73, 0x6b, 0x69, 0x70, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x69, 0x6e, 0x67,
+    0xc3, 0xa9, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x92, 0xc0, 0x90, 0xab, 0x72, 0x65, 0x70, 0x6c, 0x69, 0x63,
+    0x61, 0x74, 0x69, 0x6f, 0x6e, 0xc0, 0xae, 0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x5f, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x73,
+    0x80, 0xb1, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x5f, 0x61, 0x66, 0x74, 0x65, 0x72, 0xc0, 0xaf,
+    0x73, 0x63, 0x61, 0x6e, 0x5f, 0x63, 0x68, 0x65, 0x63, 0x6b, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0xc0, 0xad, 0x70, 0x65, 0x6e, 0x64,
+    0x69, 0x6e, 0x67, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x73, 0x90, 0xab, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x5f, 0x6c, 0x6f, 0x63,
+    0x6b, 0xc0, 0xa6, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0xc0, 0xb1, 0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f, 0x63,
+    0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74, 0x65, 0xc2, 0xb0, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x70, 0x6c, 0x61, 0x6e, 0x5f, 0x64, 0x69,
+    0x67, 0x65, 0x73, 0x74, 0xc0, 0xb0, 0x63, 0x61, 0x63, 0x68, 0x65, 0x5f, 0x6b, 0x65, 0x79, 0x5f, 0x66, 0x6f, 0x72, 0x6d, 0x61,
+    0x74, 0x00,
+];
+
+const LEGACY_LIFECYCLE_EMPTY_PAYLOAD: &[u8] = &[0x92, 0xc0, 0x90];
+
+const LEGACY_LIFECYCLE_NONEMPTY_TUPLE: &[u8] = &[
+    0x97, 0xb7, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x2d, 0x62, 0x75,
+    0x63, 0x6b, 0x65, 0x74, 0x07, 0xc0, 0xc3, 0x92, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32,
+    0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x32, 0x2e, 0x34, 0x35, 0x36, 0x5a, 0x94, 0x9a, 0x91, 0x00, 0x91, 0xff, 0x94, 0xb8, 0x32,
+    0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x30, 0x2e, 0x31, 0x32,
+    0x33, 0x5a, 0xfd, 0xc2, 0xc2, 0x96, 0x94, 0xff, 0xcd, 0x10, 0x00, 0xa0, 0x93, 0x92, 0xa0, 0xa0, 0x92, 0xc0, 0xb1, 0x76, 0x61,
+    0x6c, 0x75, 0x65, 0x2d, 0x77, 0x69, 0x74, 0x68, 0x6f, 0x75, 0x74, 0x2d, 0x6b, 0x65, 0x79, 0x92, 0xb1, 0x6b, 0x65, 0x79, 0x2d,
+    0x77, 0x69, 0x74, 0x68, 0x6f, 0x75, 0x74, 0x2d, 0x76, 0x61, 0x6c, 0x75, 0x65, 0xc0, 0x80, 0x00, 0xcd, 0x20, 0x00, 0xa0, 0x92,
+    0xa4, 0x6b, 0x69, 0x6e, 0x64, 0xa7, 0x61, 0x72, 0x63, 0x68, 0x69, 0x76, 0x65, 0xb4, 0x63, 0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74,
+    0x65, 0x2d, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x72, 0x75, 0x6c, 0x65, 0x92, 0x00, 0xf9, 0x92, 0x93, 0xff, 0x00, 0xb4,
+    0x4c, 0x45, 0x47, 0x41, 0x43, 0x59, 0x5f, 0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57, 0x4e, 0x5f, 0x43, 0x4c, 0x41, 0x53, 0x53, 0x93,
+    0xc0, 0xc0, 0xc0, 0xae, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78, 0x2f, 0xb3, 0x4c, 0x65,
+    0x67, 0x61, 0x63, 0x79, 0x55, 0x6e, 0x6b, 0x6e, 0x6f, 0x77, 0x6e, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x93, 0x93, 0xb8, 0x32,
+    0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x31, 0x2e, 0x39, 0x38,
+    0x37, 0x5a, 0x00, 0xb4, 0x4c, 0x45, 0x47, 0x41, 0x43, 0x59, 0x5f, 0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57, 0x4e, 0x5f, 0x43, 0x4c,
+    0x41, 0x53, 0x53, 0x93, 0xc0, 0xc0, 0xa0, 0x93, 0xc0, 0xc0, 0xc0, 0x9a, 0x91, 0xc0, 0x91, 0xc0, 0x94, 0xc0, 0x00, 0xc0, 0xc0,
+    0x96, 0x94, 0xc0, 0xc0, 0xc0, 0x90, 0x80, 0xc0, 0xc0, 0xc0, 0x92, 0xc0, 0xc0, 0xa0, 0x92, 0xfe, 0xc0, 0x90, 0xa0, 0xa8, 0x44,
+    0x69, 0x73, 0x61, 0x62, 0x6c, 0x65, 0x64, 0x90, 0x9a, 0xc0, 0xc0, 0xc0, 0x96, 0x94, 0xc0, 0xc0, 0xc0, 0xc0, 0x80, 0xc0, 0xc0,
+    0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xa7, 0x45, 0x6e, 0x61, 0x62, 0x6c, 0x65, 0x64, 0xc0, 0x9a, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0,
+    0xc0, 0xc0, 0xc0, 0xa7, 0x45, 0x6e, 0x61, 0x62, 0x6c, 0x65, 0x64, 0xc0, 0xc0, 0x80,
+];
+
+const LEGACY_LIFECYCLE_NONEMPTY_MAP: &[u8] = &[
+    0xde, 0x00, 0x10, 0xa4, 0x6e, 0x61, 0x6d, 0x65, 0xb7, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x6c, 0x69, 0x66, 0x65, 0x63,
+    0x79, 0x63, 0x6c, 0x65, 0x2d, 0x62, 0x75, 0x63, 0x6b, 0x65, 0x74, 0xaa, 0x6e, 0x65, 0x78, 0x74, 0x5f, 0x63, 0x79, 0x63, 0x6c,
+    0x65, 0x07, 0xac, 0x6c, 0x65, 0x61, 0x64, 0x65, 0x72, 0x5f, 0x65, 0x70, 0x6f, 0x63, 0x68, 0x00, 0xab, 0x6c, 0x61, 0x73, 0x74,
+    0x5f, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0xc0, 0xac, 0x73, 0x6b, 0x69, 0x70, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x69, 0x6e, 0x67,
+    0xc3, 0xa9, 0x6c, 0x69, 0x66, 0x65, 0x63, 0x79, 0x63, 0x6c, 0x65, 0x92, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d,
+    0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x32, 0x2e, 0x34, 0x35, 0x36, 0x5a, 0x94, 0x9a, 0x91, 0x00, 0x91,
+    0xff, 0x94, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32,
+    0x30, 0x2e, 0x31, 0x32, 0x33, 0x5a, 0xfd, 0xc2, 0xc2, 0x96, 0x94, 0xff, 0xcd, 0x10, 0x00, 0xa0, 0x93, 0x92, 0xa0, 0xa0, 0x92,
+    0xc0, 0xb1, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x2d, 0x77, 0x69, 0x74, 0x68, 0x6f, 0x75, 0x74, 0x2d, 0x6b, 0x65, 0x79, 0x92, 0xb1,
+    0x6b, 0x65, 0x79, 0x2d, 0x77, 0x69, 0x74, 0x68, 0x6f, 0x75, 0x74, 0x2d, 0x76, 0x61, 0x6c, 0x75, 0x65, 0xc0, 0x80, 0x00, 0xcd,
+    0x20, 0x00, 0xa0, 0x92, 0xa4, 0x6b, 0x69, 0x6e, 0x64, 0xa7, 0x61, 0x72, 0x63, 0x68, 0x69, 0x76, 0x65, 0xb4, 0x63, 0x6f, 0x6d,
+    0x70, 0x6c, 0x65, 0x74, 0x65, 0x2d, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x72, 0x75, 0x6c, 0x65, 0x92, 0x00, 0xf9, 0x92,
+    0x93, 0xff, 0x00, 0xb4, 0x4c, 0x45, 0x47, 0x41, 0x43, 0x59, 0x5f, 0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57, 0x4e, 0x5f, 0x43, 0x4c,
+    0x41, 0x53, 0x53, 0x93, 0xc0, 0xc0, 0xc0, 0xae, 0x6c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x2d, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78,
+    0x2f, 0xb3, 0x4c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x55, 0x6e, 0x6b, 0x6e, 0x6f, 0x77, 0x6e, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73,
+    0x93, 0x93, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32,
+    0x31, 0x2e, 0x39, 0x38, 0x37, 0x5a, 0x00, 0xb4, 0x4c, 0x45, 0x47, 0x41, 0x43, 0x59, 0x5f, 0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57,
+    0x4e, 0x5f, 0x43, 0x4c, 0x41, 0x53, 0x53, 0x93, 0xc0, 0xc0, 0xa0, 0x93, 0xc0, 0xc0, 0xc0, 0x9a, 0x91, 0xc0, 0x91, 0xc0, 0x94,
+    0xc0, 0x00, 0xc0, 0xc0, 0x96, 0x94, 0xc0, 0xc0, 0xc0, 0x90, 0x80, 0xc0, 0xc0, 0xc0, 0x92, 0xc0, 0xc0, 0xa0, 0x92, 0xfe, 0xc0,
+    0x90, 0xa0, 0xa8, 0x44, 0x69, 0x73, 0x61, 0x62, 0x6c, 0x65, 0x64, 0x90, 0x9a, 0xc0, 0xc0, 0xc0, 0x96, 0x94, 0xc0, 0xc0, 0xc0,
+    0xc0, 0x80, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xa7, 0x45, 0x6e, 0x61, 0x62, 0x6c, 0x65, 0x64, 0xc0, 0x9a, 0xc0,
+    0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xa7, 0x45, 0x6e, 0x61, 0x62, 0x6c, 0x65, 0x64, 0xc0, 0xab, 0x72, 0x65, 0x70, 0x6c,
+    0x69, 0x63, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0xc0, 0xae, 0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x5f, 0x6f, 0x62, 0x6a, 0x65, 0x63,
+    0x74, 0x73, 0x80, 0xb1, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x72, 0x65, 0x73, 0x75, 0x6d, 0x65, 0x5f, 0x61, 0x66, 0x74, 0x65, 0x72,
+    0xc0, 0xaf, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x63, 0x68, 0x65, 0x63, 0x6b, 0x70, 0x6f, 0x69, 0x6e, 0x74, 0xc0, 0xad, 0x70, 0x65,
+    0x6e, 0x64, 0x69, 0x6e, 0x67, 0x5f, 0x68, 0x65, 0x61, 0x6c, 0x73, 0x90, 0xab, 0x6f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x5f, 0x6c,
+    0x6f, 0x63, 0x6b, 0xc0, 0xa6, 0x73, 0x6f, 0x75, 0x72, 0x63, 0x65, 0xc0, 0xb1, 0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74,
+    0x5f, 0x63, 0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74, 0x65, 0xc2, 0xb0, 0x73, 0x63, 0x61, 0x6e, 0x5f, 0x70, 0x6c, 0x61, 0x6e, 0x5f,
+    0x64, 0x69, 0x67, 0x65, 0x73, 0x74, 0xc0, 0xb0, 0x63, 0x61, 0x63, 0x68, 0x65, 0x5f, 0x6b, 0x65, 0x79, 0x5f, 0x66, 0x6f, 0x72,
+    0x6d, 0x61, 0x74, 0x00,
+];
+
+const LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD: &[u8] = &[
+    0x92, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d, 0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x32,
+    0x2e, 0x34, 0x35, 0x36, 0x5a, 0x94, 0x9a, 0x91, 0x00, 0x91, 0xff, 0x94, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d,
+    0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x30, 0x2e, 0x31, 0x32, 0x33, 0x5a, 0xfd, 0xc2, 0xc2, 0x96, 0x94,
+    0xff, 0xcd, 0x10, 0x00, 0xa0, 0x93, 0x92, 0xa0, 0xa0, 0x92, 0xc0, 0xb1, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x2d, 0x77, 0x69, 0x74,
+    0x68, 0x6f, 0x75, 0x74, 0x2d, 0x6b, 0x65, 0x79, 0x92, 0xb1, 0x6b, 0x65, 0x79, 0x2d, 0x77, 0x69, 0x74, 0x68, 0x6f, 0x75, 0x74,
+    0x2d, 0x76, 0x61, 0x6c, 0x75, 0x65, 0xc0, 0x80, 0x00, 0xcd, 0x20, 0x00, 0xa0, 0x92, 0xa4, 0x6b, 0x69, 0x6e, 0x64, 0xa7, 0x61,
+    0x72, 0x63, 0x68, 0x69, 0x76, 0x65, 0xb4, 0x63, 0x6f, 0x6d, 0x70, 0x6c, 0x65, 0x74, 0x65, 0x2d, 0x6c, 0x65, 0x67, 0x61, 0x63,
+    0x79, 0x2d, 0x72, 0x75, 0x6c, 0x65, 0x92, 0x00, 0xf9, 0x92, 0x93, 0xff, 0x00, 0xb4, 0x4c, 0x45, 0x47, 0x41, 0x43, 0x59, 0x5f,
+    0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57, 0x4e, 0x5f, 0x43, 0x4c, 0x41, 0x53, 0x53, 0x93, 0xc0, 0xc0, 0xc0, 0xae, 0x6c, 0x65, 0x67,
+    0x61, 0x63, 0x79, 0x2d, 0x70, 0x72, 0x65, 0x66, 0x69, 0x78, 0x2f, 0xb3, 0x4c, 0x65, 0x67, 0x61, 0x63, 0x79, 0x55, 0x6e, 0x6b,
+    0x6e, 0x6f, 0x77, 0x6e, 0x53, 0x74, 0x61, 0x74, 0x75, 0x73, 0x93, 0x93, 0xb8, 0x32, 0x30, 0x32, 0x33, 0x2d, 0x31, 0x31, 0x2d,
+    0x31, 0x34, 0x54, 0x32, 0x32, 0x3a, 0x31, 0x33, 0x3a, 0x32, 0x31, 0x2e, 0x39, 0x38, 0x37, 0x5a, 0x00, 0xb4, 0x4c, 0x45, 0x47,
+    0x41, 0x43, 0x59, 0x5f, 0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57, 0x4e, 0x5f, 0x43, 0x4c, 0x41, 0x53, 0x53, 0x93, 0xc0, 0xc0, 0xa0,
+    0x93, 0xc0, 0xc0, 0xc0, 0x9a, 0x91, 0xc0, 0x91, 0xc0, 0x94, 0xc0, 0x00, 0xc0, 0xc0, 0x96, 0x94, 0xc0, 0xc0, 0xc0, 0x90, 0x80,
+    0xc0, 0xc0, 0xc0, 0x92, 0xc0, 0xc0, 0xa0, 0x92, 0xfe, 0xc0, 0x90, 0xa0, 0xa8, 0x44, 0x69, 0x73, 0x61, 0x62, 0x6c, 0x65, 0x64,
+    0x90, 0x9a, 0xc0, 0xc0, 0xc0, 0x96, 0x94, 0xc0, 0xc0, 0xc0, 0xc0, 0x80, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xa7,
+    0x45, 0x6e, 0x61, 0x62, 0x6c, 0x65, 0x64, 0xc0, 0x9a, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc0, 0xa7, 0x45, 0x6e, 0x61,
+    0x62, 0x6c, 0x65, 0x64, 0xc0,
+];
+
+// Keep the old tuple carrier and payload explicit when the production field changes type.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyLifecycleCacheInfo {
+    name: String,
+    next_cycle: u64,
+    last_update: Option<SystemTime>,
+    skip_healing: bool,
+    lifecycle: Option<Arc<s3s::dto::BucketLifecycleConfiguration>>,
+    replication: Option<Arc<ReplicationConfig>>,
+    failed_objects: HashMap<String, u64>,
+}
+
+struct LifecycleCacheOracleCase {
+    label: &'static str,
+    old_tuple: Vec<u8>,
+    old_payload: Vec<u8>,
+    current: DataUsageCacheInfo,
+    current_map: Vec<u8>,
+    frozen_tuple: &'static [u8],
+    frozen_map: &'static [u8],
+    frozen_payload: &'static [u8],
+}
+
+fn lifecycle_cache_oracle_cases() -> Vec<LifecycleCacheOracleCase> {
+    use s3s::dto as legacy;
+    use time::OffsetDateTime;
+    let expiration_date = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_456_789)
+        .expect("the legacy expiration fixture has an exact timestamp");
+    let transition_date = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_001_987_654_321)
+        .expect("the legacy transition fixture has an exact timestamp");
+    let expiry_updated_at = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_002_456_789_123)
+        .expect("the legacy expiry update fixture has an exact timestamp");
+
+    let absent = legacy::LifecycleRule {
+        abort_incomplete_multipart_upload: None,
+        del_marker_expiration: None,
+        expiration: None,
+        filter: None,
+        id: None,
+        noncurrent_version_expiration: None,
+        noncurrent_version_transitions: None,
+        prefix: None,
+        status: legacy::ExpirationStatus::from_static(legacy::ExpirationStatus::ENABLED),
+        transitions: None,
+    };
+    let mut empty = absent.clone();
+    empty.id = Some(String::new());
+    empty.prefix = Some(String::new());
+    empty.status = legacy::ExpirationStatus::from_static(legacy::ExpirationStatus::DISABLED);
+    empty.abort_incomplete_multipart_upload = Some(legacy::AbortIncompleteMultipartUpload {
+        days_after_initiation: None,
+    });
+    empty.del_marker_expiration = Some(legacy::DelMarkerExpiration { days: None });
+    empty.expiration = Some(legacy::LifecycleExpiration {
+        days: Some(0),
+        ..Default::default()
+    });
+    empty.filter = Some(legacy::LifecycleRuleFilter {
+        and: Some(legacy::LifecycleRuleAndOperator {
+            tags: Some(Vec::new()),
+            ..Default::default()
+        }),
+        tag: Some(legacy::Tag { key: None, value: None }),
+        ..Default::default()
+    });
+    empty.noncurrent_version_expiration = Some(legacy::NoncurrentVersionExpiration {
+        noncurrent_days: None,
+        newer_noncurrent_versions: Some(-2),
+    });
+    empty.noncurrent_version_transitions = Some(Vec::new());
+    empty.transitions = Some(Vec::new());
+    let mut absent_tags = absent.clone();
+    absent_tags.filter = Some(legacy::LifecycleRuleFilter {
+        and: Some(legacy::LifecycleRuleAndOperator::default()),
+        ..Default::default()
+    });
+    // Cached values must survive independently of lifecycle policy validation.
+    let complete = legacy::BucketLifecycleConfiguration {
+        expiry_updated_at: Some(expiry_updated_at.into()),
+        rules: vec![
+            legacy::LifecycleRule {
+                abort_incomplete_multipart_upload: Some(legacy::AbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(0),
+                }),
+                del_marker_expiration: Some(legacy::DelMarkerExpiration { days: Some(-1) }),
+                expiration: Some(legacy::LifecycleExpiration {
+                    date: Some(expiration_date.into()),
+                    days: Some(-3),
+                    expired_object_delete_marker: Some(false),
+                    expired_object_all_versions: Some(false),
+                }),
+                filter: Some(legacy::LifecycleRuleFilter {
+                    cached_tags: Default::default(),
+                    and: Some(legacy::LifecycleRuleAndOperator {
+                        prefix: Some(String::new()),
+                        tags: Some(vec![
+                            legacy::Tag {
+                                key: Some(String::new()),
+                                value: Some(String::new()),
+                            },
+                            legacy::Tag {
+                                key: None,
+                                value: Some("value-without-key".to_string()),
+                            },
+                            legacy::Tag {
+                                key: Some("key-without-value".to_string()),
+                                value: None,
+                            },
+                        ]),
+                        object_size_greater_than: Some(-1),
+                        object_size_less_than: Some(4096),
+                    }),
+                    prefix: Some(String::new()),
+                    tag: Some(legacy::Tag {
+                        key: Some("kind".to_string()),
+                        value: Some("archive".to_string()),
+                    }),
+                    object_size_greater_than: Some(0),
+                    object_size_less_than: Some(8192),
+                }),
+                id: Some("complete-legacy-rule".to_string()),
+                noncurrent_version_expiration: Some(legacy::NoncurrentVersionExpiration {
+                    noncurrent_days: Some(-7),
+                    newer_noncurrent_versions: Some(0),
+                }),
+                noncurrent_version_transitions: Some(vec![
+                    legacy::NoncurrentVersionTransition {
+                        noncurrent_days: Some(0),
+                        newer_noncurrent_versions: Some(-1),
+                        storage_class: Some(legacy::TransitionStorageClass::from_static("LEGACY_UNKNOWN_CLASS")),
+                    },
+                    legacy::NoncurrentVersionTransition {
+                        noncurrent_days: None,
+                        newer_noncurrent_versions: None,
+                        storage_class: None,
+                    },
+                ]),
+                prefix: Some("legacy-prefix/".to_string()),
+                status: legacy::ExpirationStatus::from_static("LegacyUnknownStatus"),
+                transitions: Some(vec![
+                    legacy::Transition {
+                        date: Some(transition_date.into()),
+                        days: Some(0),
+                        storage_class: Some(legacy::TransitionStorageClass::from_static("LEGACY_UNKNOWN_CLASS")),
+                    },
+                    legacy::Transition {
+                        date: None,
+                        days: None,
+                        storage_class: Some(legacy::TransitionStorageClass::from_static("")),
+                    },
+                    legacy::Transition {
+                        date: None,
+                        days: None,
+                        storage_class: None,
+                    },
+                ]),
+            },
+            empty,
+            absent_tags,
+            absent,
+        ],
+    };
+
+    use rustfs_gateway_types::persistence as persisted;
+    let domain_absent = persisted::PersistedLifecycleRule {
+        abort_incomplete_multipart_upload: None,
+        del_marker_expiration: None,
+        expiration: None,
+        filter: None,
+        id: None,
+        noncurrent_version_expiration: None,
+        noncurrent_version_transitions: None,
+        prefix: None,
+        status: "Enabled".to_owned(),
+        transitions: None,
+    };
+    let mut domain_empty = domain_absent.clone();
+    domain_empty.id = Some(String::new());
+    domain_empty.prefix = Some(String::new());
+    domain_empty.status = "Disabled".to_owned();
+    domain_empty.abort_incomplete_multipart_upload = Some(persisted::PersistedAbortIncompleteMultipartUpload {
+        days_after_initiation: None,
+    });
+    domain_empty.del_marker_expiration = Some(persisted::PersistedDelMarkerExpiration { days: None });
+    domain_empty.expiration = Some(persisted::PersistedLifecycleExpiration {
+        days: Some(0),
+        ..Default::default()
+    });
+    domain_empty.filter = Some(persisted::PersistedLifecycleFilter {
+        and: Some(persisted::PersistedLifecycleAnd {
+            tags: Some(Vec::new()),
+            ..Default::default()
+        }),
+        tag: Some(persisted::PersistedLifecycleTag { key: None, value: None }),
+        ..Default::default()
+    });
+    domain_empty.noncurrent_version_expiration = Some(persisted::PersistedNoncurrentVersionExpiration {
+        noncurrent_days: None,
+        newer_noncurrent_versions: Some(-2),
+    });
+    domain_empty.noncurrent_version_transitions = Some(Vec::new());
+    domain_empty.transitions = Some(Vec::new());
+    let mut domain_absent_tags = domain_absent.clone();
+    domain_absent_tags.filter = Some(persisted::PersistedLifecycleFilter {
+        and: Some(persisted::PersistedLifecycleAnd::default()),
+        ..Default::default()
+    });
+    // Cached values must survive independently of lifecycle policy validation.
+    let domain_complete = persisted::PersistedLifecycleConfiguration {
+        expiry_updated_at: Some(
+            expiry_updated_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("fixture date has an exact RFC3339 representation"),
+        ),
+        rules: vec![
+            persisted::PersistedLifecycleRule {
+                abort_incomplete_multipart_upload: Some(persisted::PersistedAbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(0),
+                }),
+                del_marker_expiration: Some(persisted::PersistedDelMarkerExpiration { days: Some(-1) }),
+                expiration: Some(persisted::PersistedLifecycleExpiration {
+                    date: Some(
+                        expiration_date
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .expect("fixture date has an exact RFC3339 representation"),
+                    ),
+                    days: Some(-3),
+                    expired_object_delete_marker: Some(false),
+                    expired_object_all_versions: Some(false),
+                }),
+                filter: Some(persisted::PersistedLifecycleFilter {
+                    and: Some(persisted::PersistedLifecycleAnd {
+                        prefix: Some(String::new()),
+                        tags: Some(vec![
+                            persisted::PersistedLifecycleTag {
+                                key: Some(String::new()),
+                                value: Some(String::new()),
+                            },
+                            persisted::PersistedLifecycleTag {
+                                key: None,
+                                value: Some("value-without-key".to_string()),
+                            },
+                            persisted::PersistedLifecycleTag {
+                                key: Some("key-without-value".to_string()),
+                                value: None,
+                            },
+                        ]),
+                        object_size_greater_than: Some(-1),
+                        object_size_less_than: Some(4096),
+                    }),
+                    prefix: Some(String::new()),
+                    tag: Some(persisted::PersistedLifecycleTag {
+                        key: Some("kind".to_string()),
+                        value: Some("archive".to_string()),
+                    }),
+                    object_size_greater_than: Some(0),
+                    object_size_less_than: Some(8192),
+                }),
+                id: Some("complete-legacy-rule".to_string()),
+                noncurrent_version_expiration: Some(persisted::PersistedNoncurrentVersionExpiration {
+                    noncurrent_days: Some(-7),
+                    newer_noncurrent_versions: Some(0),
+                }),
+                noncurrent_version_transitions: Some(vec![
+                    persisted::PersistedNoncurrentVersionTransition {
+                        noncurrent_days: Some(0),
+                        newer_noncurrent_versions: Some(-1),
+                        storage_class: Some("LEGACY_UNKNOWN_CLASS".to_owned()),
+                    },
+                    persisted::PersistedNoncurrentVersionTransition {
+                        noncurrent_days: None,
+                        newer_noncurrent_versions: None,
+                        storage_class: None,
+                    },
+                ]),
+                prefix: Some("legacy-prefix/".to_string()),
+                status: "LegacyUnknownStatus".to_owned(),
+                transitions: Some(vec![
+                    persisted::PersistedTransition {
+                        date: Some(
+                            transition_date
+                                .format(&time::format_description::well_known::Rfc3339)
+                                .expect("fixture date has an exact RFC3339 representation"),
+                        ),
+                        days: Some(0),
+                        storage_class: Some("LEGACY_UNKNOWN_CLASS".to_owned()),
+                    },
+                    persisted::PersistedTransition {
+                        date: None,
+                        days: None,
+                        storage_class: Some("".to_owned()),
+                    },
+                    persisted::PersistedTransition {
+                        date: None,
+                        days: None,
+                        storage_class: None,
+                    },
+                ]),
+            },
+            domain_empty,
+            domain_absent_tags,
+            domain_absent,
+        ],
+    };
+
+    let cases = [
+        (
+            "none",
+            None,
+            None,
+            LEGACY_LIFECYCLE_NONE_TUPLE,
+            LEGACY_LIFECYCLE_NONE_MAP,
+            LEGACY_LIFECYCLE_NONE_PAYLOAD,
+        ),
+        (
+            "empty",
+            Some(Arc::new(legacy::BucketLifecycleConfiguration {
+                rules: Vec::new(),
+                expiry_updated_at: None,
+            })),
+            Some(Arc::new(persisted::PersistedLifecycleConfiguration {
+                rules: Vec::new(),
+                expiry_updated_at: None,
+            })),
+            LEGACY_LIFECYCLE_EMPTY_TUPLE,
+            LEGACY_LIFECYCLE_EMPTY_MAP,
+            LEGACY_LIFECYCLE_EMPTY_PAYLOAD,
+        ),
+        (
+            "nonempty",
+            Some(Arc::new(complete)),
+            Some(Arc::new(domain_complete)),
+            LEGACY_LIFECYCLE_NONEMPTY_TUPLE,
+            LEGACY_LIFECYCLE_NONEMPTY_MAP,
+            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD,
+        ),
+    ];
+    cases
+        .into_iter()
+        .map(|(label, lifecycle, domain, frozen_tuple, frozen_map, frozen_payload)| {
+            let old = LegacyLifecycleCacheInfo {
+                name: "legacy-lifecycle-bucket".to_string(),
+                next_cycle: 7,
+                last_update: None,
+                skip_healing: true,
+                lifecycle,
+                replication: None,
+                failed_objects: HashMap::new(),
+            };
+            let mut old_tuple = Vec::new();
+            old.serialize(&mut rmp_serde::Serializer::new(&mut old_tuple))
+                .expect("the real old tuple carrier must encode");
+            let old_payload = rmp_serde::to_vec(&old.lifecycle).expect("the real old lifecycle payload must encode");
+            let current = DataUsageCacheInfo {
+                name: old.name.clone(),
+                next_cycle: old.next_cycle,
+                last_update: old.last_update,
+                skip_healing: old.skip_healing,
+                lifecycle: domain,
+                replication: None,
+                failed_objects: old.failed_objects,
+                ..Default::default()
+            };
+            let current_map = rmp_serde::to_vec(&current).expect("the actual production map writer must encode the fixture");
+            LifecycleCacheOracleCase {
+                label,
+                old_tuple,
+                old_payload,
+                current,
+                current_map,
+                frozen_tuple,
+                frozen_map,
+                frozen_payload,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn test_lifecycle_cache_legacy_msgpack_oracle() {
+    use time::OffsetDateTime;
+
+    for case in lifecycle_cache_oracle_cases() {
+        let label = case.label;
+        let old_tuple = case.old_tuple;
+        let old_payload = case.old_payload;
+        let current = case.current;
+        let current_map = case.current_map;
+        let frozen_tuple = case.frozen_tuple;
+        let frozen_map = case.frozen_map;
+        let frozen_payload = case.frozen_payload;
+        println!("legacy_lifecycle_cache {label}: tuple={old_tuple:02x?}; map={current_map:02x?}; payload={old_payload:02x?}");
+        let old_from_current: LegacyLifecycleCacheInfo =
+            rmp_serde::from_slice(&current_map).expect("the actual old reader must read the production map");
+        if label == "nonempty" {
+            let lifecycle = old_from_current
+                .lifecycle
+                .as_ref()
+                .expect("the old reader must retain the nonempty lifecycle");
+            let expiration = lifecycle.rules[0]
+                .expiration
+                .as_ref()
+                .expect("the complete rule has expiration");
+            let transition = &lifecycle.rules[0]
+                .transitions
+                .as_ref()
+                .expect("the complete rule has transitions")[0];
+            let expected_expiration_date = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_123_000_000)
+                .expect("the legacy millisecond expiration date is representable");
+            let expected_transition_date = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_001_987_000_000)
+                .expect("the legacy millisecond transition date is representable");
+            let expected_expiry_updated_at = OffsetDateTime::from_unix_timestamp_nanos(1_700_000_002_456_000_000)
+                .expect("the legacy millisecond expiry update is representable");
+            assert_eq!(
+                (
+                    expiration.date.clone().map(OffsetDateTime::from),
+                    transition.date.clone().map(OffsetDateTime::from),
+                    lifecycle.expiry_updated_at.clone().map(OffsetDateTime::from),
+                ),
+                (
+                    Some(expected_expiration_date),
+                    Some(expected_transition_date),
+                    Some(expected_expiry_updated_at),
+                ),
+                "cache serialization must retain the fixed legacy millisecond precision for Date and ExpiryUpdatedAt"
+            );
+        }
+        let frozen_tuple_read: DataUsageCacheInfo =
+            rmp_serde::from_slice(frozen_tuple).expect("the production reader must accept the fixed legacy tuple bytes");
+        let frozen_map_read: DataUsageCacheInfo =
+            rmp_serde::from_slice(frozen_map).expect("the production reader must accept the fixed legacy map bytes");
+        assert_eq!(
+            [
+                rmp_serde::to_vec(&frozen_tuple_read).expect("encode the fixed legacy tuple after production read"),
+                rmp_serde::to_vec(&frozen_map_read).expect("encode the fixed legacy map after production read"),
+                current_map,
+                rmp_serde::to_vec(&crate::lifecycle_cache::LifecycleCache(&current.lifecycle))
+                    .expect("encode the independent domain lifecycle payload"),
+            ],
+            [
+                frozen_map.to_vec(),
+                frozen_map.to_vec(),
+                frozen_map.to_vec(),
+                frozen_payload.to_vec()
+            ],
+            "fixed old bytes must be retained by both production reads and the independent production writer for {label}"
+        );
+    }
+}
+
+#[test]
+fn test_lifecycle_cache_legacy_carrier_round_trips() {
+    for case in lifecycle_cache_oracle_cases() {
+        let label = case.label;
+        let old_tuple = case.old_tuple;
+        let current_map = case.current_map;
+        let from_old: DataUsageCacheInfo =
+            rmp_serde::from_slice(&old_tuple).expect("the production reader must read the old tuple");
+        let from_old_map = rmp_serde::to_vec(&from_old).expect("the production writer must retain the old tuple payload");
+        let old_via_current: LegacyLifecycleCacheInfo =
+            rmp_serde::from_slice(&from_old_map).expect("the old reader must read the production map after an old-tuple load");
+        let old_from_current: LegacyLifecycleCacheInfo =
+            rmp_serde::from_slice(&current_map).expect("the actual old reader must read the production map");
+        assert_eq!(
+            [
+                rmp_serde::to_vec(&old_via_current).expect("encode the old reader's complete tuple after production reload"),
+                rmp_serde::to_vec(&old_from_current).expect("encode the old reader's complete tuple after production write"),
+            ],
+            [old_tuple.clone(), old_tuple],
+            "both cache directions must preserve the full old carrier for {label}"
+        );
+    }
+}
+
+#[test]
+fn test_lifecycle_cache_current_map_round_trip() {
+    for case in lifecycle_cache_oracle_cases() {
+        let label = case.label;
+        let current_map = case.current_map;
+        let round_trip: DataUsageCacheInfo =
+            rmp_serde::from_slice(&current_map).expect("the production reader must read its nonempty lifecycle map");
+        assert_eq!(
+            rmp_serde::to_vec(&round_trip).expect("the production writer must preserve the reloaded map"),
+            current_map,
+            "the complete production map must survive reload for {label}"
+        );
+    }
+}
+
+#[test]
+fn test_lifecycle_cache_strict_cached_tags_contract() {
+    use s3s::dto as legacy;
+    type LegacyPayload = Option<Arc<legacy::BucketLifecycleConfiguration>>;
+
+    let old: LegacyPayload = rmp_serde::from_slice(LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD)
+        .expect("the frozen payload must initialize the real old configuration");
+    let filter = old.as_ref().expect("nonempty old payload").rules[0]
+        .filter
+        .as_ref()
+        .expect("first old rule has a filter");
+    let object_tags = [(String::new(), String::new()), ("kind".to_owned(), "archive".to_owned())]
+        .into_iter()
+        .collect();
+    // The real old inherent method initializes its OnceLock even if matching fails.
+    let _ = filter.test_tags(&object_tags);
+    let new = crate::lifecycle_cache::deserialize(&mut rmp_serde::Deserializer::new(LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD))
+        .expect("the production reader must accept the fixed payload");
+    assert_eq!(
+        [
+            rmp_serde::to_vec(&old).expect("encode the initialized old cache"),
+            rmp_serde::to_vec(&crate::lifecycle_cache::LifecycleCache(&new)).expect("encode the new cache")
+        ],
+        [
+            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD.to_vec(),
+            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD.to_vec()
+        ],
+        "an initialized old CachedTags must still write the same empty map as the new carrier"
+    );
+
+    let slot = LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD
+        .iter()
+        .position(|byte| *byte == 0x80)
+        .expect("the first map in the fixed payload is the first filter's CachedTags slot");
+    let input_with_cache = |replacement: &[u8]| {
+        let mut bytes = LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD[..slot].to_vec();
+        bytes.extend_from_slice(replacement);
+        bytes.extend_from_slice(&LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD[slot + 1..]);
+        bytes
+    };
+    // A historical String/String map is consumed by both real readers, then
+    // rewritten empty. The original populated input is deliberately not the oracle.
+    let populated = input_with_cache(&[0x81, 0xa3, b'e', b'n', b'v', 0xa4, b'p', b'r', b'o', b'd']);
+    let old: LegacyPayload = rmp_serde::from_slice(&populated).expect("old reader accepts String/String cached tags");
+    let new = crate::lifecycle_cache::deserialize(&mut rmp_serde::Deserializer::new(populated.as_slice()))
+        .expect("new reader accepts String/String cached tags");
+    assert_eq!(
+        [
+            rmp_serde::to_vec(&old).expect("rewrite the old populated cache"),
+            rmp_serde::to_vec(&crate::lifecycle_cache::LifecycleCache(&new)).expect("rewrite the new populated cache")
+        ],
+        [
+            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD.to_vec(),
+            LEGACY_LIFECYCLE_NONEMPTY_PAYLOAD.to_vec()
+        ],
+        "both readers discard populated cached tags and both writers emit an empty map"
+    );
+
+    for (label, replacement) in [
+        ("nil", &[0xc0][..]),
+        ("array", &[0x90][..]),
+        ("scalar", &[0x01][..]),
+        ("nonstring-key", &[0x81, 0x01, 0xa1, b'v'][..]),
+        ("nonstring-value", &[0x81, 0xa1, b'k', 0x01][..]),
+    ] {
+        let input = input_with_cache(replacement);
+        let old = rmp_serde::from_slice::<LegacyPayload>(&input);
+        let new = crate::lifecycle_cache::deserialize(&mut rmp_serde::Deserializer::new(input.as_slice()));
+        assert_eq!(
+            [old.is_err(), new.is_err()],
+            [true, true],
+            "both real readers must reject {label} cached tags"
+        );
+    }
+}
+
+/// The Object Lock configuration inside the usage cache keeps the s3s DTO's
+/// derived MessagePack layout (rustfs/backlog#2745): every shape the old
+/// binary could write decodes, and the new writer produces the same bytes.
+#[test]
+fn object_lock_cache_matches_the_legacy_dto_bytes() {
+    use rustfs_gateway_types::persistence::{
+        PersistedDefaultRetention, PersistedObjectLockConfiguration, PersistedObjectLockRule,
+    };
+    use s3s::dto as legacy;
+
+    let legacy_cases = vec![
+        legacy::ObjectLockConfiguration {
+            object_lock_enabled: None,
+            rule: None,
+        },
+        legacy::ObjectLockConfiguration {
+            object_lock_enabled: Some(legacy::ObjectLockEnabled::from_static(legacy::ObjectLockEnabled::ENABLED)),
+            rule: None,
+        },
+        legacy::ObjectLockConfiguration {
+            object_lock_enabled: Some(legacy::ObjectLockEnabled::from("Disabled".to_owned())),
+            rule: Some(legacy::ObjectLockRule { default_retention: None }),
+        },
+        legacy::ObjectLockConfiguration {
+            object_lock_enabled: Some(legacy::ObjectLockEnabled::from_static(legacy::ObjectLockEnabled::ENABLED)),
+            rule: Some(legacy::ObjectLockRule {
+                default_retention: Some(legacy::DefaultRetention {
+                    days: Some(30),
+                    mode: Some(legacy::ObjectLockRetentionMode::from_static(legacy::ObjectLockRetentionMode::GOVERNANCE)),
+                    years: None,
+                }),
+            }),
+        },
+        legacy::ObjectLockConfiguration {
+            object_lock_enabled: Some(legacy::ObjectLockEnabled::from_static(legacy::ObjectLockEnabled::ENABLED)),
+            rule: Some(legacy::ObjectLockRule {
+                default_retention: Some(legacy::DefaultRetention {
+                    days: None,
+                    mode: Some(legacy::ObjectLockRetentionMode::from("compliance-ish".to_owned())),
+                    years: Some(2),
+                }),
+            }),
+        },
+    ];
+
+    for legacy_config in legacy_cases {
+        let persisted = PersistedObjectLockConfiguration {
+            object_lock_enabled: legacy_config
+                .object_lock_enabled
+                .as_ref()
+                .map(|value| value.as_str().to_owned()),
+            rule: legacy_config.rule.as_ref().map(|rule| PersistedObjectLockRule {
+                default_retention: rule.default_retention.as_ref().map(|retention| PersistedDefaultRetention {
+                    mode: retention.mode.as_ref().map(|value| value.as_str().to_owned()),
+                    days: retention.days,
+                    years: retention.years,
+                }),
+            }),
+        };
+        let old_bytes = rmp_serde::to_vec(&Some(Arc::new(legacy_config))).expect("encode the legacy DTO");
+        let current = Some(Arc::new(persisted.clone()));
+        let new_bytes = rmp_serde::to_vec(&crate::object_lock_cache::ObjectLockCache(&current)).expect("encode the new cache");
+        assert_eq!(new_bytes, old_bytes, "the new writer must produce the legacy bytes for {persisted:?}");
+
+        let decoded = crate::object_lock_cache::deserialize(&mut rmp_serde::Deserializer::new(old_bytes.as_slice()))
+            .expect("decode the legacy bytes");
+        assert_eq!(decoded.as_deref(), Some(&persisted));
+    }
+
+    let absent_old = rmp_serde::to_vec(&Option::<Arc<legacy::ObjectLockConfiguration>>::None).expect("encode absent");
+    let absent_new = rmp_serde::to_vec(&crate::object_lock_cache::ObjectLockCache(&None)).expect("encode absent");
+    assert_eq!(absent_new, absent_old);
+    let decoded =
+        crate::object_lock_cache::deserialize(&mut rmp_serde::Deserializer::new(absent_old.as_slice())).expect("decode absent");
+    assert!(decoded.is_none());
+}
+
+#[test]
+fn scan_frontier_receipt_binds_nested_debt_outside_raw_lexical_prefix() {
+    let mut cache = DataUsageCache::default();
+    cache.prepare_bucket_checkpoint("bucket", 8, 1, DataUsageCacheSource::new(0, 0), TEST_PLAN_DIGEST, valid_scan_identity());
+    cache.replace("bucket", "", DataUsageEntry::default());
+    cache.replace("bucket/a", "bucket", DataUsageEntry::default());
+    cache.replace(
+        "bucket/a/z",
+        "bucket/a",
+        DataUsageEntry {
+            failed_objects: 1,
+            ..Default::default()
+        },
+    );
+    cache.replace(
+        "bucket/a-",
+        "bucket",
+        DataUsageEntry {
+            objects: 1,
+            size: 1,
+            ..Default::default()
+        },
+    );
+    cache
+        .seal_scan_frontier(Some("bucket/a-"))
+        .expect("seal traversal after failed subtree");
+    assert_eq!(cache.validated_scan_frontier(), Some("bucket/a-"));
+    let digest = cache.info.scan_coverage_receipt.as_ref().expect("new receipt").digest;
+    assert_ne!(digest, cache.v2_coverage_prefix_digest("bucket/a-").expect("old reader digest"));
+    cache.cache.get_mut("bucket/a/z").expect("nested failure").failed_objects = 0;
+    assert!(
+        cache.validated_scan_frontier().is_none(),
+        "nested debt must be signed even when '/' sorts after '-'"
+    );
+}
+
+#[test]
+fn durable_progress_rejects_reset_regression_and_uncommitted_discovery() {
+    let identity = DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: uuid::Uuid::from_u128(7),
+        set_layout: TEST_PLAN_DIGEST,
+        publication_epoch: 2,
+        tier_registry_generation: 0,
+        scan_mode: HealScanMode::Normal,
+    };
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            source: Some(DataUsageCacheSource::new(0, 0)),
+            scan_identity: Some(identity),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_raw_enumeration_page_index: Some(RawEnumerationPageIndex::new("bucket/prefix", 2).expect("owner")),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let before = cache.durable_scan_progress();
+    let index = cache.info.scan_raw_enumeration_page_index.as_mut().expect("owner");
+    index
+        .ingest_partial_owner_entries(vec!["a".to_string(), "b".to_string()], 2, index.generation().expect("generation"))
+        .expect("discover entries");
+    assert!(
+        !cache.durable_scan_progress().advanced_from(&before),
+        "uncommitted discovery is not durable forward motion"
+    );
+    let index = cache.info.scan_raw_enumeration_page_index.as_mut().expect("owner");
+    index
+        .commit_building_page(index.generation().expect("generation"))
+        .expect("commit raw page");
+    let committed = cache.durable_scan_progress();
+    assert!(committed.advanced_from(&before));
+    assert!(!before.advanced_from(&committed), "a reset is not progress");
+    let mut replaced = committed.clone();
+    replaced.identity.as_mut().expect("identity").publication_epoch += 1;
+    assert!(!replaced.advanced_from(&before));
+    replaced = committed;
+    replaced.started_plan = Some(DataUsageScanPlanDigest([99; 32]));
+    assert!(!replaced.advanced_from(&before), "plan changes alone cannot earn another turn");
+    let mut previous = before;
+    previous.raw.clear();
+    previous.frontier = Some("bucket/a/z".to_string());
+    let mut next = previous.clone();
+    next.frontier = Some("bucket/a".to_string());
+    assert!(next.advanced_from(&previous), "DFS ancestor completion covers its descendants");
+    assert!(!previous.advanced_from(&next), "reentering a completed ancestor is a regression");
+}

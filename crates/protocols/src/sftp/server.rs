@@ -34,10 +34,10 @@ use super::lifecycle::{SessionDiag, SessionRegistry, new_session_registry};
 #[cfg(target_os = "linux")]
 use super::wedge_watchdog;
 use crate::common::client::s3::StorageBackend;
-use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
+use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext, is_temporary_credential};
 use russh::keys::{self, PrivateKey, PublicKeyBase64};
-use russh::server::{Auth, Msg, Session};
-use russh::{Channel, ChannelId, MethodKind, MethodSet, Pty, Sig};
+use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
+use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet, Pty, Sig};
 use rustfs_config::{
     DEFAULT_SFTP_HOST_KEY_RELOAD_ENABLE, DEFAULT_SFTP_HOST_KEY_RELOAD_INTERVAL, ENV_SFTP_HOST_KEY_RELOAD_ENABLE,
     ENV_SFTP_HOST_KEY_RELOAD_INTERVAL,
@@ -127,6 +127,7 @@ const SFTP_COMPRESSION: &[russh::compression::Name] = &[russh::compression::NONE
 fn build_preferred() -> russh::Preferred {
     russh::Preferred {
         kex: Cow::Borrowed(SFTP_KEX),
+        host_key_certificates: Cow::Borrowed(&[]),
         key: Cow::Borrowed(SFTP_HOST_KEY_ALGORITHMS),
         cipher: Cow::Borrowed(SFTP_CIPHERS),
         mac: Cow::Borrowed(SFTP_MACS),
@@ -638,7 +639,7 @@ mod hot_reload_tests {
         format!("{d}BEGIN {l}{d}\n{body}\n{d}END {l}{d}\n", d = PEM_BOUNDARY_DASHES, l = PEM_OPENSSH_LABEL,)
     }
 
-    fn test_ed25519_pem() -> String {
+    pub(super) fn test_ed25519_pem() -> String {
         build_pem_block(
             "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
              QyNTUxOQAAACCkeMEUpnJEbOMBXiQfjZcHZMEbHW3DlNRL+Jbi1cIqMgAAAKDviRiQ74kY\n\
@@ -1009,7 +1010,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
     fn auth_publickey_offered(
         &mut self,
         user: &str,
-        _key: &keys::PublicKey,
+        _key: russh::server::PublicKeyOffer<'_>,
     ) -> impl std::future::Future<Output = Result<Auth, Self::Error>> + Send {
         async { Ok(Auth::reject()) }
     }
@@ -1018,7 +1019,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
     fn auth_publickey(
         &mut self,
         user: &str,
-        _key: &keys::PublicKey,
+        _key: russh::server::VerifiedPublicKey<'_>,
     ) -> impl std::future::Future<Output = Result<Auth, Self::Error>> + Send {
         async { Ok(Auth::reject()) }
     }
@@ -1101,6 +1102,19 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
                 return Ok(Auth::reject());
             }
 
+            if is_temporary_credential(&identity.credentials) {
+                warn!(
+                    event = EVENT_SFTP_AUTH_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SFTP_AUTH,
+                    result = "temporary_credential_rejected",
+                    user = %masked_user,
+                    peer = %peer_addr,
+                    "sftp auth state changed"
+                );
+                return Ok(Auth::reject());
+            }
+
             // Constant-time secret comparison to prevent timing side-channel
             // attacks. Same primitive used by rustfs/src/auth.rs.
             use subtle::ConstantTimeEq;
@@ -1135,15 +1149,19 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, channel, _session), fields(peer = %self.peer_addr))]
+    #[tracing::instrument(level = "debug", skip(self, channel, reply, _session), fields(peer = %self.peer_addr))]
     fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         let id = channel.id();
         self.channels.insert(id, channel);
-        async { Ok(true) }
+        async move {
+            reply.accept().await;
+            Ok(())
+        }
     }
 
     #[tracing::instrument(level = "debug", skip(self, _session), fields(peer = %self.peer_addr, channel = ?channel))]
@@ -1404,13 +1422,13 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
         async { Ok(false) }
     }
 
-    // Channel-open rejections. russh 0.60 defaults all of these to
-    // Ok(false), but we override them explicitly with a warn log so
+    // Channel-open rejections. russh defaults to rejecting dropped channel-open
+    // handles, but we override them explicitly with a warn log so
     // (a) probe attempts are visible in operator logs and
     // (b) a future russh default flip cannot silently allow these
     //     channel types.
 
-    #[tracing::instrument(level = "warn", skip(self, _channel, _session), fields(peer = %self.peer_addr, host = %host_to_connect, port = port_to_connect))]
+    #[tracing::instrument(level = "warn", skip(self, _channel, reply, _session), fields(peer = %self.peer_addr, host = %host_to_connect, port = port_to_connect))]
     fn channel_open_direct_tcpip(
         &mut self,
         _channel: Channel<Msg>,
@@ -1418,12 +1436,16 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
         port_to_connect: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(false) }
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+            Ok(())
+        }
     }
 
-    #[tracing::instrument(level = "warn", skip(self, _channel, _session), fields(peer = %self.peer_addr, host = %host_to_connect, port = port_to_connect))]
+    #[tracing::instrument(level = "warn", skip(self, _channel, reply, _session), fields(peer = %self.peer_addr, host = %host_to_connect, port = port_to_connect))]
     fn channel_open_forwarded_tcpip(
         &mut self,
         _channel: Channel<Msg>,
@@ -1431,30 +1453,42 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
         port_to_connect: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(false) }
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+            Ok(())
+        }
     }
 
-    #[tracing::instrument(level = "warn", skip(self, _channel, _session), fields(peer = %self.peer_addr))]
+    #[tracing::instrument(level = "warn", skip(self, _channel, reply, _session), fields(peer = %self.peer_addr))]
     fn channel_open_x11(
         &mut self,
         _channel: Channel<Msg>,
         _originator_address: &str,
         _originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(false) }
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+            Ok(())
+        }
     }
 
-    #[tracing::instrument(level = "warn", skip(self, _channel, _session), fields(peer = %self.peer_addr, socket = %socket_path))]
+    #[tracing::instrument(level = "warn", skip(self, _channel, reply, _session), fields(peer = %self.peer_addr, socket = %socket_path))]
     fn channel_open_direct_streamlocal(
         &mut self,
         _channel: Channel<Msg>,
         socket_path: &str,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(false) }
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+            Ok(())
+        }
     }
 }
 
@@ -1558,6 +1592,80 @@ mod tests {
             std::time::Duration::from_secs(0),
             "auth rejection time must be zero to match S3/FTPS baseline"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_handshake_rejects_public_key_authentication() {
+        use crate::common::dummy_storage::DummyBackend;
+        use russh::client::{self, AuthResult};
+        use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+
+        struct PinnedHostKey(keys::PublicKey);
+
+        impl client::Handler for PinnedHostKey {
+            type Error = russh::Error;
+
+            async fn check_server_key(&mut self, offered: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
+                Ok(matches!(offered, PublicKeyOrCertificate::PublicKey { key, .. } if key.key_data() == self.0.key_data()))
+            }
+        }
+
+        timeout(Duration::from_secs(30), async {
+            let key = PrivateKey::from_openssh(super::hot_reload_tests::test_ed25519_pem()).expect("decode test SSH key");
+            let trusted_host_key = key.public_key().clone();
+            let config = build_ssh_config(vec![key.clone()], 600, "SSH-2.0-RustFS");
+            let peer_addr = "127.0.0.1:12345".parse().expect("test peer address");
+            let handler = SshSessionHandler {
+                storage: Arc::new(DummyBackend::new()),
+                peer_addr,
+                session_context: None,
+                channels: HashMap::new(),
+                read_only: false,
+                part_size: super::super::test_support::TEST_PART_SIZE,
+                handles_per_session: DEFAULT_HANDLES_PER_SESSION,
+                backend_op_timeout_secs: DEFAULT_BACKEND_OP_TIMEOUT_SECS,
+                read_cache_window: READ_CACHE_WINDOW_DEFAULT,
+                read_cache_total_mem_limit: READ_CACHE_TOTAL_MEM_DEFAULT,
+                read_cache_in_use: Arc::new(AtomicU64::new(0)),
+                session_diag: Arc::new(SessionDiag::new(peer_addr, peer_addr)),
+            };
+            let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+            let server = tokio::spawn(async move {
+                let session = russh::server::run_stream(config, server_stream, handler)
+                    .await
+                    .expect("start test SSH session");
+                // The client deliberately disconnects after the rejected authentication.
+                let _ = session.await;
+            });
+            let mut client =
+                client::connect_stream(Arc::new(client::Config::default()), client_stream, PinnedHostKey(trusted_host_key))
+                    .await
+                    .expect("complete SSH handshake with the pinned host key");
+            let auth = client
+                .authenticate_publickey("public-key-auth-disabled", PrivateKeyWithHashAlg::new(Arc::new(key), None))
+                .await
+                .expect("receive public-key authentication response");
+            match auth {
+                AuthResult::Failure {
+                    remaining_methods,
+                    partial_success,
+                } => {
+                    assert!(!partial_success, "public keys must not grant partial authentication");
+                    assert!(remaining_methods.contains(&MethodKind::Password));
+                    assert!(!remaining_methods.contains(&MethodKind::PublicKey));
+                }
+                AuthResult::Success => panic!("public-key authentication must remain disabled"),
+            }
+            client
+                .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+                .await
+                .expect("disconnect test client");
+            drop(client);
+            server.await.expect("join test SSH server");
+        })
+        .await
+        .expect("SSH authentication rejection must complete within the test deadline");
     }
 
     #[test]

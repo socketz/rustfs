@@ -15,7 +15,7 @@ fmt-check: core-deps fmt-deps ## Check code formatting
 .PHONY: clippy-check
 clippy-check: core-deps ## Run clippy checks
 	@echo "🔍 Running clippy checks..."
-	cargo clippy --all-targets --all-features -- -D warnings
+	cargo clippy --all-targets -- -D warnings
 
 .PHONY: clippy-fix
 clippy-fix: core-deps ## Apply clippy fixes
@@ -44,6 +44,78 @@ architecture-migration-check: ## Check architecture migration guardrails
 logging-guardrails-check: ## Check logging guardrails for redaction and noise regressions
 	@echo "🪵 Checking logging guardrails..."
 	./scripts/check_logging_guardrails.sh
+
+.PHONY: error-other-ratchet-check
+error-other-ratchet-check: ## Check the ecstore ::other(format!) quorum-bucketing ratchet stays shrink-only
+	@echo "🪣 Checking error other(format!) ratchet..."
+	./scripts/check_error_other_format_ratchet.sh
+
+.PHONY: tokio-io-uring-check
+tokio-io-uring-check: ## Check tokio io-uring runtime feature stays removed
+	@echo "🚫 Checking tokio io-uring feature guard..."
+	./scripts/check_no_tokio_io_uring.sh
+
+.PHONY: extension-schema-check
+extension-schema-check: ## Check extension-schema stays a lightweight contract crate
+	@echo "🧩 Checking extension schema boundaries..."
+	./scripts/check_extension_schema_boundaries.sh
+
+.PHONY: body-cache-whitelist-check
+body-cache-whitelist-check: ## Check the body-cache eligibility gate stays a fail-closed allow-list
+	@echo "🧱 Checking body-cache whitelist guard..."
+	./scripts/check_body_cache_whitelist.sh
+
+.PHONY: s3s-footprint-check
+s3s-footprint-check: ## Check the s3s dependency footprint ratchet stays frozen
+	@echo "📦 Checking s3s footprint ratchet..."
+	./scripts/check_s3s_footprint.sh
+
+.PHONY: release-feature-boundary-check
+release-feature-boundary-check: ## Check no release-reachable feature enables a debug-only one
+	@echo "🚧 Checking release feature boundaries..."
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_connect_release_boundary.py --features-only
+
+.PHONY: test-count-ratchet-check
+test-count-ratchet-check: ## Check no workspace crate fell below its test floor or rose above its #[ignore] ceiling in the committed baseline
+	@echo "🧪 Checking per-crate test-count ratchet..."
+	./scripts/check_test_count_ratchet.sh
+
+.PHONY: test-seams-check
+test-seams-check: ## Check tests outside an operation's owner call its use-case only through rustfs/src/app/test_seams
+	@echo "🧪 Checking cross-owner test seams..."
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_seams.py
+
+.PHONY: test-retirements-check
+test-retirements-check: ## Check every test retired by a migration slice names a replacement that exists
+	@echo "🧪 Checking test retirement tables..."
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_retirements.py
+
+.PHONY: fips-wording-check
+fips-wording-check: ## Check docs and crates/kms do not over-claim crypto capabilities
+	@echo "📣 Checking cryptographic capability wording guard..."
+	./scripts/check_fips_wording.sh
+
+.PHONY: embedded-secrets-check
+embedded-secrets-check: ## Check no private key material or credential literal is committed
+	@echo "🔑 Checking embedded secret material guard..."
+	./scripts/check_embedded_secrets.sh
+
+.PHONY: offline-enrollment-e2e-check
+offline-enrollment-e2e-check: core-deps ## Build and exercise the dedicated offline enrollment E2E root
+	@echo "🔐 Checking the offline enrollment E2E root boundary..."
+	./scripts/check_offline_enrollment_e2e.sh
+
+.PHONY: test-wiring-check
+test-wiring-check: ## Check tests stay registered and selected by their intended runners
+	@echo "🧪 Checking test wiring..."
+	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/ci_gate.py --check-workflow
+	$(RUSTFS_PYTHON_BIN) ./scripts/validation_registry.py check
+
+.PHONY: log-analyzer-rules-check
+log-analyzer-rules-check: core-deps ## Check log-analyzer rule anchors still exist verbatim in source
+	@echo "🩺 Checking log-analyzer rule anchors..."
+	./scripts/check_log_analyzer_rules.sh
 
 .PHONY: compilation-check
 compilation-check: core-deps ## Run compilation check

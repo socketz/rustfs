@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM alpine:3.23.4 AS build
+ARG BINARY_SOURCE=download
+
+FROM alpine:3.24.2 AS download
 
 ARG TARGETARCH
 ARG RELEASE=latest
+ARG RC_RELEASE=latest
 
-RUN apk add --no-cache ca-certificates curl unzip
+RUN apk add --no-cache ca-certificates curl jq unzip
 WORKDIR /build
 
 RUN set -eux; \
@@ -27,9 +30,8 @@ RUN set -eux; \
       *) echo "Unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
     esac; \
     if [ "$RELEASE" = "latest" ]; then \
-      TAG="$(curl -fsSL https://api.github.com/repos/rustfs/rustfs/releases \
-              | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4 | head -n 1)"; \
-      RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG")"; \
+      RELEASE_JSON="$(curl -fsSL https://api.github.com/repos/rustfs/rustfs/releases | jq -c '.[0]')"; \
+      TAG="$(printf '%s' "$RELEASE_JSON" | jq -r '.tag_name // empty')"; \
     else \
       TAG="$RELEASE"; \
       RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG" 2>/dev/null || true)"; \
@@ -44,14 +46,19 @@ RUN set -eux; \
         TAG="$ALT_TAG"; \
       fi; \
     fi; \
+    if [ -z "$TAG" ] || [ -z "$RELEASE_JSON" ]; then echo "Failed to resolve release metadata" >&2; exit 1; fi; \
     echo "Using tag: $TAG (arch pattern: $ARCH_SUBSTR)"; \
-    # Find download URL in assets list for this tag that contains arch substring and ends with .zip
-    URL="$(curl -fsSL "https://api.github.com/repos/rustfs/rustfs/releases/tags/$TAG" \
-           | grep -o "\"browser_download_url\": \"[^\"]*${ARCH_SUBSTR}[^\"]*\\.zip\"" \
-           | cut -d'"' -f4 | head -n 1)"; \
-    if [ -z "$URL" ]; then echo "Failed to locate release asset for $ARCH_SUBSTR at tag $TAG" >&2; exit 1; fi; \
+    ASSET_JSON="$(printf '%s' "$RELEASE_JSON" | jq -c --arg arch "$ARCH_SUBSTR" '.assets[] | select((.name | contains($arch)) and (.name | endswith(".zip"))) | {name: .name, url: .browser_download_url, digest: .digest}' | head -n 1)"; \
+    if [ -z "$ASSET_JSON" ]; then echo "Failed to locate release asset for $ARCH_SUBSTR at tag $TAG" >&2; exit 1; fi; \
+    ASSET_NAME="$(printf '%s' "$ASSET_JSON" | jq -r '.name // empty')"; \
+    URL="$(printf '%s' "$ASSET_JSON" | jq -r '.url // empty')"; \
+    DIGEST="$(printf '%s' "$ASSET_JSON" | jq -r '.digest // empty')"; \
+    SHA256="$(printf '%s' "$DIGEST" | sed 's/^sha256://')"; \
+    if [ -z "$URL" ] || [ -z "$ASSET_NAME" ]; then echo "Failed to locate release asset for $ARCH_SUBSTR at tag $TAG" >&2; exit 1; fi; \
+    if [ -z "$SHA256" ] || [ "$SHA256" = "$DIGEST" ]; then echo "Release asset $ASSET_NAME is missing a sha256 digest" >&2; exit 1; fi; \
     echo "Downloading: $URL"; \
     curl -fL "$URL" -o rustfs.zip; \
+    printf '%s  rustfs.zip\n' "$SHA256" | sha256sum -c -; \
     unzip -q rustfs.zip -d /build; \
     # If binary is not in root directory, try to locate and move from zip to /build/rustfs
     if [ ! -x /build/rustfs ]; then \
@@ -65,8 +72,19 @@ RUN set -eux; \
     chmod +x /build/rustfs; \
     rm -rf rustfs.zip /build/.tmp || true
 
+COPY scripts/download_rc.sh /usr/local/bin/download_rc.sh
+RUN sh /usr/local/bin/download_rc.sh "$TARGETARCH" musl "$RC_RELEASE" /build/rc
 
-FROM alpine:3.23.4
+
+# Candidate packaging supplies the accepted executables from verified archives.
+# The default download stage remains available for local image builds.
+FROM scratch AS supplied
+ARG TARGETARCH
+COPY .release-inputs/${TARGETARCH}/ /build/
+
+FROM ${BINARY_SOURCE} AS build
+
+FROM alpine:3.24.2
 
 ARG RELEASE=latest
 ARG BUILD_DATE
@@ -84,18 +102,30 @@ LABEL name="RustFS" \
       url="https://rustfs.com" \
       license="Apache-2.0"
 
-RUN apk update && \
-    apk add --no-cache ca-certificates coreutils curl
+# Upgrade base-image packages so published images pick up security fixes
+# (e.g. openssl/libssl3 CVEs) without waiting for a new Alpine point release.
+RUN apk upgrade --no-cache && \
+    apk add --no-cache \
+    ca-certificates \
+    coreutils \
+    curl \
+    jq \
+    tzdata \
+    && test "$(TZ=Asia/Kolkata date +%z)" = "+0530"
 
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /build/rustfs /usr/bin/rustfs
-COPY entrypoint.sh /entrypoint.sh
+COPY --from=build /build/rc /usr/bin/rc
+COPY entrypoint.sh /etc/rustfs/entrypoint.sh
+COPY bootstrap/ /etc/rustfs/bootstrap/
 
-RUN chmod +x /usr/bin/rustfs /entrypoint.sh
+RUN chmod +x /usr/bin/rustfs /usr/bin/rc /etc/rustfs/entrypoint.sh && \
+    ln -s /etc/rustfs/entrypoint.sh /entrypoint.sh
 
 RUN addgroup -g 10001 -S rustfs && \
     adduser -u 10001 -G rustfs -S rustfs -D && \
-    mkdir -p /data /logs && \
+    mkdir -p /data/.rustfs/events /data/.rustfs/audit /logs /opt/rustfs && \
+    ln -s /data/.rustfs/events /opt/rustfs/events && \
+    ln -s /data/.rustfs/audit /opt/rustfs/audit && \
     chown -R rustfs:rustfs /data /logs && \
     chmod 0750 /data /logs
 
@@ -111,6 +141,6 @@ VOLUME ["/data"]
 
 USER rustfs
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/etc/rustfs/entrypoint.sh"]
 
 CMD ["rustfs"]

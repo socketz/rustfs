@@ -22,6 +22,17 @@ Use the automated path when you want the lab to:
 - upload a predefined SSE fixture case
 - export the generated backend tree into the lab layout
 
+## Networks without Docker Hub access
+
+`capture_via_docker.sh` extracts MinIO from the official GitHub release package after verifying its pinned SHA256. The Dockerfile selects the matching amd64, arm64, or ppc64le package; the MinIO release remains `RELEASE.2025-09-07T16-13-09Z`. Python comes from Docker Hub by default. Where that registry is unreachable, public.ecr.aws mirrors the official Python images:
+
+```bash
+MINIO_LAB_PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-slim \
+./capture_via_docker.sh
+```
+
+`MINIO_LAB_MINIO_IMAGE` can override the package stage with an accessible image containing the same MinIO release at `/usr/bin/minio`. Pin that image to the same release; an unpinned `:latest` captures whatever format that day's build writes, which is not what the interop tests were validated against.
+
 ## Layout
 
 The default root is `artifacts/minio-fixture-lab`, which is already ignored by the repository.
@@ -120,6 +131,30 @@ uv run python D:\Github\rustfs\crates\rio-v2\tests\minio_fixture_lab\lab.py capt
 ```
 
 That is a runner smoke path only. Real compatibility fixtures should still prefer the intended multi-disk backend layout when the local environment can support it.
+
+## Via Docker (Linux/macOS, no local `minio` install)
+
+When you don't have a `minio` binary on the host, `capture_via_docker.sh`
+generates the fixtures the ignored round-trip tests consume using Docker only.
+It builds a throwaway image (the official MinIO server binary pulled from
+`minio/minio` plus this lab on a small Python base — `lab.py` drives MinIO's S3
+API directly, so no `mc` is needed) and runs `capture-matrix` inside it, writing
+fixtures under `crates/rio-v2/tests/fixtures/minio-generated/` (the root the Rust
+tests read):
+
+```bash
+# Default: the two 8 MiB multipart cases the round-trip tests need.
+# Pass case ids to override, or "all" for the full default matrix.
+./capture_via_docker.sh
+
+RUSTFS_MINIO_STATIC_KMS_KEY_B64=IyqsU3kMFloCNup4BsZtf/rmfHVcTgznO2F25CkEH1g= \
+  cargo test -p rustfs --features rio-v2 storage::minio_generated_read_test --lib -- --ignored
+```
+
+This is exactly what the nightly `minio-interop` GitHub Actions workflow runs
+(`.github/workflows/minio-interop.yml`), so the local and CI paths stay in sync.
+SSE-C cases still need the host-`minio` + TLS path above; the Docker helper
+targets the SSE-S3 / SSE-KMS multipart cases the interop tests assert on.
 
 ## Capture Guidance
 

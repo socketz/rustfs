@@ -12,15 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::disk::DiskAPI;
-use rustfs_io_metrics::capacity_metrics::{
-    record_capacity_cache_hit, record_capacity_cache_miss, record_capacity_cache_served, record_capacity_refresh_request,
-    record_capacity_scan_mode,
+use crate::storage_api::capacity::service::{all_local_disk, disk_drive_path, disk_endpoint};
+use rustfs_io_metrics::capacity_metrics::{record_capacity_cache_hit, record_capacity_cache_miss};
+use rustfs_object_capacity::{
+    CapacityDiskRef,
+    capacity_manager::{self, CapacityBackgroundTasks},
 };
-use rustfs_object_capacity::{CapacityDiskRef, capacity_manager, scan};
-use std::sync::Arc;
-use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 const LOG_COMPONENT_CAPACITY: &str = "capacity";
 const LOG_SUBSYSTEM_CAPACITY: &str = "capacity";
@@ -32,229 +30,19 @@ pub fn capacity_disk_ref(endpoint: impl Into<String>, drive_path: impl Into<Stri
     }
 }
 
-fn capacity_disk_refs(disks: &[rustfs_madmin::Disk]) -> Vec<CapacityDiskRef> {
-    disks
-        .iter()
-        .map(|disk| capacity_disk_ref(disk.endpoint.clone(), disk.drive_path.clone()))
-        .collect()
-}
-
-async fn refresh_admin_disks_with_subset_fallback(
-    capacity_manager: &capacity_manager::HybridCapacityManager,
-    all_disks: Vec<CapacityDiskRef>,
-    allow_dirty_subset: bool,
-) -> Result<capacity_manager::CapacityUpdate, String> {
-    let (refresh_disks, dirty_subset) = if allow_dirty_subset {
-        scan::select_capacity_refresh_disks(capacity_manager, &all_disks).await
-    } else {
-        (all_disks.clone(), false)
-    };
-
-    match scan::refresh_capacity_with_scope(refresh_disks.clone(), dirty_subset).await {
-        Ok(update) => Ok(update),
-        Err(err) if dirty_subset => {
-            warn!(
-                component = LOG_COMPONENT_CAPACITY,
-                subsystem = LOG_SUBSYSTEM_CAPACITY,
-                event = "capacity_refresh_retry",
-                scope = "dirty_subset",
-                fallback_scope = "full_disk",
-                error = %err,
-                "Capacity refresh failed and will retry with full-disk scope"
-            );
-            scan::refresh_capacity_with_scope(all_disks, false).await
-        }
-        Err(err) => Err(err),
-    }
-}
-
-pub async fn refresh_or_join_admin_disks(
-    capacity_manager: Arc<capacity_manager::HybridCapacityManager>,
-    source: capacity_manager::DataSource,
-    disks: &[rustfs_madmin::Disk],
-    allow_dirty_subset: bool,
-) -> Result<capacity_manager::CapacityUpdate, String> {
-    let all_disks = capacity_disk_refs(disks);
-    let refresh_manager = capacity_manager.clone();
-
-    capacity_manager
-        .refresh_or_join(source, move || {
-            let capacity_manager = refresh_manager.clone();
-            let all_disks = all_disks.clone();
-            async move {
-                refresh_admin_disks_with_subset_fallback(capacity_manager.as_ref(), all_disks, allow_dirty_subset).await
-            }
-        })
-        .await
-}
-
-pub async fn spawn_refresh_if_needed_admin_disks(
-    capacity_manager: Arc<capacity_manager::HybridCapacityManager>,
-    source: capacity_manager::DataSource,
-    disks: &[rustfs_madmin::Disk],
-    allow_dirty_subset: bool,
-) -> bool {
-    let all_disks = capacity_disk_refs(disks);
-    let refresh_manager = capacity_manager.clone();
-
-    capacity_manager
-        .spawn_refresh_if_needed(source, move || async move {
-            refresh_admin_disks_with_subset_fallback(refresh_manager.as_ref(), all_disks, allow_dirty_subset).await
-        })
-        .await
-}
-
 pub async fn record_capacity_write(scope_token: Option<uuid::Uuid>) {
     capacity_manager::get_capacity_manager()
         .record_write_operation_with_scope_token(scope_token)
         .await;
 }
 
-pub async fn resolve_admin_used_capacity(disks: &[rustfs_madmin::Disk], fallback_used_capacity: u64) -> u64 {
-    let capacity_manager = capacity_manager::get_capacity_manager();
-
-    if let Some(cached) = capacity_manager.get_capacity().await {
-        record_capacity_cache_hit();
-        let cache_age = cached.last_update.elapsed();
-        let fast_update_threshold = capacity_manager.get_config().fast_update_threshold;
-
-        if cache_age < fast_update_threshold {
-            record_capacity_cache_served("fresh");
-            debug!(
-                "Using cached capacity: {} bytes (age: {:?}, source: {:?}, files={}, estimated={})",
-                cached.total_used, cache_age, cached.source, cached.file_count, cached.is_estimated
-            );
-            return cached.total_used;
-        }
-
-        let needs_update = capacity_manager.needs_fast_update().await;
-        let should_block = capacity_manager.should_block_on_refresh(cache_age);
-
-        if needs_update && should_block {
-            let start = Instant::now();
-            record_capacity_refresh_request("blocking", capacity_manager::DataSource::WriteTriggered.as_metric_label());
-            return match refresh_or_join_admin_disks(
-                capacity_manager.clone(),
-                capacity_manager::DataSource::WriteTriggered,
-                disks,
-                true,
-            )
-            .await
-            {
-                Ok(update) => {
-                    let elapsed = start.elapsed();
-                    debug!(
-                        component = LOG_COMPONENT_CAPACITY,
-                        subsystem = LOG_SUBSYSTEM_CAPACITY,
-                        event = "capacity_refresh_completed",
-                        mode = "foreground",
-                        duration_ms = elapsed.as_millis() as u64,
-                        file_count = update.file_count,
-                        is_estimated = update.is_estimated,
-                        "Capacity refresh completed"
-                    );
-                    update.total_used
-                }
-                Err(err) => {
-                    warn!(
-                        component = LOG_COMPONENT_CAPACITY,
-                        subsystem = LOG_SUBSYSTEM_CAPACITY,
-                        event = "capacity_refresh_failed",
-                        mode = "foreground",
-                        fallback = "cached_value",
-                        error = %err,
-                        "Capacity refresh failed"
-                    );
-                    record_capacity_cache_served("stale");
-                    cached.total_used
-                }
-            };
-        }
-
-        record_capacity_cache_served("stale");
-        debug!(
-            component = LOG_COMPONENT_CAPACITY,
-            subsystem = LOG_SUBSYSTEM_CAPACITY,
-            event = "capacity_cache_served",
-            cache_state = "stale",
-            total_used = cached.total_used,
-            age_ms = cache_age.as_millis() as u64,
-            source = ?cached.source,
-            file_count = cached.file_count,
-            is_estimated = cached.is_estimated,
-            needs_update,
-            blocking = should_block,
-            "Served cached capacity"
-        );
-
-        record_capacity_refresh_request("background", capacity_manager::DataSource::Scheduled.as_metric_label());
-        if spawn_refresh_if_needed_admin_disks(capacity_manager.clone(), capacity_manager::DataSource::Scheduled, disks, true)
-            .await
-        {
-            debug!(
-                component = LOG_COMPONENT_CAPACITY,
-                subsystem = LOG_SUBSYSTEM_CAPACITY,
-                event = "capacity_refresh_background",
-                state = "started",
-                "Background capacity refresh state changed"
-            );
-        } else {
-            debug!(
-                component = LOG_COMPONENT_CAPACITY,
-                subsystem = LOG_SUBSYSTEM_CAPACITY,
-                event = "capacity_refresh_background",
-                state = "skipped",
-                reason = "already_running",
-                "Background capacity refresh state changed"
-            );
-        }
-
-        return cached.total_used;
-    }
-
-    let start = Instant::now();
-    record_capacity_cache_miss();
-    record_capacity_refresh_request("initial", capacity_manager::DataSource::RealTime.as_metric_label());
-    match refresh_or_join_admin_disks(capacity_manager.clone(), capacity_manager::DataSource::RealTime, disks, false).await {
-        Ok(update) => {
-            let elapsed = start.elapsed();
-            info!(
-                component = LOG_COMPONENT_CAPACITY,
-                subsystem = LOG_SUBSYSTEM_CAPACITY,
-                event = "capacity_refresh_completed",
-                mode = "initial",
-                total_used = update.total_used,
-                duration_ms = elapsed.as_millis() as u64,
-                file_count = update.file_count,
-                is_estimated = update.is_estimated,
-                "Capacity refresh completed"
-            );
-            update.total_used
-        }
-        Err(err) => {
-            warn!(
-                component = LOG_COMPONENT_CAPACITY,
-                subsystem = LOG_SUBSYSTEM_CAPACITY,
-                event = "capacity_refresh_failed",
-                mode = "initial",
-                fallback = "disk_used_capacity",
-                error = %err,
-                "Capacity refresh failed"
-            );
-            record_capacity_cache_served("fallback");
-            record_capacity_scan_mode("fallback");
-            capacity_manager
-                .update_capacity(
-                    capacity_manager::CapacityUpdate::fallback(fallback_used_capacity),
-                    capacity_manager::DataSource::Fallback,
-                )
-                .await;
-            fallback_used_capacity
-        }
+pub async fn init_capacity_management_for_local_disks() {
+    if let Some(tasks) = init_capacity_management_for_local_disks_managed().await {
+        tasks.detach();
     }
 }
 
-pub async fn init_capacity_management_for_local_disks() {
+pub async fn init_capacity_management_for_local_disks_managed() -> Option<CapacityBackgroundTasks> {
     info!(
         component = LOG_COMPONENT_CAPACITY,
         subsystem = LOG_SUBSYSTEM_CAPACITY,
@@ -263,7 +51,7 @@ pub async fn init_capacity_management_for_local_disks() {
         "Capacity manager state changed"
     );
 
-    let disks = rustfs_ecstore::store::all_local_disk().await;
+    let disks = all_local_disk().await;
     if disks.is_empty() {
         warn!(
             component = LOG_COMPONENT_CAPACITY,
@@ -273,7 +61,7 @@ pub async fn init_capacity_management_for_local_disks() {
             reason = "no_local_disks",
             "Capacity manager state changed"
         );
-        return;
+        return None;
     }
 
     info!(
@@ -286,7 +74,7 @@ pub async fn init_capacity_management_for_local_disks() {
 
     let disk_refs = disks
         .iter()
-        .map(|ds| capacity_disk_ref(ds.endpoint().to_string(), ds.to_string()))
+        .map(|ds| capacity_disk_ref(disk_endpoint(ds), disk_drive_path(ds)))
         .collect();
 
     info!(
@@ -296,7 +84,7 @@ pub async fn init_capacity_management_for_local_disks() {
         state = "starting_background_task",
         "Capacity manager state changed"
     );
-    capacity_manager::start_background_task(disk_refs).await;
+    let tasks = capacity_manager::start_background_tasks(disk_refs).await;
 
     info!(
         component = LOG_COMPONENT_CAPACITY,
@@ -305,6 +93,7 @@ pub async fn init_capacity_management_for_local_disks() {
         state = "initialized",
         "Capacity manager state changed"
     );
+    Some(tasks)
 }
 
 pub async fn get_cached_capacity_with_metrics() -> Option<(u64, &'static str)> {

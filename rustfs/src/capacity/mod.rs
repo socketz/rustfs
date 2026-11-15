@@ -23,16 +23,15 @@
 //! ## Configuration
 //!
 //! All configuration is via environment variables (see `rustfs_config`):
-//! - `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` - Update interval in seconds (default: 120)
-//! - `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` - Write trigger delay (default: 5s)
-//! - `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` - Write frequency threshold (default: 5 writes/min)
-//! - `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` - Fast update threshold (default: 30s)
+//! - `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` - Update interval in seconds (default: 600)
+//! - `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` - Write trigger delay (default: 30s)
+//! - `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` - Write frequency threshold (default: 20 writes/min)
+//! - `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` - Fast update threshold (default: 120s)
 //! - `RUSTFS_CAPACITY_MAX_FILES_THRESHOLD` - Max files before sampling (default: 200,000)
 //! - `RUSTFS_CAPACITY_STAT_TIMEOUT` - Stat operation timeout (default: 3s)
 //! - `RUSTFS_CAPACITY_SAMPLE_RATE` - Sampling rate for metrics (default: 200)
 //! - `RUSTFS_CAPACITY_METRICS_INTERVAL` - Metrics summary logging interval (default: 600s)
 //! - `RUSTFS_CAPACITY_FOLLOW_SYMLINKS` - Follow symlinks during traversal (default: false)
-//! - `RUSTFS_CAPACITY_MAX_SYMLINK_DEPTH` - Max symlink depth (default: 3)
 //! - `RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT` - Enable dynamic timeout (default: true)
 //! - `RUSTFS_CAPACITY_MIN_TIMEOUT` - Minimum timeout (default: 2s)
 //! - `RUSTFS_CAPACITY_MAX_TIMEOUT` - Maximum timeout (default: 15s)
@@ -54,6 +53,6 @@ pub mod capacity_integration;
 pub mod service;
 
 pub use service::{
-    capacity_disk_ref, get_cached_capacity_with_metrics, init_capacity_management_for_local_disks, record_capacity_write,
-    refresh_or_join_admin_disks, resolve_admin_used_capacity, spawn_refresh_if_needed_admin_disks,
+    capacity_disk_ref, get_cached_capacity_with_metrics, init_capacity_management_for_local_disks,
+    init_capacity_management_for_local_disks_managed, record_capacity_write,
 };

@@ -12,17 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_dependency_readiness};
+use crate::admin::runtime_sources::{current_federated_identity_service, default_admin_usecase};
+use crate::admin::storage_api::access::RequestContext;
 use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
-use crate::server::{
-    CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier, LICENSE, RUSTFS_ADMIN_PREFIX,
-    RequestContextLayer, VERSION,
+use crate::server::rate_limit::{
+    LABEL_RATE_LIMIT_DIMENSION, LABEL_RATE_LIMIT_SCOPE, METRIC_HTTP_SERVER_REQUESTS_RATE_LIMITED_TOTAL,
+    RATE_LIMIT_DIMENSION_CLIENT_IP, RATE_LIMIT_SCOPE_CONSOLE, RateLimitDecision, RateLimitQuota, RateLimiter,
+    apply_throttle_headers, client_ip,
 };
-use crate::storage::request_context::RequestContext;
-use crate::version::build;
+use crate::server::{
+    APPLE_TOUCH_ICON_PATH, APPLE_TOUCH_ICON_PRECOMPOSED_PATH, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier,
+    HealthProbe, LICENSE, RUSTFS_ADMIN_PREFIX, RequestContextLayer, VERSION, build_health_response_parts,
+    collect_probe_readiness, console_prefix,
+};
+use crate::version::{self, build};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::Request,
     middleware,
@@ -33,10 +39,11 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use mime_guess::from_path;
 use opentelemetry::global;
 use rust_embed::RustEmbed;
+use rustfs_iam::federation::FederatedProviderView;
 use serde::Serialize;
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use tower_http::catch_panic::CatchPanicLayer;
@@ -77,7 +84,7 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
         return Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", mime_type.to_string())
-            .body(Body::from(file.data))
+            .body(Body::from(rewrite_console_asset(path, file.data, crate::server::console_prefix())))
             .unwrap();
     }
 
@@ -89,7 +96,7 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
             return Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", mime_type.to_string())
-                .body(Body::from(file.data))
+                .body(Body::from(rewrite_console_asset(&index_path, file.data, crate::server::console_prefix())))
                 .unwrap();
         }
     }
@@ -100,7 +107,11 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
         Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", mime_type.to_string())
-            .body(Body::from(file.data))
+            .body(Body::from(rewrite_console_asset(
+                "index.html",
+                file.data,
+                crate::server::console_prefix(),
+            )))
             .unwrap()
     } else {
         Response::builder()
@@ -110,9 +121,64 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
     }
 }
 
+// Next exports bake the base path into HTML, chunk loaders, and RSC text payloads.
+// Rewrite only path references, preserving external URLs such as the source repository.
+fn rewrite_console_asset<'a>(path: &str, data: std::borrow::Cow<'a, [u8]>, prefix: &str) -> std::borrow::Cow<'a, [u8]> {
+    use std::borrow::Cow;
+
+    if prefix == crate::server::CONSOLE_PREFIX
+        || !matches!(
+            path.rsplit('.').next(),
+            Some("html" | "js" | "css" | "json" | "txt" | "webmanifest" | "svg")
+        )
+    {
+        return data;
+    }
+    let Ok(text) = std::str::from_utf8(&data) else {
+        return data;
+    };
+    let mut rewritten = Cow::Borrowed(text);
+    let escaped_default = crate::server::CONSOLE_PREFIX.replace('/', "\\/");
+    let escaped_prefix = prefix.replace('/', "\\/");
+    for (source, target) in [
+        (crate::server::CONSOLE_PREFIX, prefix),
+        (escaped_default.as_str(), escaped_prefix.as_str()),
+    ] {
+        let mut output = String::new();
+        let mut copied = 0;
+        for (offset, _) in rewritten.match_indices(source) {
+            let end = offset + source.len();
+            let before = rewritten.as_bytes().get(offset.wrapping_sub(1)).copied();
+            let after = rewritten.as_bytes().get(end).copied();
+            let starts_path = before
+                .is_none_or(|byte| byte.is_ascii_whitespace() || matches!(byte, b'"' | b'\'' | b'`' | b'(' | b'=' | b'}' | b'>'));
+            let ends_prefix = after.is_none_or(|byte| {
+                byte.is_ascii_whitespace() || matches!(byte, b'/' | b'\\' | b'"' | b'\'' | b'`' | b'?' | b'#' | b')' | b'<')
+            });
+            if starts_path && ends_prefix {
+                output.push_str(&rewritten[copied..offset]);
+                output.push_str(target);
+                copied = end;
+            }
+        }
+        if copied != 0 {
+            output.push_str(&rewritten[copied..]);
+            rewritten = Cow::Owned(output);
+        }
+    }
+    match rewritten {
+        Cow::Borrowed(_) => data,
+        Cow::Owned(text) => Cow::Owned(text.into_bytes()),
+    }
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct Config {
     #[serde(skip)]
+    #[allow(
+        dead_code,
+        reason = "reachable only from this file's tests: no route registers config_handler (backlog#1823)"
+    )]
     port: u16,
     api: Api,
     s3: S3,
@@ -120,13 +186,7 @@ pub(crate) struct Config {
     license: License,
     doc: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    oidc: Vec<OidcProviderInfo>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct OidcProviderInfo {
-    provider_id: String,
-    display_name: String,
+    oidc: Vec<FederatedProviderView>,
 }
 
 impl Config {
@@ -134,22 +194,15 @@ impl Config {
         let http_prefix = rustfs_config::RUSTFS_HTTP_PREFIX;
 
         // Collect OIDC provider info if available
-        let oidc = rustfs_iam::get_oidc()
-            .map(|sys| {
-                sys.list_visible_providers()
-                    .into_iter()
-                    .map(|p| OidcProviderInfo {
-                        provider_id: p.provider_id,
-                        display_name: p.display_name,
-                    })
-                    .collect()
-            })
+        let oidc = current_federated_identity_service()
+            .map(|federation| federation.list_visible_providers())
             .unwrap_or_default();
 
         Config {
             port,
             api: Api {
                 base_url: build_console_api_base_url(&format!("{http_prefix}{local_ip}:{port}")),
+                discovery: console_api_discovery(),
             },
             s3: S3 {
                 endpoint: format!("{http_prefix}{local_ip}:{port}"),
@@ -168,11 +221,14 @@ impl Config {
         }
     }
 
+    #[allow(
+        dead_code,
+        reason = "reachable only from this file's tests: no route registers config_handler (backlog#1823)"
+    )]
     fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn version_info(&self) -> String {
         format!(
             "RELEASE.{}@{} (rust {} {})",
@@ -181,21 +237,6 @@ impl Config {
             build::RUST_VERSION,
             build::BUILD_TARGET
         )
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn version(&self) -> String {
-        self.release.version.clone()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn license(&self) -> String {
-        format!("{} {}", self.license.name.clone(), self.license.url.clone())
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn doc(&self) -> String {
-        self.doc.clone()
     }
 }
 
@@ -207,6 +248,35 @@ fn build_console_api_base_url(base_url: &str) -> String {
 struct Api {
     #[serde(rename = "baseURL")]
     base_url: String,
+    discovery: ApiDiscovery,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ApiDiscovery {
+    #[serde(rename = "runtimeCapabilities")]
+    runtime_capabilities: String,
+    #[serde(rename = "clusterSnapshot")]
+    cluster_snapshot: String,
+    #[serde(rename = "extensionsCatalog")]
+    extensions_catalog: String,
+    #[serde(rename = "ilmExpiryStatus")]
+    ilm_expiry_status: String,
+    #[serde(rename = "ilmTransitionRun")]
+    ilm_transition_run: String,
+    #[serde(rename = "ilmTransitionJob")]
+    ilm_transition_job: String,
+}
+
+fn console_api_discovery() -> ApiDiscovery {
+    let usecase = default_admin_usecase();
+    ApiDiscovery {
+        runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
+        cluster_snapshot: usecase.cluster_snapshot_route().to_string(),
+        extensions_catalog: usecase.extensions_catalog_route().to_string(),
+        ilm_expiry_status: format!("{RUSTFS_ADMIN_PREFIX}/ilm/expiry/status"),
+        ilm_transition_run: format!("{RUSTFS_ADMIN_PREFIX}/ilm/transition/run"),
+        ilm_transition_job: format!("{RUSTFS_ADMIN_PREFIX}/ilm/transition/jobs/{{job_id}}"),
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -233,15 +303,7 @@ static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
 #[allow(clippy::const_is_empty)]
 pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16) {
     CONSOLE_CONFIG.get_or_init(|| {
-        let ver = {
-            if !build::TAG.is_empty() {
-                build::TAG.to_string()
-            } else if !build::SHORT_COMMIT.is_empty() {
-                format!("@{}", build::SHORT_COMMIT)
-            } else {
-                build::PKG_VERSION.to_string()
-            }
-        };
+        let ver = version::DISPLAY_VERSION.to_string();
 
         Config::new(local_ip, port, ver.as_str(), build::COMMIT_DATE_3339)
     });
@@ -316,7 +378,10 @@ async fn version_handler() -> impl IntoResponse {
 /// - 200 OK with JSON body containing the console configuration if initialized.
 /// - 500 Internal Server Error if configuration is not initialized.
 #[instrument(fields(uri))]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "reachable only from this file's tests: no route registers it (backlog#1823)"
+)]
 async fn config_handler(uri: Uri, headers: HeaderMap) -> impl IntoResponse {
     // Get the scheme from the headers or use the URI scheme
     let scheme = headers
@@ -366,6 +431,47 @@ async fn config_handler(uri: Uri, headers: HeaderMap) -> impl IntoResponse {
         .status(StatusCode::OK)
         .body(Body::from(cfg.to_json()))
         .unwrap()
+}
+
+/// Buffers brotli-encoded responses to add a `Content-Length` header.
+///
+/// `tower_http`'s `CompressionLayer` streams brotli via `Transfer-Encoding: chunked`
+/// without a `Content-Length`. Firefox's incremental brotli decoder aborts on this
+/// combination (`NS_BINDING_ERROR`). Chrome and Safari buffer the full chunked body
+/// before decompressing and are unaffected.
+///
+/// This middleware collects the complete body for any brotli response that lacks a
+/// `Content-Length`, then re-emits it with the correct length so Firefox can decode it.
+pub(crate) async fn buffer_brotli_responses(request: Request, next: middleware::Next) -> Response {
+    let response = next.run(request).await;
+
+    let is_brotli = response
+        .headers()
+        .get(http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == "br");
+
+    if !is_brotli || response.headers().contains_key(http::header::CONTENT_LENGTH) {
+        return response;
+    }
+
+    let (mut parts, body) = response.into_parts();
+    match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
+        Ok(bytes) => {
+            if let Ok(value) = HeaderValue::from_str(&bytes.len().to_string()) {
+                parts.headers.insert(http::header::CONTENT_LENGTH, value);
+            }
+            Response::from_parts(parts, Body::from(bytes))
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to buffer brotli console response; sending empty body without Content-Encoding"
+            );
+            parts.headers.remove(http::header::CONTENT_ENCODING);
+            Response::from_parts(parts, Body::empty())
+        }
+    }
 }
 
 /// Console access logging middleware
@@ -443,7 +549,8 @@ fn get_console_config_from_env() -> (bool, u32, u64, String) {
 /// # Returns:
 /// - `true` if the path is for console access, `false` otherwise.
 pub fn is_console_path(path: &str) -> bool {
-    path == FAVICON_PATH || has_path_prefix(path, CONSOLE_PREFIX)
+    matches!(path, FAVICON_PATH | APPLE_TOUCH_ICON_PATH | APPLE_TOUCH_ICON_PRECOMPOSED_PATH)
+        || has_path_prefix(path, console_prefix())
 }
 
 /// Setup comprehensive middleware stack with tower-http features
@@ -462,34 +569,35 @@ fn setup_console_middleware_stack(
     rate_limit_rpm: u32,
     auth_timeout: u64,
 ) -> Router {
+    let console_prefix = console_prefix();
     let mut app = Router::new()
         .route(FAVICON_PATH, get(static_handler))
-        .route(&format!("{CONSOLE_PREFIX}{LICENSE}"), get(license_handler))
-        .route(&format!("{CONSOLE_PREFIX}{VERSION}"), get(version_handler))
-        .nest(CONSOLE_PREFIX, Router::new().fallback_service(get(static_handler)))
+        .route(&format!("{console_prefix}{LICENSE}"), get(license_handler))
+        .route(&format!("{console_prefix}{VERSION}"), get(version_handler))
+        .nest(console_prefix, Router::new().fallback_service(get(static_handler)))
         .fallback_service(get(static_handler));
 
     if rustfs_utils::get_env_bool(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, rustfs_config::DEFAULT_HEALTH_ENDPOINT_ENABLE) {
         app = app
-            .route(&format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"), get(health_check).head(health_check))
+            .route(&format!("{console_prefix}{HEALTH_PREFIX}"), get(health_check).head(health_check))
             .route(
-                &format!("{CONSOLE_PREFIX}{}", crate::server::HEALTH_COMPAT_LIVE_PATH),
+                &format!("{console_prefix}{}", crate::server::HEALTH_COMPAT_LIVE_PATH),
                 get(health_check).head(health_check),
             )
-            .route(&format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"), get(health_check).head(health_check));
+            .route(&format!("{console_prefix}{HEALTH_READY_PATH}"), get(health_check).head(health_check));
     } else {
         // Keep disabled health probes from falling through to the SPA fallback.
         app = app
             .route(
-                &format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}"),
+                &format!("{console_prefix}{HEALTH_PREFIX}"),
                 get(health_route_disabled).head(health_route_disabled),
             )
             .route(
-                &format!("{CONSOLE_PREFIX}{}", crate::server::HEALTH_COMPAT_LIVE_PATH),
+                &format!("{console_prefix}{}", crate::server::HEALTH_COMPAT_LIVE_PATH),
                 get(health_route_disabled).head(health_route_disabled),
             )
             .route(
-                &format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}"),
+                &format!("{console_prefix}{HEALTH_READY_PATH}"),
                 get(health_route_disabled).head(health_route_disabled),
             );
     }
@@ -538,6 +646,8 @@ fn setup_console_middleware_stack(
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         // Compress responses
         .layer(CompressionLayer::new())
+        // Buffer brotli responses to add Content-Length
+        .layer(middleware::from_fn(buffer_brotli_responses))
         .layer(middleware::from_fn(console_logging_middleware))
         .layer(cors_layer)
         // Add timeout layer - convert auth_timeout from seconds to Duration
@@ -548,12 +658,39 @@ fn setup_console_middleware_stack(
         // Add request body limit (10MB for console uploads)
         .layer(RequestBodyLimitLayer::new(5 * 1024 * 1024 * 1024));
 
-    // Add rate limiting if enabled
+    // Per-client console rate limiting, sharing the S3 API limiter core
+    // (`server::rate_limit`). Added last so it is the outermost layer and
+    // over-limit requests are rejected before any other middleware runs.
+    // The client identity comes from validated request extensions only
+    // (trusted-proxy `ClientInfo`, then socket peer address); requests
+    // without one fail open rather than trusting spoofable headers.
     if rate_limit_enable {
-        info!("Console rate limiting enabled: {} requests per minute", rate_limit_rpm);
-        // Note: tower-http doesn't provide a built-in rate limiter, but we have the foundation
-        // For production, you would integrate with a rate limiting service like Redis
-        // For now, we log that it's configured and ready for integration
+        if let Some(quota) = RateLimitQuota::per_minute(rate_limit_rpm, 0) {
+            let limiter: Arc<RateLimiter> = Arc::new(RateLimiter::new(quota));
+            app = app.layer(middleware::from_fn(move |req: Request, next: middleware::Next| {
+                let limiter = limiter.clone();
+                async move {
+                    match client_ip(&req).map(|ip| limiter.check(&ip)) {
+                        Some(RateLimitDecision::Limited(throttle)) => {
+                            metrics::counter!(
+                                METRIC_HTTP_SERVER_REQUESTS_RATE_LIMITED_TOTAL,
+                                LABEL_RATE_LIMIT_SCOPE => RATE_LIMIT_SCOPE_CONSOLE,
+                                LABEL_RATE_LIMIT_DIMENSION => RATE_LIMIT_DIMENSION_CLIENT_IP
+                            )
+                            .increment(1);
+                            debug!(retry_after_secs = throttle.retry_after_secs, "Console request rejected by rate limit");
+                            let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+                            apply_throttle_headers(response.headers_mut(), limiter.quota().requests_per_minute, &throttle);
+                            response
+                        }
+                        _ => next.run(req).await,
+                    }
+                }
+            }));
+            info!("Console rate limiting enabled: {} requests per minute", rate_limit_rpm);
+        } else {
+            warn!("Console rate limiting enabled but RPM is 0; it stays inactive");
+        }
     }
 
     app
@@ -567,19 +704,28 @@ fn setup_console_middleware_stack(
 /// # Returns:
 /// - A `Response` containing the health check result.
 #[instrument]
-async fn health_check(method: Method, uri: Uri) -> Response {
-    let probe = if uri.path().strip_prefix(CONSOLE_PREFIX) == Some(HEALTH_READY_PATH) {
+async fn health_check(
+    method: Method,
+    uri: Uri,
+    server_ctx: Option<Extension<Arc<crate::runtime_sources::ServerContextSlot>>>,
+) -> Response {
+    let probe = if uri.path().strip_prefix(console_prefix()) == Some(HEALTH_READY_PATH) {
         HealthProbe::Readiness
     } else {
         HealthProbe::Liveness
     };
-    let readiness_report = collect_dependency_readiness().await;
+    let app_context = match server_ctx {
+        Some(Extension(server_ctx)) => server_ctx.installed_app_context(),
+        None => crate::runtime_sources::current_app_context(),
+    };
+    let object_traffic_health = app_context.map(|context| context.object_traffic_health());
+    let readiness_report = collect_probe_readiness(probe, object_traffic_health.as_deref()).await;
     let uptime = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let response_parts =
-        build_health_response_parts(method.clone(), probe, &readiness_report, "rustfs-console", Some(uptime), None);
+        build_health_response_parts(method.clone(), probe, readiness_report.as_ref(), "rustfs-console", Some(uptime), None);
 
     let builder = Response::builder()
         .status(response_parts.status_code)
@@ -725,6 +871,7 @@ pub(crate) fn make_console_server() -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::CONSOLE_PREFIX;
     use axum::body::Body;
     use axum::routing::get;
     use http::{Request, StatusCode};
@@ -791,8 +938,52 @@ mod tests {
     }
 
     #[test]
+    fn console_config_exposes_admin_discovery_paths() {
+        let cfg = Config::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001, "test", "2026-03-16T00:00:00Z");
+
+        assert_eq!(cfg.api.discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(cfg.api.discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(cfg.api.discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
+        assert_eq!(cfg.api.discovery.ilm_expiry_status, "/rustfs/admin/v3/ilm/expiry/status");
+        assert_eq!(cfg.api.discovery.ilm_transition_run, "/rustfs/admin/v3/ilm/transition/run");
+        assert_eq!(cfg.api.discovery.ilm_transition_job, "/rustfs/admin/v3/ilm/transition/jobs/{job_id}");
+    }
+
+    #[tokio::test]
+    async fn console_config_handler_serializes_admin_discovery_paths() {
+        init_console_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001);
+
+        let response = config_handler(
+            format!("http://127.0.0.1:9001{CONSOLE_PREFIX}/api/v1/config")
+                .parse()
+                .expect("console URI"),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = body.collect().await.expect("collect console config body").to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("console config JSON should deserialize");
+
+        assert_eq!(value["api"]["discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(value["api"]["discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(value["api"]["discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
+        assert_eq!(value["api"]["discovery"]["ilmExpiryStatus"], "/rustfs/admin/v3/ilm/expiry/status");
+        assert_eq!(value["api"]["discovery"]["ilmTransitionRun"], "/rustfs/admin/v3/ilm/transition/run");
+        assert_eq!(
+            value["api"]["discovery"]["ilmTransitionJob"],
+            "/rustfs/admin/v3/ilm/transition/jobs/{job_id}"
+        );
+    }
+
+    #[test]
     fn external_admin_paths_are_not_console_paths() {
-        assert!(is_console_path("/rustfs/console/"));
+        assert!(is_console_path(&format!("{CONSOLE_PREFIX}/")));
+        assert!(!is_console_path(&format!("{CONSOLE_PREFIX}-other/index.html")));
+        assert!(is_console_path("/apple-touch-icon.png"));
+        assert!(is_console_path("/apple-touch-icon-precomposed.png"));
         assert!(!is_console_path("/minio/admin/v3/info"));
         assert!(!is_console_path("/rustfs/admin/v3/info"));
     }
@@ -814,6 +1005,117 @@ mod tests {
             response.headers().contains_key("x-request-id"),
             "console response should include propagated x-request-id header"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn console_readiness_uses_the_request_server_object_progress() {
+        temp_env::async_with_vars([(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"))], async {
+            let object_traffic_health =
+                Arc::new(crate::app::object_traffic_health::ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+            let stalled = object_traffic_health
+                .track_write_storage()
+                .expect("write tracking must be enabled");
+            let app_context =
+                crate::app::gating_test_env::app_context_with_object_traffic_health(Arc::clone(&object_traffic_health)).await;
+            let server_ctx = crate::runtime_sources::ServerContextSlot::new();
+            assert!(server_ctx.install(app_context));
+
+            let response = health_check(
+                Method::GET,
+                format!("{CONSOLE_PREFIX}{HEALTH_READY_PATH}")
+                    .parse()
+                    .expect("console readiness URI"),
+                Some(Extension(server_ctx)),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("console readiness body")
+                .to_bytes();
+            let payload: serde_json::Value = serde_json::from_slice(&body).expect("console readiness JSON");
+            assert_eq!(payload["ready"], false);
+            assert_eq!(payload["degradedReasons"], serde_json::json!(["object_write_stalled"]));
+            drop(stalled);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn console_liveness_omits_readiness_state() {
+        temp_env::async_with_vars([(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"))], async {
+            let object_traffic_health =
+                Arc::new(crate::app::object_traffic_health::ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+            let _stalled = object_traffic_health
+                .track_write_storage()
+                .expect("write tracking must be enabled");
+            let app_context =
+                crate::app::gating_test_env::app_context_with_object_traffic_health(Arc::clone(&object_traffic_health)).await;
+            let server_ctx = crate::runtime_sources::ServerContextSlot::new();
+            assert!(server_ctx.install(app_context));
+
+            let response = health_check(
+                Method::GET,
+                format!("{CONSOLE_PREFIX}{HEALTH_PREFIX}")
+                    .parse()
+                    .expect("console liveness URI"),
+                Some(Extension(server_ctx)),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("console liveness body")
+                .to_bytes();
+            let payload: serde_json::Value = serde_json::from_slice(&body).expect("console liveness JSON");
+            assert_eq!(payload["status"], "ok");
+            assert!(payload.get("ready").is_none());
+            assert!(payload.get("degradedReasons").is_none());
+        })
+        .await;
+    }
+
+    // setup_console_middleware_stack reads ENV_HEALTH_ENDPOINT_ENABLE (see above).
+    #[tokio::test]
+    #[serial]
+    async fn console_rate_limit_rejects_over_limit_clients_with_429() {
+        let app = setup_console_middleware_stack(parse_cors_origins(None), true, 1, 30);
+
+        let request_for = |last_octet: u8| {
+            let mut request = Request::builder()
+                .uri(format!("{CONSOLE_PREFIX}/index.html"))
+                .body(Body::empty())
+                .expect("failed to build request");
+            request
+                .extensions_mut()
+                .insert(Some(crate::server::RemoteAddr(SocketAddr::new(
+                    IpAddr::from([198, 51, 100, last_octet]),
+                    50000,
+                ))));
+            request
+        };
+
+        let first = app.clone().oneshot(request_for(7)).await.expect("request should succeed");
+        assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let second = app.clone().oneshot(request_for(7)).await.expect("request should succeed");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            second.headers().contains_key(http::header::RETRY_AFTER),
+            "console 429 must carry Retry-After"
+        );
+
+        // A different client IP has its own budget.
+        let other = app.oneshot(request_for(8)).await.expect("request should succeed");
+        assert_ne!(other.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1063,5 +1365,89 @@ mod tests {
         assert_eq!(value, serde_json::json!({ "licensed": false }));
         assert!(value.get("name").is_none());
         assert!(value.get("expired").is_none());
+    }
+}
+
+#[cfg(test)]
+mod console_asset_prefix_tests {
+    use super::rewrite_console_asset;
+    use crate::server::CONSOLE_PREFIX;
+    use std::borrow::Cow;
+
+    #[test]
+    fn rewrites_exported_assets_and_client_routes() {
+        let fixtures = [
+            (
+                "index.html",
+                r#"<script src="/rustfs/console/_next/app.js"></script>"#,
+                r#"<script src="/console/_next/app.js"></script>"#,
+            ),
+            (
+                "app.js",
+                r#"let base="/rustfs/console";fetch(`${host}/rustfs/console/version`)"#,
+                r#"let base="/console";fetch(`${host}/console/version`)"#,
+            ),
+            ("app.css", "url(/rustfs/console/logo.svg)", "url(/console/logo.svg)"),
+            (
+                "route.txt",
+                r#"2:I[1,["/rustfs/console/_next/app.js"],"default"]"#,
+                r#"2:I[1,["/console/_next/app.js"],"default"]"#,
+            ),
+            ("config.json", r#"{"url":"\/rustfs\/console\/login"}"#, r#"{"url":"\/console\/login"}"#),
+            ("site.webmanifest", r#"{"start_url":"/rustfs/console/"}"#, r#"{"start_url":"/console/"}"#),
+            (
+                "logo.svg",
+                r#"<image href="/rustfs/console/logo.png"/>"#,
+                r#"<image href="/console/logo.png"/>"#,
+            ),
+        ];
+        for (path, input, expected) in fixtures {
+            let input = input
+                .replace("/rustfs/console", CONSOLE_PREFIX)
+                .replace("\\/rustfs\\/console", &CONSOLE_PREFIX.replace('/', "\\/"));
+            assert_eq!(
+                rewrite_console_asset(path, Cow::Borrowed(input.as_bytes()), "/console").as_ref(),
+                expected.as_bytes(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn restores_the_standard_path_from_an_oem_build() {
+        let input = format!(r#"<script src="{CONSOLE_PREFIX}/_next/app.js"></script>"#);
+        let output = rewrite_console_asset("index.html", Cow::Borrowed(input.as_bytes()), rustfs_config::DEFAULT_CONSOLE_PREFIX);
+        assert_eq!(output.as_ref(), br#"<script src="/rustfs/console/_next/app.js"></script>"#);
+    }
+
+    #[test]
+    fn preserves_unrelated_urls_paths_and_default_bytes() {
+        let input = format!(
+            r#"["https://github.com/rustfs/console","/other{CONSOLE_PREFIX}","{CONSOLE_PREFIX}-extra","{CONSOLE_PREFIX}/index.html"]"#
+        );
+        let expected = format!(
+            r#"["https://github.com/rustfs/console","/other{CONSOLE_PREFIX}","{CONSOLE_PREFIX}-extra","/console/index.html"]"#
+        );
+        assert_eq!(
+            rewrite_console_asset("app.js", Cow::Borrowed(input.as_bytes()), "/console").as_ref(),
+            expected.as_bytes()
+        );
+        let unchanged = rewrite_console_asset("app.js", Cow::Borrowed(input.as_bytes()), CONSOLE_PREFIX);
+        assert!(matches!(unchanged, Cow::Borrowed(_)));
+        assert_eq!(unchanged.as_ref(), input.as_bytes());
+    }
+
+    #[test]
+    fn preserves_binary_invalid_utf8_and_text_without_paths() {
+        let invalid_utf8 = [b"\xff".as_slice(), CONSOLE_PREFIX.as_bytes()].concat();
+        for (path, bytes) in [
+            ("image.png", CONSOLE_PREFIX.as_bytes()),
+            ("app.js", invalid_utf8.as_slice()),
+            ("app.js", b"https://github.com/rustfs/console".as_slice()),
+        ] {
+            let output = rewrite_console_asset(path, Cow::Borrowed(bytes), "/console");
+            assert!(matches!(output, Cow::Borrowed(_)), "{path}");
+            assert_eq!(output.as_ref(), bytes);
+        }
     }
 }

@@ -1,0 +1,117 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+pub(crate) use rustfs_ecstore::api::capacity::is_reserved_or_invalid_bucket as ecstore_is_reserved_or_invalid_bucket;
+pub(crate) use rustfs_ecstore::api::data_usage::{
+    DATA_USAGE_CACHE_NAME as ECSTORE_DATA_USAGE_CACHE_NAME,
+    load_admin_data_usage_from_backend_cached as ecstore_load_admin_data_usage_from_backend_cached,
+};
+pub(crate) use rustfs_ecstore::api::disk::endpoint::Endpoint as EcstoreEndpoint;
+pub(crate) use rustfs_ecstore::api::disk::error::{DiskError as EcstoreDiskError, Result as EcstoreDiskResult};
+pub(crate) use rustfs_ecstore::api::disk::{
+    BUCKET_META_PREFIX as ECSTORE_BUCKET_META_PREFIX, Bytes as EcstoreDiskBytes,
+    ConditionalFileUpdate as EcstoreConditionalFileUpdate, DeleteOptions as EcstoreDeleteOptions, DiskAPI as EcstoreDiskAPI,
+    DiskStore as EcstoreDiskStore, HEAL_REPLACEMENT_RECOVERY_DIR as ECSTORE_HEAL_REPLACEMENT_RECOVERY_DIR,
+    HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH, RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET,
+    ReplacementExecutionLease as EcstoreReplacementExecutionLease,
+};
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::disk::{
+    BackgroundEncodeBuffer as EcstoreBackgroundEncodeBuffer, BackgroundMemoryBudget as EcstoreBackgroundMemoryBudget,
+};
+pub(crate) use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, new_disk as ecstore_new_disk};
+#[cfg(all(test, not(windows)))]
+pub(crate) use rustfs_ecstore::api::disk::{
+    LocalPublicationPause as EcstoreLocalPublicationPause, LocalPublicationStage as EcstoreLocalPublicationStage,
+};
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::error::PoolMetadataError as EcstorePoolMetadataError;
+pub(crate) use rustfs_ecstore::api::error::{
+    Error as EcstoreErrorType, PoolMetadataFailure as EcstorePoolMetadataFailure, StorageError as EcstoreStorageError,
+};
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::layout::{
+    EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
+};
+pub(crate) use rustfs_ecstore::api::notification::{
+    MrfLifecycleWriterFleetProofToken as EcstoreMrfLifecycleWriterFleetProofToken,
+    acquire_mrf_lifecycle_writer_fleet_proof as ecstore_acquire_mrf_lifecycle_writer_fleet_proof,
+    mrf_lifecycle_writer_fleet_proof_current as ecstore_mrf_lifecycle_writer_fleet_proof_current,
+    mrf_lifecycle_writer_fleet_proof_matches as ecstore_mrf_lifecycle_writer_fleet_proof_matches,
+    with_mrf_lifecycle_writer_fleet_proof as ecstore_with_mrf_lifecycle_writer_fleet_proof,
+};
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::notification::{
+    new_global_notification_sys as ecstore_new_global_notification_sys,
+    start_remote_version_state_fleet_probe as ecstore_start_remote_version_state_fleet_probe,
+};
+pub(crate) use rustfs_ecstore::api::runtime::local_disk_map_read as ecstore_local_disk_map_read;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::storage::init_local_disks as ecstore_init_local_disks;
+pub(crate) use rustfs_ecstore::api::storage::{
+    ECStore as EcstoreStore, HealLifecycleExpiryContext as EcstoreHealLifecycleExpiryContext,
+    HealObjectStorageResult as EcstoreHealObjectStorageResult, POOL_META_NAME as ECSTORE_POOL_META_NAME,
+};
+use rustfs_storage_api as storage_contracts;
+
+pub(crate) mod owner {
+    pub(crate) use rustfs_ecstore::api::disk::PhysicalResourcePlan;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::disk::{PhysicalDiskBinding, PhysicalDiskSample, PhysicalDiskSampler};
+    pub(crate) use rustfs_ecstore::api::rpc::with_rpc_background_request as ecstore_with_rpc_background_request;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::spawn_blocking_with_resource_ownership as ecstore_spawn_blocking_with_resource_ownership;
+    pub(crate) use rustfs_ecstore::with_background_disk_io as ecstore_with_background_disk_io;
+    pub(crate) use rustfs_ecstore::with_background_resource_set as ecstore_with_background_resource_set;
+
+    #[cfg(test)]
+    pub(crate) use super::EcstorePoolMetadataError;
+    pub(crate) use super::EcstorePoolMetadataFailure;
+    pub(crate) use super::storage_contracts::{ObjectIO, ObjectOperations};
+
+    pub(crate) use super::{
+        ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEAL_REPLACEMENT_RECOVERY_DIR,
+        ECSTORE_HEALING_MARKER_PATH, ECSTORE_POOL_META_NAME, ECSTORE_RUSTFS_META_BUCKET, EcstoreConditionalFileUpdate,
+        EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore,
+        EcstoreEndpoint, EcstoreErrorType, EcstoreHealLifecycleExpiryContext, EcstoreStorageError, EcstoreStore,
+        ecstore_is_reserved_or_invalid_bucket, ecstore_load_admin_data_usage_from_backend_cached, ecstore_local_disk_map_read,
+    };
+
+    pub(crate) use super::{EcstoreDiskOption, ecstore_new_disk};
+}
+
+pub(crate) mod storage {
+    pub(crate) use super::EcstoreHealObjectStorageResult;
+    pub(crate) use super::storage_contracts::{
+        BucketInfo, BucketOperations, DiskSetSelector, HealOperations, ListOperations, ObjectIO, ObjectOperations,
+        StorageAdminApi,
+    };
+
+    #[cfg(test)]
+    pub(crate) use super::storage_contracts::{DeleteBucketOptions, MakeBucketOptions};
+}
+
+#[cfg(test)]
+pub(crate) mod status {
+    pub(crate) use super::storage_contracts::BucketInfo;
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
+        init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks,
+    };
+    pub(crate) use rustfs_ecstore::api::config::com::{delete_config, read_config, save_config};
+    pub(crate) use rustfs_ecstore::api::object::{ObjectOptions, PutObjReader};
+}

@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo};
-use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
+use crate::storage::storage_api::effective_storage_class;
+use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{ListPartsInfo, MAX_MULTIPART_PART_NUMBER};
+use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_xml_etag;
+use s3s::dto::{ListPartsOutput, Part, Timestamp};
 use s3s::{S3Error, S3ErrorCode};
 
 const MAX_MULTIPART_UPLOADS_LIST: i32 = 1000;
-const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ListPartsParams {
@@ -37,6 +37,11 @@ pub(crate) struct ListMultipartUploadsParams {
 pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
     let owner = rustfs_owner();
     let initiator = rustfs_initiator();
+    let transformed_parts = rustfs_utils::http::contains_key_str(&res.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION)
+        || res
+            .user_defined
+            .keys()
+            .any(|key| rustfs_utils::http::is_object_encryption_marker(key));
 
     ListPartsOutput {
         bucket: Some(res.bucket),
@@ -46,10 +51,17 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
             res.parts
                 .into_iter()
                 .map(|p| Part {
-                    e_tag: p.etag.map(|etag| to_s3s_etag(&etag)),
+                    e_tag: p.etag.map(|etag| to_s3s_xml_etag(&etag)),
                     last_modified: p.last_mod.map(Timestamp::from),
                     part_number: p.part_num.try_into().ok(),
-                    size: p.size.try_into().ok(),
+                    // Compressed parts store fewer bytes than the client sent; S3
+                    // semantics report the uploaded (logical) size, matching
+                    // GetObjectAttributes ObjectParts.
+                    size: if p.actual_size > 0 || (transformed_parts && p.actual_size == 0) {
+                        Some(p.actual_size)
+                    } else {
+                        p.size.try_into().ok()
+                    },
                     ..Default::default()
                 })
                 .collect(),
@@ -57,14 +69,14 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
         owner: Some(owner),
         initiator: Some(initiator),
         is_truncated: Some(res.is_truncated),
-        next_part_number_marker: res.next_part_number_marker.try_into().ok(),
+        next_part_number_marker: res.next_part_number_marker.and_then(|v| v.try_into().ok()),
         max_parts: res.max_parts.try_into().ok(),
         part_number_marker: res.part_number_marker.try_into().ok(),
-        storage_class: if res.storage_class.is_empty() {
-            None
-        } else {
-            Some(res.storage_class.into())
-        },
+        storage_class: Some(
+            effective_storage_class((!res.storage_class.is_empty()).then_some(res.storage_class.as_str()), None)
+                .to_string()
+                .into(),
+        ),
         ..Default::default()
     }
 }
@@ -138,7 +150,7 @@ pub(crate) fn parse_list_multipart_uploads_params(
     if let Some(key_marker) = &key_marker
         && !key_marker.starts_with(prefix.as_str())
     {
-        return Err(S3Error::with_message(S3ErrorCode::NotImplemented, "Invalid key marker".to_string()));
+        return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid key marker".to_string()));
     }
 
     Ok(ListMultipartUploadsParams {
@@ -148,54 +160,16 @@ pub(crate) fn parse_list_multipart_uploads_params(
     })
 }
 
-pub(crate) fn build_list_multipart_uploads_output(
-    bucket: String,
-    prefix: String,
-    result: ListMultipartsInfo,
-) -> ListMultipartUploadsOutput {
-    ListMultipartUploadsOutput {
-        bucket: Some(bucket),
-        prefix: Some(prefix),
-        delimiter: result.delimiter,
-        key_marker: result.key_marker,
-        upload_id_marker: result.upload_id_marker,
-        max_uploads: Some(result.max_uploads as i32),
-        is_truncated: Some(result.is_truncated),
-        uploads: Some(
-            result
-                .uploads
-                .into_iter()
-                .map(|u| MultipartUpload {
-                    key: Some(u.object),
-                    upload_id: Some(u.upload_id),
-                    initiated: u.initiated.map(Timestamp::from),
-                    ..Default::default()
-                })
-                .collect(),
-        ),
-        common_prefixes: Some(
-            result
-                .common_prefixes
-                .into_iter()
-                .map(|c| CommonPrefix { prefix: Some(c) })
-                .collect(),
-        ),
-        ..Default::default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MULTIPART_UPLOADS_LIST, build_list_multipart_uploads_output, build_list_parts_output,
-        parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
+        MAX_MULTIPART_UPLOADS_LIST, build_list_parts_output, parse_list_multipart_uploads_params, parse_list_parts_params,
+        parse_upload_part_number,
     };
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-    use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-    use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo};
+    use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{ListPartsInfo, PartInfo};
+    use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_xml_etag;
     use s3s::S3ErrorCode;
-    use s3s::dto::Timestamp;
-    use time::OffsetDateTime;
 
     #[test]
     fn test_list_parts_output_maps_parts_and_owner() {
@@ -205,7 +179,7 @@ mod tests {
             upload_id: "upload-a".to_string(),
             storage_class: "STANDARD".to_string(),
             part_number_marker: 1,
-            next_part_number_marker: 2,
+            next_part_number_marker: Some(2),
             max_parts: 1000,
             is_truncated: true,
             parts: vec![PartInfo {
@@ -231,17 +205,176 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].part_number, Some(1));
         assert_eq!(parts[0].size, Some(11));
-        assert_eq!(parts[0].e_tag, Some(to_s3s_etag("etag-1")));
+        assert_eq!(parts[0].e_tag, Some(to_s3s_xml_etag("etag-1")));
         assert_eq!(output.owner, Some(rustfs_owner()));
         assert_eq!(output.initiator, Some(rustfs_initiator()));
     }
 
     #[test]
-    fn test_list_parts_output_handles_empty_storage_class_and_overflow_markers() {
+    fn test_list_parts_output_xml_omits_terminal_marker() {
+        for (marker, part_numbers) in [(0, vec![]), (3, vec![10]), (0, vec![1, 3])] {
+            let output = build_list_parts_output(ListPartsInfo {
+                part_number_marker: marker,
+                max_parts: 2,
+                parts: part_numbers
+                    .into_iter()
+                    .map(|part_num| PartInfo {
+                        part_num,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+
+            assert_eq!(output.is_truncated, Some(false));
+            assert_eq!(output.next_part_number_marker, None);
+            let xml = String::from_utf8(crate::storage::storage_api::serialize(&output).expect("output should serialize"))
+                .expect("XML should be UTF-8");
+            assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+            assert!(xml.contains(&format!("<PartNumberMarker>{marker}</PartNumberMarker>")));
+            assert!(!xml.contains("NextPartNumberMarker"), "terminal page must omit the token: {xml}");
+        }
+    }
+
+    #[test]
+    fn test_list_parts_output_xml_preserves_truncated_marker() {
+        let output = build_list_parts_output(ListPartsInfo {
+            is_truncated: true,
+            next_part_number_marker: Some(3),
+            max_parts: 2,
+            parts: [1, 3]
+                .into_iter()
+                .map(|part_num| PartInfo {
+                    part_num,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+
+        let xml = String::from_utf8(crate::storage::storage_api::serialize(&output).expect("output should serialize"))
+            .expect("XML should be UTF-8");
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(xml.contains("<NextPartNumberMarker>3</NextPartNumberMarker>"));
+        assert_eq!(output.parts.as_ref().expect("parts should be present").len(), 2);
+    }
+
+    #[test]
+    fn test_list_parts_output_reports_logical_size_for_compressed_parts() {
         let input = ListPartsInfo {
-            storage_class: String::new(),
+            bucket: "bucket-a".to_string(),
+            object: "obj-a".to_string(),
+            upload_id: "upload-a".to_string(),
+            parts: vec![PartInfo {
+                part_num: 1,
+                // Stored (compressed) bytes on disk vs. the logical size the client uploaded.
+                size: 1_024,
+                actual_size: 8_388_608,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].size,
+            Some(8_388_608),
+            "compressed parts must report the uploaded logical size, not the stored size"
+        );
+    }
+
+    #[test]
+    fn test_list_parts_output_reports_zero_logical_size_for_compressed_parts() {
+        let mut user_defined = std::collections::HashMap::new();
+        rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_COMPRESSION, "S2".to_string());
+        let input = ListPartsInfo {
+            user_defined,
+            parts: vec![PartInfo {
+                part_num: 1,
+                // Legacy SSE writes an 8-byte end record for an empty part.
+                size: 8,
+                actual_size: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts[0].size, Some(0));
+    }
+
+    #[test]
+    fn test_list_parts_output_reports_zero_logical_size_for_encrypted_parts() {
+        let input = ListPartsInfo {
+            user_defined: std::collections::HashMap::from([(
+                rustfs_utils::http::AMZ_SERVER_SIDE_ENCRYPTION.to_string(),
+                "AES256".to_string(),
+            )]),
+            parts: vec![
+                PartInfo {
+                    part_num: 1,
+                    size: 8,
+                    actual_size: 0,
+                    ..Default::default()
+                },
+                PartInfo {
+                    part_num: 2,
+                    size: 8,
+                    actual_size: -1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts[0].size, Some(0));
+        assert_eq!(parts[1].size, Some(8));
+    }
+
+    #[test]
+    fn test_list_parts_output_falls_back_to_stored_size_when_actual_size_unknown() {
+        let input = ListPartsInfo {
+            parts: vec![
+                PartInfo {
+                    part_num: 1,
+                    size: 1_024,
+                    // Uncompressed parts leave actual_size unset.
+                    actual_size: 0,
+                    ..Default::default()
+                },
+                PartInfo {
+                    part_num: 2,
+                    size: 1_024,
+                    // Legacy/unknown sentinel must not leak a negative size to clients.
+                    actual_size: -1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].size, Some(1024));
+        assert_eq!(parts[1].size, Some(1024));
+    }
+
+    #[test]
+    fn test_list_parts_output_normalizes_legacy_storage_class_and_handles_overflow_markers() {
+        let input = ListPartsInfo {
+            storage_class: "STANDARD_IA".to_string(),
             part_number_marker: usize::MAX,
-            next_part_number_marker: usize::MAX,
+            next_part_number_marker: Some(usize::MAX),
             max_parts: usize::MAX,
             parts: vec![PartInfo {
                 part_num: usize::MAX,
@@ -254,54 +387,20 @@ mod tests {
         let output = build_list_parts_output(input);
         let parts = output.parts.as_ref().expect("parts should be present");
 
-        assert_eq!(output.storage_class, None);
+        assert_eq!(output.storage_class.as_ref().map(|value| value.as_str()), Some("STANDARD"));
         assert_eq!(output.part_number_marker, None);
         assert_eq!(output.next_part_number_marker, None);
         assert_eq!(output.max_parts, None);
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].part_number, None);
         assert_eq!(parts[0].size, None);
-    }
 
-    #[test]
-    fn test_list_multipart_uploads_output_maps_uploads_and_prefixes() {
-        let result = ListMultipartsInfo {
-            delimiter: Some("/".to_string()),
-            key_marker: Some("key-marker".to_string()),
-            upload_id_marker: Some("upload-id-marker".to_string()),
-            max_uploads: 1000,
-            is_truncated: true,
-            uploads: vec![MultipartInfo {
-                object: "obj-a".to_string(),
-                upload_id: "upload-a".to_string(),
-                initiated: Some(OffsetDateTime::UNIX_EPOCH),
-                ..Default::default()
-            }],
-            common_prefixes: vec!["prefix-a/".to_string(), "prefix-b/".to_string()],
-            ..Default::default()
-        };
-
-        let output = build_list_multipart_uploads_output("bucket-a".to_string(), "root/".to_string(), result);
-
-        let uploads = output.uploads.as_ref().expect("uploads should be present");
-        let common_prefixes = output.common_prefixes.as_ref().expect("common prefixes should be present");
-
-        assert_eq!(output.bucket.as_deref(), Some("bucket-a"));
-        assert_eq!(output.prefix.as_deref(), Some("root/"));
-        assert_eq!(output.delimiter.as_deref(), Some("/"));
-        assert_eq!(output.key_marker.as_deref(), Some("key-marker"));
-        assert_eq!(output.upload_id_marker.as_deref(), Some("upload-id-marker"));
-        assert_eq!(output.max_uploads, Some(1000));
-        assert_eq!(output.is_truncated, Some(true));
-
-        assert_eq!(uploads.len(), 1);
-        assert_eq!(uploads[0].key.as_deref(), Some("obj-a"));
-        assert_eq!(uploads[0].upload_id.as_deref(), Some("upload-a"));
-        assert_eq!(uploads[0].initiated, Some(Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
-
-        assert_eq!(common_prefixes.len(), 2);
-        assert_eq!(common_prefixes[0].prefix.as_deref(), Some("prefix-a/"));
-        assert_eq!(common_prefixes[1].prefix.as_deref(), Some("prefix-b/"));
+        let output = build_list_parts_output(ListPartsInfo::default());
+        assert_eq!(
+            output.storage_class.as_ref().map(|value| value.as_str()),
+            Some("STANDARD"),
+            "legacy uploads without a stored class must report their effective STANDARD layout"
+        );
     }
 
     #[test]
@@ -366,7 +465,7 @@ mod tests {
         let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), Some("other/key-marker".to_string()), None)
             .expect_err("expected invalid key marker");
 
-        assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("Invalid key marker"));
     }
 

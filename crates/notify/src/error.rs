@@ -15,6 +15,7 @@
 use rustfs_targets::{TargetError, arn::TargetID};
 use std::io;
 use thiserror::Error;
+use tokio::task::JoinError;
 
 /// Errors related to the notification system's lifecycle.
 #[derive(Debug, Error)]
@@ -36,6 +37,12 @@ pub enum NotificationError {
 
     #[error("Configuration error: {0}")]
     Configuration(String),
+
+    #[error("Target configuration changed during validation")]
+    ConfigurationConflict,
+
+    #[error("Notification configuration convergence failed (persisted: {persisted}): {detail}")]
+    ConfigurationConvergence { persisted: bool, detail: String },
 
     #[error("ARN not found: {0}")]
     ARNNotFound(String),
@@ -69,4 +76,25 @@ pub enum NotificationError {
 
     #[error("Storage not available: {0}")]
     StorageNotAvailable(String),
+}
+
+pub(crate) fn transition_join_error(error: JoinError) -> NotificationError {
+    let reason = if error.is_cancelled() { "cancelled" } else { "panicked" };
+    NotificationError::Initialization(format!("Notification lifecycle transition task {reason}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transition_join_error;
+
+    #[tokio::test]
+    async fn transition_join_error_does_not_expose_panic_payload() {
+        let join_error = tokio::spawn(async { panic!("do-not-expose-payload") })
+            .await
+            .expect_err("test task should panic");
+
+        let rendered = transition_join_error(join_error).to_string();
+        assert!(rendered.contains("panicked"));
+        assert!(!rendered.contains("do-not-expose-payload"));
+    }
 }

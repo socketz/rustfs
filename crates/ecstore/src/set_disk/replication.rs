@@ -12,39 +12,385 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use super::{
+    Error, FileInfo, NamespaceLockFence, ObjectInfo, ObjectOptions, OffsetDateTime, Result, SetDisks, StorageError,
+    UpdateMetadataOpts, Uuid, get_raw_etag, restore_operation_id_from_metadata,
+};
+use crate::bucket::lifecycle::lifecycle;
+use crate::core::pools::DecommissionCapacityAdmission;
+use rustfs_filemeta::metadata_keys;
+use rustfs_filemeta::{RestoreStatus, RestoreStatusOps};
+#[cfg(all(test, feature = "test-util"))]
+use std::sync::Arc;
+
+#[cfg(all(test, feature = "test-util"))]
+struct RestoreFinalizeBarrierState {
+    bucket: String,
+    object: String,
+    before_lock: bool,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+static RESTORE_FINALIZE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<RestoreFinalizeBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "test-util"))]
+pub(in crate::set_disk) struct RestoreFinalizeBarrier {
+    state: Arc<RestoreFinalizeBarrierState>,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl RestoreFinalizeBarrier {
+    pub(in crate::set_disk) fn install(bucket: &str, object: &str) -> Self {
+        Self::install_at(bucket, object, false)
+    }
+
+    pub(in crate::set_disk) fn install_before_lock(bucket: &str, object: &str) -> Self {
+        Self::install_at(bucket, object, true)
+    }
+
+    fn install_at(bucket: &str, object: &str, before_lock: bool) -> Self {
+        let state = Arc::new(RestoreFinalizeBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            before_lock,
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = RESTORE_FINALIZE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("restore finalize barrier mutex should not poison");
+        assert!(slot.is_none(), "restore finalize barrier must be installed by one test at a time");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(in crate::set_disk) async fn wait_until_paused(&self) {
+        self.state.arrived.notified().await;
+    }
+
+    pub(in crate::set_disk) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for RestoreFinalizeBarrier {
+    fn drop(&mut self) {
+        let mut slot = RESTORE_FINALIZE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("restore finalize barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+async fn maybe_pause_restore_finalize(bucket: &str, object: &str, before_lock: bool) {
+    let barrier = RESTORE_FINALIZE_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("restore finalize barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.before_lock == before_lock)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RestoreCleanupIdentity {
+    version_id: Option<Uuid>,
+    data_dir: Option<Uuid>,
+    mod_time: Option<OffsetDateTime>,
+    size: i64,
+}
+
+impl RestoreCleanupIdentity {
+    fn from_object_info(obj_info: &ObjectInfo) -> Self {
+        Self {
+            version_id: obj_info.version_id,
+            data_dir: obj_info.data_dir,
+            mod_time: obj_info.mod_time,
+            size: obj_info.size,
+        }
+    }
+
+    fn matches_file_info(&self, fi: &FileInfo, expected_etag: &str) -> bool {
+        // Normalize the nil version on both sides: a versioning-suspended object
+        // is `Some(Uuid::nil())` on one and `None` on the other, so a raw compare
+        // reports every suspended restore as "changed before finalization".
+        self.version_id.filter(|version_id| !version_id.is_nil()) == fi.version_id.filter(|version_id| !version_id.is_nil())
+            && self.data_dir == fi.data_dir
+            && self.mod_time == fi.mod_time
+            && self.size == fi.size
+            && expected_etag == get_raw_etag(&fi.metadata)
+    }
+}
+
+fn ensure_restore_metadata_lock_held(bucket: &str, object: &str, opts: &ObjectOptions, mode: &'static str) -> Result<()> {
+    if opts
+        .namespace_lock_fence
+        .as_ref()
+        .is_some_and(NamespaceLockFence::is_lock_lost)
+    {
+        return Err(StorageError::NamespaceLockQuorumUnavailable {
+            mode,
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    Ok(())
+}
 
 impl SetDisks {
+    pub(super) async fn finalize_restore_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        obj_info: &ObjectInfo,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        #[cfg(all(test, feature = "test-util"))]
+        maybe_pause_restore_finalize(bucket, object, true).await;
+        let expected = RestoreCleanupIdentity::from_object_info(obj_info);
+        let expected_operation_id = restore_operation_id_from_metadata(&opts.user_defined)?;
+        let expected_etag = obj_info
+            .etag
+            .clone()
+            .unwrap_or_else(|| get_raw_etag(obj_info.user_defined.as_ref()));
+        let version_id = expected.version_id.map(|v| v.to_string());
+        let (decommission_object_lock_guard, decommission_target_lock_covered, mut decommission_capacity_guard) =
+            if let Some(store) = opts.decommission_capacity_admission.as_ref() {
+                store
+                    .acquire_external_decommission_commit_guards(
+                        self.pool_index,
+                        bucket,
+                        object,
+                        opts.no_lock,
+                        DecommissionCapacityAdmission::Mutation,
+                    )
+                    .await?
+            } else {
+                (None, false, None)
+            };
+        let lock_guard = if !opts.no_lock && !decommission_target_lock_covered {
+            Some(
+                self.acquire_write_lock_diag("restore_finalize_metadata", bucket, object)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        if decommission_capacity_guard.is_none()
+            && let Some(store) = opts.decommission_capacity_admission.as_ref()
+        {
+            decommission_capacity_guard = Some(
+                store
+                    .acquire_external_decommission_capacity_fence(&[self.pool_index], DecommissionCapacityAdmission::Mutation)
+                    .await?,
+            );
+        }
+        let read_opts = ObjectOptions {
+            version_id,
+            versioned: opts.versioned,
+            version_suspended: opts.version_suspended,
+            include_part_checksums: true,
+            ..Default::default()
+        };
+        let (mut fi, _, disks) = self
+            .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
+            .await?
+            .into_owned();
+        if let Some(expected_operation_id) = expected_operation_id
+            && restore_operation_id_from_metadata(&fi.metadata)?.is_some_and(|actual| actual != expected_operation_id)
+        {
+            return Err(Error::other("restore operation id changed before metadata finalization"));
+        }
+        if !expected.matches_file_info(&fi, &expected_etag) {
+            return Err(Error::other("restored object changed before restore metadata finalization"));
+        }
+        #[cfg(all(test, feature = "test-util"))]
+        maybe_pause_restore_finalize(bucket, object, false).await;
+        let restore_expiry =
+            lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), opts.transition.restore_request.days.unwrap_or(1));
+        fi.metadata.insert(
+            metadata_keys::RESTORE.to_string(),
+            RestoreStatus {
+                is_restore_in_progress: Some(false),
+                restore_expiry_date: Some(restore_expiry),
+            }
+            .to_string(),
+        );
+        fi.transition_status = lifecycle::TRANSITION_COMPLETE.to_string();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut fi.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_STATUS,
+            lifecycle::TRANSITION_COMPLETE.to_string(),
+        );
+        for suffix in [
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_COPYBACK,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,
+        ] {
+            rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, suffix);
+        }
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        ensure_restore_metadata_lock_held(bucket, object, opts, "restore_finalize_metadata")?;
+        if lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            || decommission_object_lock_guard
+                .as_ref()
+                .is_some_and(|guard| guard.is_lock_lost())
+            || decommission_capacity_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+        {
+            return Err(Error::other("restore finalization lock lost before metadata update"));
+        }
+        self.update_object_meta_with_opts(
+            bucket,
+            object,
+            fi.clone(),
+            &disks,
+            &UpdateMetadataOpts {
+                replace_user_metadata: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
+    }
+
     pub async fn update_restore_metadata(
         &self,
         bucket: &str,
         object: &str,
         obj_info: &ObjectInfo,
-        _opts: &ObjectOptions,
+        opts: &ObjectOptions,
     ) -> Result<()> {
-        let mut oi = obj_info.clone();
-        oi.metadata_only = true;
-
-        Arc::make_mut(&mut oi.user_defined).remove(X_AMZ_RESTORE.as_str());
-
-        let version_id = oi.version_id.map(|v| v.to_string());
-        let _obj = self
-            .copy_object(
-                bucket,
-                object,
-                bucket,
-                object,
-                &mut oi,
-                &ObjectOptions {
-                    version_id: version_id.clone(),
-                    ..Default::default()
-                },
-                &ObjectOptions {
-                    version_id,
-                    ..Default::default()
-                },
+        if obj_info.bucket.is_empty() || obj_info.name.is_empty() {
+            return Ok(());
+        }
+        let expected = RestoreCleanupIdentity::from_object_info(obj_info);
+        let expected_operation_id = restore_operation_id_from_metadata(&opts.user_defined)?;
+        let expected_etag = obj_info
+            .etag
+            .clone()
+            .unwrap_or_else(|| get_raw_etag(obj_info.user_defined.as_ref()));
+        let version_id = expected.version_id.map(|v| v.to_string());
+        let (decommission_object_lock_guard, decommission_target_lock_covered, mut decommission_capacity_guard) =
+            if let Some(store) = opts.decommission_capacity_admission.as_ref() {
+                store
+                    .acquire_external_decommission_commit_guards(
+                        self.pool_index,
+                        bucket,
+                        object,
+                        opts.no_lock,
+                        DecommissionCapacityAdmission::Mutation,
+                    )
+                    .await?
+            } else {
+                (None, false, None)
+            };
+        let lock_guard = if !opts.no_lock && !decommission_target_lock_covered {
+            Some(
+                self.acquire_write_lock_diag("restore_cleanup_metadata", bucket, object)
+                    .await?,
             )
-            .await?;
+        } else {
+            None
+        };
+        if decommission_capacity_guard.is_none()
+            && let Some(store) = opts.decommission_capacity_admission.as_ref()
+        {
+            decommission_capacity_guard = Some(
+                store
+                    .acquire_external_decommission_capacity_fence(&[self.pool_index], DecommissionCapacityAdmission::Mutation)
+                    .await?,
+            );
+        }
+        let read_opts = ObjectOptions {
+            version_id,
+            versioned: opts.versioned,
+            version_suspended: opts.version_suspended,
+            include_part_checksums: true,
+            ..Default::default()
+        };
+        let (mut fi, _, disks) = self
+            .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
+            .await?
+            .into_owned();
+        if restore_operation_id_from_metadata(&fi.metadata)? != expected_operation_id {
+            return Ok(());
+        }
+        if !expected.matches_file_info(&fi, &expected_etag) {
+            return Ok(());
+        }
+        let copyback_data_dir = rustfs_utils::http::metadata_compat::get_consistent_str(
+            &fi.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_COPYBACK,
+        )
+        .filter(|value| *value == rustfs_utils::http::metadata_compat::RESTORE_COPYBACK_PROTOCOL_V1)
+        .and_then(|_| fi.data_dir.filter(|data_dir| !data_dir.is_nil()));
+        ensure_restore_metadata_lock_held(bucket, object, opts, "restore_cleanup_metadata")?;
+        fi.metadata.remove(metadata_keys::RESTORE);
+        fi.metadata.remove(metadata_keys::RESTORE_EXPIRY_DAYS);
+        fi.metadata.remove(metadata_keys::RESTORE_REQUEST_DATE);
+        rustfs_utils::http::metadata_compat::remove_str(
+            &mut fi.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_COPYBACK,
+        );
+        rustfs_utils::http::metadata_compat::remove_str(
+            &mut fi.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+        );
+        rustfs_utils::http::metadata_compat::remove_str(
+            &mut fi.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,
+        );
+        if lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            || decommission_object_lock_guard
+                .as_ref()
+                .is_some_and(|guard| guard.is_lock_lost())
+            || decommission_capacity_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+        {
+            return Err(Error::other("restore cleanup lock lost before metadata update".to_string()));
+        }
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        self.update_object_meta_with_opts(
+            bucket,
+            object,
+            fi,
+            &disks,
+            &UpdateMetadataOpts {
+                replace_user_metadata: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        if let Some(data_dir) = copyback_data_dir {
+            let cleanup = self
+                .commit_rename_data_dir_and_mark_capacity(
+                    &disks,
+                    bucket,
+                    object,
+                    &data_dir.to_string(),
+                    "",
+                    self.default_write_quorum(),
+                )
+                .await;
+            self.report_old_data_dir_cleanup(bucket, object, &data_dir.to_string(), &cleanup)
+                .await;
+        }
         Ok(())
     }
 }

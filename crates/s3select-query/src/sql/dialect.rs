@@ -12,24 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub use rustfs_s3select_api::query::parser::RustFsDialect;
+
+#[cfg(test)]
 use datafusion::sql::sqlparser::dialect::Dialect;
-
-#[derive(Debug, Default)]
-pub struct RustFsDialect;
-
-impl Dialect for RustFsDialect {
-    fn is_identifier_start(&self, ch: char) -> bool {
-        ch.is_alphabetic() || ch == '_' || ch == '#' || ch == '@'
-    }
-
-    fn is_identifier_part(&self, ch: char) -> bool {
-        ch.is_alphabetic() || ch.is_ascii_digit() || ch == '@' || ch == '$' || ch == '#' || ch == '_'
-    }
-
-    fn supports_group_by_expr(&self) -> bool {
-        true
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -196,6 +182,13 @@ mod tests {
         let dialect = RustFsDialect;
 
         assert!(dialect.supports_group_by_expr(), "RustFsDialect should support GROUP BY expressions");
+    }
+
+    #[test]
+    fn test_supports_partiql_paths() {
+        let dialect = RustFsDialect;
+
+        assert!(dialect.supports_partiql(), "RustFsDialect should support JSON source paths");
     }
 
     #[test]

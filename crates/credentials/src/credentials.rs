@@ -30,7 +30,7 @@ use time::OffsetDateTime;
 static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
 
 /// Global RPC authentication token
-pub static GLOBAL_RUSTFS_RPC_SECRET: OnceLock<String> = OnceLock::new();
+static GLOBAL_RUSTFS_RPC_SECRET: OnceLock<String> = OnceLock::new();
 
 /// Public error returned when RPC authentication is not safely configured.
 pub const RPC_SECRET_REQUIRED_MESSAGE: &str = "RPC authentication secret is not configured";
@@ -243,7 +243,9 @@ fn derive_rpc_secret(access_key: &str, secret_key: &str) -> Option<String> {
         return None;
     }
 
-    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret_key.as_bytes()).expect("HMAC can take key of any size");
+    let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(secret_key.as_bytes()) else {
+        return None;
+    };
     mac.update(RPC_SECRET_DERIVATION_CONTEXT);
     mac.update(&[0]);
     mac.update(access_key.as_bytes());
@@ -257,9 +259,21 @@ fn resolve_rpc_secret(env_secret: Option<&str>, global_access: Option<&str>, glo
     }
 
     match (global_access, global_secret) {
-        (Some(access_key), Some(secret_key)) => derive_rpc_secret(access_key, secret_key),
+        (Some(access_key), Some(secret_key)) => {
+            // Fail closed when either half of the active credential pair still
+            // uses the public default. Operators must configure both custom
+            // credentials or provide RUSTFS_RPC_SECRET explicitly.
+            if access_key.trim() == DEFAULT_ACCESS_KEY || secret_key.trim() == DEFAULT_SECRET_KEY {
+                return None;
+            }
+            derive_rpc_secret(access_key, secret_key)
+        }
         _ => None,
     }
+}
+
+pub fn set_global_rpc_secret(secret: String) -> Result<(), String> {
+    GLOBAL_RUSTFS_RPC_SECRET.set(secret)
 }
 
 pub fn try_get_rpc_token() -> std::io::Result<String> {
@@ -284,7 +298,7 @@ pub fn try_get_rpc_token() -> std::io::Result<String> {
 
 #[deprecated(note = "use try_get_rpc_token to handle missing RPC secrets explicitly")]
 pub fn get_rpc_token() -> String {
-    try_get_rpc_token().expect(RPC_SECRET_REQUIRED_MESSAGE)
+    try_get_rpc_token().unwrap_or_default()
 }
 
 /// A wrapper struct for masking sensitive strings in Debug implementations.
@@ -569,14 +583,14 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_rpc_secret_allows_default_credentials_for_derivation() {
+    fn test_resolve_rpc_secret_rejects_default_credentials_for_derivation() {
         assert!(resolve_rpc_secret(None, None, None).is_none());
 
-        let expected = derive_rpc_secret(DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY).expect("secret should derive");
-        assert_eq!(
-            resolve_rpc_secret(None, Some(DEFAULT_ACCESS_KEY), Some(DEFAULT_SECRET_KEY)).as_deref(),
-            Some(expected.as_str())
-        );
+        // Fail closed when either half of the credential pair uses the public
+        // default.
+        assert!(resolve_rpc_secret(None, Some(DEFAULT_ACCESS_KEY), Some(DEFAULT_SECRET_KEY)).is_none());
+        assert!(resolve_rpc_secret(None, Some(DEFAULT_ACCESS_KEY), Some("custom-global-secret")).is_none());
+        assert!(resolve_rpc_secret(None, Some("custom-access"), Some(DEFAULT_SECRET_KEY)).is_none());
 
         assert!(resolve_rpc_secret(Some(DEFAULT_SECRET_KEY), Some("custom-access"), Some("custom-global-secret")).is_none());
     }
@@ -596,10 +610,23 @@ mod tests {
         assert_string_return(get_rpc_token);
     }
 
+    #[allow(deprecated)]
+    #[test]
+    fn test_get_rpc_token_matches_fallible_api_contract() {
+        match try_get_rpc_token() {
+            Ok(secret) => assert_eq!(get_rpc_token(), secret),
+            Err(_) => assert_eq!(get_rpc_token(), ""),
+        }
+    }
+
     #[test]
     fn test_resolve_rpc_secret_accepts_non_default_secret() {
         assert_eq!(
             resolve_rpc_secret(Some("custom-rpc-secret"), None, None).as_deref(),
+            Some("custom-rpc-secret")
+        );
+        assert_eq!(
+            resolve_rpc_secret(Some("custom-rpc-secret"), Some(DEFAULT_ACCESS_KEY), Some(DEFAULT_SECRET_KEY)).as_deref(),
             Some("custom-rpc-secret")
         );
         let expected = derive_rpc_secret("custom-access", "custom-global-secret").expect("secret should derive");

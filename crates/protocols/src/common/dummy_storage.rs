@@ -29,21 +29,73 @@
 //! driver is dropped. SessionContext fixtures live next to the
 //! SessionContext type in common::session.
 
+#[cfg(feature = "webdav")]
+use crate::common::client::s3::SessionCapacityView;
 use crate::common::client::s3::StorageBackend;
+#[cfg(any(feature = "webdav", feature = "sftp"))]
+use crate::common::session::SessionContext;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::stream::{self, StreamExt};
-use s3s::dto::{
+use futures_util::stream::{self, Stream, StreamExt};
+use rustfs_credentials::Credentials;
+use rustfs_gateway_stream::{ByteStream, PayloadCaps, PayloadRead, PayloadStream, StreamError, TrailingHeaders};
+use rustfs_gateway_types::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
-    CopyObjectInput, CopyObjectOutput, CopyPartResult, CreateBucketOutput, CreateMultipartUploadInput,
-    CreateMultipartUploadOutput, DeleteBucketOutput, DeleteObjectOutput, ETag, GetObjectOutput, HeadBucketOutput,
-    HeadObjectOutput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, PutObjectInput, PutObjectOutput, StreamingBlob,
-    Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+    CopyObjectInput, CopyObjectOutput, CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
+    DeleteBucketOutput, DeleteObjectOutput, GetObjectOutput, HeadBucketOutput, HeadObjectOutput, ListBucketsOutput,
+    ListObjectsV2Input, ListObjectsV2Output, Object, PutObjectInput, PutObjectOutput, UploadPartCopyInput, UploadPartCopyOutput,
+    UploadPartInput, UploadPartOutput,
 };
+use rustfs_gateway_types::{BucketName, ETag, ObjectKey, Timestamp};
 use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use thiserror::Error;
 use tokio::sync::Notify;
+
+const OPAQUE_UPLOAD_ID: &str = "<opaque>";
+
+struct StreamPayload<S> {
+    inner: Pin<Box<S>>,
+}
+
+impl<S> PayloadStream for StreamPayload<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<PayloadRead, StreamError>> {
+        let this = self.get_mut();
+        loop {
+            match this.inner.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => continue,
+                Poll::Ready(Some(Ok(bytes))) => return Poll::Ready(Ok(PayloadRead::Chunk(bytes))),
+                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(StreamError::from(error))),
+                Poll::Ready(None) => {
+                    return Poll::Ready(Ok(PayloadRead::Eof {
+                        trailers: TrailingHeaders::empty(),
+                    }));
+                }
+            }
+        }
+    }
+
+    fn caps(&self) -> PayloadCaps {
+        PayloadCaps::PUSH
+    }
+
+    fn len_hint(&self) -> Option<u64> {
+        None
+    }
+}
+
+fn stream_body<S>(stream: S) -> ByteStream
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    ByteStream::new(Box::pin(StreamPayload { inner: Box::pin(stream) })).expect("unbounded test stream has valid capabilities")
+}
 
 /// Error type returned by DummyBackend. Variants model the backend error
 /// categories that SFTP maps onto wire status codes.
@@ -121,7 +173,17 @@ pub struct HeadObjectCall {
     pub key: String,
 }
 
+/// Recorded invocation of delete_object. Tests assert on these to observe
+/// which objects a recursive delete path actually removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteObjectCall {
+    pub bucket: String,
+    pub key: String,
+}
+
 struct Inner {
+    capture_upload_bodies: bool,
+    upload_bodies: Vec<Vec<u8>>,
     // Response queues. Each method pops from its own queue. Empty queue
     // plus no default means a configured-miss error.
     get_object: VecDeque<Result<GetObjectOutput, DummyError>>,
@@ -132,6 +194,10 @@ struct Inner {
     head_bucket: VecDeque<Result<HeadBucketOutput, DummyError>>,
     list_objects_v2: VecDeque<Result<ListObjectsV2Output, DummyError>>,
     list_buckets: VecDeque<Result<ListBucketsOutput, DummyError>>,
+    session_list_buckets: VecDeque<rustfs_s3_types::S3Result<ListBucketsOutput>>,
+    last_session_list_context: Option<(http::HeaderMap, bool)>,
+    #[cfg(feature = "webdav")]
+    session_capacity_view: VecDeque<rustfs_s3_types::S3Result<Option<SessionCapacityView>>>,
     create_bucket: VecDeque<Result<CreateBucketOutput, DummyError>>,
     delete_bucket: VecDeque<Result<DeleteBucketOutput, DummyError>>,
     copy_object: VecDeque<Result<CopyObjectOutput, DummyError>>,
@@ -142,12 +208,16 @@ struct Inner {
     upload_part_copy: VecDeque<Result<UploadPartCopyOutput, DummyError>>,
 
     // Observation logs.
+    list_authorizations: Vec<ListObjectsV2Input>,
+    list_objects_calls: Vec<ListObjectsV2Input>,
     abort_multipart_calls: Vec<AbortCall>,
     put_object_calls: Vec<PutObjectCall>,
     create_multipart_calls: Vec<CreateMultipartCall>,
     upload_part_calls: Vec<UploadPartCall>,
     complete_multipart_calls: Vec<CompleteCall>,
     head_object_calls: Vec<HeadObjectCall>,
+    delete_object_calls: Vec<DeleteObjectCall>,
+    delete_bucket_calls: Vec<String>,
 
     // Cancellation-test support. When stall_upload_part is true every
     // upload_part invocation signals upload_part_entered and then awaits
@@ -175,6 +245,8 @@ struct Inner {
 impl Inner {
     fn new() -> Self {
         Self {
+            capture_upload_bodies: false,
+            upload_bodies: Vec::new(),
             get_object: VecDeque::new(),
             get_object_range: VecDeque::new(),
             put_object: VecDeque::new(),
@@ -183,6 +255,10 @@ impl Inner {
             head_bucket: VecDeque::new(),
             list_objects_v2: VecDeque::new(),
             list_buckets: VecDeque::new(),
+            session_list_buckets: VecDeque::new(),
+            last_session_list_context: None,
+            #[cfg(feature = "webdav")]
+            session_capacity_view: VecDeque::new(),
             create_bucket: VecDeque::new(),
             delete_bucket: VecDeque::new(),
             copy_object: VecDeque::new(),
@@ -191,12 +267,16 @@ impl Inner {
             complete_multipart_upload: VecDeque::new(),
             abort_multipart_upload: VecDeque::new(),
             upload_part_copy: VecDeque::new(),
+            list_authorizations: Vec::new(),
+            list_objects_calls: Vec::new(),
             abort_multipart_calls: Vec::new(),
             put_object_calls: Vec::new(),
             create_multipart_calls: Vec::new(),
             upload_part_calls: Vec::new(),
             complete_multipart_calls: Vec::new(),
             head_object_calls: Vec::new(),
+            delete_object_calls: Vec::new(),
+            delete_bucket_calls: Vec::new(),
             stall_upload_part: false,
             upload_part_entered: None,
             stall_put_object: false,
@@ -213,8 +293,26 @@ impl Inner {
 /// tested, and keep another clone for observation. Method calls are
 /// fire-and-forget from the driver's perspective and synchronous on the
 /// test side.
+///
+/// Cloning shares the same queues and observation logs, so a test can hand
+/// one clone to a driver that takes its backend by value and keep another
+/// for assertions.
+#[derive(Clone)]
 pub struct DummyBackend {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
+    deny_authorization: bool,
+    stall_authorization: bool,
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
+    stall_session_listing: bool,
+}
+
+// Drivers whose trait bounds require `Debug` (for example FtpsDriver) cannot be
+// instantiated with this double otherwise. The queues themselves are not worth
+// rendering, and locking to print them would risk deadlocking a failing test.
+impl std::fmt::Debug for DummyBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DummyBackend").finish_non_exhaustive()
+    }
 }
 
 impl Default for DummyBackend {
@@ -228,12 +326,76 @@ impl DummyBackend {
     /// configured-miss error until a queue is populated.
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(Inner::new()),
+            inner: Arc::new(Mutex::new(Inner::new())),
+            deny_authorization: false,
+            stall_authorization: false,
+            #[cfg(any(feature = "webdav", feature = "sftp"))]
+            stall_session_listing: false,
         }
+    }
+
+    pub fn list_authorizations(&self) -> Vec<ListObjectsV2Input> {
+        self.inner.lock().expect("list authorization log").list_authorizations.clone()
+    }
+
+    pub fn list_objects_calls(&self) -> Vec<ListObjectsV2Input> {
+        self.inner.lock().expect("list call log").list_objects_calls.clone()
+    }
+
+    pub fn deny_authorization(mut self) -> Self {
+        self.deny_authorization = true;
+        self
+    }
+
+    /// Make every authorize_operation await std::future::pending, so a
+    /// caller's authorization deadline elapses instead of an allow or deny.
+    pub fn stall_authorization(mut self) -> Self {
+        self.stall_authorization = true;
+        self
+    }
+
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
+    pub fn stall_session_listing(mut self) -> Self {
+        self.stall_session_listing = true;
+        self
+    }
+
+    /// Opt in to consuming upload bodies for byte-for-byte protocol tests.
+    pub fn capture_upload_bodies(&self) {
+        self.inner.lock().expect("lock").capture_upload_bodies = true;
+    }
+
+    pub fn upload_bodies(&self) -> Vec<Vec<u8>> {
+        self.inner.lock().expect("lock").upload_bodies.clone()
+    }
+
+    async fn record_upload_body(&self, body: &mut Option<ByteStream>) -> Result<(), DummyError> {
+        if !self.inner.lock().expect("lock").capture_upload_bodies {
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        if let Some(mut stream) = body.take() {
+            while let PayloadRead::Chunk(chunk) = futures_util::future::poll_fn(|cx| Pin::new(&mut stream).poll_read(cx))
+                .await
+                .map_err(|e| DummyError::Injected(e.to_string()))?
+            {
+                bytes.extend_from_slice(&chunk);
+            }
+        }
+        self.inner.lock().expect("lock").upload_bodies.push(bytes);
+        Ok(())
     }
 
     // Queue-configuration helpers. Each test stages the responses it
     // expects in order. The method pops in FIFO order.
+
+    pub fn queue_head_bucket_ok(&self) {
+        self.inner
+            .lock()
+            .expect("queue bucket metadata")
+            .head_bucket
+            .push_back(Ok(HeadBucketOutput::default()));
+    }
 
     /// Queue a head_object Ok response with the given size and mtime.
     pub fn queue_head_object_ok(&self, size: u64, mtime: Option<Timestamp>) {
@@ -263,6 +425,56 @@ impl DummyBackend {
             .push_back(Ok(PutObjectOutput::default()));
     }
 
+    /// Queue a successful create_bucket. Authorization tests use this to tell
+    /// "denied before the backend" apart from "backend refused": an unqueued
+    /// create_bucket returns `Unconfigured`, so only a queued success proves the
+    /// driver reached the backend.
+    pub fn queue_create_bucket_ok(&self) {
+        self.inner
+            .lock()
+            .expect("lock")
+            .create_bucket
+            .push_back(Ok(CreateBucketOutput::default()));
+    }
+
+    /// Queue a legacy list_buckets response.
+    pub fn queue_list_buckets_ok(&self, output: ListBucketsOutput) {
+        self.inner.lock().expect("lock").list_buckets.push_back(Ok(output));
+    }
+
+    /// Queue a legacy list_buckets error.
+    pub fn queue_list_buckets_err(&self, error: DummyError) {
+        self.inner.lock().expect("lock").list_buckets.push_back(Err(error));
+    }
+
+    /// Queue a session-aware list_buckets response.
+    pub fn queue_session_list_buckets_ok(&self, output: ListBucketsOutput) {
+        self.inner.lock().expect("lock").session_list_buckets.push_back(Ok(output));
+    }
+
+    /// Queue a session-aware list_buckets error.
+    pub fn queue_session_list_buckets_err(&self, error: rustfs_s3_types::S3Error) {
+        self.inner.lock().expect("lock").session_list_buckets.push_back(Err(error));
+    }
+
+    /// Return the context from the last session-aware list_buckets request.
+    pub fn last_session_list_context(&self) -> Option<(http::HeaderMap, bool)> {
+        self.inner.lock().expect("lock").last_session_list_context.clone()
+    }
+
+    /// Queue a session_capacity_view response; `None` models a backend that
+    /// cannot report capacity at all.
+    #[cfg(feature = "webdav")]
+    pub fn queue_session_capacity_view_ok(&self, view: Option<SessionCapacityView>) {
+        self.inner.lock().expect("lock").session_capacity_view.push_back(Ok(view));
+    }
+
+    /// Queue a session_capacity_view error.
+    #[cfg(feature = "webdav")]
+    pub fn queue_session_capacity_view_err(&self, error: rustfs_s3_types::S3Error) {
+        self.inner.lock().expect("lock").session_capacity_view.push_back(Err(error));
+    }
+
     /// Queue a put_object error. Used by the commit_write retry tests
     /// to script SlowDown / AccessDenied sequences against the
     /// rustfs_utils::retry::is_s3code_in_message_retryable predicate.
@@ -287,28 +499,26 @@ impl DummyBackend {
     /// Queue a create_multipart_upload Ok carrying the given upload_id.
     pub fn queue_create_multipart_upload_ok(&self, upload_id: impl Into<String>) {
         let out = CreateMultipartUploadOutput {
-            upload_id: Some(upload_id.into()),
+            upload_id: upload_id.into(),
             ..Default::default()
         };
         self.inner.lock().expect("lock").create_multipart_upload.push_back(Ok(out));
     }
 
     /// Queue an upload_part Ok response carrying the given ETag. The
-    /// string is wrapped in ETag::Strong. Callers that need ETag::Weak
-    /// can queue a custom UploadPartOutput instead of using this helper.
+    /// string is wrapped in a strong ETag.
     pub fn queue_upload_part_ok(&self, e_tag: impl Into<String>) {
         let out = UploadPartOutput {
-            e_tag: Some(ETag::Strong(e_tag.into())),
+            e_tag: ETag::new(e_tag.into()).expect("test ETag"),
             ..Default::default()
         };
         self.inner.lock().expect("lock").upload_part.push_back(Ok(out));
     }
 
-    /// Queue an upload_part Ok response with no ETag. Exercises the
-    /// missing-ETag branch a driver may guard against.
+    /// Queue an upload_part Ok response with the required ETag placeholder.
     pub fn queue_upload_part_ok_without_etag(&self) {
         let out = UploadPartOutput {
-            e_tag: None,
+            e_tag: ETag::default(),
             ..Default::default()
         };
         self.inner.lock().expect("lock").upload_part.push_back(Ok(out));
@@ -322,10 +532,7 @@ impl DummyBackend {
     /// Queue an upload_part_copy Ok response carrying the given ETag.
     pub fn queue_upload_part_copy_ok(&self, e_tag: impl Into<String>) {
         let out = UploadPartCopyOutput {
-            copy_part_result: Some(CopyPartResult {
-                e_tag: Some(ETag::Strong(e_tag.into())),
-                ..Default::default()
-            }),
+            e_tag: ETag::new(e_tag.into()).expect("test ETag"),
             ..Default::default()
         };
         self.inner.lock().expect("lock").upload_part_copy.push_back(Ok(out));
@@ -356,6 +563,43 @@ impl DummyBackend {
             .push_back(Ok(ListObjectsV2Output::default()));
     }
 
+    /// Queue a list_objects_v2 Ok response listing the given keys as a
+    /// single, non-truncated page. Recursive-delete tests use this to give
+    /// the delete loop something to iterate over.
+    pub fn queue_list_objects_v2_ok_with_keys(&self, keys: &[&str]) {
+        let contents = keys
+            .iter()
+            .map(|key| Object {
+                key: ObjectKey::new((*key).to_string()).expect("test object key"),
+                ..Default::default()
+            })
+            .collect();
+        let out = ListObjectsV2Output {
+            contents,
+            is_truncated: false,
+            ..Default::default()
+        };
+        self.inner.lock().expect("lock").list_objects_v2.push_back(Ok(out));
+    }
+
+    /// Queue a delete_object Ok response.
+    pub fn queue_delete_object_ok(&self) {
+        self.inner
+            .lock()
+            .expect("lock")
+            .delete_object
+            .push_back(Ok(DeleteObjectOutput::default()));
+    }
+
+    /// Queue a delete_bucket Ok response.
+    pub fn queue_delete_bucket_ok(&self) {
+        self.inner
+            .lock()
+            .expect("lock")
+            .delete_bucket
+            .push_back(Ok(DeleteBucketOutput::default()));
+    }
+
     /// Queue a list_objects_v2 error. Used to verify that callers do
     /// not fall through to a destructive operation when the empty-check
     /// itself fails.
@@ -371,12 +615,21 @@ impl DummyBackend {
         self.inner.lock().expect("lock").get_object_range.push_back(Err(err));
     }
 
+    pub fn queue_get_object_bytes(&self, payload: Vec<u8>) {
+        let output = GetObjectOutput {
+            content_length: Some(i64::try_from(payload.len()).expect("test payload length")),
+            body: Some(ByteStream::from_bytes(Bytes::from(payload))),
+            ..Default::default()
+        };
+        self.inner.lock().expect("lock").get_object.push_back(Ok(output));
+    }
+
     /// Queue a get_object_range Ok response carrying the given bytes as
     /// the streaming body. content_length is set to bytes.len().
     pub fn queue_get_object_range_bytes(&self, payload: Vec<u8>) {
         let size = payload.len() as i64;
         let body = Bytes::from(payload);
-        let blob = StreamingBlob::wrap(stream::once(async move { Ok::<Bytes, std::io::Error>(body) }));
+        let blob = stream_body(stream::once(async move { Ok::<Bytes, std::io::Error>(body) }));
         let out = GetObjectOutput {
             body: Some(blob),
             content_length: Some(size),
@@ -397,7 +650,7 @@ impl DummyBackend {
         let head = Bytes::from(initial_chunk);
         let body_stream = stream::once(async move { Ok::<Bytes, std::io::Error>(head) })
             .chain(stream::pending::<Result<Bytes, std::io::Error>>());
-        let blob = StreamingBlob::wrap(body_stream);
+        let blob = stream_body(body_stream);
         let out = GetObjectOutput {
             body: Some(blob),
             content_length: Some(reported_content_length),
@@ -476,6 +729,16 @@ impl DummyBackend {
     }
 
     /// Snapshot the head_object call log.
+    /// Snapshot the recorded delete_object invocations.
+    pub fn delete_object_calls(&self) -> Vec<DeleteObjectCall> {
+        self.inner.lock().expect("lock").delete_object_calls.clone()
+    }
+
+    /// Snapshot the buckets passed to delete_bucket.
+    pub fn delete_bucket_calls(&self) -> Vec<String> {
+        self.inner.lock().expect("lock").delete_bucket_calls.clone()
+    }
+
     pub fn head_object_calls(&self) -> Vec<HeadObjectCall> {
         self.inner.lock().expect("lock").head_object_calls.clone()
     }
@@ -485,12 +748,46 @@ impl DummyBackend {
 impl StorageBackend for DummyBackend {
     type Error = DummyError;
 
+    async fn authorize_operation(
+        &self,
+        session: &crate::common::session::SessionContext,
+        action: &crate::common::gateway::S3Action,
+        bucket: &str,
+        object: Option<&str>,
+    ) -> Result<(), crate::common::gateway::AuthorizationError> {
+        if self.deny_authorization {
+            return Err(crate::common::gateway::AuthorizationError::AccessDenied);
+        }
+        if self.stall_authorization {
+            std::future::pending::<()>().await;
+        }
+        crate::common::gateway::authorize_operation(session, action, bucket, object).await
+    }
+
+    async fn authorize_list_objects(
+        &self,
+        session: &crate::common::session::SessionContext,
+        input: &ListObjectsV2Input,
+    ) -> Result<(), crate::common::gateway::AuthorizationError> {
+        self.inner
+            .lock()
+            .expect("record list authorization")
+            .list_authorizations
+            .push(input.clone());
+        self.authorize_operation(
+            session,
+            &crate::common::gateway::S3Action::ListBucket,
+            input.bucket.as_str(),
+            input.prefix.as_deref(),
+        )
+        .await
+    }
+
     async fn get_object(
         &self,
         bucket: &str,
         key: &str,
-        _ak: &str,
-        _sk: &str,
+        _credentials: &Credentials,
         _start_pos: Option<u64>,
     ) -> Result<GetObjectOutput, Self::Error> {
         match self.inner.lock().expect("lock").get_object.pop_front() {
@@ -503,8 +800,7 @@ impl StorageBackend for DummyBackend {
         &self,
         bucket: &str,
         key: &str,
-        _ak: &str,
-        _sk: &str,
+        _credentials: &Credentials,
         _start_pos: u64,
         _length: u64,
     ) -> Result<GetObjectOutput, Self::Error> {
@@ -514,16 +810,17 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn put_object(&self, input: PutObjectInput, _ak: &str, _sk: &str) -> Result<PutObjectOutput, Self::Error> {
+    async fn put_object(&self, mut input: PutObjectInput, _credentials: &Credentials) -> Result<PutObjectOutput, Self::Error> {
+        self.record_upload_body(&mut input.body).await?;
         // Decide control flow while holding the lock. Release before
         // awaiting so the stall path does not hold the Mutex across
         // an await point.
         let (stall, entered, popped) = {
             let mut inner = self.inner.lock().expect("lock");
             inner.put_object_calls.push(PutObjectCall {
-                bucket: input.bucket.to_string(),
-                key: input.key.to_string(),
-                metadata: input.metadata.clone(),
+                bucket: input.bucket.as_str().to_owned(),
+                key: input.key.as_str().to_owned(),
+                metadata: (!input.metadata.is_empty()).then(|| input.metadata.into_iter().collect()),
             });
             let stall = inner.stall_put_object;
             let entered = inner.put_object_entered.clone();
@@ -543,14 +840,24 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn delete_object(&self, bucket: &str, key: &str, _ak: &str, _sk: &str) -> Result<DeleteObjectOutput, Self::Error> {
-        match self.inner.lock().expect("lock").delete_object.pop_front() {
+    async fn delete_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        _credentials: &Credentials,
+    ) -> Result<DeleteObjectOutput, Self::Error> {
+        let mut inner = self.inner.lock().expect("lock");
+        inner.delete_object_calls.push(DeleteObjectCall {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        });
+        match inner.delete_object.pop_front() {
             Some(r) => r,
             None => Err(DummyError::NoSuchKey(format!("{bucket}/{key}"))),
         }
     }
 
-    async fn head_object(&self, bucket: &str, key: &str, _ak: &str, _sk: &str) -> Result<HeadObjectOutput, Self::Error> {
+    async fn head_object(&self, bucket: &str, key: &str, _credentials: &Credentials) -> Result<HeadObjectOutput, Self::Error> {
         {
             let mut inner = self.inner.lock().expect("lock");
             inner.head_object_calls.push(HeadObjectCall {
@@ -564,7 +871,7 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn head_bucket(&self, bucket: &str, _ak: &str, _sk: &str) -> Result<HeadBucketOutput, Self::Error> {
+    async fn head_bucket(&self, bucket: &str, _credentials: &Credentials) -> Result<HeadBucketOutput, Self::Error> {
         match self.inner.lock().expect("lock").head_bucket.pop_front() {
             Some(r) => r,
             None => Err(DummyError::NoSuchBucket(bucket.to_string())),
@@ -573,15 +880,15 @@ impl StorageBackend for DummyBackend {
 
     async fn list_objects_v2(
         &self,
-        _input: ListObjectsV2Input,
-        _ak: &str,
-        _sk: &str,
+        input: ListObjectsV2Input,
+        _credentials: &Credentials,
     ) -> Result<ListObjectsV2Output, Self::Error> {
         // Decide control flow while holding the lock. Release before
         // awaiting so the stall path does not hold the Mutex across
         // an await point.
         let (stall, entered, popped) = {
             let mut inner = self.inner.lock().expect("lock");
+            inner.list_objects_calls.push(input);
             let stall = inner.stall_list_objects_v2;
             let entered = inner.list_objects_v2_entered.clone();
             let popped = if stall { None } else { inner.list_objects_v2.pop_front() };
@@ -600,28 +907,70 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn list_buckets(&self, _ak: &str, _sk: &str) -> Result<ListBucketsOutput, Self::Error> {
+    async fn list_buckets(&self, _credentials: &Credentials) -> Result<ListBucketsOutput, Self::Error> {
         match self.inner.lock().expect("lock").list_buckets.pop_front() {
             Some(r) => r,
             None => Ok(ListBucketsOutput::default()),
         }
     }
 
-    async fn create_bucket(&self, _bucket: &str, _ak: &str, _sk: &str) -> Result<CreateBucketOutput, Self::Error> {
+    #[cfg(any(feature = "webdav", feature = "sftp"))]
+    async fn list_buckets_for_session(
+        &self,
+        session_context: &SessionContext,
+        request_headers: &http::HeaderMap,
+        secure_transport: bool,
+    ) -> rustfs_s3_types::S3Result<ListBucketsOutput> {
+        let _ = session_context;
+        if self.stall_session_listing {
+            std::future::pending::<()>().await;
+        }
+        let mut inner = self.inner.lock().expect("lock");
+        inner.last_session_list_context = Some((request_headers.clone(), secure_transport));
+        // Fail closed when nothing is queued, like the trait default for
+        // backends without session-aware listing.
+        inner.session_list_buckets.pop_front().unwrap_or_else(|| {
+            Err(rustfs_s3_types::S3Error::with_message(
+                rustfs_s3_types::S3ErrorCode::AccessDenied,
+                "Session-aware bucket listing is not supported",
+            ))
+        })
+    }
+
+    /// Capacity reporting is opt-in; an empty queue models a backend without
+    /// capacity support so unrelated tests keep omitting quota properties.
+    #[cfg(feature = "webdav")]
+    async fn session_capacity_view(
+        &self,
+        _session_context: &SessionContext,
+        _request_headers: &http::HeaderMap,
+        _secure_transport: bool,
+    ) -> rustfs_s3_types::S3Result<Option<SessionCapacityView>> {
+        self.inner
+            .lock()
+            .expect("lock")
+            .session_capacity_view
+            .pop_front()
+            .unwrap_or(Ok(None))
+    }
+
+    async fn create_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<CreateBucketOutput, Self::Error> {
         match self.inner.lock().expect("lock").create_bucket.pop_front() {
             Some(r) => r,
             None => Err(DummyError::Unconfigured("create_bucket")),
         }
     }
 
-    async fn delete_bucket(&self, bucket: &str, _ak: &str, _sk: &str) -> Result<DeleteBucketOutput, Self::Error> {
-        match self.inner.lock().expect("lock").delete_bucket.pop_front() {
+    async fn delete_bucket(&self, bucket: &str, _credentials: &Credentials) -> Result<DeleteBucketOutput, Self::Error> {
+        let mut inner = self.inner.lock().expect("lock");
+        inner.delete_bucket_calls.push(bucket.to_string());
+        match inner.delete_bucket.pop_front() {
             Some(r) => r,
             None => Err(DummyError::NoSuchBucket(bucket.to_string())),
         }
     }
 
-    async fn copy_object(&self, _input: CopyObjectInput, _ak: &str, _sk: &str) -> Result<CopyObjectOutput, Self::Error> {
+    async fn copy_object(&self, _input: CopyObjectInput, _credentials: &Credentials) -> Result<CopyObjectOutput, Self::Error> {
         match self.inner.lock().expect("lock").copy_object.pop_front() {
             Some(r) => r,
             None => Err(DummyError::Unconfigured("copy_object")),
@@ -631,15 +980,14 @@ impl StorageBackend for DummyBackend {
     async fn create_multipart_upload(
         &self,
         input: CreateMultipartUploadInput,
-        _ak: &str,
-        _sk: &str,
+        _credentials: &Credentials,
     ) -> Result<CreateMultipartUploadOutput, Self::Error> {
         {
             let mut inner = self.inner.lock().expect("lock");
             inner.create_multipart_calls.push(CreateMultipartCall {
-                bucket: input.bucket.to_string(),
-                key: input.key.to_string(),
-                metadata: input.metadata.clone(),
+                bucket: input.bucket.as_str().to_owned(),
+                key: input.key.as_str().to_owned(),
+                metadata: (!input.metadata.is_empty()).then(|| input.metadata.into_iter().collect()),
             });
         }
         match self.inner.lock().expect("lock").create_multipart_upload.pop_front() {
@@ -648,18 +996,19 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn upload_part(&self, input: UploadPartInput, _ak: &str, _sk: &str) -> Result<UploadPartOutput, Self::Error> {
+    async fn upload_part(&self, mut input: UploadPartInput, _credentials: &Credentials) -> Result<UploadPartOutput, Self::Error> {
+        self.record_upload_body(&mut input.body).await?;
         // Record the call and decide the control flow while holding the
         // lock. Release the lock before awaiting so the stall path does
         // not hold the Mutex across an await point.
         let (stall, entered, popped) = {
             let mut inner = self.inner.lock().expect("lock");
             inner.upload_part_calls.push(UploadPartCall {
-                bucket: input.bucket.to_string(),
-                key: input.key.to_string(),
-                upload_id: input.upload_id.to_string(),
+                bucket: input.bucket.as_str().to_owned(),
+                key: input.key.as_str().to_owned(),
+                upload_id: OPAQUE_UPLOAD_ID.to_owned(),
                 part_number: input.part_number,
-                content_length: input.content_length,
+                content_length: Some(input.content_length),
             });
             let stall = inner.stall_upload_part;
             let entered = inner.upload_part_entered.clone();
@@ -682,20 +1031,15 @@ impl StorageBackend for DummyBackend {
     async fn complete_multipart_upload(
         &self,
         input: CompleteMultipartUploadInput,
-        _ak: &str,
-        _sk: &str,
+        _credentials: &Credentials,
     ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
-        let part_count = input
-            .multipart_upload
-            .as_ref()
-            .and_then(|mpu| mpu.parts.as_ref().map(|p| p.len()))
-            .unwrap_or(0);
+        let part_count = input.multipart_upload.parts.len();
         {
             let mut inner = self.inner.lock().expect("lock");
             inner.complete_multipart_calls.push(CompleteCall {
-                bucket: input.bucket.to_string(),
-                key: input.key.to_string(),
-                upload_id: input.upload_id.to_string(),
+                bucket: input.bucket.as_str().to_owned(),
+                key: input.key.as_str().to_owned(),
+                upload_id: OPAQUE_UPLOAD_ID.to_owned(),
                 part_count,
             });
         }
@@ -708,15 +1052,14 @@ impl StorageBackend for DummyBackend {
     async fn abort_multipart_upload(
         &self,
         input: AbortMultipartUploadInput,
-        _ak: &str,
-        _sk: &str,
+        _credentials: &Credentials,
     ) -> Result<AbortMultipartUploadOutput, Self::Error> {
         {
             let mut inner = self.inner.lock().expect("lock");
             inner.abort_multipart_calls.push(AbortCall {
-                bucket: input.bucket.to_string(),
-                key: input.key.to_string(),
-                upload_id: input.upload_id.to_string(),
+                bucket: input.bucket.as_str().to_owned(),
+                key: input.key.as_str().to_owned(),
+                upload_id: OPAQUE_UPLOAD_ID.to_owned(),
             });
         }
         match self.inner.lock().expect("lock").abort_multipart_upload.pop_front() {
@@ -728,8 +1071,7 @@ impl StorageBackend for DummyBackend {
     async fn upload_part_copy(
         &self,
         _input: UploadPartCopyInput,
-        _ak: &str,
-        _sk: &str,
+        _credentials: &Credentials,
     ) -> Result<UploadPartCopyOutput, Self::Error> {
         match self.inner.lock().expect("lock").upload_part_copy.pop_front() {
             Some(r) => r,
@@ -745,7 +1087,8 @@ mod tests {
     #[tokio::test]
     async fn dummy_backend_reports_not_found_by_default() {
         let backend = DummyBackend::new();
-        let result = backend.head_object("b", "k", "ak", "sk").await;
+        let credentials = Credentials::default();
+        let result = backend.head_object("bucket", "k", &credentials).await;
         let Err(err) = result else {
             panic!("default head_object must return an error");
         };
@@ -758,38 +1101,38 @@ mod tests {
     #[tokio::test]
     async fn dummy_backend_returns_queued_head_object_response() {
         let backend = DummyBackend::new();
+        let credentials = Credentials::default();
         backend.queue_head_object_ok(42, None);
-        let out = backend.head_object("b", "k", "ak", "sk").await.expect("queued Ok");
+        let out = backend.head_object("bucket", "k", &credentials).await.expect("queued Ok");
         assert_eq!(out.content_length, Some(42));
     }
 
     #[tokio::test]
     async fn dummy_backend_logs_abort_multipart_calls() {
         let backend = Arc::new(DummyBackend::new());
+        let credentials = Credentials::default();
         let input = AbortMultipartUploadInput::builder()
-            .bucket("b".to_string())
-            .key("k".to_string())
-            .upload_id("UP-1".to_string())
-            .build()
-            .expect("build");
-        backend.abort_multipart_upload(input, "ak", "sk").await.expect("Ok");
+            .bucket(BucketName::new("bucket").expect("bucket"))
+            .key(ObjectKey::new("k").expect("key"))
+            .upload_id(rustfs_gateway_types::UploadIdClaim::from_wire("UP-1"))
+            .build();
+        backend.abort_multipart_upload(input, &credentials).await.expect("Ok");
         let calls = backend.abort_multipart_calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].upload_id, "UP-1");
+        assert_eq!(calls[0].upload_id, OPAQUE_UPLOAD_ID);
     }
 
     #[tokio::test]
     async fn dummy_backend_unconfigured_errors_loudly() {
         let backend = DummyBackend::new();
+        let credentials = Credentials::default();
         let err = backend
             .create_multipart_upload(
                 CreateMultipartUploadInput::builder()
-                    .bucket("b".to_string())
-                    .key("k".to_string())
-                    .build()
-                    .expect("build"),
-                "ak",
-                "sk",
+                    .bucket(BucketName::new("bucket").expect("bucket"))
+                    .key(ObjectKey::new("k").expect("key"))
+                    .build(),
+                &credentials,
             )
             .await
             .expect_err("default create_multipart_upload must error");

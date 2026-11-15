@@ -12,25 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
+use crate::admin::runtime_sources::{AppContext, app_context_from_envelope, default_admin_usecase};
+use crate::admin::service::config::{
+    preflight_dynamic_config_reload_for_context, signal_dynamic_config_reload_checked_for_context,
+};
 use crate::admin::{
-    auth::validate_admin_request,
-    router::{AdminOperation, Operation, S3Router},
+    auth::authorize_admin_envelope,
+    handlers::supervise_admin_mutation,
+    router::{AdminOperation, S3Router},
 };
-use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{
-    ADMIN_PREFIX, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches, RemoteAddr, current_module_switch_snapshot,
-    init_event_notifier, refresh_audit_module_enabled, refresh_notify_module_enabled,
-    refresh_persisted_module_switches_from_store, save_persisted_module_switches_to_store, shutdown_event_notifier,
-    start_audit_system, stop_audit_system, validate_module_switch_update,
+    ADMIN_PREFIX, MODULE_SWITCHES_SIGNAL_SUBSYSTEM, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches,
+    apply_audit_module_switch_for_context, current_module_switch_snapshot, mark_event_notifier_reconciled,
+    mark_event_notifier_unreconciled, refresh_audit_module_enabled, refresh_notify_module_enabled,
+    refresh_persisted_module_switches_from, refresh_persisted_module_switches_from_store, save_persisted_module_switches_to,
+    validate_module_switch_update, with_notify_runtime_reconcile_lock,
 };
+use http::header::CONTENT_TYPE;
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
-use rustfs_audit::AuditError;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Request, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
+use rustfs_s3_types::{Body, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub fn register_module_switch_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -62,10 +69,22 @@ struct ModuleSwitchesResponse {
     persisted_audit_enabled: bool,
     notify_source: ModuleSwitchSource,
     audit_source: ModuleSwitchSource,
+    admin_discovery: ModuleSwitchDiscovery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct ModuleSwitchDiscovery {
+    #[serde(rename = "runtimeCapabilities")]
+    runtime_capabilities: &'static str,
+    #[serde(rename = "clusterSnapshot")]
+    cluster_snapshot: &'static str,
+    #[serde(rename = "extensionsCatalog")]
+    extensions_catalog: &'static str,
 }
 
 impl From<ModuleSwitchSnapshot> for ModuleSwitchesResponse {
     fn from(value: ModuleSwitchSnapshot) -> Self {
+        let usecase = default_admin_usecase();
         Self {
             notify_enabled: value.notify_enabled,
             audit_enabled: value.audit_enabled,
@@ -73,41 +92,34 @@ impl From<ModuleSwitchSnapshot> for ModuleSwitchesResponse {
             persisted_audit_enabled: value.persisted_audit_enabled,
             notify_source: value.notify_source,
             audit_source: value.audit_source,
+            admin_discovery: ModuleSwitchDiscovery {
+                runtime_capabilities: usecase.runtime_capabilities_route(),
+                cluster_snapshot: usecase.cluster_snapshot_route(),
+                extensions_catalog: usecase.extensions_catalog_route(),
+            },
         }
     }
 }
 
-fn build_response<T: Serialize>(
-    status: StatusCode,
-    body: &T,
-    request_id: Option<&http::HeaderValue>,
-) -> S3Result<S3Response<(StatusCode, Body)>> {
+fn build_response<T: Serialize>(status: StatusCode, body: &T, request_id: Option<&http::HeaderValue>) -> S3Result<AdminResponse> {
     let data = serde_json::to_vec(body).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
     let mut header = HeaderMap::new();
     header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
     if let Some(v) = request_id {
         header.insert("x-request-id", v.clone());
     }
-    Ok(S3Response::with_headers((status, Body::from(data)), header))
+    Ok(AdminResponse::with_headers(status, Body::from(data), header))
 }
 
-async fn authorize_module_switch_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+/// The pre-check keeps these endpoints' historical missing-credentials message;
+/// the shared gate reports "get cred failed".
+async fn authorize_module_switch_request(req: &AdminRequest, action: AdminAction) -> S3Result<()> {
+    if req.credentials().is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(action)],
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-    )
-    .await
+    authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
+    Ok(())
 }
 
 async fn refresh_module_switch_snapshot() -> S3Result<ModuleSwitchSnapshot> {
@@ -121,14 +133,87 @@ async fn refresh_module_switch_snapshot() -> S3Result<ModuleSwitchSnapshot> {
     Ok(current_module_switch_snapshot())
 }
 
+async fn apply_module_switch_update(context: Arc<AppContext>, switches: PersistedModuleSwitches) -> S3Result<()> {
+    preflight_dynamic_config_reload_for_context(Some(context.as_ref()), MODULE_SWITCHES_SIGNAL_SUBSYSTEM).await?;
+    let store = context.object_store();
+    let mut failures = with_notify_runtime_reconcile_lock(async {
+        mark_event_notifier_unreconciled();
+        let notification_system = rustfs_notify::ensure_live_events();
+        if switches.notify_enabled {
+            notification_system
+                .reload_persisted_config_from_store(store.clone())
+                .await
+                .map_err(|err| {
+                    tracing::warn!(error = %err, "Failed to load notification config for module switch update");
+                    s3_error!(InternalError, "failed to load notification config")
+                })?;
+        }
+
+        let transition_system = notification_system.clone();
+        let notify_transition = save_persisted_module_switches_to(store.clone(), switches, move || {
+            let enabled = refresh_notify_module_enabled();
+            transition_system.publish_targets_enabled(enabled, None)
+        })
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "Failed to save module switches");
+            s3_error!(InternalError, "failed to save module switches")
+        })?;
+
+        let mut failures = Vec::new();
+        let mut notify_converged = true;
+        if let Err(err) = notify_transition.wait().await {
+            tracing::warn!(error = %err, "Local notification runtime failed to apply module switch update");
+            notify_converged = false;
+            failures.push("local notify");
+        }
+        if !switches.notify_enabled
+            && let Err(err) = notification_system.reload_persisted_config_from_store(store).await
+        {
+            tracing::warn!(error = %err, "Local notification config cache failed to reload after module disable");
+            notify_converged = false;
+            failures.push("local notify config cache");
+        }
+        if notify_converged && notification_system.runtime_lifecycle_is_converged() {
+            mark_event_notifier_reconciled();
+        } else if notify_converged {
+            failures.push("local notify convergence");
+        }
+
+        Ok::<_, rustfs_s3_types::S3Error>(failures)
+    })
+    .await?;
+
+    if apply_audit_module_switch_for_context(Some(context.as_ref())).await.is_err() {
+        tracing::warn!(reason = "apply_failed", "Local audit runtime failed to apply module switch update");
+        failures.push("local audit");
+    }
+    if let Err(err) =
+        signal_dynamic_config_reload_checked_for_context(Some(context.as_ref()), MODULE_SWITCHES_SIGNAL_SUBSYSTEM).await
+    {
+        tracing::warn!(error = %err, "Peer nodes failed to apply module switch update");
+        failures.push("peer module switches");
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(s3_error!(
+            InternalError,
+            "module switches persisted but runtime convergence failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
 pub struct GetModuleSwitchesHandler {}
 
 #[async_trait::async_trait]
 impl Operation for GetModuleSwitchesHandler {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_module_switch_request(&req, AdminAction::ServerInfoAdminAction).await?;
         let snapshot = refresh_module_switch_snapshot().await?;
-        build_response(StatusCode::OK, &ModuleSwitchesResponse::from(snapshot), req.headers.get("x-request-id"))
+        build_response(StatusCode::OK, &ModuleSwitchesResponse::from(snapshot), req.headers().get("x-request-id"))
     }
 }
 
@@ -136,14 +221,17 @@ pub struct UpdateModuleSwitchesHandler {}
 
 #[async_trait::async_trait]
 impl Operation for UpdateModuleSwitchesHandler {
-    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         authorize_module_switch_request(&req, AdminAction::ConfigUpdateAdminAction).await?;
-        refresh_persisted_module_switches_from_store()
+        let context =
+            app_context_from_envelope(req.envelope()).ok_or_else(|| s3_error!(InternalError, "storage layer not initialized"))?;
+        let store = context.object_store();
+        refresh_persisted_module_switches_from(store.clone())
             .await
             .map_err(|e| s3_error!(InternalError, "failed to reload persisted module switches: {}", e))?;
 
         let body = req
-            .input
+            .take_body()
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
@@ -165,36 +253,36 @@ impl Operation for UpdateModuleSwitchesHandler {
             return Err(s3_error!(InvalidRequest, "{err}"));
         }
 
-        save_persisted_module_switches_to_store(switches)
-            .await
-            .map_err(|e| s3_error!(InternalError, "failed to save module switches: {}", e))?;
-
-        // Apply the new effective values immediately on this node so the console
-        // response reflects the runtime state after to write completes.
-        if refresh_notify_module_enabled() {
-            init_event_notifier().await;
-        } else {
-            shutdown_event_notifier().await;
-        }
-
-        if refresh_audit_module_enabled() {
-            match start_audit_system().await {
-                Ok(()) | Err(AuditError::AlreadyInitialized) => {}
-                Err(e) => return Err(s3_error!(InternalError, "failed to apply audit module switch: {}", e)),
-            }
-        } else {
-            stop_audit_system()
-                .await
-                .map_err(|e| s3_error!(InternalError, "failed to stop audit module after switch update: {}", e))?;
-        }
+        supervise_admin_mutation("module switch update", apply_module_switch_update(context, switches)).await?;
 
         let snapshot = current_module_switch_snapshot();
-        build_response(StatusCode::OK, &ModuleSwitchesResponse::from(snapshot), req.headers.get("x-request-id"))
+        build_response(StatusCode::OK, &ModuleSwitchesResponse::from(snapshot), req.headers().get("x-request-id"))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{ModuleSwitchDiscovery, ModuleSwitchSource, ModuleSwitchesResponse};
+    use rustfs_s3_types::Body;
+
+    /// These endpoints authorize through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message they have always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn module_switch_gate_keeps_its_missing_credentials_message() {
+        let req = crate::admin::operation::test_support::TestRequest::new(http::Method::GET, "/rustfs/admin/v3/module-switches")
+            .headers(http::HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::from(String::new()))
+            .build();
+
+        let err = super::authorize_module_switch_request(&req, rustfs_policy::policy::action::AdminAction::ServerInfoAdminAction)
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &rustfs_s3_types::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
+
     #[test]
     fn module_switch_handlers_require_admin_authorization_contract() {
         let src = include_str!("module_switch.rs");
@@ -213,6 +301,34 @@ mod tests {
             put_block.contains("authorize_module_switch_request(&req, AdminAction::ConfigUpdateAdminAction).await?;"),
             "module switch PUT should require ConfigUpdateAdminAction"
         );
+        assert!(
+            put_block.contains(
+                "supervise_admin_mutation(\"module switch update\", apply_module_switch_update(context, switches)).await?;"
+            ),
+            "module switch PUT must delegate the complete mutation to its supervisor"
+        );
+    }
+
+    #[test]
+    fn module_switch_response_exposes_admin_discovery_paths() {
+        let response = ModuleSwitchesResponse {
+            notify_enabled: true,
+            audit_enabled: false,
+            persisted_notify_enabled: true,
+            persisted_audit_enabled: false,
+            notify_source: ModuleSwitchSource::Console,
+            audit_source: ModuleSwitchSource::Console,
+            admin_discovery: ModuleSwitchDiscovery {
+                runtime_capabilities: "/rustfs/admin/v4/runtime/capabilities",
+                cluster_snapshot: "/rustfs/admin/v4/cluster/snapshot",
+                extensions_catalog: "/rustfs/admin/v4/extensions/catalog",
+            },
+        };
+
+        let value = serde_json::to_value(response).expect("module switch response should serialize");
+        assert_eq!(value["admin_discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(value["admin_discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(value["admin_discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
     }
 
     fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {

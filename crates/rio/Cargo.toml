@@ -28,35 +28,82 @@ documentation = "https://docs.rs/rustfs-rio/latest/rustfs_rio/"
 [lints]
 workspace = true
 
+[features]
+internode-transport = []
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "hotpath/reqwest-0-13",
+    "rustfs-config/hotpath",
+    "rustfs-io-metrics/hotpath",
+    "rustfs-tls-runtime/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-io-metrics/hotpath-alloc",
+    "rustfs-tls-runtime/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-io-metrics/hotpath-cpu",
+    "rustfs-tls-runtime/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+]
+
 [dependencies]
-tokio = { workspace = true, features = ["full"] }
-rand = { workspace = true }
+hotpath.workspace = true
+arc-swap.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+rand = { workspace = true, features = ["serde"] }
 http.workspace = true
-aes-gcm = { workspace = true }
+hyper.workspace = true
+aes-gcm = { workspace = true, features = ["rand_core"] }
 crc-fast = { workspace = true }
 pin-project-lite.workspace = true
-serde = { workspace = true }
-bytes.workspace = true
-reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+bytes = { workspace = true, features = ["serde"] }
+reqwest = { workspace = true, features = ["stream"] }
 rustls-pki-types.workspace = true
-tokio-util.workspace = true
-faster-hex.workspace = true
+tokio-util = { workspace = true, features = ["io", "compat"] }
 futures.workspace = true
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-io-metrics.workspace = true
 rustfs-tls-runtime.workspace = true
 rustfs-utils = { workspace = true, features = ["io", "hash", "compress"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 md-5 = { workspace = true }
+hmac.workspace = true
+minlz.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-base64.workspace = true
+base64-simd.workspace = true
 sha1.workspace = true
 sha2.workspace = true
-s3s.workspace = true
+xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 hex-simd.workspace = true
 
 [dev-dependencies]
+faster-hex.workspace = true
+rcgen.workspace = true
+tokio-rustls.workspace = true
+temp-env = { workspace = true, features = ["async_closure"] }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-test = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
+proptest = { workspace = true }
 axum = { workspace = true }
+hyper = { workspace = true, features = ["http2", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util = { workspace = true }
+
+[[bench]]
+name = "tee_reader"
+harness = false

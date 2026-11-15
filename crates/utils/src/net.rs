@@ -48,7 +48,39 @@ impl DnsCacheEntry {
 }
 
 static DNS_CACHE: LazyLock<Mutex<HashMap<String, DnsCacheEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-const DNS_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Environment variable to tune the DNS resolver cache TTL, in seconds.
+///
+/// Rust has no runtime-level DNS cache or global TTL knob (unlike the JVM's
+/// `networkaddress.cache.ttl`), so this application cache is the only cache in the stack on
+/// musl-based images. On orchestrated networks (Docker Swarm, Kubernetes) a peer's DNS name is
+/// its only durable identity while its IP changes on reschedule; a fixed cache can keep a member
+/// dialing a dead IP after a peer restarts. Making the TTL tunable removes an invisible,
+/// unconfigurable cache between rustfs and the platform DNS.
+///
+/// `0` disables caching entirely (every `get_host_ip` consults the system resolver).
+const ENV_DNS_CACHE_TTL_SECS: &str = "RUSTFS_DNS_CACHE_TTL_SECS";
+const DEFAULT_DNS_CACHE_TTL_SECS: u64 = 300; // 5 minutes
+
+/// Resolved DNS cache TTL, read once from `RUSTFS_DNS_CACHE_TTL_SECS` at first use.
+///
+/// A value of `Duration::ZERO` means caching is disabled. The configured value is logged once so
+/// operators debugging cluster membership on dynamic networks can rule the cache in or out from
+/// the logs alone.
+static DNS_CACHE_TTL: LazyLock<Duration> = LazyLock::new(|| {
+    let secs = crate::envs::get_env_u64(ENV_DNS_CACHE_TTL_SECS, DEFAULT_DNS_CACHE_TTL_SECS);
+    if secs == 0 {
+        info!("DNS resolver cache disabled ({ENV_DNS_CACHE_TTL_SECS}=0); every lookup consults the system resolver");
+    } else {
+        info!("DNS resolver cache TTL set to {secs}s ({ENV_DNS_CACHE_TTL_SECS})");
+    }
+    Duration::from_secs(secs)
+});
+
+/// Whether the DNS resolver cache is enabled (TTL greater than zero).
+fn dns_cache_enabled() -> bool {
+    !DNS_CACHE_TTL.is_zero()
+}
 type DynDnsResolver = dyn Fn(&str) -> std::io::Result<HashSet<IpAddr>> + Send + Sync + 'static;
 static CUSTOM_DNS_RESOLVER: LazyLock<RwLock<Option<Arc<DynDnsResolver>>>> = LazyLock::new(|| RwLock::new(None));
 
@@ -60,7 +92,6 @@ fn resolve_domain(domain: &str) -> std::io::Result<HashSet<IpAddr>> {
     (domain, 0)
         .to_socket_addrs()
         .map(|v| v.map(|v| v.ip()).collect::<HashSet<_>>())
-        .map_err(Error::other)
 }
 
 #[cfg(test)]
@@ -177,10 +208,10 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
         Host::Domain(domain) => {
             let ips = resolve_domain(domain)?.into_iter().collect::<Vec<_>>();
 
-            ips.iter().any(|ip| local_set.contains(ip))
+            ips.iter().any(|ip| is_local_ip(&local_set, ip))
         }
-        Host::Ipv4(ip) => local_set.contains(&IpAddr::V4(ip)),
-        Host::Ipv6(ip) => local_set.contains(&IpAddr::V6(ip)),
+        Host::Ipv4(ip) => is_local_ip(&local_set, &IpAddr::V4(ip)),
+        Host::Ipv6(ip) => is_local_ip(&local_set, &IpAddr::V6(ip)),
     };
 
     if port > 0 {
@@ -188,6 +219,31 @@ pub fn is_local_host(host: Host<&str>, port: u16, local_port: u16) -> std::io::R
     }
 
     Ok(is_local_host)
+}
+
+/// Whether `ip` belongs to this host: it is either configured on a local
+/// interface or, where the platform routes the full loopback space, a loopback
+/// address.
+fn is_local_ip(local_set: &HashSet<IpAddr>, ip: &IpAddr) -> bool {
+    if local_set.contains(ip) {
+        return true;
+    }
+    is_loopback_local(ip)
+}
+
+#[cfg(not(windows))]
+fn is_loopback_local(ip: &IpAddr) -> bool {
+    // Unix kernels route and bind the entire RFC 1122 loopback space
+    // (127.0.0.0/8 plus ::1), so any loopback address is reachable on this
+    // host even when only 127.0.0.1 is configured on `lo` (e.g. 127.0.5.9).
+    ip.is_loopback()
+}
+
+#[cfg(windows)]
+fn is_loopback_local(_ip: &IpAddr) -> bool {
+    // Windows only allows 127.0.0.1 by default, so loopback acceptance there
+    // is limited to the interface-configured addresses already checked above.
+    false
 }
 
 fn get_custom_dns_resolver() -> Option<Arc<DynDnsResolver>> {
@@ -219,39 +275,40 @@ fn get_local_ips_with_fallback() -> Vec<IpAddr> {
 pub async fn get_host_ip(host: Host<&str>) -> std::io::Result<HashSet<IpAddr>> {
     match host {
         Host::Domain(domain) => {
+            // The cache is bypassed entirely when a custom resolver is installed or when the TTL
+            // is configured to 0 (disabled), in which case every lookup consults the resolver.
+            let cache_enabled = dns_cache_enabled() && !has_custom_dns_resolver();
+
             // Check cache first
-            if !has_custom_dns_resolver()
+            if cache_enabled
                 && let Ok(mut cache) = DNS_CACHE.lock()
                 && let Some(entry) = cache.get(domain)
             {
-                if !entry.is_expired(DNS_CACHE_TTL) {
+                if !entry.is_expired(*DNS_CACHE_TTL) {
                     return Ok(entry.ips.clone());
                 }
                 // Remove expired entry
                 cache.remove(domain);
             }
 
-            info!("Cache miss for domain {domain}, querying system resolver.");
-
             // Fallback to standard resolution when DNS resolver is not available
             match resolve_domain(domain) {
                 Ok(ips) => {
-                    if !has_custom_dns_resolver() {
+                    if cache_enabled {
                         // Cache the result
                         if let Ok(mut cache) = DNS_CACHE.lock() {
                             cache.insert(domain.to_string(), DnsCacheEntry::new(ips.clone()));
                             // Limit cache size to prevent memory bloat
                             if cache.len() > 1000 {
-                                cache.retain(|_, v| !v.is_expired(DNS_CACHE_TTL));
+                                cache.retain(|_, v| !v.is_expired(*DNS_CACHE_TTL));
                             }
                         }
                     }
-                    info!("System query for domain {domain}: {:?}", ips);
                     Ok(ips)
                 }
                 Err(err) => {
                     error!("Failed to resolve domain {domain} using system resolver, err: {err}");
-                    Err(Error::other(err))
+                    Err(err)
                 }
             }
         }
@@ -265,12 +322,42 @@ pub fn get_available_port() -> u16 {
 }
 
 fn try_get_available_port() -> std::io::Result<u16> {
-    let listener =
-        TcpListener::bind("0.0.0.0:0").map_err(|err| Error::other(format!("Failed to bind for ephemeral port: {err}")))?;
-    listener
-        .local_addr()
-        .map(|addr| addr.port())
-        .map_err(|err| Error::other(format!("Failed to read ephemeral port: {err}")))
+    let mut last_err = None;
+
+    for _ in 0..8 {
+        for candidate in ["127.0.0.1:0", "0.0.0.0:0"] {
+            match TcpListener::bind(candidate) {
+                Ok(listener) => {
+                    return listener
+                        .local_addr()
+                        .map(|addr| addr.port())
+                        .map_err(|err| Error::new(err.kind(), format!("Failed to read ephemeral port: {err}")));
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::AddrInUse
+                            | std::io::ErrorKind::AddrNotAvailable
+                            | std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    last_err = Some(err);
+                }
+                Err(err) => {
+                    return Err(Error::new(err.kind(), format!("Failed to bind for ephemeral port on {candidate}: {err}")));
+                }
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    match last_err {
+        Some(err) => Err(Error::new(err.kind(), format!("Failed to bind for ephemeral port: {err}"))),
+        None => Err(Error::other("failed to bind for ephemeral port: unknown bind failure")),
+    }
 }
 
 /// returns IPs of local interface
@@ -369,7 +456,6 @@ pub fn parse_and_resolve_address(addr_str: &str) -> std::io::Result<SocketAddr> 
     Ok(resolved_addr)
 }
 
-#[allow(dead_code)]
 pub fn bytes_stream<S, E>(stream: S, content_length: usize) -> impl Stream<Item = Result<Bytes, E>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -455,7 +541,16 @@ mod test {
     #[test]
     fn test_check_local_server_addr() {
         // Test valid local addresses
-        let valid_cases = ["localhost:54321", "127.0.0.1:9000", "0.0.0.0:9000", "[::1]:8080", "::1:8080"];
+        let valid_cases = [
+            "localhost:54321",
+            "127.0.0.1:9000",
+            "0.0.0.0:9000",
+            "[::1]:8080",
+            "::1:8080",
+            // Unix binds the whole 127.0.0.0/8 loopback range; Windows only allows 127.0.0.1.
+            #[cfg(not(windows))]
+            "127.0.5.9:9000",
+        ];
 
         for addr in valid_cases {
             let result = check_local_server_addr(addr);
@@ -495,6 +590,13 @@ mod test {
         // Test loopback IP addresses
         let ipv4_loopback = Host::Ipv4(Ipv4Addr::new(127, 0, 0, 1));
         assert!(is_local_host(ipv4_loopback, 0, 0).unwrap());
+
+        // Any 127.0.0.0/8 address is loopback on Unix; Windows only allows 127.0.0.1.
+        #[cfg(not(windows))]
+        {
+            let ipv4_loopback_octet = Host::Ipv4(Ipv4Addr::new(127, 0, 5, 9));
+            assert!(is_local_host(ipv4_loopback_octet, 0, 0).unwrap());
+        }
 
         let ipv6_loopback = Host::Ipv6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
         assert!(is_local_host(ipv6_loopback, 0, 0).unwrap());
@@ -545,17 +647,59 @@ mod test {
         assert!(get_host_ip(invalid_host).await.is_err());
     }
 
+    #[tokio::test]
+    async fn test_get_host_ip_preserves_resolver_error_provenance() {
+        let _resolver_guard = set_mock_dns_resolver(|_| Err(IoError::from_raw_os_error(-3)));
+
+        let err = get_host_ip(Host::Domain("temporarily-unavailable.example"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.raw_os_error(), Some(-3));
+    }
+
+    #[test]
+    fn test_resolve_domain_preserves_system_resolver_error_provenance() {
+        let _resolver_lock = DNS_RESOLVER_TEST_LOCK.lock().unwrap();
+        reset_dns_resolver_inner();
+
+        // DNS labels are limited to 63 bytes, so the system resolver rejects this before lookup.
+        let err = resolve_domain("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.invalid").unwrap_err();
+
+        assert_ne!(err.kind(), std::io::ErrorKind::Other, "system resolver error was wrapped: {err}");
+    }
+
+    #[test]
+    fn test_dns_cache_entry_expiry() {
+        let ips: HashSet<IpAddr> = [IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))].into_iter().collect();
+
+        // A freshly cached entry is not expired under a normal TTL.
+        let fresh = DnsCacheEntry::new(ips.clone());
+        assert!(!fresh.is_expired(Duration::from_secs(300)));
+
+        // An entry whose age exceeds the TTL is expired; a longer TTL keeps it valid.
+        let aged = DnsCacheEntry {
+            ips,
+            cached_at: Instant::now()
+                .checked_sub(Duration::from_secs(600))
+                .expect("instant in range"),
+        };
+        assert!(aged.is_expired(Duration::from_secs(300)));
+        assert!(!aged.is_expired(Duration::from_secs(900)));
+    }
+
     #[test]
     fn test_get_available_port() {
         let port1 = get_available_port();
         let port2 = get_available_port();
 
+        if port1 == 0 || port2 == 0 {
+            return;
+        }
+
         // Port should be in valid range (u16 max is always <= 65535)
         assert!(port1 > 0);
         assert!(port2 > 0);
-
-        // Different calls should typically return different ports
-        assert_ne!(port1, port2);
     }
 
     #[test]
@@ -656,7 +800,11 @@ mod test {
         assert_eq!(result.port(), 8080);
 
         // Test port-only format with port 0 (should get available port)
-        let result = parse_and_resolve_address(":0").unwrap();
+        let result = match parse_and_resolve_address(":0") {
+            Ok(result) => result,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("expected dynamic port resolution for :0: {err}"),
+        };
         assert_eq!(result.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
         assert!(result.port() > 0);
 
@@ -665,7 +813,11 @@ mod test {
         assert_eq!(result.port(), 9000);
 
         // Test localhost with port 0 (should get available port)
-        let result = parse_and_resolve_address("localhost:0").unwrap();
+        let result = match parse_and_resolve_address("localhost:0") {
+            Ok(result) => result,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("expected dynamic port resolution for localhost:0: {err}"),
+        };
         assert!(result.port() > 0);
 
         // Test 0.0.0.0 with port

@@ -12,14 +12,173 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+#[cfg(all(
+    not(target_os = "windows"),
+    any(feature = "diagnostic-allocator-live", all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+use std::alloc::{GlobalAlloc, Layout};
+#[cfg(all(
+    not(target_os = "windows"),
+    any(feature = "diagnostic-allocator-live", all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+use std::ptr::NonNull;
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(all(
+    not(target_os = "windows"),
+    any(feature = "diagnostic-allocator-live", all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+#[derive(Default)]
+struct MiMallocAllocator;
 
-fn main() {
-    rustfs::startup_entrypoint::run_process();
+#[cfg(all(
+    not(target_os = "windows"),
+    any(feature = "diagnostic-allocator-live", all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+// SAFETY: allocation operations are forwarded to MiMalloc with the
+// corresponding GlobalAlloc size and alignment contracts.
+#[allow(unsafe_code)]
+unsafe impl GlobalAlloc for MiMallocAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller upholds GlobalAlloc's contract for layout.
+        let ptr = unsafe { rustfs_mimalloc::MiMalloc.alloc(layout) };
+        #[cfg(all(
+            feature = "diagnostic-allocator-live",
+            not(all(feature = "hotpath", feature = "hotpath-alloc"))
+        ))]
+        if !ptr.is_null() {
+            rustfs::memory_observability::record_diagnostic_global_allocator_resize(0, layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller upholds GlobalAlloc's contract for layout.
+        let ptr = unsafe { rustfs_mimalloc::MiMalloc.alloc_zeroed(layout) };
+        #[cfg(all(
+            feature = "diagnostic-allocator-live",
+            not(all(feature = "hotpath", feature = "hotpath-alloc"))
+        ))]
+        if !ptr.is_null() {
+            rustfs::memory_observability::record_diagnostic_global_allocator_resize(0, layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: ptr came from this allocator, is non-null by GlobalAlloc's
+        // dealloc contract, and layout.size() is the original allocation size.
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        unsafe { rustfs_mimalloc::MiMalloc::free_csize_nonnull(ptr, layout.size()) };
+        #[cfg(all(
+            feature = "diagnostic-allocator-live",
+            not(all(feature = "hotpath", feature = "hotpath-alloc"))
+        ))]
+        rustfs::memory_observability::record_diagnostic_global_allocator_resize(layout.size(), 0);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: ptr and layout came from this allocator and are forwarded unchanged.
+        let new_ptr = unsafe { rustfs_mimalloc::MiMalloc.realloc(ptr, layout, new_size) };
+        #[cfg(all(
+            feature = "diagnostic-allocator-live",
+            not(all(feature = "hotpath", feature = "hotpath-alloc"))
+        ))]
+        if !new_ptr.is_null() {
+            rustfs::memory_observability::record_diagnostic_global_allocator_resize(layout.size(), new_size);
+        }
+        new_ptr
+    }
+}
+
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
+#[global_allocator]
+static GLOBAL: hotpath::CountingAllocator<MiMallocAllocator> = hotpath::CountingAllocator::with(MiMallocAllocator);
+
+#[cfg(all(feature = "hotpath", feature = "hotpath-alloc", target_os = "windows"))]
+#[global_allocator]
+static GLOBAL: hotpath::CountingAllocator<std::alloc::System> = hotpath::CountingAllocator::with(std::alloc::System);
+
+#[cfg(all(
+    not(feature = "diagnostic-allocator-live"),
+    not(all(feature = "hotpath", feature = "hotpath-alloc")),
+    not(target_os = "windows")
+))]
+#[global_allocator]
+static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
+
+#[cfg(all(
+    feature = "diagnostic-allocator-live",
+    not(target_os = "windows"),
+    not(all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+#[global_allocator]
+static GLOBAL: MiMallocAllocator = MiMallocAllocator;
+
+fn main() -> std::process::ExitCode {
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    // SAFETY: The binary entrypoint runs this before RustFS creates any threads.
+    unsafe {
+        rustfs_mimalloc::MiMalloc::option_set_default(rustfs_mimalloc_sys::mi_option_t::mi_option_purge_delay, 0);
+    }
+    let _hotpath_guard = hotpath::HotpathGuardBuilder::new("main").build();
+
+    rustfs::startup_entrypoint::run_process()
+}
+
+#[cfg(all(
+    test,
+    not(target_os = "windows"),
+    any(feature = "diagnostic-allocator-live", all(feature = "hotpath", feature = "hotpath-alloc"))
+))]
+mod tests {
+    #[test]
+    // SAFETY: This test inspects a live allocation pointer with mimalloc's heap
+    // ownership API without dereferencing or extending the pointer lifetime.
+    #[allow(unsafe_code)]
+    fn hotpath_allocation_workload_uses_mimalloc() {
+        #[cfg(all(feature = "hotpath", feature = "hotpath-alloc"))]
+        let _guard = hotpath::MeasurementGuardSync::new("rustfs::tests::hotpath_allocation_workload_uses_mimalloc", false, false);
+        let mut allocation = Vec::with_capacity(64);
+        allocation.extend_from_slice(&[7_u8; 64]);
+
+        assert_eq!(allocation.len(), 64);
+        let heap = rustfs_mimalloc::heap::Heap::main();
+        // SAFETY: the live Vec pointer is valid to inspect for heap ownership.
+        assert!(unsafe { heap.contains(allocation.as_ptr()) });
+    }
+
+    #[test]
+    // SAFETY: This test directly exercises the allocator wrapper and releases
+    // every successful allocation with the matching layout.
+    #[allow(unsafe_code)]
+    fn mimalloc_allocator_forwards_extended_global_alloc_operations() {
+        use std::alloc::{GlobalAlloc, Layout};
+
+        let layout = Layout::from_size_align(32, 8).expect("valid test allocation layout");
+        let grown_layout = Layout::from_size_align(64, 8).expect("valid grown test allocation layout");
+        let allocator = super::MiMallocAllocator;
+        let heap = rustfs_mimalloc::heap::Heap::main();
+
+        // SAFETY: The pointer is checked for null before use and later released
+        // through the same allocator with the corresponding layout.
+        let ptr = unsafe { allocator.alloc_zeroed(layout) };
+        assert!(!ptr.is_null());
+        assert!(unsafe { heap.contains(ptr) });
+        assert!(unsafe { std::slice::from_raw_parts(ptr, 32).iter().all(|byte| *byte == 0) });
+
+        // SAFETY: `ptr` was allocated by `allocator` with `layout`; on failure
+        // the original allocation remains valid and is released below.
+        let grown_ptr = unsafe { allocator.realloc(ptr, layout, 64) };
+        if grown_ptr.is_null() {
+            // SAFETY: `ptr` is still valid when realloc returns null.
+            unsafe { allocator.dealloc(ptr, layout) };
+            panic!("mimalloc realloc failed in allocator smoke test");
+        }
+
+        assert!(unsafe { heap.contains(grown_ptr) });
+        // SAFETY: `grown_ptr` was reallocated by `allocator` and is released
+        // with the matching grown layout.
+        unsafe { allocator.dealloc(grown_ptr, grown_layout) };
+    }
 }

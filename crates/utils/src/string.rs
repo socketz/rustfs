@@ -32,10 +32,10 @@ use std::sync::LazyLock;
 /// let false_values = ["0", "f", "F", "false", "FALSE", "False", "off", "OFF", "Off", "disabled"];
 ///
 /// for val in true_values.iter() {
-///     assert_eq!(parse_bool(val).unwrap(), true);
+///     assert_eq!(parse_bool(val).expect("operation should succeed"), true);
 /// }
 /// for val in false_values.iter() {
-///     assert_eq!(parse_bool(val).unwrap(), false);
+///     assert_eq!(parse_bool(val).expect("operation should succeed"), false);
 /// }
 /// ```
 ///
@@ -236,7 +236,8 @@ pub fn match_as_pattern_prefix(pattern: &str, text: &str) -> bool {
     text.len() <= pattern.len()
 }
 
-static ELLIPSES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(.*)(\{[0-9A-Fa-f]*\.\.\.[0-9A-Fa-f]*\})(.*)").unwrap());
+static ELLIPSES_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(.*)(\{[0-9A-Fa-f]*\.\.\.[0-9A-Fa-f]*\})(.*)").expect("operation should succeed"));
 
 /// Ellipses constants
 const OPEN_BRACES: &str = "{";
@@ -351,7 +352,7 @@ impl ArgPattern {
 /// use rustfs_utils::string::find_ellipses_patterns;
 ///
 /// let pattern = "http://rustfs{2...3}/export/set{1...64}";
-/// let arg_pattern = find_ellipses_patterns(pattern).unwrap();
+/// let arg_pattern = find_ellipses_patterns(pattern).expect("operation should succeed");
 /// assert_eq!(arg_pattern.total_sizes(), 128);
 /// ```
 pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
@@ -359,7 +360,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
         Some(caps) => caps,
         None => {
             return Err(Error::other(format!(
-                "Invalid ellipsis format in ({arg}), Ellipsis range must be provided in format {{N...M}} where N and M are decimal or hexadecimal positive integers, M must be greater than N, with a maximum expanded range size of {MAX_ELLIPSES_RANGE_SIZE}"
+                "Invalid ellipsis format. Ellipsis range must be provided in format {{N...M}} where N and M are decimal or hexadecimal positive integers, M must be greater than N, with a maximum expanded range size of {MAX_ELLIPSES_RANGE_SIZE}"
             )));
         }
     };
@@ -398,7 +399,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
             || p.suffix.contains(CLOSE_BRACES)
         {
             return Err(Error::other(format!(
-                "Invalid ellipsis format in ({arg}), Ellipsis range must be provided in format {{N...M}} where N and M are decimal or hexadecimal positive integers, M must be greater than N, with a maximum expanded range size of {MAX_ELLIPSES_RANGE_SIZE}"
+                "Invalid ellipsis format. Ellipsis range must be provided in format {{N...M}} where N and M are decimal or hexadecimal positive integers, M must be greater than N, with a maximum expanded range size of {MAX_ELLIPSES_RANGE_SIZE}"
             )));
         }
     }
@@ -442,10 +443,7 @@ pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
         }
 
         // Bare `...` without braces (e.g. "1...64") is still an ellipsis attempt.
-        if v.contains(ELLIPSES) {
-            return true;
-        }
-        false
+        v.contains(ELLIPSES)
     })
 }
 
@@ -469,7 +467,7 @@ pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
 /// ```no_run
 /// use rustfs_utils::string::parse_ellipses_range;
 ///
-/// let range = parse_ellipses_range("{1...5}").unwrap();
+/// let range = parse_ellipses_range("{1...5}").expect("operation should succeed");
 /// assert_eq!(range, vec!["1", "2", "3", "4", "5"]);
 /// ```
 ///
@@ -935,6 +933,15 @@ mod tests {
     fn test_find_ellipses_patterns_error_mentions_hex_ranges() {
         let err = find_ellipses_patterns("{1..64}").unwrap_err();
         assert!(err.to_string().contains("decimal or hexadecimal"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn test_find_ellipses_patterns_leftover_brace_error_does_not_echo_input() {
+        let err = find_ellipses_patterns("http://:brace-secret@server/{1...2}}").unwrap_err();
+        assert!(
+            !err.to_string().contains("brace-secret"),
+            "ellipsis error leaked endpoint credentials: {err}"
+        );
     }
 
     #[test]

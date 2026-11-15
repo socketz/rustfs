@@ -17,7 +17,37 @@ use rustfs_credentials::Credentials;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use time::OffsetDateTime;
 use tracing::{debug, info};
+
+/// Proof that [`KeystoneAuthProvider::authenticate_with_token_and_proof`] validated a token: the
+/// fields are private and nothing else in or outside this crate builds one. Carries the user id
+/// and the expiry, never the token; deliberately neither `Clone` nor `Debug`.
+///
+/// ```compile_fail,E0451
+/// let _ = rustfs_keystone::ValidatedKeystoneToken {
+///     user_id: String::new(),
+///     expires_at: time::OffsetDateTime::UNIX_EPOCH,
+/// };
+/// ```
+pub struct ValidatedKeystoneToken {
+    user_id: String,
+    expires_at: OffsetDateTime,
+}
+
+impl ValidatedKeystoneToken {
+    /// The Keystone user id the token was issued to.
+    #[must_use]
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    /// The token's expiry as Keystone reported it.
+    #[must_use]
+    pub fn expires_at(&self) -> OffsetDateTime {
+        self.expires_at
+    }
+}
 
 /// Keystone authentication provider
 ///
@@ -49,13 +79,20 @@ impl KeystoneAuthProvider {
 
     /// Authenticate using Keystone token (X-Auth-Token header)
     pub async fn authenticate_with_token(&self, token: &str) -> Result<Credentials> {
+        self.authenticate_with_token_and_proof(token)
+            .await
+            .map(|(credentials, _)| credentials)
+    }
+
+    /// [`Self::authenticate_with_token`], together with the proof of that validation.
+    pub async fn authenticate_with_token_and_proof(&self, token: &str) -> Result<(Credentials, ValidatedKeystoneToken)> {
         // Check cache first
         if self.enable_cache
             && let Some(cached_token) = self.token_cache.get(token).await
             && !cached_token.is_expired()
         {
             debug!("Token cache hit: user_id={}", cached_token.user_id);
-            return Ok(self.keystone_token_to_credentials(&cached_token));
+            return Ok(self.validated(&cached_token));
         }
 
         if self.enable_cache {
@@ -82,7 +119,26 @@ impl KeystoneAuthProvider {
             keystone_token.username, keystone_token.project_name
         );
 
-        Ok(self.keystone_token_to_credentials(&keystone_token))
+        Ok(self.validated(&keystone_token))
+    }
+
+    fn validated(&self, token: &KeystoneToken) -> (Credentials, ValidatedKeystoneToken) {
+        let proof = ValidatedKeystoneToken {
+            user_id: token.user_id.clone(),
+            expires_at: token.expires_at,
+        };
+        (self.keystone_token_to_credentials(token), proof)
+    }
+
+    /// Revalidate a long-lived subscription directly with Keystone, bypassing
+    /// the request cache so token revocation terminates an existing stream.
+    /// Returns the same authentication and expiry errors as a new token login.
+    pub async fn revalidate_subscription_token(&self, token: &str) -> Result<Credentials> {
+        let validated = self.client.validate_token(token).await?;
+        if validated.is_expired() {
+            return Err(KeystoneError::TokenExpired);
+        }
+        Ok(self.keystone_token_to_credentials(&validated))
     }
 
     /// Authenticate using EC2 credentials (S3 API with AWS SigV4)
@@ -120,24 +176,14 @@ impl KeystoneAuthProvider {
     }
 
     /// Convert EC2 credential to Keystone token
-    async fn ec2_to_keystone_token(&self, ec2_cred: &EC2Credential) -> Result<KeystoneToken> {
-        // In a real implementation, you'd need to:
-        // 1. Use admin credentials to get user/project details
-        // 2. Or maintain a mapping table
-        // For simplicity, construct a minimal token
-
-        Ok(KeystoneToken {
-            token: String::new(),
-            user_id: ec2_cred.user_id.clone(),
-            username: ec2_cred.user_id.clone(), // Use user_id as username
-            project_id: ec2_cred.project_id.clone(),
-            project_name: ec2_cred.project_id.clone(),
-            domain_id: None,
-            domain_name: None,
-            roles: vec!["Member".to_string()], // Default role
-            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(24),
-            issued_at: time::OffsetDateTime::now_utc(),
-        })
+    ///
+    /// Fails closed. A correct implementation must resolve the full identity
+    /// (user, project, roles, expiry) from Keystone using admin credentials or
+    /// a trusted mapping. It must never fabricate roles or derive identity from
+    /// client-supplied input. Until that is modeled against a live server, this
+    /// path refuses to mint a token.
+    async fn ec2_to_keystone_token(&self, _ec2_cred: &EC2Credential) -> Result<KeystoneToken> {
+        Err(KeystoneError::Ec2AuthUnsupported)
     }
 
     /// Convert Keystone token to RustFS credentials
@@ -236,6 +282,7 @@ mod tests {
             None,
             "Default".to_string(),
             true,
+            Duration::from_secs(30),
         );
 
         let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60), true);
@@ -275,6 +322,7 @@ mod tests {
             None,
             "Default".to_string(),
             true,
+            Duration::from_secs(30),
         );
 
         let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60), true);
@@ -290,5 +338,35 @@ mod tests {
 
         cred.groups = Some(vec!["Admin".to_string()]);
         assert!(provider.is_admin(&cred));
+    }
+
+    #[tokio::test]
+    async fn test_ec2_authentication_fails_closed() {
+        // The EC2/SigV4 path must never fabricate an identity from client input.
+        // It must fail closed rather than produce credentials.
+        let client = KeystoneClient::new(
+            "http://localhost:5000".to_string(),
+            crate::KeystoneVersion::V3,
+            None,
+            None,
+            None,
+            "Default".to_string(),
+            true,
+            Duration::from_secs(30),
+        );
+
+        let provider = KeystoneAuthProvider::new(client, 100, Duration::from_secs(60), true).without_cache();
+
+        // A `:`-bearing access key previously shaped user_id/project_id. It must
+        // no longer produce any credentials.
+        let result = provider
+            .authenticate_with_ec2("attacker:admin-project", "sig", "string-to-sign")
+            .await;
+
+        assert!(result.is_err(), "EC2 auth must not return fabricated credentials");
+        assert!(
+            matches!(result, Err(KeystoneError::Ec2AuthUnsupported)),
+            "EC2 auth must fail closed with Ec2AuthUnsupported"
+        );
     }
 }

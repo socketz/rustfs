@@ -13,30 +13,28 @@
 // limitations under the License.
 
 use super::iam_error::iam_error_to_s3_error;
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::{
+    admin::runtime_sources::current_action_credentials,
     admin::{
-        auth::validate_admin_request,
+        auth::authorize_admin_envelope,
         handlers::site_replication::site_replication_iam_change_hook,
-        router::{AdminOperation, Operation, S3Router},
+        router::{AdminOperation, S3Router},
         utils::has_space_be,
     },
-    auth::{check_key_valid, constant_time_eq, get_session_token},
-    server::{ADMIN_PREFIX, RemoteAddr},
+    auth::constant_time_eq,
+    server::ADMIN_PREFIX,
 };
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use percent_encoding::percent_decode_str;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user};
 use rustfs_madmin::{GroupAddRemove, GroupStatus, SITE_REPL_API_VERSION, SRGroupInfo, SRIAMItem};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{
-    Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
-    header::{CONTENT_LENGTH, CONTENT_TYPE},
-    s3_error,
-};
+use rustfs_s3_types::{Body, S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::Deserialize;
 use serde_urlencoded::from_bytes;
 use tracing::warn;
@@ -88,7 +86,7 @@ pub struct GroupQuery {
 pub struct ListGroups {}
 #[async_trait::async_trait]
 impl Operation for ListGroups {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         warn!(
             event = EVENT_ADMIN_GROUP_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -98,24 +96,13 @@ impl Operation for ListGroups {
             "admin group state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::ListGroupsAdminAction)]).await?;
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ListGroupsAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
-
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -135,16 +122,16 @@ impl Operation for ListGroups {
         let body = serde_json::to_vec(&groups).map_err(|e| s3_error!(InternalError, "failed to serialize response: {:?}", e))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), header))
     }
 }
 
 pub struct GetGroup {}
 #[async_trait::async_trait]
 impl Operation for GetGroup {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         warn!(
             event = EVENT_ADMIN_GROUP_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -154,25 +141,14 @@ impl Operation for GetGroup {
             "admin group state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::GetGroupAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::GetGroupAdminAction)]).await?;
 
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: GroupQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
@@ -180,7 +156,7 @@ impl Operation for GetGroup {
                 GroupQuery::default()
             }
         };
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -201,9 +177,9 @@ impl Operation for GetGroup {
         let body = serde_json::to_vec(&g).map_err(|e| s3_error!(InternalError, "failed to serialize response: {:?}", e))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
-        Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::from(body), header))
     }
 }
 
@@ -227,7 +203,7 @@ impl Operation for GetGroup {
 pub struct DeleteGroup {}
 #[async_trait::async_trait]
 impl Operation for DeleteGroup {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         warn!(
             event = EVENT_ADMIN_GROUP_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -237,26 +213,15 @@ impl Operation for DeleteGroup {
             "admin group state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::RemoveUserFromGroupAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::RemoveUserFromGroupAdminAction)]).await?;
 
         let group = decode_delete_group_name(&params)?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -317,9 +282,9 @@ impl Operation for DeleteGroup {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::empty(), header))
     }
 }
 
@@ -353,7 +318,7 @@ fn decode_delete_group_name<'a>(params: &'a Params<'_, '_>) -> S3Result<std::bor
 pub struct SetGroupStatus {}
 #[async_trait::async_trait]
 impl Operation for SetGroupStatus {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         warn!(
             event = EVENT_ADMIN_GROUP_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -363,25 +328,14 @@ impl Operation for SetGroupStatus {
             "admin group state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::EnableGroupAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(AdminAction::EnableGroupAdminAction)]).await?;
 
         let query = {
-            if let Some(query) = req.uri.query() {
+            if let Some(query) = req.uri().query() {
                 let input: GroupQuery =
                     from_bytes(query.as_bytes()).map_err(|_e| s3_error!(InvalidArgument, "failed to decode query"))?;
                 input
@@ -394,7 +348,7 @@ impl Operation for SetGroupStatus {
             return Err(s3_error!(InvalidArgument, "group is required"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -469,16 +423,16 @@ impl Operation for SetGroupStatus {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::empty(), header))
     }
 }
 
 pub struct UpdateGroupMembers {}
 #[async_trait::async_trait]
 impl Operation for UpdateGroupMembers {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: AdminRequest, _params: Params<'_, '_>) -> S3Result<AdminResponse> {
         warn!(
             event = EVENT_ADMIN_GROUP_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -488,24 +442,20 @@ impl Operation for UpdateGroupMembers {
             "admin group state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials().is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::AddUserToGroupAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        authorize_admin_envelope(
+            req.envelope(),
+            vec![
+                Action::AdminAction(AdminAction::AddUserToGroupAdminAction),
+                Action::AdminAction(AdminAction::RemoveUserFromGroupAdminAction),
+            ],
         )
         .await?;
 
-        let mut input = req.input;
+        let mut input = req.take_body();
         let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
@@ -525,6 +475,13 @@ impl Operation for UpdateGroupMembers {
         let args: GroupAddRemove = serde_json::from_slice(&body)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid JSON: {e}")))?;
 
+        let action = if args.is_remove {
+            AdminAction::RemoveUserFromGroupAdminAction
+        } else {
+            AdminAction::AddUserToGroupAdminAction
+        };
+        authorize_admin_envelope(req.envelope(), vec![Action::AdminAction(action)]).await?;
+
         warn!(
             event = EVENT_ADMIN_GROUP_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -537,7 +494,7 @@ impl Operation for UpdateGroupMembers {
             "admin group state"
         );
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -551,7 +508,7 @@ impl Operation for UpdateGroupMembers {
                         ));
                     }
 
-                    get_global_action_cred()
+                    current_action_credentials()
                         .map(|cred| {
                             if constant_time_eq(&cred.access_key, member) {
                                 return Err(S3Error::with_message(
@@ -619,7 +576,7 @@ impl Operation for UpdateGroupMembers {
                 && is_err_no_such_group(&err)
                 && has_space_be(&args.group)
             {
-                return Err(s3_error!(InvalidArgument, "group not found"));
+                return Err(s3_error!(InvalidArgument, "group name contains whitespace"));
             }
 
             iam_store
@@ -664,16 +621,34 @@ impl Operation for UpdateGroupMembers {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
-        Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
+        Ok(AdminResponse::with_headers(StatusCode::OK, Body::empty(), header))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Uri;
     use matchit::Router;
+
+    fn credential_less_request(method: Method, uri: &'static str) -> AdminRequest {
+        crate::admin::operation::test_support::TestRequest::new(method, Uri::from_static(uri))
+            .headers(HeaderMap::new())
+            .extensions(http::Extensions::new())
+            .body(Body::empty())
+            .build()
+    }
+
+    async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str) {
+        let err = operation
+            .call(credential_less_request(method, uri), Params::new())
+            .await
+            .expect_err("a group admin request without credentials must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
 
     fn with_delete_group_params<T>(path: &str, f: impl FnOnce(&Params<'_, '_>) -> T) -> T {
         let mut router = Router::new();
@@ -726,5 +701,198 @@ mod tests {
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("group name contains invalid characters"));
+    }
+
+    #[tokio::test]
+    async fn group_handlers_keep_their_missing_credentials_response() {
+        assert_missing_credentials(&ListGroups {}, Method::GET, "/rustfs/admin/v3/groups").await;
+        assert_missing_credentials(&GetGroup {}, Method::GET, "/rustfs/admin/v3/group").await;
+        assert_missing_credentials(&DeleteGroup {}, Method::DELETE, "/rustfs/admin/v3/group/dev").await;
+        assert_missing_credentials(&SetGroupStatus {}, Method::PUT, "/rustfs/admin/v3/set-group-status").await;
+        assert_missing_credentials(&UpdateGroupMembers {}, Method::PUT, "/rustfs/admin/v3/update-group-members").await;
+    }
+
+    fn source_block<'a>(production: &'a str, marker: &str) -> &'a str {
+        let block = production
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("{marker} should exist"))
+            .1;
+        let end = ["\npub struct ", "\nasync fn ", "\npub(crate) async fn ", "\n#[cfg(test)]"]
+            .into_iter()
+            .filter_map(|boundary| block.find(boundary))
+            .min()
+            .unwrap_or(block.len());
+        &block[..end]
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn group_members_handler_enforces_add_and_remove_permissions() {
+        use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+        use rustfs_iam::store::{Store as _, UserType, object::ObjectStore};
+        use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+        use rustfs_policy::policy::Policy;
+        use std::sync::Arc;
+
+        struct ReadyIam(Arc<rustfs_iam::sys::IamSys<ObjectStore>>);
+        impl IamInterface for ReadyIam {
+            fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<ObjectStore>> {
+                Arc::clone(&self.0)
+            }
+            fn is_ready(&self) -> bool {
+                true
+            }
+        }
+        struct TestKms;
+        impl KmsInterface for TestKms {
+            fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                Arc::new(rustfs_kms::KmsServiceManager::new())
+            }
+        }
+
+        let (_directory, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        ObjectStore::new(store.clone())
+            .save_iam_config(
+                serde_json::json!({"version": 1}),
+                format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+            )
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(store.clone()).await.expect("initialize IAM");
+        for key in ["group-adder", "group-remover", "group-member"] {
+            iam.create_user(
+                key,
+                &AddOrUpdateUserReq {
+                    secret_key: "group-user-secret".to_owned(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create group test user");
+        }
+        for (key, allow, deny) in [
+            ("group-adder", "admin:AddUserToGroup", "admin:RemoveUserFromGroup"),
+            ("group-remover", "admin:RemoveUserFromGroup", "admin:AddUserToGroup"),
+        ] {
+            let document = serde_json::json!({"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": [allow]}, {"Effect": "Deny", "Action": [deny]}
+            ]});
+            iam.set_policy(
+                key,
+                Policy::parse_config(&serde_json::to_vec(&document).expect("policy JSON")).expect("parse policy"),
+            )
+            .await
+            .expect("store delegated policy");
+            iam.policy_db_set(key, UserType::Reg, false, key)
+                .await
+                .expect("attach delegated policy");
+        }
+        iam.add_users_to_group("guardrail", vec!["group-member".to_owned()])
+            .await
+            .expect("seed protected group");
+        let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(Arc::clone(&iam))), Arc::new(TestKms)));
+        assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+            access_key: "group-test-root".to_owned(),
+            secret_key: "group-root-secret".to_owned(),
+            status: "on".to_owned(),
+            ..Default::default()
+        }));
+        publish_test_app_context(context);
+
+        for (key, remove, allowed) in [
+            ("group-adder", true, false),
+            ("group-remover", false, false),
+            ("group-remover", true, true),
+            ("group-adder", false, true),
+        ] {
+            let before = iam
+                .get_group_description("guardrail")
+                .await
+                .expect("read original membership")
+                .members;
+            let req = crate::admin::operation::test_support::TestRequest::new(
+                Method::PUT,
+                Uri::from_static("/rustfs/admin/v3/update-group-members"),
+            )
+            .credentials(key, "group-user-secret", None)
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "group": "guardrail", "members": ["group-member"], "groupStatus": "enabled", "isRemove": remove
+                }))
+                .expect("group update JSON"),
+            )
+            .build();
+            let result = UpdateGroupMembers {}.call(req, Params::new()).await;
+            let after = iam
+                .get_group_description("guardrail")
+                .await
+                .expect("read resulting membership")
+                .members;
+            if allowed {
+                result.expect("matching delegated action permits the mutation");
+                assert_eq!(after.contains(&"group-member".to_owned()), !remove);
+            } else {
+                let error = result.expect_err("the opposite action must not authorize the mutation");
+                assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(after, before, "a rejected mutation must preserve the group");
+            }
+        }
+    }
+
+    #[test]
+    fn update_group_members_authorizes_the_decoded_mutation() {
+        let source = include_str!("group.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source");
+        let handler = source_block(source, "impl Operation for UpdateGroupMembers");
+        assert_eq!(handler.matches("authorize_admin_envelope(").count(), 2);
+        let decoded = handler
+            .find("let args: GroupAddRemove")
+            .expect("decode request before choosing action");
+        let action = handler
+            .find("let action = if args.is_remove")
+            .expect("body controls requested action");
+        let gate = handler.rfind("authorize_admin_envelope(").expect("mutation authorization");
+        assert!(decoded < action && action < gate);
+        assert!(handler[action..gate].contains("AdminAction::RemoveUserFromGroupAdminAction"));
+        assert!(handler[action..gate].contains("AdminAction::AddUserToGroupAdminAction"));
+        for mutation in [".remove_users_from_group(", ".add_users_to_group("] {
+            assert!(gate < handler.find(mutation).expect("group mutation"));
+        }
+    }
+
+    #[test]
+    fn group_handlers_use_the_shared_admin_gate_with_their_actions() {
+        let production = include_str!("group.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+
+        for (handler, action) in [
+            ("ListGroups", "ListGroupsAdminAction"),
+            ("GetGroup", "GetGroupAdminAction"),
+            ("DeleteGroup", "RemoveUserFromGroupAdminAction"),
+            ("SetGroupStatus", "EnableGroupAdminAction"),
+        ] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert_eq!(
+                block.matches("authorize_admin_envelope(").count(),
+                1,
+                "{handler} must use exactly one shared gate"
+            );
+            assert_eq!(
+                block.matches("Action::AdminAction(").count(),
+                1,
+                "{handler} must request exactly one admin action"
+            );
+            assert!(
+                block.contains(&format!("AdminAction::{action}")),
+                "{handler} must authorize with {action}"
+            );
+        }
+
+        assert!(!production.contains("check_key_valid(get_session_token"));
     }
 }

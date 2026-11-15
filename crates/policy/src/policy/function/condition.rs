@@ -21,6 +21,7 @@ use time::OffsetDateTime;
 
 use super::key_name::KeyName;
 use super::{addr::AddrFunc, binary::BinaryFunc, bool_null::BoolFunc, date::DateFunc, number::NumberFunc, string::StringFunc};
+use crate::policy::function::Quantifier;
 
 #[derive(Clone, Deserialize, Debug)]
 pub enum Condition {
@@ -60,6 +61,11 @@ pub enum Condition {
 
 impl Condition {
     pub fn from_deserializer<'a, D: MapAccess<'a>>(key: &str, d: &mut D) -> Result<Self, D::Error> {
+        // Two suffixes are retained for existing serialized policies. Bound the
+        // chain before parsing so Clone, evaluation and Drop stay bounded too.
+        if key.ends_with("IfExistsIfExistsIfExists") {
+            return Err(Error::custom("condition operator has too many IfExists suffixes"));
+        }
         Ok(match key {
             "StringEquals" => Self::StringEquals(d.next_value()?),
             "StringNotEquals" => Self::StringNotEquals(d.next_value()?),
@@ -139,6 +145,39 @@ impl Condition {
         }
     }
 
+    pub fn key_names(&self) -> Vec<String> {
+        use Condition::*;
+        match self {
+            StringEquals(s)
+            | StringNotEquals(s)
+            | StringEqualsIgnoreCase(s)
+            | StringNotEqualsIgnoreCase(s)
+            | StringLike(s)
+            | StringNotLike(s)
+            | ArnLike(s)
+            | ArnNotLike(s)
+            | ArnEquals(s)
+            | ArnNotEquals(s) => s.key_names().collect(),
+            BinaryEquals(s) => s.key_names().collect(),
+            IpAddress(s) | NotIpAddress(s) => s.key_names().collect(),
+            Null(s) | Bool(s) => s.key_names().collect(),
+            NumericEquals(s)
+            | NumericNotEquals(s)
+            | NumericLessThan(s)
+            | NumericLessThanEquals(s)
+            | NumericGreaterThan(s)
+            | NumericGreaterThanIfExists(s)
+            | NumericGreaterThanEquals(s) => s.key_names().collect(),
+            DateEquals(s)
+            | DateNotEquals(s)
+            | DateLessThan(s)
+            | DateLessThanEquals(s)
+            | DateGreaterThan(s)
+            | DateGreaterThanEquals(s) => s.key_names().collect(),
+            IfExists(inner) => inner.key_names(),
+        }
+    }
+
     pub fn has_any_key_in(&self, values: &HashMap<String, Vec<String>>) -> bool {
         use Condition::*;
         match self {
@@ -207,7 +246,7 @@ impl Condition {
 
     pub fn evaluate_with_resolver<'a>(
         &'a self,
-        for_all: bool,
+        quantifier: Quantifier,
         values: &'a HashMap<String, Vec<String>>,
         resolver: Option<&'a dyn PolicyVariableResolver>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
@@ -215,39 +254,69 @@ impl Condition {
             use Condition::*;
 
             let r = match self {
-                StringEquals(s) => s.evaluate_with_resolver(for_all, false, false, false, values, resolver).await,
-                StringNotEquals(s) => s.evaluate_with_resolver(for_all, false, false, true, values, resolver).await,
-                StringEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, false, values, resolver).await,
-                StringNotEqualsIgnoreCase(s) => s.evaluate_with_resolver(for_all, true, false, true, values, resolver).await,
-                StringLike(s) => s.evaluate_with_resolver(for_all, false, true, false, values, resolver).await,
-                StringNotLike(s) => s.evaluate_with_resolver(for_all, false, true, true, values, resolver).await,
-                ArnLike(s) => s.evaluate_with_resolver(for_all, false, true, false, values, resolver).await,
-                ArnNotLike(s) => s.evaluate_with_resolver(for_all, false, true, true, values, resolver).await,
-                ArnEquals(s) => s.evaluate_with_resolver(for_all, false, false, false, values, resolver).await,
-                ArnNotEquals(s) => s.evaluate_with_resolver(for_all, false, false, true, values, resolver).await,
+                StringEquals(s) => {
+                    s.evaluate_with_resolver(quantifier, false, false, false, values, resolver)
+                        .await
+                }
+                StringNotEquals(s) => {
+                    s.evaluate_with_resolver(quantifier, false, false, true, values, resolver)
+                        .await
+                }
+                StringEqualsIgnoreCase(s) => {
+                    s.evaluate_with_resolver(quantifier, true, false, false, values, resolver)
+                        .await
+                }
+                StringNotEqualsIgnoreCase(s) => {
+                    s.evaluate_with_resolver(quantifier, true, false, true, values, resolver)
+                        .await
+                }
+                StringLike(s) => {
+                    s.evaluate_with_resolver(quantifier, false, true, false, values, resolver)
+                        .await
+                }
+                StringNotLike(s) => {
+                    s.evaluate_with_resolver(quantifier, false, true, true, values, resolver)
+                        .await
+                }
+                ArnLike(s) => {
+                    s.evaluate_with_resolver(quantifier, false, true, false, values, resolver)
+                        .await
+                }
+                ArnNotLike(s) => {
+                    s.evaluate_with_resolver(quantifier, false, true, true, values, resolver)
+                        .await
+                }
+                ArnEquals(s) => {
+                    s.evaluate_with_resolver(quantifier, false, false, false, values, resolver)
+                        .await
+                }
+                ArnNotEquals(s) => {
+                    s.evaluate_with_resolver(quantifier, false, false, true, values, resolver)
+                        .await
+                }
                 BinaryEquals(s) => s.evaluate(values),
                 IpAddress(s) => s.evaluate(values),
                 NotIpAddress(s) => s.evaluate(values),
                 Null(s) => s.evaluate_null(values),
                 Bool(s) => s.evaluate_bool(values),
                 NumericEquals(s) => s.evaluate(i64::eq, false, values),
-                NumericNotEquals(s) => s.evaluate(i64::ne, false, values),
+                NumericNotEquals(s) => s.evaluate(i64::ne, true, values),
                 NumericLessThan(s) => s.evaluate(i64::lt, false, values),
                 NumericLessThanEquals(s) => s.evaluate(i64::le, false, values),
                 NumericGreaterThan(s) => s.evaluate(i64::gt, false, values),
                 NumericGreaterThanIfExists(s) => s.evaluate(i64::ge, true, values),
                 NumericGreaterThanEquals(s) => s.evaluate(i64::ge, false, values),
-                DateEquals(s) => s.evaluate(OffsetDateTime::eq, values),
-                DateNotEquals(s) => s.evaluate(OffsetDateTime::ne, values),
-                DateLessThan(s) => s.evaluate(OffsetDateTime::lt, values),
-                DateLessThanEquals(s) => s.evaluate(OffsetDateTime::le, values),
-                DateGreaterThan(s) => s.evaluate(OffsetDateTime::gt, values),
-                DateGreaterThanEquals(s) => s.evaluate(OffsetDateTime::ge, values),
+                DateEquals(s) => s.evaluate(OffsetDateTime::eq, false, values),
+                DateNotEquals(s) => s.evaluate(OffsetDateTime::ne, true, values),
+                DateLessThan(s) => s.evaluate(OffsetDateTime::lt, false, values),
+                DateLessThanEquals(s) => s.evaluate(OffsetDateTime::le, false, values),
+                DateGreaterThan(s) => s.evaluate(OffsetDateTime::gt, false, values),
+                DateGreaterThanEquals(s) => s.evaluate(OffsetDateTime::ge, false, values),
                 IfExists(inner) => {
                     if !inner.has_any_key_in(values) {
                         return true;
                     }
-                    return inner.evaluate_with_resolver(for_all, values, resolver).await;
+                    return inner.evaluate_with_resolver(quantifier, values, resolver).await;
                 }
             };
 
@@ -375,7 +444,7 @@ mod tests {
 
         // "AES256" != "aws:kms" is true, so StringNotEquals should evaluate to true
         assert!(
-            cond.evaluate_with_resolver(false, &values, None).await,
+            cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "StringNotEquals should be true when values differ"
         );
 
@@ -383,7 +452,7 @@ mod tests {
 
         // "aws:kms" != "aws:kms" is false, so StringNotEquals should evaluate to false
         assert!(
-            !cond.evaluate_with_resolver(false, &values, None).await,
+            !cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "StringNotEquals should be false when values match"
         );
     }
@@ -396,14 +465,14 @@ mod tests {
         values.insert("x-amz-server-side-encryption".to_string(), vec!["aws:kms".to_string()]);
 
         assert!(
-            cond.evaluate_with_resolver(false, &values, None).await,
+            cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "StringEquals should be true when values match"
         );
 
         values.insert("x-amz-server-side-encryption".to_string(), vec!["AES256".to_string()]);
 
         assert!(
-            !cond.evaluate_with_resolver(false, &values, None).await,
+            !cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "StringEquals should be false when values differ"
         );
     }
@@ -417,7 +486,7 @@ mod tests {
         // Key absent: rvalues is empty, intersection is empty.
         // for_all=false: ivalues.count() > 0 → false. Negated → true.
         assert!(
-            cond.evaluate_with_resolver(false, &values, None).await,
+            cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "StringNotEquals should be true when key is absent"
         );
     }
@@ -456,6 +525,31 @@ mod tests {
     }
 
     #[test]
+    fn repeated_if_exists_suffixes_are_rejected_before_recursion() {
+        for count in [3, 10_000] {
+            let key = format!("StringEquals{}", "IfExists".repeat(count));
+            let document = serde_json::json!({key: {"s3:x-amz-server-side-encryption": "aws:kms"}});
+            let result = serde_json::from_slice::<Functions>(&serde_json::to_vec(&document).expect("serialize condition"));
+            assert!(result.is_err(), "{count} suffixes must be rejected without constructing a deep chain");
+        }
+    }
+
+    #[tokio::test]
+    async fn numeric_and_date_not_equals_match_absent_keys() {
+        for (operator, key, value, absent) in [
+            ("NumericNotEquals", "s3:max-keys", "30", true),
+            ("NumericEquals", "s3:max-keys", "30", false),
+            ("DateNotEquals", "s3:object-lock-retain-until-date", "2030-01-01T00:00:00Z", true),
+            ("DateEquals", "s3:object-lock-retain-until-date", "2030-01-01T00:00:00Z", false),
+        ] {
+            let document = serde_json::json!({operator: {key: value}});
+            let functions: Functions =
+                serde_json::from_slice(&serde_json::to_vec(&document).expect("serialize condition")).expect("parse condition");
+            assert_eq!(functions.evaluate(&HashMap::new()).await, absent, "{operator}");
+        }
+    }
+
+    #[test]
     fn test_nested_if_exists_serde_round_trip() {
         // Verifies that nested IfExists(IfExists(StringEquals)) serializes with the
         // correct key and round-trips through serde without data loss.
@@ -482,7 +576,7 @@ mod tests {
 
         let values = HashMap::new();
         assert!(
-            cond.evaluate_with_resolver(false, &values, None).await,
+            cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "IfExists should return true when the key is absent"
         );
     }
@@ -496,14 +590,14 @@ mod tests {
         values.insert("x-amz-server-side-encryption".to_string(), vec!["aws:kms".to_string()]);
 
         assert!(
-            cond.evaluate_with_resolver(false, &values, None).await,
+            cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "IfExists should delegate to inner and return true when values match"
         );
 
         values.insert("x-amz-server-side-encryption".to_string(), vec!["AES256".to_string()]);
 
         assert!(
-            !cond.evaluate_with_resolver(false, &values, None).await,
+            !cond.evaluate_with_resolver(Quantifier::None, &values, None).await,
             "IfExists should delegate to inner and return false when values differ"
         );
     }

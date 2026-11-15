@@ -28,20 +28,46 @@ documentation = "https://docs.rs/rustfs-rio-v2/latest/rustfs_rio_v2/"
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "rustfs-rio/hotpath",
+    "rustfs-utils/hotpath",
+    "rustfs-filemeta/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-rio/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+    "rustfs-filemeta/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-rio/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+    "rustfs-filemeta/hotpath-cpu",
+]
+
 [dependencies]
-aes-gcm.workspace = true
-bytes.workspace = true
-hex.workspace = true
+hotpath.workspace = true
+aes-gcm = { workspace = true, features = ["rand_core"] }
+bytes = { workspace = true, features = ["serde"] }
+chacha20poly1305.workspace = true
+hex-simd.workspace = true
 hmac.workspace = true
-minlz = "1.1.0"
+minlz.workspace = true
 pin-project-lite.workspace = true
-rand.workspace = true
+rand = { workspace = true, features = ["serde"] }
 rustfs-rio.workspace = true
 rustfs-utils.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 
 [dev-dependencies]
 rustfs-filemeta.workspace = true

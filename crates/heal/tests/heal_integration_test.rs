@@ -12,29 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 use http::HeaderMap;
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
-use rustfs_ecstore::{
-    disk::endpoint::Endpoint,
-    endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
-    store::ECStore,
-    store_api::{BucketOperations, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader},
-};
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
-    storage::{ECStoreHealStorage, HealStorageAPI},
-    task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
+    outcome::{HealExecutionOutcome, HealTraversalCoverage},
+    storage::{ECStoreHealStorage, HealObjectOptions as ObjectOptions, HealPutObjReader as PutObjReader, HealStorageAPI},
+    task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType},
 };
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
 use serial_test::serial;
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Once, OnceLock},
+    sync::Arc,
     time::Duration,
 };
 use tokio::fs;
-use tokio_util::sync::CancellationToken;
 use tracing::info;
 use walkdir::WalkDir;
+
+mod storage_api;
+
+use storage_api::integration::{BucketOperations, ECStore, ObjectIO as _, ObjectOperations as _, WriteCompletion};
 
 const HEAL_FORMAT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 const HEAL_FORMAT_WAIT_INTERVAL: Duration = Duration::from_millis(250);
@@ -57,98 +57,42 @@ async fn wait_for_path_exists(path: &Path, timeout: Duration, interval: Duration
     }
 }
 
-static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>)> = OnceLock::new();
-static INIT: Once = Once::new();
-
-pub fn init_tracing() {
-    INIT.call_once(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
-            .with_thread_names(true)
-            .try_init();
-    });
+fn find_part_file(obj_dir: &Path) -> Option<PathBuf> {
+    WalkDir::new(obj_dir)
+        .min_depth(2)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_type().is_file() && entry.file_name().to_str().is_some_and(|name| name.starts_with("part.")))
+        .map(|entry| entry.into_path())
 }
 
-/// Test helper: Create test environment with ECStore
-async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>) {
-    init_tracing();
+async fn wait_for_object_copies(disks: &[PathBuf], bucket: &str, object: &str) {
+    tokio::time::timeout(HEAL_FORMAT_WAIT_TIMEOUT, async {
+        loop {
+            if disks.iter().all(|disk| {
+                let obj_dir = disk.join(bucket).join(object);
+                obj_dir.join("xl.meta").exists() && find_part_file(&obj_dir).is_some()
+            }) {
+                break;
+            }
+            tokio::time::sleep(HEAL_FORMAT_WAIT_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("PUT rename tails must converge before corrupting the disk fixture");
+}
 
-    // Fast path: already initialized, just clone and return
-    if let Some((paths, ecstore, heal_storage)) = GLOBAL_ENV.get() {
-        return (paths.clone(), ecstore.clone(), heal_storage.clone());
-    }
-
-    // create temp dir as 4 disks with unique base dir
-    let test_base_dir = format!("/tmp/rustfs_heal_heal_test_{}", uuid::Uuid::new_v4());
-    let temp_dir = std::path::PathBuf::from(&test_base_dir);
-    if temp_dir.exists() {
-        fs::remove_dir_all(&temp_dir).await.ok();
-    }
-    fs::create_dir_all(&temp_dir).await.unwrap();
-
-    // create 4 disk dirs
-    let disk_paths = vec![
-        temp_dir.join("disk1"),
-        temp_dir.join("disk2"),
-        temp_dir.join("disk3"),
-        temp_dir.join("disk4"),
-    ];
-
-    for disk_path in &disk_paths {
-        fs::create_dir_all(disk_path).await.unwrap();
-    }
-
-    // create EndpointServerPools
-    let mut endpoints = Vec::new();
-    for (i, disk_path) in disk_paths.iter().enumerate() {
-        let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
-        // set correct index
-        endpoint.set_pool_index(0);
-        endpoint.set_set_index(0);
-        endpoint.set_disk_index(i);
-        endpoints.push(endpoint);
-    }
-
-    let pool_endpoints = PoolEndpoints {
-        legacy: false,
-        set_count: 1,
-        drives_per_set: 4,
-        endpoints: Endpoints::from(endpoints),
-        cmd_line: "test".to_string(),
-        platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
-    };
-
-    let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
-
-    // format disks (only first time)
-    rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
-
-    // create ECStore with dynamic port 0 (let OS assign) or fixed 9001 if free
-    let port = 9001; // for simplicity
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
-        .await
-        .unwrap();
-
-    // init bucket metadata system
-    let buckets_list = ecstore
-        .list_bucket(&rustfs_storage_api::BucketOptions {
-            no_metadata: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let buckets = buckets_list.into_iter().map(|v| v.name).collect();
-    rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
-
-    // Create heal storage layer
-    let heal_storage = Arc::new(ECStoreHealStorage::new(ecstore.clone()));
-
-    // Store in global once lock
-    let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone(), heal_storage.clone()));
-
-    (disk_paths, ecstore, heal_storage)
+/// Test helper: build the shared 4-disk temp-dir ECStore environment
+/// (rustfs-test-utils, backlog#1153 infra-1) and wrap it in the heal storage
+/// layer. Port 0 + uuid temp dirs keep this parallel-safe under nextest.
+async fn heal_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>) {
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .prefix("rustfs_heal_heal_test")
+        .build()
+        .await;
+    let heal_storage = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+    (env.disk_paths, env.ecstore, heal_storage)
 }
 
 /// Test helper: Create a test bucket
@@ -164,20 +108,187 @@ async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
 async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, data: &[u8]) {
     let mut reader = PutObjReader::from_vec(data.to_vec());
     let object_info = (**ecstore)
-        .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+        .put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
         .await
         .expect("Failed to upload test object");
 
     info!("Uploaded test object: {}/{} ({} bytes)", bucket, object, object_info.size);
 }
 
+async fn empty_replacement_with_committed_delete(
+    ecstore: &Arc<ECStore>,
+    disk_paths: &[PathBuf],
+    bucket: &str,
+    object: &str,
+) -> (uuid::Uuid, uuid::Uuid) {
+    use rustfs_filemeta::FileInfo;
+    use storage_api::integration::{
+        DeleteOptions, DeleteRecoveryAction, DeleteRecoveryState, DiskAPI as _, DiskSetSelector, StorageAdminApi as _,
+    };
+    assert_eq!(disk_paths.len(), 4, "replacement fixture needs four paths");
+    let incarnation = ecstore
+        .bucket_incarnation_id_from_disk(bucket)
+        .await
+        .expect("admit the survivor bucket generation");
+    let disks = ecstore
+        .disk_set_inventory(DiskSetSelector::new(0, 0))
+        .await
+        .expect("read the live fixture set");
+    assert_eq!(disks.len(), 4);
+    let transaction = uuid::Uuid::new_v4();
+    // Retain a certified survivor decision without the normal delete's
+    // immediate recovery/cleanup consuming the fault input.
+    for disk in &disks[1..] {
+        let disk = disk.as_ref().expect("all three preparation survivors are online");
+        disk.delete_version_recoverable(
+            bucket,
+            object,
+            FileInfo {
+                name: object.to_owned(),
+                ..Default::default()
+            },
+            false,
+            DeleteOptions {
+                old_data_dir: Some(transaction),
+                delete_recovery_bucket_incarnation: Some(incarnation),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("prepare the same delete on every survivor");
+    }
+    for disk in &disks[1..] {
+        let disk = disk.as_ref().expect("all three survivors are online");
+        let prepared = disk
+            .inspect_delete_transaction(bucket, object, transaction)
+            .await
+            .expect("inspect prepared survivor decision");
+        assert_eq!(prepared.state, DeleteRecoveryState::NewPrepared);
+        let committed = disk
+            .settle_delete_transaction(bucket, object, transaction, prepared.fingerprint, DeleteRecoveryAction::PublishCommit)
+            .await
+            .expect("publish the retained survivor decision");
+        assert_eq!(committed.state, DeleteRecoveryState::QuorumCommitted);
+    }
+    // Linux disk I/O pins the root inode. Clearing its contents models the
+    // empty target on every platform; renaming it leaves Linux handles on
+    // the retired data and does not simulate a replacement for this test.
+    for entry in std::fs::read_dir(&disk_paths[0]).expect("read target root") {
+        let entry = entry.expect("read target entry");
+        if entry.file_type().expect("target entry type").is_dir() {
+            std::fs::remove_dir_all(entry.path()).expect("clear target directory");
+        } else {
+            std::fs::remove_file(entry.path()).expect("clear target file");
+        }
+    }
+    (incarnation, transaction)
+}
+
 mod serial_tests {
     use super::*;
+
+    async fn bucket_directory_loss_task(cluster: bool, missing: usize, dry_run: bool, source: HealRequestSource) {
+        let temp = tempfile::tempdir().expect("isolated bucket recovery fixture");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp.path())
+            .build()
+            .await;
+        let bucket = "task-directory-recovery";
+        env.make_bucket(bucket, false).await;
+        let storage = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
+        let expected = storage
+            .admit_bucket_incarnation(bucket)
+            .await
+            .expect("committed bucket generation");
+        for disk in env.disk_paths.iter().rev().take(missing) {
+            fs::remove_dir(disk.join(bucket))
+                .await
+                .expect("remove only an empty bucket directory");
+        }
+        assert_eq!(env.disk_paths.iter().filter(|disk| disk.join(bucket).exists()).count(), 4 - missing);
+        let mut request = HealRequest::new(
+            if cluster {
+                HealType::Cluster
+            } else {
+                HealType::Bucket {
+                    bucket: bucket.to_owned(),
+                }
+            },
+            HealOptions {
+                recursive: true,
+                dry_run,
+                recreate_missing: false,
+                timeout: Some(Duration::from_secs(30)),
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = source;
+        if !cluster && source == HealRequestSource::Admin {
+            request.bucket_incarnation_id = Some(expected);
+        }
+        let task = HealTask::from_request(request, storage.clone());
+        let result = task.execute().await;
+        if missing == 4 || source != HealRequestSource::Admin {
+            assert!(
+                result.is_err(),
+                "unproven or unbound recovery must fail: missing={missing}, source={source:?}"
+            );
+        } else {
+            result.unwrap_or_else(|error| {
+                panic!(
+                    "administrator task must reach generation-bound reconstruction: cluster={cluster}, missing={missing}: {error}"
+                )
+            });
+            let outcome = task.get_outcome().await;
+            assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+            assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+        }
+        let remaining = if dry_run || missing == 4 || source != HealRequestSource::Admin {
+            4 - missing
+        } else {
+            4
+        };
+        assert_eq!(env.disk_paths.iter().filter(|disk| disk.join(bucket).is_dir()).count(), remaining);
+        assert_eq!(storage.admit_bucket_incarnation(bucket).await.expect("retained metadata"), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_admin_bucket_directory_recovery_from_task_entry() {
+        for cluster in [false, true] {
+            // Two surviving directories satisfy ordinary reads; one does not.
+            for missing in [2, 3] {
+                bucket_directory_loss_task(cluster, missing, false, HealRequestSource::Admin).await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_admin_bucket_directory_recovery_dry_run_from_task_entry() {
+        bucket_directory_loss_task(false, 3, true, HealRequestSource::Admin).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_admin_bucket_directory_recovery_rejects_unproven_scope() {
+        bucket_directory_loss_task(false, 4, false, HealRequestSource::Admin).await;
+        bucket_directory_loss_task(false, 3, false, HealRequestSource::Internal).await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_object_basic() {
-        let (disk_paths, ecstore, heal_storage) = setup_test_env().await;
+        let (disk_paths, ecstore, heal_storage) = heal_env().await;
 
         // Create test bucket and object
         let bucket_name = "test-heal-object-basic";
@@ -186,18 +297,10 @@ mod serial_tests {
 
         create_test_bucket(&ecstore, bucket_name).await;
         upload_test_object(&ecstore, bucket_name, object_name, &test_data).await;
-        let _obj_dir = disk_paths[0].join(bucket_name).join(object_name);
+        wait_for_object_copies(&disk_paths, bucket_name, object_name).await;
         // ─── 1️⃣ delete single data shard file ─────────────────────────────────────
         let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
-        // find part file at depth 2, e.g. .../<uuid>/part.1
-        let target_part = WalkDir::new(&obj_dir)
-            .min_depth(2)
-            .max_depth(2)
-            .into_iter()
-            .filter_map(Result::ok)
-            .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
-            .map(|e| e.into_path())
-            .expect("Failed to locate part file to delete");
+        let target_part = find_part_file(&obj_dir).expect("converged fixture must contain a part file");
 
         std::fs::remove_file(&target_part).expect("failed to delete part file");
         assert!(!target_part.exists());
@@ -234,10 +337,132 @@ mod serial_tests {
         info!("Heal object basic test passed");
     }
 
+    // Regression for PR #4356 review (issues #3231, #3191): healing an object that
+    // needs no shard repair must still reclaim leaked pre-#3510 data dirs.
+    //
+    // The reclaim was originally wired only into `heal_object`'s post-heal tail,
+    // which is unreachable when `disks_to_heal_count == 0` — exactly the state of
+    // the objects the sweep targets (valid `xl.meta`, all shards present, plus one
+    // orphaned UUID data dir). A healthy heal took the early return and reclaimed
+    // nothing. This drives the full heal path on an untouched object and asserts
+    // the stray dir is swept, while a dry-run heal leaves it in place.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_heal_object_reclaims_orphan_data_dir_when_healthy() {
+        let (disk_paths, ecstore, heal_storage) = heal_env().await;
+
+        let bucket_name = "test-heal-reclaim-orphan";
+        let object_name = "healthy-object.bin";
+        let test_data = non_inline_test_data();
+
+        create_test_bucket(&ecstore, bucket_name).await;
+        upload_test_object(&ecstore, bucket_name, object_name, &test_data).await;
+        wait_for_object_copies(&disk_paths, bucket_name, object_name).await;
+
+        // Plant a leaked, unreferenced UUID data dir under the object on every disk
+        // that actually holds the object (i.e. has an `xl.meta`). Planting on a disk
+        // without `xl.meta` would (correctly) trip the fail-closed guard and abort
+        // the whole reclaim, so we only seed disks that carry the object.
+        let orphan_dir = uuid::Uuid::new_v4().to_string();
+        let mut seeded_orphans: Vec<PathBuf> = Vec::new();
+        for disk_path in &disk_paths {
+            let obj_dir = disk_path.join(bucket_name).join(object_name);
+            if !obj_dir.join("xl.meta").exists() {
+                continue;
+            }
+            let stray = obj_dir.join(&orphan_dir);
+            fs::create_dir_all(&stray).await.expect("orphan data dir should be created");
+            fs::write(stray.join("part.1"), b"leaked pre-#3510 data")
+                .await
+                .expect("orphan part should be written");
+            seeded_orphans.push(stray);
+        }
+        assert!(
+            !seeded_orphans.is_empty(),
+            "test setup failed: no disk carried the object to seed an orphan under"
+        );
+
+        let dry_run_opts = HealOpts {
+            dry_run: true,
+            recreate: true,
+            remove: false,
+            update_parity: true,
+            ..Default::default()
+        };
+        let (_res, err) = heal_storage
+            .heal_object(bucket_name, object_name, None, &dry_run_opts)
+            .await
+            .expect("dry-run heal should succeed");
+        assert!(err.is_none(), "dry-run heal returned error: {err:?}");
+        for stray in &seeded_orphans {
+            assert!(stray.exists(), "dry-run heal must NOT remove the orphan data dir: {stray:?}");
+        }
+
+        // Snapshot the live (referenced) data dirs so we can assert they survive.
+        let mut live_dirs: Vec<PathBuf> = Vec::new();
+        for disk_path in &disk_paths {
+            let obj_dir = disk_path.join(bucket_name).join(object_name);
+            if !obj_dir.join("xl.meta").exists() {
+                continue;
+            }
+            for entry in WalkDir::new(&obj_dir)
+                .min_depth(1)
+                .max_depth(1)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if entry.file_type().is_dir() && name != orphan_dir {
+                    live_dirs.push(entry.into_path());
+                }
+            }
+        }
+        assert!(!live_dirs.is_empty(), "expected at least one live data dir to remain");
+
+        let heal_opts = HealOpts {
+            dry_run: false,
+            recreate: true,
+            remove: false,
+            update_parity: true,
+            ..Default::default()
+        };
+        let (_res, err) = heal_storage
+            .heal_object(bucket_name, object_name, None, &heal_opts)
+            .await
+            .expect("heal should succeed");
+        assert!(err.is_none(), "heal returned error: {err:?}");
+
+        for stray in &seeded_orphans {
+            assert!(!stray.exists(), "healthy heal must reclaim the orphan data dir: {stray:?}");
+        }
+        for live in &live_dirs {
+            assert!(live.exists(), "referenced data dir must be preserved: {live:?}");
+        }
+        for disk_path in &disk_paths {
+            let obj_dir = disk_path.join(bucket_name).join(object_name);
+            if obj_dir.exists() {
+                assert!(obj_dir.join("xl.meta").exists(), "xl.meta must be preserved: {obj_dir:?}");
+            }
+        }
+
+        // The object must remain intact and readable after the reclaim.
+        let mut reader = ecstore
+            .get_object_reader(bucket_name, object_name, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("Failed to get object reader after reclaim");
+        let mut downloaded_data = Vec::new();
+        tokio::io::copy(&mut reader, &mut downloaded_data)
+            .await
+            .expect("Failed to read object after reclaim");
+        assert_eq!(downloaded_data, test_data, "object contents must survive orphan reclaim");
+
+        info!("Heal object orphan-reclaim test passed");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_bucket_basic() {
-        let (disk_paths, ecstore, heal_storage) = setup_test_env().await;
+        let (disk_paths, ecstore, heal_storage) = heal_env().await;
 
         // Create test bucket
         let bucket_name = "test-heal-bucket-basic";
@@ -270,6 +495,7 @@ mod serial_tests {
                 recreate_missing: false,
                 scan_mode: HealScanMode::Normal,
                 update_parity: false,
+                no_lock: false,
                 timeout: Some(Duration::from_secs(300)),
                 pool_index: None,
                 set_index: None,
@@ -307,7 +533,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_format_basic() {
-        let (disk_paths, _ecstore, heal_storage) = setup_test_env().await;
+        let (disk_paths, _ecstore, heal_storage) = heal_env().await;
 
         // ─── 1️⃣ delete format.json on one disk ──────────────
         let format_path = disk_paths[0].join(".rustfs.sys").join("format.json");
@@ -333,7 +559,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_format_with_data() {
-        let (disk_paths, ecstore, heal_storage) = setup_test_env().await;
+        let (disk_paths, ecstore, heal_storage) = heal_env().await;
 
         // Create test bucket and object
         let bucket_name = "test-heal-format-with-data";
@@ -342,20 +568,16 @@ mod serial_tests {
 
         create_test_bucket(&ecstore, bucket_name).await;
         upload_test_object(&ecstore, bucket_name, object_name, &test_data).await;
+        wait_for_object_copies(&disk_paths, bucket_name, object_name).await;
         let obj_dir = disk_paths[0].join(bucket_name).join(object_name);
-        let target_part = WalkDir::new(&obj_dir)
-            .min_depth(2)
-            .max_depth(2)
-            .into_iter()
-            .filter_map(Result::ok)
-            .find(|e| e.file_type().is_file() && e.file_name().to_str().map(|n| n.starts_with("part.")).unwrap_or(false))
-            .map(|e| e.into_path())
-            .expect("Failed to locate part file to delete");
+        let target_part = find_part_file(&obj_dir).expect("converged fixture must contain a part file");
 
         // ─── 1️⃣ delete format.json on one disk ──────────────
         let format_path = disk_paths[0].join(".rustfs.sys").join("format.json");
-        std::fs::remove_dir_all(&disk_paths[0]).expect("failed to delete all contents under disk_paths[0]");
+        let failed_disk_path = disk_paths[0].with_extension("failed");
+        std::fs::rename(&disk_paths[0], &failed_disk_path).expect("failed to detach disk_paths[0]");
         std::fs::create_dir_all(&disk_paths[0]).expect("failed to recreate disk_paths[0] directory");
+        assert!(!format_path.exists(), "replacement disk already contains format.json before heal");
         println!("✅ Deleted format.json on disk: {:?}", disk_paths[0]);
 
         let (_format_result, format_error) = heal_storage.heal_format(false).await.expect("failed to run heal_format");
@@ -422,7 +644,7 @@ mod serial_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
     async fn test_heal_storage_api_direct() {
-        let (_disk_paths, ecstore, heal_storage) = setup_test_env().await;
+        let (_disk_paths, ecstore, heal_storage) = heal_env().await;
 
         // Test direct heal storage API calls
 
@@ -443,6 +665,7 @@ mod serial_tests {
             scan_mode: HealScanMode::Normal,
             update_parity: false,
             no_lock: false,
+            read_repair: false,
             pool: None,
             set: None,
         };
@@ -464,6 +687,7 @@ mod serial_tests {
             scan_mode: HealScanMode::Normal,
             update_parity: false,
             no_lock: false,
+            read_repair: false,
             pool: None,
             set: None,
         };
@@ -476,4 +700,384 @@ mod serial_tests {
 
         info!("Direct heal storage API test passed");
     }
+}
+
+#[test]
+#[serial]
+fn historical_rebalance_topology_allows_format_and_object_rebuild() {
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("historical-rebalance-rebuild".to_owned())
+        .stack_size(STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("historical rebalance recovery runtime");
+            runtime.block_on(historical_rebalance_topology_allows_format_and_object_rebuild_case());
+        })
+        .expect("historical rebalance recovery test thread")
+        .join()
+        .expect("historical rebalance recovery test result");
+}
+
+async fn historical_rebalance_topology_allows_format_and_object_rebuild_case() {
+    use storage_api::integration::{
+        DiskAPI as _, DiskError, DiskOption, RUSTFS_META_BUCKET, RebalStatus, RebalanceMeta, RebalanceStats, new_disk,
+    };
+
+    let temp = tempfile::tempdir().expect("isolated historical rebalance fixture");
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .base_dir(temp.path())
+        .build()
+        .await;
+    let ecstore = env.ecstore;
+    let disks = env.disk_paths;
+    let storage = Arc::new(ECStoreHealStorage::new(ecstore.clone()));
+    assert_eq!(ecstore.pools.len(), 1);
+    let bucket = "historical-rebalance-rebuild";
+    let object = "non-inline-object";
+    let expected = non_inline_test_data();
+    create_test_bucket(&ecstore, bucket).await;
+    upload_test_object(&ecstore, bucket, object, &expected).await;
+    wait_for_object_copies(&disks, bucket, object).await;
+
+    // Model the persisted post-removal state. This test does not execute a
+    // rebalance worker, decommission lifecycle, or mount-identity handoff.
+    let mut historical = RebalanceMeta {
+        id: uuid::Uuid::new_v4().to_string(),
+        pool_stats: vec![RebalanceStats::default(), RebalanceStats::default()],
+        ..Default::default()
+    };
+    for pool in &mut historical.pool_stats {
+        pool.participating = true;
+        pool.info.status = RebalStatus::Completed;
+    }
+    historical
+        .save_with_opts(
+            ecstore.pools[0].clone(),
+            ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("persist completed historical two-pool metadata on the current metadata pool");
+    let historical_bytes = ecstore.pools[0]
+        .get_object_reader(RUSTFS_META_BUCKET, "rebalance.bin", None, HeaderMap::new(), &ObjectOptions::default())
+        .await
+        .expect("open persisted historical metadata")
+        .read_all()
+        .await
+        .expect("read persisted historical metadata");
+    let old_format: serde_json::Value = serde_json::from_slice(
+        &fs::read(disks[0].join(RUSTFS_META_BUCKET).join("format.json"))
+            .await
+            .expect("read target format"),
+    )
+    .expect("decode target format");
+    let target_object = disks[0].join(bucket).join(object);
+    let old_shard = fs::read(find_part_file(&target_object).expect("original target shard"))
+        .await
+        .expect("read original target shard bytes");
+
+    // Preserve the root inode held by disk I/O, while replacing its contents
+    // with an empty target, as in the existing fresh-target recovery fixture.
+    for entry in std::fs::read_dir(&disks[0]).expect("read replacement target root") {
+        let entry = entry.expect("replacement target entry");
+        if entry.file_type().expect("replacement entry type").is_dir() {
+            fs::remove_dir_all(entry.path()).await.expect("empty target directory");
+        } else {
+            fs::remove_file(entry.path()).await.expect("empty target file");
+        }
+    }
+    assert!(!disks[0].join(RUSTFS_META_BUCKET).join("format.json").exists());
+    assert!(!target_object.exists());
+    // A replacement reconnects with a fresh handle. Reusing the old handle
+    // would retain its cached format bytes despite the emptied directory.
+    let endpoint = ecstore.pools[0].endpoints.endpoints.as_ref()[0].clone();
+    let replacement = new_disk(
+        &endpoint,
+        &DiskOption {
+            cleanup: false,
+            health_check: false,
+        },
+    )
+    .await
+    .expect("open a fresh replacement disk handle");
+    assert!(matches!(replacement.get_disk_id().await, Err(DiskError::UnformattedDisk)));
+    ecstore.pools[0].get_disks(0).disks.write().await[0] = Some(replacement);
+    let target = endpoint.to_string();
+    let (_, format_error) = storage
+        .heal_replacement_format(false, 0, 0, std::slice::from_ref(&target))
+        .await
+        .expect("historical topology must admit target-scoped format repair");
+    assert!(format_error.is_none(), "target format repair: {format_error:?}");
+    let repaired_format: serde_json::Value = serde_json::from_slice(
+        &fs::read(disks[0].join(RUSTFS_META_BUCKET).join("format.json"))
+            .await
+            .expect("read repaired target format"),
+    )
+    .expect("decode repaired target format");
+    assert_eq!(
+        repaired_format["xl"]["this"], old_format["xl"]["this"],
+        "format repair must retain the original slot UUID"
+    );
+    assert!(
+        !target_object.exists(),
+        "format repair alone must not be mistaken for object reconstruction"
+    );
+
+    let mut request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: vec![bucket.to_owned()],
+            set_disk_id: "pool_0_set_0".to_owned(),
+        },
+        HealOptions {
+            recursive: true,
+            pool_index: Some(0),
+            set_index: Some(0),
+            scan_mode: HealScanMode::Deep,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    request.source = HealRequestSource::Admin;
+    let task = HealTask::from_request(request, storage);
+    task.execute()
+        .await
+        .expect("rebuild objects after historical-topology format repair");
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+    assert_eq!(outcome.coverage, HealTraversalCoverage::Complete);
+    // Verify target-side physical repair before a GET could perform read repair.
+    assert!(target_object.join("xl.meta").exists());
+    let rebuilt_shard = fs::read(find_part_file(&target_object).expect("rebuilt target shard"))
+        .await
+        .expect("read rebuilt target shard bytes");
+    assert_eq!(rebuilt_shard, old_shard, "the replacement shard must contain the original encoded bytes");
+    let actual = ecstore
+        .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+        .await
+        .expect("open rebuilt object")
+        .read_all()
+        .await
+        .expect("read rebuilt object bytes");
+    assert_eq!(actual, expected, "reconstructed object bytes must be unchanged");
+    let retained_history = ecstore.pools[0]
+        .get_object_reader(RUSTFS_META_BUCKET, "rebalance.bin", None, HeaderMap::new(), &ObjectOptions::default())
+        .await
+        .expect("open retained historical metadata")
+        .read_all()
+        .await
+        .expect("read retained historical metadata");
+    assert_eq!(retained_history, historical_bytes, "healing must retain the historical rebalance payload");
+}
+
+#[test]
+#[serial]
+fn replacement_delete_recovery_on_fresh_target() {
+    // Match the debug server's worker stack for the composed Heal future.
+    // Libtest otherwise polls it on its smaller calling-thread stack.
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("replacement-delete-recovery".to_owned())
+        .stack_size(STACK_SIZE)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("replacement recovery runtime");
+            runtime.block_on(replacement_delete_recovery_on_fresh_target_case());
+        })
+        .expect("replacement recovery test thread")
+        .join()
+        .expect("replacement recovery test result");
+}
+
+async fn replacement_delete_recovery_on_fresh_target_case() {
+    use rustfs_heal::Error;
+    use rustfs_heal::heal::task::HealTask;
+    use rustfs_heal_contracts::heal_channel::HealRequestSource;
+    use storage_api::integration::{
+        DeleteRecoveryState, DiskAPI as _, DiskError, DiskSetSelector, EcstoreStorageError, StorageAdminApi as _,
+    };
+
+    for (source, erasure_set) in [
+        (HealRequestSource::AutoHeal, true),
+        (HealRequestSource::Admin, true),
+        (HealRequestSource::Admin, false),
+    ] {
+        let (disk_paths, ecstore, storage) = heal_env().await;
+        let bucket = "replacement-delete-prepass";
+        create_test_bucket(&ecstore, bucket).await;
+        let original = non_inline_test_data();
+        for key in ["live", "deleted"] {
+            upload_test_object(&ecstore, bucket, key, &original).await;
+            wait_for_object_copies(&disk_paths, bucket, key).await;
+        }
+        let (incarnation, transaction) = empty_replacement_with_committed_delete(&ecstore, &disk_paths, bucket, "deleted").await;
+        let updated = vec![17; NON_INLINE_TEST_DATA_SIZE];
+        upload_test_object(&ecstore, bucket, "live", &updated).await;
+        upload_test_object(&ecstore, bucket, "outage-created", &original).await;
+        let (_, error) = storage.heal_format(false).await.expect("format target");
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(
+            ecstore
+                .bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("survivor incarnation remains authoritative"),
+            incarnation
+        );
+        let current_disks = ecstore
+            .disk_set_inventory(DiskSetSelector::new(0, 0))
+            .await
+            .expect("read the formatted live set");
+        assert!(
+            matches!(
+                current_disks[0]
+                    .as_ref()
+                    .expect("formatted target is attached")
+                    .stat_volume(bucket)
+                    .await,
+                Err(DiskError::VolumeNotFound)
+            ),
+            "the formatted target must still lack its publication bucket"
+        );
+        for disk in &current_disks[1..] {
+            let retained = disk
+                .as_ref()
+                .expect("survivor remains attached")
+                .inspect_delete_transaction(bucket, "deleted", transaction)
+                .await
+                .expect("retained committed survivor proof");
+            assert_eq!(retained.state, DeleteRecoveryState::QuorumCommitted);
+        }
+        // A committed survivor journal must be adopted, but publishing its
+        // witness cannot recreate a missing bucket outside lifecycle ownership.
+        let premature = storage
+            .recover_delete_transactions(bucket, None, None, &HealOpts::default())
+            .await;
+        assert!(
+            matches!(&premature, Err(Error::Storage(EcstoreStorageError::FileNotFound))),
+            "{source:?} erasure_set={erasure_set}: {premature:?}"
+        );
+        let heal_type = if erasure_set {
+            HealType::ErasureSet {
+                buckets: vec![bucket.to_owned()],
+                set_disk_id: "pool_0_set_0".to_owned(),
+            }
+        } else {
+            HealType::Bucket {
+                bucket: bucket.to_owned(),
+            }
+        };
+        let mut request = HealRequest::new(
+            heal_type,
+            HealOptions {
+                recursive: true,
+                pool_index: Some(0),
+                set_index: Some(0),
+                scan_mode: HealScanMode::Deep,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = source;
+        if !erasure_set {
+            request.bucket_incarnation_id = Some(incarnation);
+        }
+        HealTask::from_request(request, storage.clone())
+            .execute()
+            .await
+            .unwrap_or_else(|err| panic!("{source:?} erasure_set={erasure_set}: {err}"));
+        // Check physical repair before GET can hide missing shards via read repair.
+        for key in ["live", "outage-created"] {
+            assert!(disk_paths[0].join(bucket).join(key).join("xl.meta").exists());
+            assert!(find_part_file(&disk_paths[0].join(bucket).join(key)).is_some());
+        }
+        for (key, expected) in [("live", updated.as_slice()), ("outage-created", original.as_slice())] {
+            let mut reader = ecstore
+                .get_object_reader(bucket, key, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("open rebuilt object");
+            assert_eq!(reader.read_all().await.expect("read rebuilt bytes"), expected);
+        }
+        assert!(matches!(
+            ecstore.get_object_info(bucket, "deleted", &ObjectOptions::default()).await,
+            Err(EcstoreStorageError::ObjectNotFound(_, _))
+        ));
+        assert_eq!(
+            ecstore
+                .bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("retained incarnation"),
+            incarnation
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn bucket_removal_recovers_delete_proofs_before_removing_empty_volumes() {
+    use rustfs_heal::heal::task::HealTask;
+    use rustfs_heal_contracts::heal_channel::HealRequestSource;
+    use storage_api::integration::{DeleteRecoveryState, DiskAPI as _, DiskSetSelector, StorageAdminApi as _};
+    let (disk_paths, ecstore, storage) = heal_env().await;
+    let bucket = "delete-proof-before-volume-removal";
+    create_test_bucket(&ecstore, bucket).await;
+    upload_test_object(&ecstore, bucket, "deleted", &non_inline_test_data()).await;
+    wait_for_object_copies(&disk_paths, bucket, "deleted").await;
+    let (incarnation, transaction) = empty_replacement_with_committed_delete(&ecstore, &disk_paths, bucket, "deleted").await;
+    let (_, error) = storage.heal_format(false).await.expect("format target");
+    assert!(error.is_none());
+    storage
+        .heal_bucket(
+            bucket,
+            &HealOpts {
+                recreate: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("empty target volume");
+    assert!(disk_paths[0].join(bucket).exists());
+    let disks = ecstore
+        .disk_set_inventory(DiskSetSelector::new(0, 0))
+        .await
+        .expect("live removal fixture set");
+    for disk in &disks[1..] {
+        let retained = disk
+            .as_ref()
+            .expect("removal survivor remains attached")
+            .inspect_delete_transaction(bucket, "deleted", transaction)
+            .await
+            .expect("removal must still adopt the retained delete proof");
+        assert_eq!(retained.state, DeleteRecoveryState::QuorumCommitted);
+    }
+    let mut request = HealRequest::new(
+        HealType::Bucket {
+            bucket: bucket.to_owned(),
+        },
+        HealOptions {
+            recursive: false,
+            remove_corrupted: true,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    request.source = HealRequestSource::Admin;
+    request.bucket_incarnation_id = Some(incarnation);
+    HealTask::from_request(request, storage)
+        .execute()
+        .await
+        .expect("settle journals before deleting empty volumes");
+    assert!(
+        disk_paths.iter().all(|path| !path.join(bucket).exists()),
+        "all empty replicas should be removed after proof settlement"
+    );
 }

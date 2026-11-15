@@ -27,8 +27,8 @@ use russh::client::{self, Handle};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use rustfs_config::{
-    ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_IDLE_TIMEOUT, ENV_SFTP_PART_SIZE,
-    ENV_SFTP_READ_ONLY,
+    ENV_CONSOLE_ENABLE, ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_IDLE_TIMEOUT,
+    ENV_SFTP_PART_SIZE, ENV_SFTP_READ_ONLY,
 };
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -152,6 +152,7 @@ pub async fn test_sftp_core_operations() -> Result<()> {
         .ok_or_else(|| anyhow!("host key dir path is not utf-8"))?;
     let mut server_process = ServerProcess::new(
         Command::new(&binary_path)
+            .env(ENV_CONSOLE_ENABLE, "false")
             .env(ENV_SFTP_ENABLE, "true")
             .env(ENV_SFTP_ADDRESS, SFTP_ADDRESS)
             .env(ENV_SFTP_HOST_KEY_DIR, host_key_dir_str)
@@ -393,9 +394,9 @@ pub async fn test_sftp_core_operations() -> Result<()> {
         info!("PASS: S3-written object matches via S3 GetObject and SFTP READ");
 
         // --- Cross-API directory visibility: SFTP mkdir, S3 ListObjectsV2 ---
-        // SFTP mkdir writes a __XLDIR__ marker. The rustfs S3 listing path
-        // decodes that marker back to a trailing-slash key, so the asserted
-        // pattern is "subdir_sftp/".
+        // SFTP mkdir writes a zero-byte object at the trailing-slash key.
+        // Storage encodes that key to the __XLDIR__ marker, and the S3
+        // listing path decodes the marker back to a trailing-slash key.
         info!("Testing SFTP: SFTP-created sub-directory visible via S3 ListObjectsV2");
         let sftp_subdir_name = "subdir_sftp";
         let sftp_subdir_path = format!("/{bucket}/{sftp_subdir_name}");
@@ -421,20 +422,21 @@ pub async fn test_sftp_core_operations() -> Result<()> {
         );
         info!("PASS: SFTP mkdir visible to S3 ListObjectsV2");
 
-        // --- Cross-API directory visibility: S3 marker, SFTP readdir ---
-        // aws-sdk-s3 PutObject writes a zero-byte marker keyed with the
-        // __XLDIR__ suffix. SFTP readdir must decode the marker back to a
-        // bare directory entry whose file_type reports as a directory.
-        info!("Testing SFTP: S3-created __XLDIR__ marker visible via SFTP readdir");
+        // --- Cross-API directory visibility: S3 directory object, SFTP readdir ---
+        // aws-sdk-s3 PutObject writes a zero-byte object at the trailing-slash
+        // key. The __XLDIR__ suffix is reserved on the client-key boundary, so
+        // a direct put of that suffix is rejected. Storage encodes the slash
+        // key, and SFTP readdir must show a directory entry.
+        info!("Testing SFTP: S3-created directory object visible via SFTP readdir");
         let s3_subdir_name = "subdir_s3";
-        let s3_subdir_marker_key = format!("{s3_subdir_name}{XLDIR_SUFFIX}");
+        let s3_subdir_key = format!("{s3_subdir_name}/");
         s3.put_object()
             .bucket(bucket)
-            .key(&s3_subdir_marker_key)
+            .key(&s3_subdir_key)
             .body(ByteStream::from_static(b""))
             .send()
             .await
-            .map_err(|e| anyhow!("S3 PutObject {}/{} failed: {:?}", bucket, s3_subdir_marker_key, e))?;
+            .map_err(|e| anyhow!("S3 PutObject {}/{} failed: {:?}", bucket, s3_subdir_key, e))?;
         let bucket_entries: Vec<(String, bool)> = sftp
             .read_dir(&bucket_path)
             .await?
@@ -443,9 +445,9 @@ pub async fn test_sftp_core_operations() -> Result<()> {
         let visible_via_sftp = bucket_entries.iter().any(|(name, is_dir)| name == s3_subdir_name && *is_dir);
         assert!(
             visible_via_sftp,
-            "S3-created marker must appear as a directory in SFTP readdir: entries were {bucket_entries:?}"
+            "S3-created directory object must appear as a directory in SFTP readdir: entries were {bucket_entries:?}"
         );
-        info!("PASS: S3 marker visible to SFTP readdir as a directory");
+        info!("PASS: S3 directory object visible to SFTP readdir as a directory");
 
         // --- Pre-cleanup of cross-protocol fixtures ---
         // Removes the new files and sub-directories so the existing rmdir
@@ -504,6 +506,7 @@ pub async fn test_sftp_idle_timeout_disconnects() -> Result<()> {
         .ok_or_else(|| anyhow!("host key dir path is not utf-8"))?;
     let mut server_process = ServerProcess::new(
         Command::new(&binary_path)
+            .env(ENV_CONSOLE_ENABLE, "false")
             .env(ENV_SFTP_ENABLE, "true")
             .env(ENV_SFTP_ADDRESS, IDLE_SFTP_ADDRESS)
             .env(ENV_SFTP_HOST_KEY_DIR, host_key_dir_str)

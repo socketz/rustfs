@@ -11,14 +11,19 @@ test process directly.
 
 ## Running Tests
 
+Use the canonical CI-equivalent protocol command in the parent
+[`e2e_test` README](../../README.md#troubleshooting).
+
+For targeted debugging of the core suite only:
+
 ```bash
-RUSTFS_BUILD_FEATURES=ftps,webdav,sftp cargo test --package e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
+python3 scripts/e2e_binary.py build --features ftps,webdav,sftp
+python3 scripts/e2e_binary.py run --features ftps,webdav,sftp -- cargo test --package e2e_test test_protocol_core_suite -- --test-threads=1 --nocapture
 ```
 
-`RUSTFS_BUILD_FEATURES` controls which features the test rustfs binary is
-built with. When this variable is set, the protocol test runner schedules
-only entries whose protocol is present in the requested feature list. Leave
-it unset to run every protocol entry.
+This targeted command does not cover the full `e2e-protocols` profile.
+
+`e2e_binary.py` supplies `RUSTFS_BUILD_FEATURES` from the verified server's resolved Cargo features. The protocol runner schedules only entries present in that feature list; helpers check that their required features are available without rebuilding the server.
 `--test-threads=1` is required because every entry spawns a rustfs server
 on fixed bind ports.
 
@@ -72,9 +77,7 @@ core protocol surface plus cross-protocol consistency:
   existing path returns an error, bad-password authentication is rejected
 - Cross-protocol via aws-sdk-s3: SFTP write then S3 read with SHA256 match,
   S3 write then SFTP read with SHA256 match
-- Cross-API directory visibility: SFTP-created sub-directory visible via S3
-  ListObjectsV2, S3-created `__XLDIR__` marker visible via SFTP readdir as a
-  directory entry
+- Cross-API directory visibility: SFTP-created sub-directory visible via S3 ListObjectsV2, and an S3 trailing-slash directory object visible via SFTP readdir as a directory entry
 
 #### sftp_compliance (`test_sftp_compliance_suite`)
 
@@ -133,4 +136,3 @@ property without consulting any external doc.
 Bind ports 9023 (SFTP) and 9100 (S3). Spawns rustfs with
 `RUSTFS_SFTP_IDLE_TIMEOUT=5`, sleeps 10 s past the timeout, then issues an
 SFTP request and asserts the server has closed the session.
-

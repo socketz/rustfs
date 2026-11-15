@@ -51,6 +51,7 @@ impl NotifyRuntimeView {
             .into_iter()
             .map(|snapshot| NotificationTargetMetricSnapshot {
                 failed_messages: snapshot.failed_messages,
+                failed_store_length: snapshot.failed_store_length,
                 queue_length: snapshot.queue_length,
                 target_id: snapshot.target_id,
                 target_type: snapshot.target_type,
@@ -60,7 +61,8 @@ impl NotifyRuntimeView {
     }
 
     pub async fn snapshot_target_health(&self) -> Vec<RuntimeTargetHealthSnapshot> {
-        self.target_list.read().await.runtime_health_snapshots().await
+        let targets = self.target_list.read().await.values();
+        rustfs_targets::health_snapshots_for_targets(targets).await
     }
 
     pub async fn runtime_status_snapshot(&self) -> rustfs_targets::RuntimeStatusSnapshot {
@@ -74,106 +76,12 @@ impl NotifyRuntimeView {
 mod tests {
     use super::NotifyRuntimeView;
     use crate::{Event, notifier::TargetList};
-    use async_trait::async_trait;
     use rustfs_targets::arn::TargetID;
-    use rustfs_targets::store::{Key, Store};
-    use rustfs_targets::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliverySnapshot};
-    use rustfs_targets::{ReplayWorkerManager, StoreError, Target, TargetError};
-    use serde::{Serialize, de::DeserializeOwned};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    };
-    use tokio::sync::RwLock;
-
-    #[derive(Clone)]
-    struct TestTarget {
-        active: bool,
-        enabled: bool,
-        failed_messages: Arc<AtomicU64>,
-        id: TargetID,
-        total_messages: Arc<AtomicU64>,
-    }
-
-    impl TestTarget {
-        fn new(id: &str, name: &str) -> Self {
-            Self {
-                active: true,
-                enabled: true,
-                failed_messages: Arc::new(AtomicU64::new(0)),
-                id: TargetID::new(id.to_string(), name.to_string()),
-                total_messages: Arc::new(AtomicU64::new(0)),
-            }
-        }
-
-        fn with_active(mut self, active: bool) -> Self {
-            self.active = active;
-            self
-        }
-
-        fn with_enabled(mut self, enabled: bool) -> Self {
-            self.enabled = enabled;
-            self
-        }
-
-        fn record_successes(&self, count: u64) {
-            self.total_messages.store(count, Ordering::Relaxed);
-        }
-
-        fn record_failures(&self, count: u64) {
-            self.failed_messages.store(count, Ordering::Relaxed);
-        }
-    }
-
-    #[async_trait]
-    impl<E> Target<E> for TestTarget
-    where
-        E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
-    {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            Ok(self.active)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            None
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
-            Box::new(self.clone())
-        }
-
-        async fn init(&self) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        fn is_enabled(&self) -> bool {
-            self.enabled
-        }
-
-        fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
-            TargetDeliverySnapshot {
-                failed_messages: self.failed_messages.load(Ordering::Relaxed),
-                queue_length: 0,
-                total_messages: self.total_messages.load(Ordering::Relaxed),
-            }
-        }
-    }
+    use rustfs_targets::target::TargetDeliverySnapshot;
+    use rustfs_targets::testkit::MockTarget;
+    use rustfs_targets::{ReplayWorkerManager, Target};
+    use std::sync::Arc;
+    use tokio::sync::{Notify, RwLock};
 
     #[tokio::test]
     async fn runtime_view_reports_empty_runtime_queries() {
@@ -207,12 +115,22 @@ mod tests {
         let target_list = Arc::new(RwLock::new(TargetList::new()));
         let replay_workers = Arc::new(RwLock::new(ReplayWorkerManager::new()));
 
-        let online = Arc::new(TestTarget::new("primary", "webhook"));
-        online.record_successes(3);
-        online.record_failures(1);
+        let online = Arc::new(MockTarget::new("primary", "webhook").with_delivery_snapshot(TargetDeliverySnapshot {
+            failed_messages: 1,
+            failed_store_length: 7,
+            queue_length: 0,
+            total_messages: 3,
+        }));
 
-        let disabled = Arc::new(TestTarget::new("backup", "mqtt").with_enabled(false).with_active(false));
-        disabled.record_successes(2);
+        let disabled = Arc::new(
+            MockTarget::new("backup", "mqtt")
+                .disabled()
+                .with_active(false)
+                .with_delivery_snapshot(TargetDeliverySnapshot {
+                    total_messages: 2,
+                    ..TargetDeliverySnapshot::default()
+                }),
+        );
 
         {
             let mut targets = target_list.write().await;
@@ -240,9 +158,11 @@ mod tests {
         assert_eq!(metric_snapshots.len(), 2);
         assert_eq!(metric_snapshots[0].target_id, "backup:mqtt");
         assert_eq!(metric_snapshots[0].failed_messages, 0);
+        assert_eq!(metric_snapshots[0].failed_store_length, 0);
         assert_eq!(metric_snapshots[0].total_messages, 2);
         assert_eq!(metric_snapshots[1].target_id, "primary:webhook");
         assert_eq!(metric_snapshots[1].failed_messages, 1);
+        assert_eq!(metric_snapshots[1].failed_store_length, 7);
         assert_eq!(metric_snapshots[1].total_messages, 3);
 
         let health_snapshots = runtime_view.snapshot_target_health().await;
@@ -257,5 +177,30 @@ mod tests {
         let status = runtime_view.runtime_status_snapshot().await;
         assert_eq!(status.target_count, 2);
         assert_eq!(status.replay_worker_count, 0);
+    }
+
+    #[tokio::test]
+    async fn health_probe_does_not_hold_the_target_list_read_lock() {
+        let target_list = Arc::new(RwLock::new(TargetList::new()));
+        let release = Arc::new(Notify::new());
+        let target = MockTarget::new("blocked", "webhook").with_health_gate(release.clone());
+        let started = target.health_started();
+        target_list
+            .write()
+            .await
+            .add(Arc::new(target) as Arc<dyn Target<Event> + Send + Sync>)
+            .expect("test target should be added");
+        let runtime_view = NotifyRuntimeView::new(target_list.clone(), Arc::new(RwLock::new(ReplayWorkerManager::new())));
+
+        let snapshot_task = tokio::spawn(async move { runtime_view.snapshot_target_health().await });
+        started.notified().await;
+
+        let write_guard = tokio::time::timeout(std::time::Duration::from_secs(1), target_list.write())
+            .await
+            .expect("network health probe must not retain the target-list read lock");
+        drop(write_guard);
+        release.notify_one();
+
+        assert_eq!(snapshot_task.await.expect("snapshot task should finish").len(), 1);
     }
 }

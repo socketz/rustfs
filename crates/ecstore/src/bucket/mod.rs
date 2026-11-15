@@ -12,10 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: bucket subsystems still contain staged ECStore migration code.
+
 pub mod bandwidth;
 pub mod bucket_target_sys;
+pub mod config_parse_mode;
+pub mod durability;
 pub mod error;
+pub mod etag;
 pub mod lifecycle;
+pub mod lockless_cache;
 pub mod metadata;
 pub mod metadata_sys;
 #[cfg(test)]
@@ -25,7 +31,10 @@ mod msgp_decode;
 pub mod object_lock;
 pub mod policy_sys;
 pub mod quota;
+pub mod remote_s3_client;
 pub mod replication;
+pub(crate) mod retirement;
+pub mod sealed_credentials;
 pub mod tagging;
 pub mod target;
 pub mod utils;

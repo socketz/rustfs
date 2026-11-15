@@ -12,12 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::operation::AdminResponse;
 use crate::server::{MINIO_ADMIN_PREFIX, has_path_prefix};
+use http::header::CONTENT_TYPE;
+use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use rustfs_crypto::{decrypt_data, decrypt_stream_io, encrypt_stream_io};
-use s3s::{Body, S3Result, s3_error};
+use rustfs_s3_types::{S3Error, S3ErrorCode, S3Result, s3_error};
+use serde::Serialize;
+use std::collections::HashMap;
+use tokio::sync::Semaphore;
+use url::form_urlencoded;
 
+// Each compatible request can run two 64 MiB derivations. Keep both CPU and
+// memory bounded without occupying runtime workers or queueing unbounded jobs.
+static ADMIN_DECRYPT_PERMITS: Semaphore = Semaphore::const_new(2);
+/// How long a compat admin request queues for a decryption slot before it is
+/// told to retry; a burst of a few requests completes instead of failing.
+const ADMIN_DECRYPT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Returns `true` if `s` contains any whitespace character.
+///
+/// Used to reject identifiers (access keys, user/group/policy names) that
+/// contain spaces. Detects whitespace anywhere in the string — leading,
+/// trailing, or internal — so values like `"my key"` are correctly rejected.
 pub(crate) fn has_space_be(s: &str) -> bool {
-    s.trim().len() != s.len()
+    s.chars().any(char::is_whitespace)
 }
 
 pub(crate) fn is_compat_admin_request(path: &str) -> bool {
@@ -25,20 +44,39 @@ pub(crate) fn is_compat_admin_request(path: &str) -> bool {
 }
 
 pub(crate) async fn read_compatible_admin_body(
-    mut input: Body,
+    input: impl Into<rustfs_s3_types::Body>,
     max_len: usize,
     path: &str,
     secret_key: &str,
 ) -> S3Result<Vec<u8>> {
-    let body = input
-        .store_all_limited(max_len)
-        .await
-        .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
+    // Legacy handlers still hand over the s3s body; owned handlers pass the
+    // RustFS body. Both read through the owned type so one limit applies.
+    let mut input: rustfs_s3_types::Body = input.into();
+    let body = input.store_all_limited(max_len).await.map_err(|e| {
+        if e.is::<rustfs_s3_types::BodyTooLarge>() {
+            s3_error!(InvalidRequest, "failed to read request body: length limit exceeded")
+        } else {
+            s3_error!(InvalidRequest, "failed to read request body: {}", e)
+        }
+    })?;
 
     if is_compat_admin_request(path) {
-        decrypt_stream_io(secret_key.as_bytes(), body.as_ref())
-            .or_else(|_| decrypt_data(secret_key.as_bytes(), body.as_ref()))
-            .map_err(|e| s3_error!(InvalidRequest, "failed to decrypt MinIO admin payload: {}", e))
+        let permit = ADMIN_DECRYPT_PERMITS.acquire();
+        let permit = tokio::time::timeout(ADMIN_DECRYPT_WAIT, permit)
+            .await
+            .map_err(|_| s3_error!(SlowDown, "Admin payload decryption is busy"))?
+            .map_err(|_| s3_error!(SlowDown, "Admin payload decryption is busy"))?;
+        let secret_key = secret_key.to_owned();
+        tokio::task::spawn_blocking(move || {
+            // Cancellation of the request must not release admission while the
+            // non-cancellable derivation is still running.
+            let _permit = permit;
+            decrypt_stream_io(secret_key.as_bytes(), body.as_ref())
+                .or_else(|_| decrypt_data(secret_key.as_bytes(), body.as_ref()))
+                .map_err(|e| s3_error!(InvalidRequest, "failed to decrypt MinIO admin payload: {}", e))
+        })
+        .await
+        .map_err(|_| s3_error!(InternalError, "Admin payload decryption failed"))?
     } else {
         Ok(body.to_vec())
     }
@@ -54,11 +92,94 @@ pub(crate) fn encode_compatible_admin_payload(path: &str, secret_key: &str, data
     }
 }
 
+/// Serialize `value` as the JSON body of an admin response with `status`.
+///
+/// The admin surface answers almost every endpoint this way, so the shape is
+/// pinned here rather than re-derived per handler: `Content-Type:
+/// application/json`, no other header, and the serialized bytes verbatim as
+/// the body. Serialization failure is reported as `InternalError`; the
+/// response structs the admin handlers pass here are plain owned data, so that
+/// arm is unreachable in practice.
+pub(crate) fn owned_json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<AdminResponse> {
+    let data = serde_json::to_vec(value)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(AdminResponse::with_headers(status, rustfs_s3_types::Body::from(data), headers))
+}
+
+/// A bodiless admin response carrying only `status`.
+///
+/// Used by the endpoints whose success answer is the status code itself
+/// (`204 No Content`, or a `200 OK` acknowledgement with nothing to report).
+/// No `Content-Type` is set, because there is no content to type.
+pub(crate) fn owned_empty_response(status: StatusCode) -> AdminResponse {
+    AdminResponse::new(status, rustfs_s3_types::Body::empty())
+}
+
+/// Collect a request URI's query string into a parameter map.
+///
+/// Parsed with `form_urlencoded`, as the rest of the admin surface does, so a
+/// parameter written without a value (`?status`) arrives as an empty value
+/// rather than disappearing: a validated parameter must be able to tell "not
+/// asked for" from "asked for, unreadable". Percent escapes and `+` are
+/// decoded, and a repeated key keeps its last occurrence.
+pub(crate) fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    if let Some(query) = uri.query() {
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            params.insert(key.into_owned(), value.into_owned());
+        }
+    }
+    params
+}
+
+/// Every query pair of `uri`, decoded and in request order; repeated keys are kept.
+pub(crate) fn parse_query_pairs(uri: &Uri) -> Vec<(String, String)> {
+    uri.query()
+        .map(|query| {
+            form_urlencoded::parse(query.as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The first value of `key`, decoded; `Some("")` for a key written without a value.
+pub(crate) fn query_value_exact(uri: &Uri, key: &str) -> Option<String> {
+    parse_query_pairs(uri)
+        .into_iter()
+        .find_map(|(k, v)| if k == key { Some(v) } else { None })
+}
+
+/// Every value of `key`, decoded and in request order.
+pub(crate) fn query_values_exact(uri: &Uri, key: &str) -> Vec<String> {
+    parse_query_pairs(uri)
+        .into_iter()
+        .filter_map(|(k, v)| if k == key { Some(v) } else { None })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rustfs_crypto::encrypt_data;
-    use s3s::Body;
+    use rustfs_s3_types::Body;
+
+    #[test]
+    fn has_space_be_detects_any_whitespace() {
+        // Internal space — the original bug: access keys like "my key" slipped
+        // past validation because only leading/trailing space was detected.
+        assert!(has_space_be("my key"));
+        assert!(has_space_be("ab\tcd"));
+        // Leading / trailing whitespace (already caught before the fix).
+        assert!(has_space_be(" abcd"));
+        assert!(has_space_be("abcd "));
+        // Clean identifiers must pass.
+        assert!(!has_space_be("abcd"));
+        assert!(!has_space_be("my-key_01"));
+        assert!(!has_space_be(""));
+    }
 
     #[test]
     fn detects_compat_admin_paths_only_for_external_prefix() {
@@ -89,14 +210,209 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(admin_decrypt)]
     async fn reads_legacy_compat_payload_as_fallback() {
         let payload = b"{\"ok\":true}".to_vec();
         let encrypted = encrypt_data(b"secret", &payload).expect("encrypt payload");
 
-        let decoded = read_compatible_admin_body(Body::from(encrypted), 1024, "/minio/admin/v3/list-users", "secret")
+        let decoded = read_compatible_admin_body(s3s::Body::from(encrypted), 1024, "/minio/admin/v3/list-users", "secret")
             .await
             .expect("decode payload");
 
         assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    async fn owned_empty_response_carries_only_the_status() {
+        let (status, headers, mut body) = owned_empty_response(StatusCode::NO_CONTENT).into_parts();
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(headers.is_empty());
+        assert!(body.store_all_limited(16).await.expect("empty body reads").is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_an_owned_body_past_the_limit() {
+        let err =
+            read_compatible_admin_body(rustfs_s3_types::Body::from("nine bytes!"), 8, "/rustfs/admin/v3/list-users", "secret")
+                .await
+                .expect_err("eleven bytes exceed an eight byte limit");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("failed to read request body: length limit exceeded"));
+
+        let legacy_body = s3s::Body::http_body(http_body_util::Full::new(bytes::Bytes::from_static(b"nine bytes!")));
+        let legacy_err = read_compatible_admin_body(legacy_body, 8, "/rustfs/admin/v3/list-users", "secret")
+            .await
+            .expect_err("legacy streaming bodies retain the same limit error");
+        assert_eq!(legacy_err.code(), err.code());
+        assert_eq!(legacy_err.message(), err.message());
+
+        let exact =
+            read_compatible_admin_body(rustfs_s3_types::Body::from("12345678"), 8, "/rustfs/admin/v3/list-users", "secret")
+                .await
+                .expect("the exact byte limit is allowed");
+        assert_eq!(exact, b"12345678");
+
+        let failed_body = rustfs_s3_types::Body::from_stream(futures_util::stream::iter([Err::<bytes::Bytes, _>(
+            std::io::Error::other("transport failed"),
+        )]));
+        let stream_err = read_compatible_admin_body(failed_body, 8, "/rustfs/admin/v3/list-users", "secret")
+            .await
+            .expect_err("transport errors remain distinct from the byte limit");
+        assert_eq!(stream_err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(stream_err.message(), Some("failed to read request body: transport failed"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(admin_decrypt)]
+    async fn compatible_admin_decryption_rejects_excess_work_without_blocking_native_requests() {
+        let permits = ADMIN_DECRYPT_PERMITS
+            .acquire_many(2)
+            .await
+            .expect("reserve decryption capacity");
+        let error = read_compatible_admin_body(Body::from(vec![0; 64]), 1024, "/minio/admin/v3/add-user", "secret")
+            .await
+            .expect_err("excess KDF work must not queue");
+        assert_eq!(error.code(), &S3ErrorCode::SlowDown);
+        let plain = read_compatible_admin_body(Body::from(String::from("{}")), 1024, "/rustfs/admin/v3/add-user", "secret")
+            .await
+            .expect("native admin does not use KDF capacity");
+        assert_eq!(plain, b"{}");
+        drop(permits);
+        let encrypted = encrypt_stream_io(b"secret", b"{}").expect("encrypt compatible request");
+        assert_eq!(
+            read_compatible_admin_body(Body::from(encrypted), 1024, "/minio/admin/v3/add-user", "secret")
+                .await
+                .expect("capacity returns after work finishes"),
+            b"{}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(admin_decrypt)]
+    fn cancelled_admin_decryption_keeps_capacity_until_blocking_work_finishes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("build single-worker runtime");
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || wait.recv().expect("release blocker"));
+            let request = tokio::spawn(read_compatible_admin_body(
+                Body::from(vec![0; 64]),
+                1024,
+                "/minio/admin/v3/add-user",
+                "secret",
+            ));
+            tokio::task::yield_now().await;
+            assert_eq!(
+                ADMIN_DECRYPT_PERMITS.available_permits(),
+                1,
+                "decryption was queued off the runtime worker"
+            );
+            request.abort();
+            assert!(request.await.expect_err("request cancelled").is_cancelled());
+            assert_eq!(
+                ADMIN_DECRYPT_PERMITS.available_permits(),
+                1,
+                "cancellation must not release queued work admission"
+            );
+            release.send(()).expect("unblock worker");
+            blocker.await.expect("blocking task finished");
+            let all = ADMIN_DECRYPT_PERMITS
+                .acquire_many(2)
+                .await
+                .expect("decryption finished and released capacity");
+            drop(all);
+        });
+    }
+
+    async fn body_bytes(mut body: rustfs_s3_types::Body) -> Vec<u8> {
+        body.store_all_limited(64 * 1024).await.expect("body should read").to_vec()
+    }
+
+    /// The wire contract every admin endpoint that returns JSON depends on:
+    /// the requested status, `application/json`, and the serialized bytes
+    /// verbatim — nothing else.
+    #[tokio::test]
+    async fn owned_json_response_carries_status_content_type_and_serialized_body() {
+        #[derive(Serialize)]
+        struct Payload {
+            success: bool,
+            message: &'static str,
+        }
+
+        let (status, headers, body) = owned_json_response(
+            StatusCode::ACCEPTED,
+            &Payload {
+                success: true,
+                message: "queued",
+            },
+        )
+        .expect("payload should serialize")
+        .into_parts();
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()), Some("application/json"));
+        assert_eq!(headers.len(), 1);
+        assert_eq!(body_bytes(body).await, br#"{"success":true,"message":"queued"}"#.to_vec());
+    }
+
+    /// A serialization failure must surface as `InternalError` rather than a
+    /// panic or a half-written body.
+    #[test]
+    fn owned_json_response_reports_serialization_failure_as_internal_error() {
+        struct Unserializable;
+
+        impl Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("nope"))
+            }
+        }
+
+        let err = owned_json_response(StatusCode::OK, &Unserializable).expect_err("serialization must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InternalError);
+        assert!(err.message().unwrap_or_default().contains("failed to serialize response"));
+    }
+
+    /// The bodiless answer must stay bodiless and must not claim a content
+    /// type: callers use it for `204 No Content` and bare acknowledgements.
+    #[tokio::test]
+    async fn owned_empty_response_has_no_body_and_no_headers() {
+        for expected in [StatusCode::OK, StatusCode::NO_CONTENT] {
+            let (status, headers, mut body) = owned_empty_response(expected).into_parts();
+            assert_eq!(status, expected);
+            assert!(headers.is_empty());
+            assert!(body.store_all_limited(16).await.expect("empty body reads").is_empty());
+        }
+    }
+
+    /// Percent escapes must be decoded, so a job id or key id containing `/`
+    /// arrives whole rather than as its escape sequence.
+    #[test]
+    fn extract_query_params_decodes_percent_escapes() {
+        let uri: Uri = "/rustfs/admin/v3/status-job?jobId=abc%2F123"
+            .parse()
+            .expect("uri should parse");
+        let params = extract_query_params(&uri);
+        assert_eq!(params.get("jobId"), Some(&"abc/123".to_string()));
+    }
+
+    /// A parameter written without a value must arrive as an empty value, not
+    /// vanish: a validated parameter has to tell "not asked for" from "asked
+    /// for, unreadable". A missing query string yields no parameters at all.
+    #[test]
+    fn extract_query_params_keeps_valueless_parameters_and_survives_no_query() {
+        let valueless: Uri = "/rustfs/admin/v3/kms/keys?status".parse().expect("uri should parse");
+        let params = extract_query_params(&valueless);
+        assert_eq!(params.get("status"), Some(&String::new()));
+
+        let plus: Uri = "/rustfs/admin/v3/kms/keys?name=a+b".parse().expect("uri should parse");
+        assert_eq!(extract_query_params(&plus).get("name"), Some(&"a b".to_string()));
+
+        let bare: Uri = "/rustfs/admin/v3/kms/keys".parse().expect("uri should parse");
+        assert!(extract_query_params(&bare).is_empty());
     }
 }

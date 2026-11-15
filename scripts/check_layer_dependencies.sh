@@ -13,9 +13,18 @@ fi
 classify_source_layer() {
   local file="$1"
 
-  if [[ "$file" == rustfs/src/app/* ]]; then
+  if [[ "$file" == rustfs/src/server/* ]] ||
+    [[ "$file" == rustfs/src/startup_*.rs ]] ||
+    [[ "$file" == rustfs/src/init.rs ]] ||
+    [[ "$file" == rustfs/src/main.rs ]] ||
+    [[ "$file" == rustfs/src/lib.rs ]] ||
+    [[ "$file" == rustfs/src/embedded.rs ]]; then
+    printf 'composition'
+  elif [[ "$file" == rustfs/src/app/* ]]; then
     printf 'app'
-  elif [[ "$file" == rustfs/src/admin/* ]] || [[ "$file" == rustfs/src/storage/ecfs.rs ]] || [[ "$file" == rustfs/src/storage/s3_api/* ]]; then
+  elif [[ "$file" == rustfs/src/admin/* ]] || [[ "$file" == rustfs/src/storage/ecfs.rs ]] ||
+    [[ "$file" == rustfs/src/storage/legacy_edge/* ]] || [[ "$file" == rustfs/src/storage/s3_api/* ]] ||
+    [[ "$file" == rustfs/src/storage/s3_compat/* ]]; then
     printf 'interface'
   elif [[ "$file" == rustfs/src/* ]]; then
     printf 'infra'
@@ -30,6 +39,14 @@ classify_target_layer() {
   local storage_path
 
   case "$root" in
+    init | main | lib | embedded | startup_*)
+      printf 'composition'
+      ;;
+    server)
+      # Server files are composition roots when they import lower layers, but
+      # their exported HTTP contracts belong to the interface boundary.
+      printf 'interface'
+      ;;
     app)
       printf 'app'
       ;;
@@ -39,7 +56,9 @@ classify_target_layer() {
     storage)
       storage_path="${path#storage::}"
       if [[ "$storage_path" == "ecfs" ]] || [[ "$storage_path" == ecfs::* ]] ||
-        [[ "$storage_path" == "s3_api" ]] || [[ "$storage_path" == s3_api::* ]]; then
+        [[ "$storage_path" == "legacy_edge" ]] || [[ "$storage_path" == legacy_edge::* ]] ||
+        [[ "$storage_path" == "s3_api" ]] || [[ "$storage_path" == s3_api::* ]] ||
+        [[ "$storage_path" == "s3_compat" ]] || [[ "$storage_path" == s3_compat::* ]]; then
         printf 'interface'
       else
         printf 'infra'
@@ -53,6 +72,9 @@ classify_target_layer() {
 
 layer_rank() {
   case "$1" in
+    composition)
+      printf '4'
+      ;;
     interface)
       printf '3'
       ;;
@@ -66,6 +88,111 @@ layer_rank() {
       printf '0'
       ;;
   esac
+}
+
+is_reverse_dependency() {
+  local source_rank target_rank
+
+  source_rank="$(layer_rank "$1")"
+  target_rank="$(layer_rank "$2")"
+  (( source_rank < target_rank ))
+}
+
+assert_dependency_direction() {
+  local expected="$1"
+  local source="$2"
+  local target="$3"
+  local actual='allowed'
+
+  if is_reverse_dependency "$source" "$target"; then
+    actual='reverse'
+  fi
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'Layer dependency guard self-test failed: %s -> %s (expected %s, got %s)\n' \
+      "$source" "$target" "$expected" "$actual" >&2
+    exit 1
+  fi
+}
+
+run_layer_model_self_tests() {
+  local server_source app_source storage_source server_target admin_target app_target storage_target
+  local s3_compat_source s3_compat_target
+
+  server_source="$(classify_source_layer rustfs/src/server/http.rs)"
+  app_source="$(classify_source_layer rustfs/src/app/bucket_usecase.rs)"
+  storage_source="$(classify_source_layer rustfs/src/storage/rpc/node_service.rs)"
+  server_target="$(classify_target_layer server::http)"
+  admin_target="$(classify_target_layer admin::router)"
+  app_target="$(classify_target_layer app::bucket_usecase)"
+  storage_target="$(classify_target_layer storage::rpc)"
+  # The s3s edge adapters convert wire requests into app types, as ecfs.rs does.
+  s3_compat_source="$(classify_source_layer rustfs/src/storage/s3_compat/envelope.rs)"
+  s3_compat_target="$(classify_target_layer storage::s3_compat::envelope)"
+
+  assert_dependency_direction 'allowed' "$server_source" "$admin_target"
+  assert_dependency_direction 'allowed' "$server_source" "$app_target"
+  assert_dependency_direction 'allowed' "$server_source" "$storage_target"
+  assert_dependency_direction 'reverse' "$app_source" "$server_target"
+  assert_dependency_direction 'reverse' "$storage_source" "$server_target"
+  assert_dependency_direction 'reverse' "$app_source" "$admin_target"
+  assert_dependency_direction 'reverse' "$storage_source" "$admin_target"
+  assert_dependency_direction 'allowed' "$s3_compat_source" "$app_target"
+  assert_dependency_direction 'reverse' "$app_source" "$s3_compat_target"
+  assert_dependency_direction 'reverse' "$storage_source" "$s3_compat_target"
+
+  # A mechanical split moves ecfs.rs code into storage/legacy_edge/ and the
+  # usecase files' code into same-named directories; each keeps its layer.
+  assert_source_layer 'interface' rustfs/src/storage/ecfs.rs
+  assert_source_layer 'interface' rustfs/src/storage/legacy_edge/bucket_core.rs
+  assert_source_layer 'interface' rustfs/src/storage/legacy_edge/tests/object_meta.rs
+  assert_source_layer 'infra' rustfs/src/storage/legacy_edge.rs
+  assert_source_layer 'infra' rustfs/src/storage/legacy_edge_helper.rs
+  assert_source_layer 'app' rustfs/src/app/bucket_usecase/cors.rs
+  assert_source_layer 'app' rustfs/src/app/multipart_usecase/complete.rs
+  assert_target_layer 'interface' storage::legacy_edge
+  assert_target_layer 'interface' storage::legacy_edge::object_meta
+  assert_target_layer 'infra' storage::legacy_edge_helper
+  assert_dependency_direction 'allowed' "$(classify_source_layer rustfs/src/storage/legacy_edge/bucket_core.rs)" "$app_target"
+  assert_dependency_direction 'reverse' "$app_source" "$(classify_target_layer storage::legacy_edge::bucket_core)"
+  assert_dependency_direction 'reverse' "$storage_source" "$(classify_target_layer storage::legacy_edge)"
+  assert_dedicated_test_file 'yes' rustfs/src/app/lifecycle_transition_api_test.rs
+  assert_dedicated_test_file 'yes' rustfs/src/app/lifecycle_transition_api_test/put.rs
+  assert_dedicated_test_file 'no' rustfs/src/app/lifecycle_transition_api_test_support.rs
+  assert_dedicated_test_file 'no' rustfs/src/app/lifecycle_transition_api.rs
+  assert_dedicated_test_file 'no' rustfs/src/app/bucket_usecase/cors.rs
+  assert_dedicated_test_file 'no' rustfs/src/storage/legacy_edge/bucket_core.rs
+}
+
+assert_source_layer() {
+  local expected="$1" file="$2" actual
+
+  actual="$(classify_source_layer "$file")"
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'Layer dependency guard self-test failed: %s classified as %s (expected %s)\n' "$file" "$actual" "$expected" >&2
+    exit 1
+  fi
+}
+
+assert_target_layer() {
+  local expected="$1" path="$2" actual
+
+  actual="$(classify_target_layer "$path")"
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'Layer dependency guard self-test failed: crate::%s classified as %s (expected %s)\n' "$path" "$actual" "$expected" >&2
+    exit 1
+  fi
+}
+
+assert_dedicated_test_file() {
+  local expected="$1" file="$2" actual='no'
+
+  if is_dedicated_test_file "$file"; then
+    actual='yes'
+  fi
+  if [[ "$actual" != "$expected" ]]; then
+    printf 'Layer dependency guard self-test failed: %s dedicated test file = %s (expected %s)\n' "$file" "$actual" "$expected" >&2
+    exit 1
+  fi
 }
 
 normalize_import_group_item() {
@@ -180,8 +307,22 @@ normalize_import_path() {
   printf '%s\n' "$path"
 }
 
+# The guard is file-scoped: dedicated test modules are excluded, while inline
+# #[cfg(test)] imports remain subject to the source file's layer. The
+# lifecycle_transition_api_test/ directory is where a mechanical split of
+# lifecycle_transition_api_test.rs moves its tests (rustfs/backlog#2765).
+is_dedicated_test_file() {
+  local file="$1"
+
+  [[ "$file" == *_test.rs ]] || [[ "$file" == */tests/* ]] ||
+    [[ "$file" == rustfs/src/app/lifecycle_transition_api_test/* ]]
+}
+
 emit_crate_use_statements() {
   (cd "$ROOT_DIR" && rg --files -g '*.rs' rustfs/src | while IFS= read -r file; do
+    if is_dedicated_test_file "$file"; then
+      continue
+    fi
     perl -0777 -ne '
       while (/\buse\s+crate::.*?;/sg) {
         my $statement = $&;
@@ -193,6 +334,32 @@ emit_crate_use_statements() {
     ' "$file"
   done)
 }
+
+write_baseline_file() {
+  local entries="$1"
+
+  cat >"$BASELINE_FILE" <<'EOF'
+# Layer dependency baseline for the rustfs binary crate.
+#
+# RATCHET RULE (backlog#1834): this file only shrinks. A PR may delete lines
+# (after migrating the violation) via --update-baseline; a PR that ADDS a line
+# is baselining a brand-new layering violation and must carry an explicit
+# exemption rationale in its description — the baseline is a migration ledger,
+# not an amnesty list.
+#
+# The guard models production imports as:
+#   composition -> interface -> app -> infra
+#
+# Canonical dependency entry:
+#   dep|source_file|source_layer->target_layer|crate::imported_symbol
+#
+# Canonical conceptual cycle entry:
+#   cycle|left_layer<->right_layer
+EOF
+  cat "$entries" >>"$BASELINE_FILE"
+}
+
+run_layer_model_self_tests
 
 normalize_baseline_file() {
   local input="$1"
@@ -233,6 +400,98 @@ normalize_baseline_file() {
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+# --- Cross-crate Rust source include guard (rustfs/backlog#1884) ---
+#
+# `use`-based layer checks cannot see `include_str!`/`include!` edges, and a
+# crate that includes another crate's `.rs` source couples itself to that
+# crate's file layout — a contract crate reverse-including an implementation
+# or binary crate was exactly the unguarded edge found in backlog#1884. Rule:
+# an `include_str!`/`include!` whose target is a `.rs` file must not resolve
+# outside the including crate's own directory. Same-crate source includes
+# (self-asserting tripwires) stay allowed; non-`.rs` targets (protos, fixtures)
+# and `OUT_DIR` includes of generated code are out of scope.
+INCLUDE_GUARD="${TMP_DIR}/include_guard.pl"
+cat >"$INCLUDE_GUARD" <<'PERL'
+use strict;
+use warnings;
+use File::Basename qw(dirname);
+use File::Find qw(find);
+
+my ($root, @dirs) = @ARGV;
+my @files;
+find(
+    sub { push @files, $File::Find::name if -f && /\.rs$/ && $File::Find::name !~ m{/target/} },
+    map { "$root/$_" } @dirs
+);
+
+sub normalize {
+    my @parts;
+    for my $part (split m{/+}, $_[0]) {
+        next if $part eq '' || $part eq '.';
+        if ($part eq '..') { pop @parts } else { push @parts, $part }
+    }
+    return '/' . join('/', @parts);
+}
+
+my @violations;
+for my $file (sort @files) {
+    open my $fh, '<', $file or next;
+    my $src = do { local $/; <$fh> };
+    close $fh;
+
+    my $dir   = dirname($file);
+    my $crate = $dir;
+    $crate = dirname($crate) while $crate ne $root && $crate ne '/' && !-f "$crate/Cargo.toml";
+    next if $crate eq $root || $crate eq '/';
+
+    while (
+        $src =~ /include(?:_str)?!\s*\(\s*(?:concat!\s*\(\s*env!\s*\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*"([^"]+)"|"([^"]+)")/gs
+    ) {
+        my ($manifest_rel, $file_rel) = ($1, $2);
+        my $target = defined $manifest_rel ? "$crate$manifest_rel" : "$dir/$file_rel";
+        next unless $target =~ /\.rs$/;
+        my $resolved     = normalize($target);
+        my $crate_prefix = normalize($crate) . '/';
+        if (index($resolved, $crate_prefix) != 0) {
+            push @violations, "$file includes $resolved outside its crate " . normalize($crate);
+        }
+    }
+}
+print "$_\n" for @violations;
+exit(@violations ? 1 : 0);
+PERL
+
+# Self-test: a fixture workspace with one escaping file-relative include, one
+# escaping CARGO_MANIFEST_DIR include, and several allowed forms.
+FIXTURE_ROOT="${TMP_DIR}/include_fixture"
+mkdir -p "$FIXTURE_ROOT/crates/a/src" "$FIXTURE_ROOT/crates/a/tests" "$FIXTURE_ROOT/crates/b/src"
+touch "$FIXTURE_ROOT/crates/a/Cargo.toml" "$FIXTURE_ROOT/crates/b/Cargo.toml"
+cat >"$FIXTURE_ROOT/crates/a/src/lib.rs" <<'EOF'
+const ESCAPE_RELATIVE: &str = include_str!("../../b/src/lib.rs");
+const ESCAPE_MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../b/src/other.rs"));
+const SAME_CRATE: &str = include_str!("sibling.rs");
+const SAME_CRATE_MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/sibling.rs"));
+const NON_RUST: &str = include_str!("../../b/src/schema.proto");
+EOF
+cat >"$FIXTURE_ROOT/crates/a/tests/contract.rs" <<'EOF'
+const OWN_SRC: &str = include_str!("../src/lib.rs");
+EOF
+INCLUDE_SELF_TEST_OUTPUT="$(perl "$INCLUDE_GUARD" "$FIXTURE_ROOT" crates 2>&1 || true)"
+if [[ "$(printf '%s\n' "$INCLUDE_SELF_TEST_OUTPUT" | grep -c 'outside its crate')" != "2" ]] ||
+  ! grep -q 'crates/b/src/lib.rs' <<<"$INCLUDE_SELF_TEST_OUTPUT" ||
+  ! grep -q 'crates/b/src/other.rs' <<<"$INCLUDE_SELF_TEST_OUTPUT"; then
+  echo "Cross-crate include guard self-test failed; expected exactly the two escaping fixtures to be flagged:" >&2
+  printf '%s\n' "$INCLUDE_SELF_TEST_OUTPUT" >&2
+  exit 1
+fi
+
+if ! INCLUDE_VIOLATIONS="$(perl "$INCLUDE_GUARD" "$ROOT_DIR" crates rustfs 2>&1)"; then
+  echo "Cross-crate include guard failed: a Rust source include escapes its crate directory."
+  echo "Move the assertion into the crate that owns the included file (or assert the compiled artifact) instead of reading another crate's source."
+  printf '%s\n' "$INCLUDE_VIOLATIONS"
+  exit 1
+fi
+
 VIOLATIONS_RAW="${TMP_DIR}/violations_raw.txt"
 EDGES_RAW="${TMP_DIR}/edges_raw.txt"
 CURRENT_BASELINE="${TMP_DIR}/current_baseline.txt"
@@ -265,10 +524,7 @@ while IFS= read -r line; do
       printf '%s->%s\n' "$source_layer" "$target_layer" >>"$EDGES_RAW"
     fi
 
-    source_rank="$(layer_rank "$source_layer")"
-    target_rank="$(layer_rank "$target_layer")"
-
-    if (( source_rank < target_rank )); then
+    if is_reverse_dependency "$source_layer" "$target_layer"; then
       printf 'dep|%s|%s->%s|crate::%s\n' "$file" "$source_layer" "$target_layer" "$import_path" >>"$VIOLATIONS_RAW"
     fi
   done < <(normalize_import_path "$text")
@@ -292,7 +548,7 @@ done <"${TMP_DIR}/edges_sorted.txt" | sort -u >"${TMP_DIR}/cycles_sorted.txt"
 cat "${TMP_DIR}/violations_sorted.txt" "${TMP_DIR}/cycles_sorted.txt" | sort -u >"$CURRENT_BASELINE"
 
 if [[ "$MODE" == "update" ]]; then
-  cp "$CURRENT_BASELINE" "$BASELINE_FILE"
+  write_baseline_file "$CURRENT_BASELINE"
   echo "Updated baseline: $BASELINE_FILE"
   exit 0
 fi
@@ -313,6 +569,8 @@ comm -23 "${TMP_DIR}/baseline_sorted.txt" "$CURRENT_BASELINE" >"$STALE_ITEMS"
 
 if [[ -s "$NEW_ITEMS" ]]; then
   echo "Layer dependency guard failed: new reverse dependencies or cycles detected"
+  echo "Fix the layering instead of baselining it. The baseline is a shrink-only migration ledger (backlog#1834):"
+  echo "re-running with --update-baseline to ADD these entries requires an explicit exemption rationale in the PR description."
   cat "$NEW_ITEMS"
   exit 1
 fi

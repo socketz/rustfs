@@ -23,6 +23,12 @@ SHELL := $(shell which bash)
 .SHELLFLAGS = -eu -o pipefail -c
 
 DOCKER_CLI ?= docker
+# Python interpreter for the repository's helper scripts. They import tomllib
+# (Python 3.11+), while macOS still ships /usr/bin/python3 at 3.9, so calls go
+# through a resolver that picks a new-enough interpreter (or falls back to uv).
+# Override with RUSTFS_PYTHON=/path/to/python3.12, or replace the resolver via
+# RUSTFS_PYTHON_BIN=<command>.
+RUSTFS_PYTHON_BIN ?= ./scripts/python_bin.sh
 IMAGE_NAME ?= rustfs:v1.0.0
 CONTAINER_NAME ?= rustfs-dev
 # Docker build configurations
@@ -64,9 +70,11 @@ How to use me:
 
 	🔧 Code Quality:
 		make fmt                                 # Format code
-		make clippy                              # Run clippy checks
-		make test                                # Run tests
-		make pre-commit                          # Run all pre-commit checks
+		make clippy-check                        # Run clippy (all targets, all features, -D warnings)
+		make quick-check                         # Fast workspace compile check (excludes e2e_test)
+		make test                                # Script tests + workspace tests + doc tests
+		make pre-commit                          # Fast gate: fmt-check + guard scripts + quick-check (NO clippy, NO tests)
+		make pre-pr                              # Full pre-PR gate: pre-commit gates + clippy-check + test
 
 	🚀 Quick Start:
 		make build                               # Build RustFS binary
@@ -78,4 +86,3 @@ endef
 export HEADER
 
 -include $(addsuffix /*.mak, $(shell find .config/make -type d))
-

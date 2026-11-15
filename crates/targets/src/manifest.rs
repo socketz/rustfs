@@ -13,12 +13,15 @@
 // limitations under the License.
 
 use crate::domain::TargetDomain;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use rustfs_config::{
-    AMQP_PASSWORD, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY, KAFKA_SASL_PASSWORD, KAFKA_TLS_CLIENT_CERT, KAFKA_TLS_CLIENT_KEY,
-    MQTT_PASSWORD, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MYSQL_DSN_STRING, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY,
-    NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TOKEN, POSTGRES_DSN_STRING,
-    POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, PULSAR_AUTH_TOKEN, PULSAR_PASSWORD, REDIS_PASSWORD, REDIS_TLS_CLIENT_CERT,
-    REDIS_TLS_CLIENT_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY,
+    AMQP_PASSWORD, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY, AMQP_URL, KAFKA_SASL_PASSWORD, KAFKA_TLS_CLIENT_CERT,
+    KAFKA_TLS_CLIENT_KEY, MQTT_PASSWORD, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MYSQL_DSN_STRING, MYSQL_TLS_CLIENT_CERT,
+    MYSQL_TLS_CLIENT_KEY, NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TOKEN,
+    POSTGRES_DSN_STRING, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, PULSAR_AUTH_TOKEN, PULSAR_PASSWORD, REDIS_PASSWORD,
+    REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY, REDIS_URL, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY,
 };
 
 /// Shared plugin manifest metadata for a target implementation.
@@ -31,6 +34,51 @@ pub struct TargetPluginManifest {
     pub target_type: &'static str,
     pub supported_domains: &'static [TargetDomain],
     pub secret_fields: &'static [&'static str],
+}
+
+impl TargetPluginManifest {
+    /// Configuration fields that bind saved credentials to a destination and its TLS trust policy.
+    /// Changing these fields requires callers to supply credentials again instead of reusing hidden values.
+    pub fn credential_binding_fields(&self) -> &'static [&'static str] {
+        use rustfs_config::*;
+        match self.target_type {
+            "webhook" => &[WEBHOOK_ENDPOINT, WEBHOOK_CLIENT_CA, WEBHOOK_SKIP_TLS_VERIFY],
+            "mqtt" => &[
+                MQTT_BROKER,
+                MQTT_USERNAME,
+                MQTT_TLS_POLICY,
+                MQTT_TLS_CA,
+                MQTT_TLS_TRUST_LEAF_AS_CA,
+            ],
+            "kafka" => &[
+                KAFKA_BROKERS,
+                KAFKA_TLS_ENABLE,
+                KAFKA_TLS_CA,
+                KAFKA_SASL_ENABLE,
+                KAFKA_SASL_MECHANISM,
+                KAFKA_SASL_USERNAME,
+            ],
+            "amqp" => &[AMQP_URL, AMQP_USERNAME, AMQP_TLS_CA],
+            "nats" => &[NATS_ADDRESS, NATS_USERNAME, NATS_TLS_CA, NATS_TLS_REQUIRED],
+            "pulsar" => &[
+                PULSAR_BROKER,
+                PULSAR_USERNAME,
+                PULSAR_TLS_CA,
+                PULSAR_TLS_ALLOW_INSECURE,
+                PULSAR_TLS_HOSTNAME_VERIFICATION,
+            ],
+            "mysql" => &[MYSQL_DSN_STRING, MYSQL_TLS_CA],
+            "redis" => &[
+                REDIS_URL,
+                REDIS_USERNAME,
+                REDIS_TLS_POLICY,
+                REDIS_TLS_CA,
+                REDIS_TLS_ALLOW_INSECURE,
+            ],
+            "postgres" => &[POSTGRES_DSN_STRING, POSTGRES_TLS_CA, POSTGRES_TLS_REQUIRED],
+            _ => &[],
+        }
+    }
 }
 
 /// Declares how a plugin is packaged relative to the RustFS process boundary.
@@ -100,7 +148,12 @@ pub struct TargetPluginMarketplaceManifest {
     pub distribution: Option<TargetPluginDistributionManifest>,
 }
 
-const BUILTIN_PLUGIN_API_COMPATIBILITY_VERSION: &str = "rustfs.target-plugin.v1";
+/// The plugin API compatibility version this build understands. Installable
+/// external plugins must declare exactly this value in their marketplace
+/// manifest to be installable; anything else is rejected during planning.
+pub const SUPPORTED_PLUGIN_API_COMPATIBILITY_VERSION: &str = "rustfs.target-plugin.v1";
+
+const BUILTIN_PLUGIN_API_COMPATIBILITY_VERSION: &str = SUPPORTED_PLUGIN_API_COMPATIBILITY_VERSION;
 const BUILTIN_PLUGIN_RUNTIME_PROTOCOL_VERSION: &str = "rustfs.target-runtime.v1";
 
 const SUPPORTED_BUILTIN_DOMAINS: &[TargetDomain] = &[TargetDomain::Audit, TargetDomain::Notify];
@@ -109,7 +162,7 @@ const NO_SECRET_FIELDS: &[&str] = &[];
 const WEBHOOK_SECRET_FIELDS: &[&str] = &[WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY];
 const MQTT_SECRET_FIELDS: &[&str] = &[MQTT_PASSWORD, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY];
 const KAFKA_SECRET_FIELDS: &[&str] = &[KAFKA_TLS_CLIENT_CERT, KAFKA_TLS_CLIENT_KEY, KAFKA_SASL_PASSWORD];
-const AMQP_SECRET_FIELDS: &[&str] = &[AMQP_PASSWORD, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY];
+const AMQP_SECRET_FIELDS: &[&str] = &[AMQP_URL, AMQP_PASSWORD, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY];
 const NATS_SECRET_FIELDS: &[&str] = &[
     NATS_PASSWORD,
     NATS_TOKEN,
@@ -119,7 +172,7 @@ const NATS_SECRET_FIELDS: &[&str] = &[
 ];
 const PULSAR_SECRET_FIELDS: &[&str] = &[PULSAR_AUTH_TOKEN, PULSAR_PASSWORD];
 const MYSQL_SECRET_FIELDS: &[&str] = &[MYSQL_DSN_STRING, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY];
-const REDIS_SECRET_FIELDS: &[&str] = &[REDIS_PASSWORD, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY];
+const REDIS_SECRET_FIELDS: &[&str] = &[REDIS_URL, REDIS_PASSWORD, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY];
 const POSTGRES_SECRET_FIELDS: &[&str] = &[POSTGRES_DSN_STRING, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY];
 
 #[inline]
@@ -210,8 +263,20 @@ fn builtin_plugin_id(target_type: &'static str) -> &'static str {
         "mysql" => "builtin:mysql",
         "redis" => "builtin:redis",
         "postgres" => "builtin:postgres",
-        _ => "custom:target",
+        _ => custom_plugin_id(target_type),
     }
+}
+
+/// Interns a unique `custom:<target_type>` plugin id per non-builtin target type.
+/// A shared fallback id would make distinct custom plugins collide in every
+/// identity-keyed surface (registry keys, canonical instance ids, admin catalog).
+/// The leak is bounded by the number of distinct registered target types.
+fn custom_plugin_id(target_type: &'static str) -> &'static str {
+    static CUSTOM_PLUGIN_IDS: OnceLock<Mutex<HashMap<&'static str, &'static str>>> = OnceLock::new();
+    let ids = CUSTOM_PLUGIN_IDS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut ids = ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    ids.entry(target_type)
+        .or_insert_with(|| Box::leak(format!("custom:{target_type}").into_boxed_str()))
 }
 
 #[cfg(test)]
@@ -223,7 +288,17 @@ mod tests {
         installable_target_marketplace_manifest,
     };
     use crate::domain::TargetDomain;
+    use rustfs_config::{AMQP_URL, REDIS_URL};
     use rustfs_config::{KAFKA_SASL_PASSWORD, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY};
+
+    #[test]
+    fn broker_urls_are_secret_and_credentials_are_bound_to_connection_settings() {
+        for (target, url) in [("amqp", AMQP_URL), ("redis", REDIS_URL)] {
+            let manifest = builtin_target_manifest(target);
+            assert!(manifest.secret_fields.contains(&url));
+            assert!(manifest.credential_binding_fields().contains(&url));
+        }
+    }
 
     #[test]
     fn builtin_webhook_manifest_marks_secret_fields() {
@@ -261,6 +336,18 @@ mod tests {
         let manifest = builtin_target_marketplace_manifest("kafka");
 
         assert_eq!(manifest.supported_domains, &[TargetDomain::Audit, TargetDomain::Notify]);
+    }
+
+    #[test]
+    fn custom_target_types_get_unique_stable_plugin_ids() {
+        let first = builtin_target_manifest("custom-a");
+        let second = builtin_target_manifest("custom-b");
+
+        assert_eq!(first.plugin_id, "custom:custom-a");
+        assert_eq!(second.plugin_id, "custom:custom-b");
+        assert_ne!(first.plugin_id, second.plugin_id);
+        // Interned: repeated lookups return the same &'static str.
+        assert!(std::ptr::eq(first.plugin_id, builtin_target_manifest("custom-a").plugin_id));
     }
 
     #[test]
